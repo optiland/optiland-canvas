@@ -1,0 +1,32 @@
+[package]
+name = "oc-wasm"
+description = "Optiland Canvas WASM bindings: scene mutation + interactive trace for the web shell."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# Skip the wasm-opt (binaryen) download+pass: it needs a GitHub release download
+# and is only a size optimization. Fine to leave off for dev; flip to a version
+# string (e.g. wasm-opt = ["-O"]) for a production bundle.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+
+[dependencies]
+oc-core = { path = "../oc-core" }
+# The freehand-stroke fitter (M3, §5.3). Pure geometry; wasm-clean.
+oc-fit = { path = "../oc-fit" }
+# CPU-only interactive backend (no wgpu): the guaranteed-portable path that
+# compiles to wasm32 today. The WebGPU backend is enabled in the browser build
+# via oc-gpu's `gpu` feature once the WebGPU device is wired to the canvas.
+oc-gpu = { path = "../oc-gpu", default-features = false }
+# The exact f64 reference tracer, serial (no rayon) so it runs in wasm. Displayed
+# metrics come from here, never the f32 interactive path (§4.1).
+oc-trace = { path = "../oc-trace", default-features = false }
+# Element clipboard: serialize/deserialize a single element for copy/paste.
+serde_json = { workspace = true }
+wasm-bindgen = "0.2"

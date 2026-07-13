@@ -1,0 +1,33 @@
+[package]
+name = "oc-gpu"
+description = "Optiland Canvas interactive tracer: wgpu compute (f32) with a CPU fallback."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["gpu"]
+# The wgpu compute backend. Disable for the portable CPU-only build (the
+# no-WebGPU fallback / web-worker path, and anything targeting wasm without
+# WebGPU wiring).
+gpu = ["dep:wgpu", "dep:pollster"]
+
+[dependencies]
+oc-core.workspace = true
+glam.workspace = true
+bytemuck = { version = "1", features = ["derive"] }
+wgpu = { version = "22.1", optional = true }
+pollster = { version = "0.3", optional = true }
+
+[dev-dependencies]
+oc-trace.workspace = true
+
+[[example]]
+name = "gpu_probe"
+required-features = ["gpu"]
+
+[[example]]
+name = "drag"
+required-features = ["gpu"]

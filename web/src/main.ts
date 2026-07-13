@@ -1,0 +1,469 @@
+// Optiland Canvas — M2 web shell ("it's optics").
+//
+// Scene lives in Rust (§2). This file holds UI state only. Two tracers, per the
+// spec's tiering (§4.1): the interactive f32 path draws the picture every frame
+// (spectral colour, ghost layer, TIR glow); the f64 reference feeds the
+// detector dock's *numbers*, on idle.
+
+import init, { Canvas } from "../pkg/oc_wasm.js";
+import { initM3 } from "./m3";
+
+const SCALE = 6.5; // px per mm
+type V2 = { x: number; y: number };
+type Glass = { name: string; nd: number; vd: number };
+
+async function main() {
+  await init();
+
+  const view = document.getElementById("view") as HTMLCanvasElement;
+  const ctx = view.getContext("2d")!;
+  const stat = document.getElementById("stat")!;
+  const abbe = document.getElementById("abbe") as HTMLCanvasElement;
+  const actx = abbe.getContext("2d")!;
+  const abbeLabel = document.getElementById("abbeLabel")!;
+  const hist = document.getElementById("hist") as HTMLCanvasElement;
+  const hctx = hist.getContext("2d")!;
+  const dockNums = document.getElementById("dockNums")!;
+  const ghostsBox = document.getElementById("ghosts") as HTMLInputElement;
+  const ghostOpacity = document.getElementById("ghostOpacity") as HTMLInputElement;
+  const tirBox = document.getElementById("tir") as HTMLInputElement;
+  const density = document.getElementById("density") as HTMLInputElement;
+
+  // --- scene -------------------------------------------------------------
+  const scene = new Canvas();
+  scene.setMaxDepth(10);
+  const committed: Glass = { name: "N-BK7", nd: 1.5168, vd: 64.17 };
+  const lensId = scene.addSinglet(0, 0, 50, 4, 12, committed.nd, committed.vd);
+  // Spectral count only affects dispersion smoothness (in the collimated beam
+  // all wavelengths are coincident → they sum to white regardless of count), so
+  // keep it modest for a cheap trace; spatial density is what fills the beam.
+  scene.addWhiteBeam(-70, 0, 0, 10, 16, 9); // 16 rays × 9 spectral lines
+  scene.addDetector(52, -7, 52, 7, 48);
+  const lens: V2 = { x: 0, y: 0 };
+
+  // M3 module (draw / inspect / snap / pin). It owns element manipulation on the
+  // canvas; assigned near the end once renderView/refreshReference exist.
+  let m3: { overlay: (ctx: CanvasRenderingContext2D) => void } | null = null;
+
+  const glasses: Glass[] = JSON.parse(scene.abbeGlassesJson());
+  const hull = Array.from(scene.abbeHull()); // [vd, nd, ...]
+
+  // --- world <-> screen (zoom + pan) -------------------------------------
+  const w = () => window.innerWidth;
+  const h = () => window.innerHeight;
+  let scale = SCALE;        // px per mm (zoom)
+  let panX = 0, panY = 0;   // screen-px offset of the world origin from centre
+  const toScreen = (p: V2): V2 => ({ x: w() / 2 + panX + p.x * scale, y: h() / 2 + panY - p.y * scale });
+  const toWorld = (px: number, py: number): V2 => ({ x: (px - w() / 2 - panX) / scale, y: (h() / 2 + panY - py) / scale });
+
+  // Zoom about a screen point, keeping the world point under it fixed.
+  function zoomAt(clientX: number, clientY: number, factor: number) {
+    const before = toWorld(clientX, clientY);
+    scale = Math.min(400, Math.max(0.4, scale * factor));
+    panX = clientX - w() / 2 - before.x * scale;
+    panY = clientY - h() / 2 + before.y * scale;
+  }
+  const panBy = (dxScreen: number, dyScreen: number) => { panX += dxScreen; panY += dyScreen; };
+  const resetView = () => { scale = SCALE; panX = 0; panY = 0; };
+
+  function resize() {
+    const dpr = window.devicePixelRatio || 1;
+    view.width = Math.floor(window.innerWidth * dpr);
+    view.height = Math.floor(window.innerHeight * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener("resize", () => { resize(); renderView(); });
+  resize();
+
+  // --- HDR ray layer (spectral, additive, tonemapped) -------------------
+  // The scientifically correct model (spec §4.3): accumulate each spectral ray
+  // additively into a *linear* HDR buffer (colours from oc-wasm are linear light
+  // weighted by remaining flux), then tonemap on present. White light is the
+  // sum of its wavelengths → a full spectrum adds up to white; where wavelengths
+  // physically separate, you get coloured fringes; and Reinhard tonemapping maps
+  // the huge dynamic range (a focus is enormously brighter than a stray ray)
+  // into [0,1] without the blow-out that plagues un-tonemapped additive.
+  const rayCanvas = document.createElement("canvas");
+  const rayCtx = rayCanvas.getContext("2d")!;
+  let hdr = new Float32Array(0);
+  let img: ImageData | null = null;
+  let bufW = 0, bufH = 0;
+  // Dirty-rectangle tracking (device px): the lit region this frame (cx*) and
+  // last frame (lb*). Clearing, tonemapping and uploading only this rectangle —
+  // instead of the whole screen every frame — is what keeps it responsive on a
+  // hi-DPI panel where the full buffer is millions of pixels.
+  let cx0 = 0, cy0 = 0, cx1 = -1, cy1 = -1;
+  let lbx0 = 0, lby0 = 0, lbx1 = -1, lby1 = -1;
+  const EXPOSURE = 1.0;
+
+  // Reinhard tonemap x/(1+x) ∈ [0,1) followed by linear→sRGB, baked into a LUT
+  // so the per-pixel present loop stays cheap.
+  const l2s = (c: number) => (c <= 0.0031308 ? 12.92 * c : 1.055 * Math.pow(c, 1 / 2.4) - 0.055);
+  const TONE = new Uint8ClampedArray(1025);
+  for (let i = 0; i <= 1024; i++) TONE[i] = Math.round(l2s(i / 1024) * 255);
+
+  function ensureBuffers(W: number, H: number) {
+    if (W === bufW && H === bufH) return;
+    bufW = W; bufH = H;
+    rayCanvas.width = W; rayCanvas.height = H;
+    hdr = new Float32Array(W * H * 3);
+    img = rayCtx.createImageData(W, H);
+    lbx1 = -1; lby1 = -1; // fresh buffers → no stale lit region
+  }
+
+  // Antialiased additive line (Xiaolin Wu). Coordinates are in device pixels;
+  // `r,g,b` are the flux-weighted linear contribution. Each column deposits
+  // total coverage 1 split across the two straddling pixels, so brightness per
+  // unit length is constant and edges are smooth.
+  function plot(x: number, y: number, r: number, g: number, b: number, c: number) {
+    if (c <= 0 || x < 0 || x >= bufW || y < 0 || y >= bufH) return;
+    const k = (y * bufW + x) * 3;
+    hdr[k] += r * c;
+    hdr[k + 1] += g * c;
+    hdr[k + 2] += b * c;
+    if (x < cx0) cx0 = x;
+    if (x > cx1) cx1 = x;
+    if (y < cy0) cy0 = y;
+    if (y > cy1) cy1 = y;
+  }
+  function addLine(x0: number, y0: number, x1: number, y1: number, r: number, g: number, b: number) {
+    // Clip to the buffer first (Liang–Barsky). Exit rays run to the scene
+    // bounds — tens of thousands of pixels off-screen — so rasterizing the
+    // unclipped span would burn the whole frame on no-op iterations.
+    const dx0 = x1 - x0, dy0 = y1 - y0;
+    let t0 = 0, t1 = 1;
+    const edges = [[-dx0, x0], [dx0, bufW - 1 - x0], [-dy0, y0], [dy0, bufH - 1 - y0]];
+    for (const [p, q] of edges) {
+      if (p === 0) {
+        if (q < 0) return; // parallel and outside
+      } else {
+        const t = q / p;
+        if (p < 0) { if (t > t1) return; if (t > t0) t0 = t; }
+        else { if (t < t0) return; if (t < t1) t1 = t; }
+      }
+    }
+    x1 = x0 + t1 * dx0; y1 = y0 + t1 * dy0;
+    x0 = x0 + t0 * dx0; y0 = y0 + t0 * dy0;
+
+    let steep = Math.abs(y1 - y0) > Math.abs(x1 - x0);
+    if (steep) { [x0, y0] = [y0, x0]; [x1, y1] = [y1, x1]; }
+    if (x0 > x1) { [x0, x1] = [x1, x0]; [y0, y1] = [y1, y0]; }
+    const dx = x1 - x0;
+    const grad = dx === 0 ? 1 : (y1 - y0) / dx;
+    const ix0 = Math.round(x0), ix1 = Math.round(x1);
+    let intery = y0 + grad * (ix0 - x0 + 0.5);
+    for (let x = ix0; x <= ix1; x++) {
+      const y = Math.floor(intery);
+      const f = intery - y;
+      if (steep) {
+        plot(y, x, r, g, b, 1 - f);
+        plot(y + 1, x, r, g, b, f);
+      } else {
+        plot(x, y, r, g, b, 1 - f);
+        plot(x, y + 1, r, g, b, f);
+      }
+      intery += grad;
+    }
+  }
+
+  // --- interactive view -------------------------------------------------
+  function renderView() {
+    const t0 = performance.now();
+    const segs = scene.traceColored(); // 9 floats/segment: ax ay bx by r g b flux flags
+    const traceMs = performance.now() - t0;
+    const gOpacity = Number(ghostOpacity.value) / 100;
+    const showTir = tirBox.checked;
+    const W = w(), H = h();
+    // Accumulate at device resolution so the ray layer is 1:1 with the display
+    // (no upscale blur); rasterize with antialiasing (no stair-stepping).
+    const dpr = window.devicePixelRatio || 1;
+    const DW = Math.round(W * dpr), DH = Math.round(H * dpr);
+    ensureBuffers(DW, DH);
+    // Zero only last frame's lit region (not the whole buffer), then open a
+    // fresh current box that plot() grows.
+    for (let y = lby0; y <= lby1; y++) {
+      let k = (y * bufW + lbx0) * 3;
+      for (let x = lbx0; x <= lbx1; x++, k += 3) { hdr[k] = 0; hdr[k + 1] = 0; hdr[k + 2] = 0; }
+    }
+    cx0 = bufW; cy0 = bufH; cx1 = -1; cy1 = -1;
+
+    // Flux fraction relative to a fresh launch ray (all launch rays start equal),
+    // so brightness is energy, not ray count.
+    let maxFlux = 1e-9;
+    for (let i = 7; i < segs.length; i += 9) if (segs[i] > maxFlux) maxFlux = segs[i];
+
+    let count = 0;
+    const tirDots: V2[] = [];
+    for (let i = 0; i + 8 < segs.length; i += 9) {
+      const flags = Math.round(segs[i + 8]);
+      const ghost = (flags & 4) !== 0;
+      const frac = Math.min(1, segs[i + 7] / maxFlux);
+      // Ghosts are a dim (~4% energy) layer with their own opacity control (§5.5).
+      const wgt = (ghost ? frac * gOpacity * 8 : frac) * EXPOSURE;
+      if (wgt < 1e-4) continue;
+      const a = toScreen({ x: segs[i], y: segs[i + 1] });
+      const b = toScreen({ x: segs[i + 2], y: segs[i + 3] });
+      // rasterize in device px; keep CSS-space endpoint for overlay markers
+      addLine(a.x * dpr, a.y * dpr, b.x * dpr, b.y * dpr, segs[i + 4] * wgt, segs[i + 5] * wgt, segs[i + 6] * wgt);
+      if ((flags & 2) !== 0 && showTir) tirDots.push(b);
+      count++;
+    }
+
+    // Tonemap over the union of this frame's and last frame's lit boxes: lit
+    // pixels get written, pixels that went dark get cleared to transparent.
+    const px = img!.data;
+    let ux0 = bufW, uy0 = bufH, ux1 = -1, uy1 = -1;
+    if (cx1 >= cx0) { ux0 = Math.min(ux0, cx0); uy0 = Math.min(uy0, cy0); ux1 = Math.max(ux1, cx1); uy1 = Math.max(uy1, cy1); }
+    if (lbx1 >= lbx0) { ux0 = Math.min(ux0, lbx0); uy0 = Math.min(uy0, lby0); ux1 = Math.max(ux1, lbx1); uy1 = Math.max(uy1, lby1); }
+    if (ux1 >= ux0) {
+      for (let y = uy0; y <= uy1; y++) {
+        let k = (y * bufW + ux0) * 3;
+        let p = (y * bufW + ux0) * 4;
+        for (let x = ux0; x <= ux1; x++, k += 3, p += 4) {
+          const r = hdr[k], g = hdr[k + 1], b = hdr[k + 2];
+          if (r === 0 && g === 0 && b === 0) { px[p + 3] = 0; continue; }
+          px[p] = TONE[(r / (1 + r) * 1024) | 0];
+          px[p + 1] = TONE[(g / (1 + g) * 1024) | 0];
+          px[p + 2] = TONE[(b / (1 + b) * 1024) | 0];
+          px[p + 3] = 255;
+        }
+      }
+      rayCtx.putImageData(img!, 0, 0, ux0, uy0, ux1 - ux0 + 1, uy1 - uy0 + 1);
+    }
+    // Remember this frame's lit box so next frame can clear exactly it.
+    lbx0 = cx0; lby0 = cy0; lbx1 = cx1; lby1 = cy1;
+
+    // Compose: dark background, faint axis + detector, then add the ray layer.
+    ctx.fillStyle = "#06080d";
+    ctx.fillRect(0, 0, W, H);
+    // Optical axis is world y = 0, so it pans/zooms with the scene (not fixed
+    // at screen centre — otherwise a stray line lingers after panning).
+    const axisY = toScreen({ x: 0, y: 0 }).y;
+    ctx.strokeStyle = "rgba(120,140,170,0.16)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(0, axisY);
+    ctx.lineTo(W, axisY);
+    ctx.stroke();
+    const d0 = toScreen({ x: 52, y: -7 });
+    const d1 = toScreen({ x: 52, y: 7 });
+    ctx.strokeStyle = "rgba(127,214,255,0.4)";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(d0.x, d0.y);
+    ctx.lineTo(d1.x, d1.y);
+    ctx.stroke();
+
+    // Add the device-resolution ray layer 1:1 (bypass the dpr transform).
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.globalCompositeOperation = "lighter";
+    ctx.drawImage(rayCanvas, 0, 0);
+    ctx.restore();
+
+    // TIR highlight: a ring where a surface is in total internal reflection.
+    if (showTir) {
+      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = "rgba(255,120,80,0.9)";
+      for (const p of tirDots) {
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 4, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+    }
+
+    // M3 overlay: element outlines, selection handles, snap guides, and the
+    // freehand fit preview. It owns on-canvas manipulation, so the old fixed
+    // lens-handle ellipse is retired in its favour.
+    m3?.overlay(ctx);
+
+    const ms = performance.now() - t0;
+    stat.textContent = `${count} segs · ${ms.toFixed(1)} ms (trace ${traceMs.toFixed(1)}) · ${committed.name} nd ${committed.nd.toFixed(4)} V ${committed.vd.toFixed(1)}`;
+  }
+
+  // --- Abbe picker (§5.4) -----------------------------------------------
+  const VD = [95, 20], ND = [1.43, 1.95]; // axis ranges (Vd decreases →)
+  const AW = abbe.width, AH = abbe.height;
+  const abX = (vd: number) => ((VD[0] - vd) / (VD[0] - VD[1])) * AW;
+  const abY = (nd: number) => AH - ((nd - ND[0]) / (ND[1] - ND[0])) * AH;
+  const abVd = (px: number) => VD[0] - (px / AW) * (VD[0] - VD[1]);
+  const abNd = (py: number) => ND[0] + ((AH - py) / AH) * (ND[1] - ND[0]);
+
+  function drawAbbe(cursor?: V2, obtainable = true) {
+    actx.clearRect(0, 0, AW, AH);
+    // hatch the whole panel (the "unobtainable" fill)
+    actx.strokeStyle = "rgba(90,70,70,0.35)";
+    actx.lineWidth = 1;
+    for (let d = -AH; d < AW; d += 7) {
+      actx.beginPath();
+      actx.moveTo(d, 0);
+      actx.lineTo(d + AH, AH);
+      actx.stroke();
+    }
+    // carve out the obtainable region (fill hull with panel bg)
+    if (hull.length >= 6) {
+      actx.beginPath();
+      actx.moveTo(abX(hull[0]), abY(hull[1]));
+      for (let i = 2; i < hull.length; i += 2) actx.lineTo(abX(hull[i]), abY(hull[i + 1]));
+      actx.closePath();
+      actx.fillStyle = "#0a0e16";
+      actx.fill();
+      actx.strokeStyle = "rgba(127,214,255,0.5)";
+      actx.stroke();
+    }
+    // glass dots
+    for (const gl of glasses) {
+      actx.fillStyle = "rgba(200,220,245,0.85)";
+      actx.beginPath();
+      actx.arc(abX(gl.vd), abY(gl.nd), 2.2, 0, Math.PI * 2);
+      actx.fill();
+    }
+    // committed marker
+    actx.strokeStyle = "#ffd678";
+    actx.lineWidth = 1.5;
+    actx.beginPath();
+    actx.arc(abX(committed.vd), abY(committed.nd), 4, 0, Math.PI * 2);
+    actx.stroke();
+    // cursor preview
+    if (cursor) {
+      actx.strokeStyle = obtainable ? "#7fffa0" : "#ff5a3c";
+      actx.beginPath();
+      actx.arc(cursor.x, cursor.y, 5, 0, Math.PI * 2);
+      actx.stroke();
+    }
+  }
+
+  function nearestGlass(vd: number, nd: number): Glass | null {
+    let best: Glass | null = null;
+    let bestD = Infinity;
+    for (const gl of glasses) {
+      const dx = abX(gl.vd) - abX(vd), dy = abY(gl.nd) - abY(nd);
+      const dsq = dx * dx + dy * dy;
+      if (dsq < bestD) { bestD = dsq; best = gl; }
+    }
+    return bestD < 100 ? best : null; // within 10 px → snap
+  }
+
+  function applyGlass(g: Glass) {
+    committed.name = g.name;
+    committed.nd = g.nd;
+    committed.vd = g.vd;
+    scene.setElementAbbe(lensId, g.nd, g.vd);
+  }
+
+  abbe.addEventListener("pointermove", (e) => {
+    const rect = abbe.getBoundingClientRect();
+    const px = e.clientX - rect.left, py = e.clientY - rect.top;
+    const snap = nearestGlass(abVd(px), abNd(py));
+    const nd = snap ? snap.nd : abNd(py);
+    const vd = snap ? snap.vd : abVd(px);
+    const ok = scene.isObtainable(nd, vd);
+    drawAbbe({ x: snap ? abX(vd) : px, y: snap ? abY(nd) : py }, ok);
+    if (ok) {
+      abbeLabel.textContent = snap ? `${snap.name} — nd ${nd.toFixed(4)}, V ${vd.toFixed(1)}`
+        : `custom — nd ${nd.toFixed(4)}, V ${vd.toFixed(1)}`;
+      scene.setElementAbbe(lensId, nd, vd); // live preview: chromatic spread re-converges
+      renderView();
+    } else {
+      abbeLabel.textContent = "unobtainable — no glass exists here";
+    }
+  });
+  abbe.addEventListener("pointerdown", (e) => {
+    const rect = abbe.getBoundingClientRect();
+    const px = e.clientX - rect.left, py = e.clientY - rect.top;
+    const snap = nearestGlass(abVd(px), abNd(py));
+    const nd = snap ? snap.nd : abNd(py);
+    const vd = snap ? snap.vd : abVd(px);
+    if (scene.isObtainable(nd, vd)) {
+      applyGlass(snap ?? { name: "custom", nd, vd });
+      renderView();
+      refreshReference();
+    }
+  });
+  abbe.addEventListener("pointerleave", () => {
+    applyGlass(committed); // revert preview to the committed glass
+    drawAbbe();
+    renderView();
+    refreshReference();
+  });
+
+  // --- detector dock (f64 reference numbers, on idle) --------------------
+  function refreshReference() {
+    const info = JSON.parse(scene.detectorJson(0));
+    hctx.clearRect(0, 0, hist.width, hist.height);
+    if (!info || info.hits === 0) {
+      dockNums.textContent = "no rays on detector";
+      return;
+    }
+    const bins: number[] = info.bins;
+    const max = Math.max(...bins, 1e-12);
+    const bw = hist.width / bins.length;
+    hctx.fillStyle = "#7fd6ff";
+    for (let i = 0; i < bins.length; i++) {
+      const bh = (bins[i] / max) * (hist.height - 2);
+      hctx.fillRect(i * bw, hist.height - bh, Math.max(1, bw - 0.5), bh);
+    }
+    const cen = info.centroid == null ? "—" : (info.centroid * 14 - 7).toFixed(3);
+    dockNums.textContent = `hits ${info.hits} · flux ${info.flux.toFixed(3)} · centroid y ${cen} mm · OPL ${Number(info.opl).toFixed(2)} mm`;
+  }
+
+  // --- controls ----------------------------------------------------------
+  ghostsBox.addEventListener("change", () => { scene.setGhosts(ghostsBox.checked); renderView(); });
+  ghostOpacity.addEventListener("input", renderView);
+  tirBox.addEventListener("change", renderView);
+  // Ray density: source 0 is the beam. Live retrace while sliding; the reference
+  // dock (heavier) recomputes only on release.
+  density.addEventListener("input", () => { scene.setSourceRays(0, Number(density.value)); renderView(); });
+  density.addEventListener("change", refreshReference);
+
+  // --- drag the lens (fallback; M3 module takes over when loaded) --------
+  let dragging = false;
+  view.addEventListener("pointerdown", (e) => {
+    if (m3) return; // the M3 module owns on-canvas manipulation (select/draw/pin)
+    const p = toWorld(e.clientX, e.clientY);
+    if (Math.abs(p.x - lens.x) < 6 && Math.abs(p.y - lens.y) < 14) {
+      dragging = true;
+      view.classList.add("dragging");
+      view.setPointerCapture(e.pointerId);
+    }
+  });
+  view.addEventListener("pointermove", (e) => {
+    if (!dragging) return;
+    const p = toWorld(e.clientX, e.clientY);
+    lens.x = p.x;
+    lens.y = p.y;
+    scene.moveElement(lensId, lens.x, lens.y);
+    renderView();
+  });
+  const endDrag = (e: PointerEvent) => {
+    if (!dragging) return;
+    dragging = false;
+    view.classList.remove("dragging");
+    try { view.releasePointerCapture(e.pointerId); } catch { /* ignore */ }
+    refreshReference(); // numbers settle after release (§4.1)
+  };
+  view.addEventListener("pointerup", endDrag);
+  view.addEventListener("pointercancel", endDrag);
+
+  // --- go ----------------------------------------------------------------
+  m3 = initM3({
+    scene,
+    view,
+    toScreen,
+    toWorld,
+    zoomAt,
+    panBy,
+    resetView,
+    render: renderView,
+    refresh: refreshReference,
+    demoLensId: lensId,
+  });
+  drawAbbe();
+  renderView();
+  refreshReference();
+}
+
+main().catch((e) => {
+  document.body.innerHTML = `<pre style="padding:2rem;color:#f88">Failed to start: ${e}\n\nBuild the wasm first:  npm run wasm</pre>`;
+  console.error(e);
+});

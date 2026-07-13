@@ -1,0 +1,34 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/oc-core",
+    "crates/oc-trace",
+    "crates/oc-gpu",
+    "crates/oc-fit",
+    "crates/oc-wasm",
+]
+
+# Future-milestone crates (see README "Milestones"). They are intentionally
+# NOT workspace members yet so that `cargo test` stays green with a minimal
+# dependency footprint:
+#   crates/oc-py    (M5)  PyO3 bindings; Optiland import/export
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/optiland/optiland-canvas"
+rust-version = "1.75"
+
+[workspace.dependencies]
+oc-core = { path = "crates/oc-core" }
+oc-trace = { path = "crates/oc-trace" }
+oc-fit = { path = "crates/oc-fit" }
+glam = { version = "0.29", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rayon = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

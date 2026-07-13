@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Optiland Canvas — M3</title>
+    <style>
+      :root { color-scheme: dark; }
+      html, body { margin: 0; height: 100%; overflow: hidden; background: #06080d; color: #cdd6e4;
+        font: 12px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+      canvas#view { position: fixed; inset: 0; width: 100vw; height: 100vh; cursor: grab; }
+      canvas#view.dragging { cursor: grabbing; }
+      .panel { position: fixed; background: rgba(10,14,22,0.86); border: 1px solid #1e2a3d;
+        border-radius: 8px; padding: 10px 12px; backdrop-filter: blur(6px); }
+      #hud { top: 12px; left: 14px; pointer-events: none; }
+      #hud b { color: #7fd6ff; }
+      #hud #stat { opacity: 0.7; }
+      #controls { top: 12px; right: 14px; width: 250px; }
+      #controls h3 { margin: 0 0 6px; font-size: 12px; color: #7fd6ff; }
+      #abbe { display: block; margin-top: 6px; border-radius: 4px; cursor: crosshair; }
+      #abbeLabel { opacity: 0.75; margin-top: 4px; min-height: 15px; }
+      #dock { bottom: 12px; right: 14px; width: 250px; }
+      #dock h3 { margin: 0 0 6px; font-size: 12px; color: #7fd6ff; }
+      #hist { display: block; border-radius: 4px; background: #04060a; }
+      #dockNums { opacity: 0.8; margin-top: 4px; }
+      label.row { display: flex; align-items: center; gap: 6px; margin: 4px 0; }
+      input[type="range"] { flex: 1; }
+
+      /* --- M3 "it's precise" --- */
+      #tools { top: 12px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 8px; }
+      #tools button { background: #12203a; color: #cdd6e4; border: 1px solid #24344d; border-radius: 6px;
+        padding: 4px 10px; cursor: pointer; font: inherit; }
+      #tools button.active { background: #1d4e6b; color: #e8f6ff; border-color: #3a86b0; }
+      /* inspector cards — compact pop-ups (positioned in JS, many at once). */
+      .card { width: 158px; padding: 7px 8px; }
+      .card h3 { margin: 0 0 5px; font-size: 12px; color: #7fd6ff; cursor: move;
+        display: flex; justify-content: space-between; align-items: center; user-select: none; }
+      .c-hdrbtns { display: flex; gap: 2px; }
+      .c-close, .c-pinpos { background: none; border: none; color: #8aa1b8; cursor: pointer;
+        font-size: 12px; line-height: 1; padding: 0 2px; }
+      .c-close { font-size: 14px; }
+      .c-close:hover, .c-pinpos:hover { color: #e8f6ff; }
+      .c-pinpos.pinned { opacity: 1; filter: drop-shadow(0 0 2px #7fd6ff); }
+      .field { display: flex; align-items: center; gap: 4px; margin: 2px 0; }
+      .field > span:first-child { width: 26px; opacity: 0.75; }
+      .field input[type="number"] { flex: 1; width: 40px; min-width: 0; background: #0a1220; color: #e8f6ff;
+        border: 1px solid #24344d; border-radius: 4px; padding: 1px 4px; font: inherit; }
+      .field input:disabled { opacity: 0.4; }
+      .field .u { width: 18px; opacity: 0.45; text-align: right; }
+      button.pin { background: none; border: none; cursor: pointer; padding: 0; opacity: 0.45; font-size: 11px; }
+      button.pin.pinned { opacity: 1; }
+      .sub { opacity: 0.7; margin-top: 2px; min-height: 14px; font-size: 11px; }
+      #fitpanel { bottom: 12px; left: 50%; transform: translateX(-50%); width: 268px; text-align: center; }
+      #fitpanel h3 { margin: 0 0 6px; font-size: 12px; color: #7fd6ff; }
+      #fitpanel button { background: #12203a; color: #cdd6e4; border: 1px solid #24344d; border-radius: 6px;
+        padding: 3px 14px; margin: 4px 3px 0; cursor: pointer; font: inherit; }
+      #fitCommit { background: #1d4e6b; border-color: #3a86b0; }
+    </style>
+  </head>
+  <body>
+    <canvas id="view"></canvas>
+
+    <div class="panel" id="hud">
+      <div><b>Optiland Canvas</b> — M2 "it's optics"</div>
+      <div>drag the lens · hover the Abbe map to change its glass</div>
+      <div id="stat"></div>
+    </div>
+
+    <div class="panel" id="controls">
+      <h3>material — Abbe map</h3>
+      <canvas id="abbe" width="228" height="180"></canvas>
+      <div id="abbeLabel">hover to preview glass</div>
+      <label class="row">ray density <input type="range" id="density" min="8" max="120" value="16" /></label>
+      <label class="row"><input type="checkbox" id="ghosts" /> ghost layer</label>
+      <label class="row">ghost opacity <input type="range" id="ghostOpacity" min="0" max="100" value="45" /></label>
+      <label class="row"><input type="checkbox" id="tir" checked /> TIR highlight</label>
+      <label class="row"><input type="checkbox" id="gridBox" /> grid
+        <span style="opacity:0.6">spacing</span>
+        <input type="number" id="gridSpacing" value="5" min="0.5" step="0.5" style="width:48px; background:#0a1220; color:#e8f6ff; border:1px solid #24344d; border-radius:4px; padding:2px 4px; font:inherit" />
+        <span style="opacity:0.5">mm</span></label>
+    </div>
+
+    <div class="panel" id="dock">
+      <h3>detector — irradiance (reference f64)</h3>
+      <canvas id="hist" width="228" height="90"></canvas>
+      <div id="dockNums">—</div>
+    </div>
+
+    <!-- M3: tool palette -->
+    <div class="panel" id="tools">
+      <button id="tool-select">◈ select</button>
+      <button id="tool-draw">✎ draw</button>
+      <button id="tool-pin">📌 pin</button>
+      <span id="m3hint" class="sub"></span>
+    </div>
+
+    <!-- M3: inspector-card template — cloned per element (many open at once) -->
+    <template id="cardTemplate">
+      <div class="panel card">
+        <h3><span class="c-title">#0</span><span class="c-hdrbtns"><button class="c-pinpos" title="pin card location">📍</button><button class="c-close" title="close">✕</button></span></h3>
+        <label class="row"><input type="checkbox" class="c-lock" /> lock</label>
+        <div class="field"><span>x</span><input type="number" data-name="x" /><button class="pin" data-name="x" title="pin">📍</button><span class="u">mm</span></div>
+        <div class="field"><span>y</span><input type="number" data-name="y" /><button class="pin" data-name="y" title="pin">📍</button><span class="u">mm</span></div>
+        <div class="field"><span>rot</span><input type="number" data-name="rot" /><button class="pin" data-name="rot" title="pin">📍</button><span class="u">°</span></div>
+        <div class="c-singlet">
+          <div class="field"><span>r1</span><input type="number" data-name="radius1" /><button class="pin" data-name="radius1" title="pin">📍</button><span class="u">mm</span></div>
+          <div class="field"><span>r2</span><input type="number" data-name="radius2" /><button class="pin" data-name="radius2" title="pin">📍</button><span class="u">mm</span></div>
+          <div class="field"><span>t</span><input type="number" data-name="thickness" /><button class="pin" data-name="thickness" title="pin">📍</button><span class="u">mm</span></div>
+          <div class="field"><span>ca1</span><input type="number" data-name="half_ap1" /><button class="pin" data-name="half_ap1" title="pin">📍</button><span class="u">mm</span></div>
+          <div class="field"><span>ca2</span><input type="number" data-name="half_ap2" /><button class="pin" data-name="half_ap2" title="pin">📍</button><span class="u">mm</span></div>
+          <div class="field"><span>k1</span><input type="number" data-name="conic_k1" /><button class="pin" data-name="conic_k1" title="pin">📍</button><span class="u"></span></div>
+          <div class="field"><span>k2</span><input type="number" data-name="conic_k2" /><button class="pin" data-name="conic_k2" title="pin">📍</button><span class="u"></span></div>
+        </div>
+        <div class="c-fit">
+          <label class="row">fit <input type="range" class="c-fitslider" min="0" max="5" value="1" /></label>
+          <div class="c-fitlabel sub"></div>
+        </div>
+      </div>
+    </template>
+
+    <!-- M3: freehand fit — complexity slider (§5.3) -->
+    <div class="panel" id="fitpanel" style="display:none">
+      <h3>fit complexity — cost of manufacturability</h3>
+      <label class="row">simple <input type="range" id="fitSlider" min="0" max="5" value="1" /> precise</label>
+      <div id="fitLabel" class="sub"></div>
+      <label class="row" style="justify-content:center"><input type="checkbox" id="fitMirror" /> mirror (reflective)</label>
+      <div><button id="fitCommit">commit</button><button id="fitCancel">cancel</button></div>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

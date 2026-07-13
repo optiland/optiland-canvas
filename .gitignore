@@ -1,0 +1,17 @@
+/target
+Cargo.lock
+*.ocanvas
+!examples/**/*.ocanvas
+
+# web shell
+web/node_modules
+web/pkg
+web/dist
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+

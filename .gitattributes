@@ -1,0 +1,9 @@
+# Normalize line endings across platforms (org is cross-platform; devs on Windows).
+* text=auto
+
+# Keep shell scripts and WGSL as LF.
+*.sh   text eol=lf
+*.wgsl text eol=lf
+
+# Treat the wasm blob (if ever committed) and other binaries as binary.
+*.wasm binary

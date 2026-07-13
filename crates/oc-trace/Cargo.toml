@@ -1,0 +1,22 @@
+[package]
+name = "oc-trace"
+description = "Optiland Canvas reference tracer: CPU, f64, exact. The source of truth."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["parallel"]
+# rayon-parallel tracing. Off for wasm32 (no threads) — the reference then runs
+# serially, which is fine for the on-idle "numbers come from the reference" path.
+parallel = ["dep:rayon"]
+
+[dependencies]
+oc-core.workspace = true
+glam.workspace = true
+rayon = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json.workspace = true

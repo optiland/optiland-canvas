@@ -1,0 +1,189 @@
+{
+  "z_start": -25.0,
+  "comment": "Sequential rotationally-symmetric systems. Each surface: signed radius (0 or 1e99 = plane), conic k, thickness to next vertex, refractive index of the medium AFTER the surface (n_after), and interaction type. First surface vertex sits at z=0; medium before it is air (n=1). Rays are launched at z=z_start with height y and tilt angle_deg (meridional plane): dir = (N=cos, M=sin). Canvas maps axis +x <-> optiland +z, transverse y <-> y.",
+  "systems": [
+    {
+      "name": "biconvex_n1.5_const",
+      "kind": "singlet",
+      "half_ap": 16.0,
+      "image_z": 60.0,
+      "surfaces": [
+        {"radius": 50.0,  "conic": 0.0, "thickness": 6.0, "n_after": 1.5, "type": "refract", "coeffs": []},
+        {"radius": -50.0, "conic": 0.0, "thickness": 0.0, "n_after": 1.0, "type": "refract", "coeffs": []}
+      ],
+      "rays": [
+        {"y": -14.0, "angle_deg": 0.0}, {"y": -12.0, "angle_deg": 0.0},
+        {"y": -6.0, "angle_deg": 0.0}, {"y": -1.0, "angle_deg": 0.0},
+        {"y": 0.0, "angle_deg": 0.0},  {"y": 1.0, "angle_deg": 0.0},
+        {"y": 6.0, "angle_deg": 0.0},  {"y": 12.0, "angle_deg": 0.0},
+        {"y": 14.0, "angle_deg": 0.0},
+        {"y": -10.0, "angle_deg": 8.0}, {"y": 0.0, "angle_deg": 8.0},
+        {"y": 10.0, "angle_deg": 8.0}, {"y": -8.0, "angle_deg": -12.0},
+        {"y": 5.0, "angle_deg": -12.0}
+      ]
+    },
+    {
+      "name": "planoconvex_flat_front_n1.5168",
+      "kind": "singlet",
+      "half_ap": 16.0,
+      "image_z": 70.0,
+      "surfaces": [
+        {"radius": 1e99, "conic": 0.0, "thickness": 5.0, "n_after": 1.5168, "type": "refract", "coeffs": []},
+        {"radius": -30.0, "conic": 0.0, "thickness": 0.0, "n_after": 1.0, "type": "refract", "coeffs": []}
+      ],
+      "rays": [
+        {"y": -12.0, "angle_deg": 0.0}, {"y": -6.0, "angle_deg": 0.0},
+        {"y": 0.0, "angle_deg": 0.0}, {"y": 6.0, "angle_deg": 0.0},
+        {"y": 12.0, "angle_deg": 0.0},
+        {"y": -8.0, "angle_deg": 10.0}, {"y": 8.0, "angle_deg": 10.0}
+      ]
+    },
+    {
+      "name": "planoconvex_curved_front_n1.5168",
+      "kind": "singlet",
+      "half_ap": 16.0,
+      "image_z": 70.0,
+      "surfaces": [
+        {"radius": 30.0, "conic": 0.0, "thickness": 5.0, "n_after": 1.5168, "type": "refract", "coeffs": []},
+        {"radius": 1e99, "conic": 0.0, "thickness": 0.0, "n_after": 1.0, "type": "refract", "coeffs": []}
+      ],
+      "rays": [
+        {"y": -12.0, "angle_deg": 0.0}, {"y": -6.0, "angle_deg": 0.0},
+        {"y": 0.0, "angle_deg": 0.0}, {"y": 6.0, "angle_deg": 0.0},
+        {"y": 12.0, "angle_deg": 0.0},
+        {"y": -8.0, "angle_deg": 10.0}, {"y": 8.0, "angle_deg": 10.0}
+      ]
+    },
+    {
+      "name": "meniscus_positive_n1.6",
+      "kind": "singlet",
+      "half_ap": 12.0,
+      "image_z": 90.0,
+      "surfaces": [
+        {"radius": 25.0, "conic": 0.0, "thickness": 4.0, "n_after": 1.6, "type": "refract", "coeffs": []},
+        {"radius": 60.0, "conic": 0.0, "thickness": 0.0, "n_after": 1.0, "type": "refract", "coeffs": []}
+      ],
+      "rays": [
+        {"y": -9.0, "angle_deg": 0.0}, {"y": -4.0, "angle_deg": 0.0},
+        {"y": 0.0, "angle_deg": 0.0}, {"y": 4.0, "angle_deg": 0.0},
+        {"y": 9.0, "angle_deg": 0.0},
+        {"y": -6.0, "angle_deg": 9.0}, {"y": 6.0, "angle_deg": 9.0}
+      ]
+    },
+    {
+      "name": "parabolic_front_conic_singlet_n1.5",
+      "kind": "singlet",
+      "half_ap": 16.0,
+      "image_z": 60.0,
+      "surfaces": [
+        {"radius": 50.0, "conic": -1.0, "thickness": 6.0, "n_after": 1.5, "type": "refract", "coeffs": []},
+        {"radius": -50.0, "conic": 0.0, "thickness": 0.0, "n_after": 1.0, "type": "refract", "coeffs": []}
+      ],
+      "rays": [
+        {"y": -14.0, "angle_deg": 0.0}, {"y": -9.0, "angle_deg": 0.0},
+        {"y": 0.0, "angle_deg": 0.0}, {"y": 9.0, "angle_deg": 0.0},
+        {"y": 14.0, "angle_deg": 0.0},
+        {"y": -10.0, "angle_deg": 7.0}, {"y": 10.0, "angle_deg": 7.0}
+      ]
+    },
+    {
+      "name": "even_asphere_front_singlet_n1.5",
+      "kind": "singlet",
+      "half_ap": 20.0,
+      "image_z": 60.0,
+      "surfaces": [
+        {"radius": 50.0, "conic": 0.0, "thickness": 6.0, "n_after": 1.5, "type": "refract", "coeffs": [1e-6, -2e-9]},
+        {"radius": -50.0, "conic": 0.0, "thickness": 0.0, "n_after": 1.0, "type": "refract", "coeffs": []}
+      ],
+      "rays": [
+        {"y": -16.0, "angle_deg": 0.0}, {"y": -8.0, "angle_deg": 0.0},
+        {"y": 0.0, "angle_deg": 0.0}, {"y": 8.0, "angle_deg": 0.0},
+        {"y": 16.0, "angle_deg": 0.0},
+        {"y": -10.0, "angle_deg": 6.0}, {"y": 10.0, "angle_deg": 6.0}
+      ]
+    },
+    {
+      "name": "air_spaced_doublet_const",
+      "kind": "doublet",
+      "half_ap": 14.0,
+      "image_z": 60.0,
+      "surfaces": [
+        {"radius": 60.0,   "conic": 0.0, "thickness": 5.0, "n_after": 1.6, "type": "refract", "coeffs": []},
+        {"radius": -60.0,  "conic": 0.0, "thickness": 3.0, "n_after": 1.0, "type": "refract", "coeffs": []},
+        {"radius": 40.0,   "conic": 0.0, "thickness": 4.0, "n_after": 1.5, "type": "refract", "coeffs": []},
+        {"radius": -200.0, "conic": 0.0, "thickness": 0.0, "n_after": 1.0, "type": "refract", "coeffs": []}
+      ],
+      "rays": [
+        {"y": -12.0, "angle_deg": 0.0}, {"y": -6.0, "angle_deg": 0.0},
+        {"y": 0.0, "angle_deg": 0.0}, {"y": 6.0, "angle_deg": 0.0},
+        {"y": 12.0, "angle_deg": 0.0},
+        {"y": -8.0, "angle_deg": 6.0}, {"y": 8.0, "angle_deg": 6.0},
+        {"y": 0.0, "angle_deg": -9.0}
+      ]
+    },
+    {
+      "name": "cemented_doublet_const",
+      "kind": "doublet",
+      "half_ap": 14.0,
+      "image_z": 90.0,
+      "surfaces": [
+        {"radius": 60.0,   "conic": 0.0, "thickness": 5.0, "n_after": 1.62, "type": "refract", "coeffs": []},
+        {"radius": -45.0,  "conic": 0.0, "thickness": 3.0, "n_after": 1.52, "type": "refract", "coeffs": []},
+        {"radius": -150.0, "conic": 0.0, "thickness": 0.0, "n_after": 1.0,  "type": "refract", "coeffs": []}
+      ],
+      "rays": [
+        {"y": -12.0, "angle_deg": 0.0}, {"y": -6.0, "angle_deg": 0.0},
+        {"y": 0.0, "angle_deg": 0.0}, {"y": 6.0, "angle_deg": 0.0},
+        {"y": 12.0, "angle_deg": 0.0},
+        {"y": -8.0, "angle_deg": 6.0}, {"y": 8.0, "angle_deg": 6.0},
+        {"y": 0.0, "angle_deg": -9.0}
+      ]
+    },
+    {
+      "name": "plano_asphere_REAR_exit_n1.5",
+      "kind": "singlet",
+      "half_ap": 16.0,
+      "image_z": 60.0,
+      "surfaces": [
+        {"radius": 1e99, "conic": 0.0, "thickness": 6.0, "n_after": 1.5, "type": "refract", "coeffs": []},
+        {"radius": -50.0, "conic": 0.0, "thickness": 0.0, "n_after": 1.0, "type": "refract", "coeffs": [1e-6, -2e-9]}
+      ],
+      "rays": [
+        {"y": -14.0, "angle_deg": 0.0}, {"y": -8.0, "angle_deg": 0.0},
+        {"y": 0.0, "angle_deg": 0.0}, {"y": 8.0, "angle_deg": 0.0},
+        {"y": 14.0, "angle_deg": 0.0}
+      ]
+    },
+    {
+      "name": "parabolic_mirror_R8",
+      "kind": "mirror",
+      "half_ap": 4.0,
+      "radius": 8.0,
+      "conic": -1.0,
+      "image_z": -4.0,
+      "rays": [
+        {"y": -3.0, "angle_deg": 0.0}, {"y": -1.5, "angle_deg": 0.0},
+        {"y": 0.5, "angle_deg": 0.0}, {"y": 1.5, "angle_deg": 0.0},
+        {"y": 3.0, "angle_deg": 0.0}
+      ]
+    }
+  ],
+  "dispersion_systems": [
+    {
+      "name": "biconvex_NBK7_dispersion",
+      "kind": "singlet",
+      "glass": "N-BK7",
+      "half_ap": 22.0,
+      "image_z": 60.0,
+      "surfaces": [
+        {"radius": 50.0, "conic": 0.0, "thickness": 6.0, "type": "refract", "coeffs": []},
+        {"radius": -50.0, "conic": 0.0, "thickness": 0.0, "type": "refract", "coeffs": []}
+      ],
+      "wavelengths_um": [0.48613, 0.58756, 0.65627],
+      "rays": [
+        {"y": -15.0, "angle_deg": 0.0}, {"y": 0.0, "angle_deg": 0.0},
+        {"y": 15.0, "angle_deg": 0.0}
+      ]
+    }
+  ]
+}

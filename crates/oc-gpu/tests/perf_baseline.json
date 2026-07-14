@@ -1,0 +1,43 @@
+{
+  "cpu": {
+    "f32_cpu_2000x8": {
+      "units": 0.022797152022997192
+    },
+    "f32_cpu_8000x8": {
+      "units": 0.10238714409548576
+    },
+    "f64_ref_2000x8": {
+      "units": 0.012317278270468909
+    },
+    "f64_ref_8000x8": {
+      "units": 0.03247686574351907
+    }
+  },
+  "gpu": {
+    "Dx12:AMD Radeon(TM) Graphics": {
+      "ms_2000x8": 0.259,
+      "ms_8000x8": 1.3979
+    },
+    "Dx12:Microsoft Basic Render Driver": {
+      "ms_2000x8": 9.1205,
+      "ms_8000x8": 34.2916
+    },
+    "Dx12:NVIDIA GeForce RTX 5070": {
+      "ms_2000x8": 0.1657,
+      "ms_8000x8": 0.5481
+    },
+    "Gl:NVIDIA GeForce RTX 5070/PCIe/SSE2": {
+      "ms_2000x8": 0.7206,
+      "ms_8000x8": 1.1924
+    },
+    "Vulkan:AMD Radeon(TM) Graphics": {
+      "ms_2000x8": 0.693,
+      "ms_8000x8": 1.7233
+    },
+    "Vulkan:NVIDIA GeForce RTX 5070": {
+      "ms_2000x8": 0.5524,
+      "ms_8000x8": 0.9184
+    }
+  },
+  "note": "machine-normalized CPU units; per-adapter GPU ms. Regenerate with OC_PERF_BLESS=1."
+}

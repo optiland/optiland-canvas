@@ -144,4 +144,4 @@ Each milestone ships something you can open and play with.
 
 ## License
 
-Dual-licensed under either [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
+Dual-licensed under either [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option. This is the standard Rust licensing pair: MIT keeps compatibility with GPLv2, while Apache-2.0 adds an explicit patent grant, so anyone reusing the code can pick whichever fits their needs.

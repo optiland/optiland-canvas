@@ -494,27 +494,13 @@ export function initM4(app: App4): M4 {
   // ===================== overlay + lifecycle ============================
   function overlay(ctx: CanvasRenderingContext2D) {
     if (!wavefrontActive() || wfRays.length === 0) return;
-    // The wavefront is the surface of constant OPL: join every ray's OPL = wfT
-    // point across the fan. It is flat in the collimated beam and curves as the
-    // rays converge/aberrate — the picture *is* the physics (§5.5).
-    const pts: Array<V2 | null> = wfRays.map((ray) => pointAtOpl(ray, wfT));
+    // Mark the front with a dot at each ray's OPL = wfT point — the equal-OPL
+    // surface (§5.5). No connecting curve: the ray tips already read the front,
+    // and a line threading crossing rays near focus only adds clutter.
     ctx.save();
-    // Connect consecutive active rays (break the line across any that have
-    // already passed, so no false chord jumps a gap).
-    ctx.strokeStyle = "rgba(255,238,180,0.9)";
-    ctx.lineWidth = 1.6;
-    ctx.beginPath();
-    let pen = false;
-    for (const p of pts) {
-      if (!p) { pen = false; continue; }
-      const s = app.toScreen(p);
-      if (pen) ctx.lineTo(s.x, s.y);
-      else { ctx.moveTo(s.x, s.y); pen = true; }
-    }
-    ctx.stroke();
-    // A dot at each front point for emphasis.
     ctx.fillStyle = "rgba(255,238,180,0.95)";
-    for (const p of pts) {
+    for (const ray of wfRays) {
+      const p = pointAtOpl(ray, wfT);
       if (!p) continue;
       const s = app.toScreen(p);
       ctx.beginPath(); ctx.arc(s.x, s.y, 1.8, 0, Math.PI * 2); ctx.fill();

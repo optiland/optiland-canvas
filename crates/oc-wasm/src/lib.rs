@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 
 use oc_core::{
     convex_hull, point_in_hull, reference_glasses, ConicParams, Detector, Edge, Element, ElementId,
-    Isometry2, Material, Scene, Source, SourceKind, Spectrum, Vec2,
+    Isometry2, Layer, LayerId, Material, Scene, Source, SourceKind, Spectrum, Vec2,
 };
 use oc_fit::{fit_stroke, sample_edge, surface_rim, Fit, FitLadder, DEFAULT_TOL_UM};
 use oc_gpu::{color::wavelength_um_to_linear, scene::GpuScene, trace_cpu, BuildOpts};
@@ -28,6 +28,49 @@ struct FittedSurface {
     ladder: FitLadder,
     rung: usize,
     thickness: f64,
+}
+
+/// One node of the non-linear undo history (§5.2: "Undo is a tree, not a
+/// stack"). Scenes are kilobytes, so every commit snapshots the whole document
+/// as JSON; branch points are where the variation gallery (§5.6) reads its
+/// live variants from. Freehand fit-ladders are *not* snapshotted (they are not
+/// serializable) — an undo past a freehand commit keeps the geometry but drops
+/// that element's complexity slider.
+struct HistoryNode {
+    parent: Option<usize>,
+    children: Vec<usize>,
+    label: String,
+    scene_json: String,
+    /// Sorted `(element_id, param_code)` pins, so they survive undo (§5.2).
+    pins: Vec<(u32, u8)>,
+    active_layer: u32,
+    /// Monotonic id shown in the sidebar; stable as the tree grows.
+    seq: u32,
+}
+
+/// The undo tree: a flat arena of [`HistoryNode`]s plus the current position.
+struct History {
+    nodes: Vec<HistoryNode>,
+    current: usize,
+    next_seq: u32,
+}
+
+impl History {
+    fn single(scene_json: String, pins: Vec<(u32, u8)>, active_layer: u32, label: &str) -> Self {
+        History {
+            nodes: vec![HistoryNode {
+                parent: None,
+                children: Vec::new(),
+                label: label.to_string(),
+                scene_json,
+                pins,
+                active_layer,
+                seq: 0,
+            }],
+            current: 0,
+            next_seq: 1,
+        }
+    }
 }
 
 /// Editable parameters that can be individually pinned (§5.1/§5.2). The returned
@@ -61,18 +104,27 @@ pub struct Canvas {
     fitted: HashMap<u32, FittedSurface>,
     /// Pinned `(element_id, param_code)` pairs — locked against edits (§5.2).
     param_pins: HashSet<(u32, u8)>,
+    /// Layer new elements are assigned to (§5.6).
+    active_layer: u32,
+    /// Non-linear undo history (§5.2). Lazily reset by JS after the demo scene
+    /// is built, so undo does not walk back into an empty document.
+    history: History,
 }
 
 #[wasm_bindgen]
 impl Canvas {
     #[wasm_bindgen(constructor)]
     pub fn new() -> Canvas {
+        let scene = Scene::new();
+        let history = History::single(scene.to_json(), Vec::new(), 0, "start");
         Canvas {
-            scene: Scene::new(),
+            scene,
             max_depth: 10,
             ghosts: false,
             fitted: HashMap::new(),
             param_pins: HashSet::new(),
+            active_layer: 0,
+            history,
         }
     }
 
@@ -138,7 +190,7 @@ impl Canvas {
             Material::AbbePoint { nd, vd },
         );
         e.transform = Isometry2::from_pos(Vec2::new(x, y));
-        self.scene.add_element(e).0
+        self.add_on_active(e).0
     }
 
     /// Add a plane mirror segment from `(x0,y0)` to `(x1,y1)`.
@@ -151,7 +203,7 @@ impl Canvas {
             vec![Edge::Line { a, b }, Edge::Line { a: b, b: a }],
             Material::Mirror { reflectivity: 1.0 },
         );
-        self.scene.add_element(e).0
+        self.add_on_active(e).0
     }
 
     /// Add a collimated monochromatic source. `aim_deg` is the beam direction.
@@ -305,37 +357,13 @@ impl Canvas {
     /// ray's wavelength; `flags` bit1 = TIR, bit2 = ghost.
     #[wasm_bindgen(js_name = traceColored)]
     pub fn trace_colored(&self) -> Vec<f32> {
-        let opts = BuildOpts {
-            ghosts: self.ghosts,
-            max_segs: if self.ghosts { 24 } else { 12 },
-            flux_eps: 1e-4,
-        };
-        let gs = GpuScene::build_with(&self.scene, opts);
-        let per_ray = trace_cpu(&gs, self.max_depth);
-        let mut out = Vec::new();
-        for segs in &per_ray {
-            for s in segs {
-                // Linear light — the caller accumulates additively then tonemaps.
-                let [r, g, b] = wavelength_um_to_linear(s.lambda_um);
-                out.extend_from_slice(&[
-                    s.a.x,
-                    s.a.y,
-                    s.b.x,
-                    s.b.y,
-                    r,
-                    g,
-                    b,
-                    s.flux,
-                    s.flags as f32,
-                ]);
-            }
-        }
-        out
+        colored_segments(&self.visible_scene(), self.max_depth, self.ghosts)
     }
 
     /// Legacy M1 trace: flat `[ax, ay, bx, by, flux]` per segment.
     pub fn trace(&self) -> Vec<f32> {
-        let gs = GpuScene::build_with(&self.scene, BuildOpts::default());
+        let vs = self.visible_scene();
+        let gs = GpuScene::build_with(&vs, BuildOpts::default());
         let per_ray = trace_cpu(&gs, self.max_depth);
         let mut out = Vec::new();
         for segs in &per_ray {
@@ -358,7 +386,7 @@ impl Canvas {
             ghosts: self.ghosts,
             ..TraceConfig::default()
         };
-        let res = ref_trace(&self.scene, &cfg);
+        let res = ref_trace(&self.visible_scene(), &cfg);
         let d = &res.detectors[idx];
         let bins: Vec<String> = d.bins.iter().map(|v| format!("{v}")).collect();
         let centroid = d.centroid_u().map_or("null".into(), |v| format!("{v}"));
@@ -459,7 +487,7 @@ impl Canvas {
             Material::AbbePoint { nd, vd }
         };
         let e = Element::new(ElementId(0), body, material);
-        let id = self.scene.add_element(e).0;
+        let id = self.add_on_active(e).0;
         self.fitted.insert(
             id,
             FittedSurface {
@@ -800,6 +828,11 @@ impl Canvas {
                 e.transform.pos.x += dx;
                 e.transform.pos.y += dy;
                 e.locked = false;
+                // Keep the copied element's own layer if it still exists,
+                // otherwise fall back to the active layer (§5.6).
+                if e.layer.index() >= self.scene.layers.len() {
+                    e.layer = LayerId(self.active_layer);
+                }
                 self.scene.add_element(e).0 as i32
             }
             Err(_) => -1,
@@ -820,13 +853,14 @@ impl Canvas {
             .enumerate()
             .map(|(i, e)| {
                 format!(
-                    "{{\"id\":{},\"x\":{},\"y\":{},\"rot_deg\":{},\"locked\":{},\"kind\":\"{}\"}}",
+                    "{{\"id\":{},\"x\":{},\"y\":{},\"rot_deg\":{},\"locked\":{},\"kind\":\"{}\",\"layer\":{}}}",
                     i,
                     e.transform.pos.x,
                     e.transform.pos.y,
                     e.transform.rot.to_degrees(),
                     e.locked,
-                    self.element_kind(i as u32, e)
+                    self.element_kind(i as u32, e),
+                    e.layer.0
                 )
             })
             .collect();
@@ -857,7 +891,422 @@ impl Canvas {
     }
 }
 
+// === M4: layers · undo tree · wavefront scrub · variation gallery ==========
+// "It's a workflow." Scene state still lives in Rust (§2); the shell drives
+// these through the opaque handle and mirrors nothing.
+
+#[wasm_bindgen]
 impl Canvas {
+    // --- layers (§5.6) -----------------------------------------------------
+
+    /// All layers: `[{id,name,visible,opacity,count}]`, `count` = elements on
+    /// the layer.
+    #[wasm_bindgen(js_name = layersJson)]
+    pub fn layers_json(&self) -> String {
+        let items: Vec<String> = self
+            .scene
+            .layers
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                let count = self
+                    .scene
+                    .elements
+                    .iter()
+                    .filter(|e| e.layer.index() == i)
+                    .count();
+                format!(
+                    "{{\"id\":{},\"name\":{},\"visible\":{},\"opacity\":{},\"count\":{}}}",
+                    i,
+                    json_str(&l.name),
+                    l.visible,
+                    l.opacity,
+                    count
+                )
+            })
+            .collect();
+        format!("[{}]", items.join(","))
+    }
+
+    /// Add a new (visible) layer; returns its id.
+    #[wasm_bindgen(js_name = addLayer)]
+    pub fn add_layer(&mut self, name: &str) -> u32 {
+        let id = self.scene.layers.len() as u32;
+        self.scene.layers.push(Layer {
+            name: if name.is_empty() {
+                format!("Layer {id}")
+            } else {
+                name.to_string()
+            },
+            visible: true,
+            opacity: 1.0,
+        });
+        id
+    }
+
+    #[wasm_bindgen(js_name = renameLayer)]
+    pub fn rename_layer(&mut self, id: u32, name: &str) -> bool {
+        match self.scene.layers.get_mut(id as usize) {
+            Some(l) => {
+                l.name = name.to_string();
+                true
+            }
+            None => false,
+        }
+    }
+
+    #[wasm_bindgen(js_name = setLayerVisible)]
+    pub fn set_layer_visible(&mut self, id: u32, visible: bool) -> bool {
+        match self.scene.layers.get_mut(id as usize) {
+            Some(l) => {
+                l.visible = visible;
+                true
+            }
+            None => false,
+        }
+    }
+
+    #[wasm_bindgen(js_name = setLayerOpacity)]
+    pub fn set_layer_opacity(&mut self, id: u32, opacity: f64) -> bool {
+        match self.scene.layers.get_mut(id as usize) {
+            Some(l) => {
+                l.opacity = opacity.clamp(0.0, 1.0);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Remove a layer, merging its elements onto layer 0 and re-indexing the
+    /// `layer` field of every element above it. The last layer cannot be
+    /// removed. Returns true on success.
+    #[wasm_bindgen(js_name = removeLayer)]
+    pub fn remove_layer(&mut self, id: u32) -> bool {
+        let n = self.scene.layers.len();
+        let idx = id as usize;
+        if idx >= n || n <= 1 {
+            return false;
+        }
+        self.scene.layers.remove(idx);
+        for e in &mut self.scene.elements {
+            let li = e.layer.index();
+            if li == idx {
+                e.layer = LayerId(0);
+            } else if li > idx {
+                e.layer = LayerId((li - 1) as u32);
+            }
+        }
+        let a = self.active_layer as usize;
+        if a == idx {
+            self.active_layer = 0;
+        } else if a > idx {
+            self.active_layer -= 1;
+        }
+        true
+    }
+
+    #[wasm_bindgen(js_name = setActiveLayer)]
+    pub fn set_active_layer(&mut self, id: u32) {
+        if (id as usize) < self.scene.layers.len() {
+            self.active_layer = id;
+        }
+    }
+
+    #[wasm_bindgen(js_name = activeLayer)]
+    pub fn active_layer(&self) -> u32 {
+        self.active_layer
+    }
+
+    /// Assign an element to a layer (§5.6). Returns true on success.
+    #[wasm_bindgen(js_name = setElementLayer)]
+    pub fn set_element_layer(&mut self, elem_id: u32, layer_id: u32) -> bool {
+        if (layer_id as usize) >= self.scene.layers.len() {
+            return false;
+        }
+        match self.scene.elements.get_mut(elem_id as usize) {
+            Some(e) => {
+                e.layer = LayerId(layer_id);
+                true
+            }
+            None => false,
+        }
+    }
+
+    // --- undo tree (§5.2) --------------------------------------------------
+
+    /// Reset the history to a single root node snapshotting the current state.
+    /// The shell calls this once after building its demo scene, so undo does
+    /// not walk back into the empty start document.
+    #[wasm_bindgen(js_name = historyReset)]
+    pub fn history_reset(&mut self, label: &str) {
+        self.history = History::single(
+            self.scene.to_json(),
+            self.pins_sorted(),
+            self.active_layer,
+            label,
+        );
+    }
+
+    /// Snapshot the current state as a new child of the current node and move
+    /// there (§5.2). Returns the new node id, or -1 if nothing changed.
+    #[wasm_bindgen]
+    pub fn commit(&mut self, label: &str) -> i32 {
+        let json = self.scene.to_json();
+        let pins = self.pins_sorted();
+        {
+            let cur = &self.history.nodes[self.history.current];
+            if cur.scene_json == json && cur.pins == pins && cur.active_layer == self.active_layer {
+                return -1;
+            }
+        }
+        let seq = self.history.next_seq;
+        self.history.next_seq += 1;
+        let parent = self.history.current;
+        let new_idx = self.history.nodes.len();
+        self.history.nodes.push(HistoryNode {
+            parent: Some(parent),
+            children: Vec::new(),
+            label: label.to_string(),
+            scene_json: json,
+            pins,
+            active_layer: self.active_layer,
+            seq,
+        });
+        self.history.nodes[parent].children.push(new_idx);
+        self.history.current = new_idx;
+        new_idx as i32
+    }
+
+    #[wasm_bindgen(js_name = canUndo)]
+    pub fn can_undo(&self) -> bool {
+        self.history.nodes[self.history.current].parent.is_some()
+    }
+
+    #[wasm_bindgen(js_name = canRedo)]
+    pub fn can_redo(&self) -> bool {
+        !self.history.nodes[self.history.current].children.is_empty()
+    }
+
+    /// Move to the parent node, restoring its scene (§5.2). True if it moved.
+    #[wasm_bindgen]
+    pub fn undo(&mut self) -> bool {
+        if let Some(p) = self.history.nodes[self.history.current].parent {
+            self.restore_node(p);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Move to the most recently created child, restoring it. True if it moved.
+    #[wasm_bindgen]
+    pub fn redo(&mut self) -> bool {
+        if let Some(&c) = self.history.nodes[self.history.current].children.last() {
+            self.restore_node(c);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Jump to an arbitrary node — a branch click in the sidebar or a variant
+    /// in the gallery (§5.6). Returns true if the id is valid.
+    #[wasm_bindgen(js_name = historyJumpTo)]
+    pub fn history_jump_to(&mut self, id: u32) -> bool {
+        if (id as usize) < self.history.nodes.len() {
+            self.restore_node(id as usize);
+            true
+        } else {
+            false
+        }
+    }
+
+    #[wasm_bindgen(js_name = currentHistoryNode)]
+    pub fn current_history_node(&self) -> u32 {
+        self.history.current as u32
+    }
+
+    /// The whole undo tree for the sidebar (§5.2) / variation gallery (§5.6):
+    /// `{current, nodes:[{id,seq,parent,label,children:[…]}]}`.
+    #[wasm_bindgen(js_name = historyJson)]
+    pub fn history_json(&self) -> String {
+        let nodes: Vec<String> = self
+            .history
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                let parent = n.parent.map_or(-1i64, |p| p as i64);
+                let children: Vec<String> = n.children.iter().map(|c| c.to_string()).collect();
+                format!(
+                    "{{\"id\":{},\"seq\":{},\"parent\":{},\"label\":{},\"children\":[{}]}}",
+                    i,
+                    n.seq,
+                    parent,
+                    json_str(&n.label),
+                    children.join(",")
+                )
+            })
+            .collect();
+        format!(
+            "{{\"current\":{},\"nodes\":[{}]}}",
+            self.history.current,
+            nodes.join(",")
+        )
+    }
+
+    // --- wavefront scrub (§5.5) --------------------------------------------
+
+    /// Reference (f64) trace for the wavefront timeline. Flat array, **11 floats
+    /// per segment**: `[ax, ay, bx, by, r, g, b, flux, flags, opl0, opl1]`.
+    /// `opl0`/`opl1` are the cumulative optical path length (mm) at the segment
+    /// ends — the propagation clock. The shell clips every segment at a common
+    /// OPL `t` to draw the wavefront at that instant, and reads the largest
+    /// `opl1` for the timeline's end. `flags` is 0 (layout parity with
+    /// `traceColored`).
+    #[wasm_bindgen(js_name = traceWavefront)]
+    pub fn trace_wavefront(&self) -> Vec<f32> {
+        let cfg = TraceConfig {
+            ghosts: self.ghosts,
+            ..TraceConfig::default()
+        };
+        let res = ref_trace(&self.visible_scene(), &cfg);
+        let mut out = Vec::with_capacity(res.segments.len() * 11);
+        for s in &res.segments {
+            let [r, g, b] = wavelength_um_to_linear(s.lambda_um as f32);
+            out.extend_from_slice(&[
+                s.a.x as f32,
+                s.a.y as f32,
+                s.b.x as f32,
+                s.b.y as f32,
+                r,
+                g,
+                b,
+                s.flux as f32,
+                0.0,
+                s.opl0 as f32,
+                s.opl1 as f32,
+            ]);
+        }
+        out
+    }
+
+    // --- variation gallery (§5.6) ------------------------------------------
+
+    /// Interactive (f32) trace of a saved history node, for a live gallery
+    /// thumbnail. Same 9-floats-per-segment layout as `traceColored`; empty if
+    /// the node id is invalid.
+    #[wasm_bindgen(js_name = traceNodeColored)]
+    pub fn trace_node_colored(&self, id: u32) -> Vec<f32> {
+        match self.node_scene(id) {
+            Some(scene) => colored_segments(&scene, self.max_depth, self.ghosts),
+            None => Vec::new(),
+        }
+    }
+
+    /// Reference (f64) detector readout for a saved node, so variants are
+    /// compared on the *same* detector (§5.6). `{hits,flux,centroid,opl}`, or
+    /// `null`.
+    #[wasm_bindgen(js_name = nodeDetectorJson)]
+    pub fn node_detector_json(&self, id: u32, idx: usize) -> String {
+        let Some(scene) = self.node_scene(id) else {
+            return "null".to_string();
+        };
+        if idx >= scene.detectors.len() {
+            return "null".to_string();
+        }
+        let cfg = TraceConfig {
+            ghosts: self.ghosts,
+            ..TraceConfig::default()
+        };
+        let res = ref_trace(&scene, &cfg);
+        let d = &res.detectors[idx];
+        let centroid = d.centroid_u().map_or("null".into(), |v| format!("{v}"));
+        let opl = d.mean_opl().map_or("null".into(), |v| format!("{v}"));
+        format!(
+            "{{\"hits\":{},\"flux\":{},\"centroid\":{},\"opl\":{}}}",
+            d.hits, d.total_flux, centroid, opl
+        )
+    }
+
+    /// A one-line summary of a node for the gallery card:
+    /// `{label,seq,elements,sources,detectors}`, or `null`.
+    #[wasm_bindgen(js_name = nodeSummaryJson)]
+    pub fn node_summary_json(&self, id: u32) -> String {
+        let Some(node) = self.history.nodes.get(id as usize) else {
+            return "null".to_string();
+        };
+        let Some(scene) = self.node_scene(id) else {
+            return "null".to_string();
+        };
+        format!(
+            "{{\"label\":{},\"seq\":{},\"elements\":{},\"sources\":{},\"detectors\":{}}}",
+            json_str(&node.label),
+            node.seq,
+            scene.elements.len(),
+            scene.sources.len(),
+            scene.detectors.len()
+        )
+    }
+}
+
+impl Canvas {
+    /// The scene as it should be *traced*: elements on hidden layers are dropped
+    /// so light ignores them (§5.6). When every layer is visible this borrows the
+    /// live scene — no clone on the hot path. (Onion-skin ghosts of hidden layers
+    /// are drawn by the shell from the overlay data, not traced.)
+    fn visible_scene(&self) -> std::borrow::Cow<'_, Scene> {
+        let layers = &self.scene.layers;
+        let all_visible = layers.iter().all(|l| l.visible);
+        if all_visible {
+            std::borrow::Cow::Borrowed(&self.scene)
+        } else {
+            let mut s = self.scene.clone();
+            s.elements
+                .retain(|e| layers.get(e.layer.index()).map_or(true, |l| l.visible));
+            std::borrow::Cow::Owned(s)
+        }
+    }
+
+    /// Add an element onto the currently-active layer (§5.6).
+    fn add_on_active(&mut self, mut e: Element) -> ElementId {
+        let max = self.scene.layers.len().saturating_sub(1) as u32;
+        e.layer = LayerId(self.active_layer.min(max));
+        self.scene.add_element(e)
+    }
+
+    /// Pins as a sorted vec, for deterministic history snapshots/comparison.
+    fn pins_sorted(&self) -> Vec<(u32, u8)> {
+        let mut v: Vec<(u32, u8)> = self.param_pins.iter().copied().collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// Parse a history node's snapshotted scene (variation-gallery trace, §5.6).
+    fn node_scene(&self, id: u32) -> Option<Scene> {
+        self.history
+            .nodes
+            .get(id as usize)
+            .and_then(|n| Scene::from_json(&n.scene_json).ok())
+    }
+
+    /// Restore scene + pins + active layer from a history node and make it
+    /// current (§5.2). Freehand fit ladders are not serialized, so the
+    /// complexity slider resets for freehand elements after an undo.
+    fn restore_node(&mut self, idx: usize) {
+        let (json, pins, active) = {
+            let n = &self.history.nodes[idx];
+            (n.scene_json.clone(), n.pins.clone(), n.active_layer)
+        };
+        if let Ok(scene) = Scene::from_json(&json) {
+            self.scene = scene;
+            self.param_pins = pins.into_iter().collect();
+            self.active_layer = active.min(self.scene.layers.len().saturating_sub(1) as u32);
+            self.fitted.clear();
+            self.history.current = idx;
+        }
+    }
+
     /// Is the element locked?
     fn locked(&self, id: u32) -> bool {
         self.scene
@@ -896,6 +1345,58 @@ impl Default for Canvas {
 }
 
 // --- free helpers ----------------------------------------------------------
+
+/// Trace a scene on the interactive f32 path and pack colored segments — 9
+/// floats each `[ax, ay, bx, by, r, g, b, flux, flags]`, in linear light (the
+/// caller accumulates additively then tonemaps). Shared by the live view and
+/// the variation-gallery thumbnails so both render identically.
+fn colored_segments(scene: &Scene, max_depth: u32, ghosts: bool) -> Vec<f32> {
+    let opts = BuildOpts {
+        ghosts,
+        max_segs: if ghosts { 24 } else { 12 },
+        flux_eps: 1e-4,
+    };
+    let gs = GpuScene::build_with(scene, opts);
+    let per_ray = trace_cpu(&gs, max_depth);
+    let mut out = Vec::new();
+    for segs in &per_ray {
+        for s in segs {
+            let [r, g, b] = wavelength_um_to_linear(s.lambda_um);
+            out.extend_from_slice(&[
+                s.a.x,
+                s.a.y,
+                s.b.x,
+                s.b.y,
+                r,
+                g,
+                b,
+                s.flux,
+                s.flags as f32,
+            ]);
+        }
+    }
+    out
+}
+
+/// Escape a string as a JSON string literal (quotes included) — for names and
+/// history labels that the shell round-trips through `JSON.parse`.
+fn json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
 
 fn flat_to_points(flat_xy: &[f64]) -> Vec<Vec2> {
     flat_xy
@@ -1017,4 +1518,144 @@ fn read_singlet(e: &Element) -> Option<Singlet> {
         k1: front.k,
         k2: rear.k,
     })
+}
+
+#[cfg(test)]
+mod m4_tests {
+    use super::*;
+
+    fn beam_and_lens() -> Canvas {
+        let mut c = Canvas::new();
+        c.add_collimated_source(-70.0, 0.0, 0.0, 10.0, 5, 0.5876);
+        c
+    }
+
+    // --- layers (§5.6) -----------------------------------------------------
+
+    #[test]
+    fn hidden_layer_leaves_the_trace() {
+        let mut c = beam_and_lens();
+        let base = c.trace_colored().len(); // 5 straight rays, no optics
+        c.add_singlet(0.0, 0.0, 50.0, 4.0, 12.0, 1.5168, 64.17); // active layer 0
+        let with_lens = c.trace_colored().len();
+        assert!(with_lens > base, "a visible lens must add ray segments");
+        // Hiding layer 0 removes the lens → light ignores it → straight rays again.
+        assert!(c.set_layer_visible(0, false));
+        assert_eq!(c.trace_colored().len(), base);
+        assert!(c.set_layer_visible(0, true));
+        assert_eq!(c.trace_colored().len(), with_lens);
+    }
+
+    #[test]
+    fn active_layer_assignment_and_removal_reindex() {
+        let mut c = Canvas::new();
+        assert_eq!(c.add_layer(""), 1);
+        assert_eq!(c.add_layer(""), 2);
+        c.set_active_layer(2);
+        assert_eq!(c.active_layer(), 2);
+        c.add_singlet(0.0, 0.0, 50.0, 4.0, 12.0, 1.5168, 64.17);
+        assert!(c.elements_overlay_json().contains("\"layer\":2"));
+        // Removing layer 1 shifts layer 2 → 1; the element follows.
+        assert!(c.remove_layer(1));
+        assert!(c.elements_overlay_json().contains("\"layer\":1"));
+        assert_eq!(c.active_layer(), 1);
+        // The last layer cannot be removed.
+        assert!(c.remove_layer(1));
+        assert!(!c.remove_layer(0));
+    }
+
+    // --- undo tree (§5.2) --------------------------------------------------
+
+    #[test]
+    fn undo_redo_and_branching() {
+        let mut c = beam_and_lens();
+        c.history_reset("scene");
+        assert!(!c.can_undo());
+        c.add_singlet(0.0, 0.0, 50.0, 4.0, 12.0, 1.5168, 64.17);
+        let lens_node = c.commit("add lens");
+        assert!(lens_node > 0);
+        assert_eq!(c.element_count(), 1);
+        assert!(c.can_undo());
+        // Undo removes the lens; redo restores it.
+        assert!(c.undo());
+        assert_eq!(c.element_count(), 0);
+        assert!(c.can_redo());
+        assert!(c.redo());
+        assert_eq!(c.element_count(), 1);
+        // Branch: from the root, take a different path (a mirror).
+        assert!(c.undo());
+        assert_eq!(c.element_count(), 0);
+        c.add_mirror(-5.0, -5.0, 5.0, 5.0);
+        c.commit("add mirror");
+        assert_eq!(c.element_count(), 1);
+        // Jump back to the lens branch — the tree is non-linear (§5.2).
+        assert!(c.history_jump_to(lens_node as u32));
+        assert_eq!(c.element_count(), 1);
+        // The lens branch really is the singlet, not the mirror.
+        assert!(c.elements_overlay_json().contains("\"kind\":\"singlet\""));
+    }
+
+    #[test]
+    fn commit_dedups_no_ops() {
+        let mut c = beam_and_lens();
+        c.history_reset("scene");
+        c.add_singlet(0.0, 0.0, 50.0, 4.0, 12.0, 1.5168, 64.17);
+        assert!(c.commit("edit") >= 0);
+        // No change since the last commit → nothing to snapshot.
+        assert_eq!(c.commit("edit"), -1);
+    }
+
+    #[test]
+    fn pins_survive_undo() {
+        let mut c = beam_and_lens();
+        let id = c.add_singlet(0.0, 0.0, 50.0, 4.0, 12.0, 1.5168, 64.17);
+        c.history_reset("scene");
+        c.set_param_pinned(id, "x", true);
+        c.commit("pin x");
+        c.set_param_pinned(id, "x", false);
+        c.commit("unpin x");
+        assert!(!c.is_param_pinned(id, "x"));
+        assert!(c.undo()); // back to the pinned snapshot
+        assert!(c.is_param_pinned(id, "x"));
+    }
+
+    // --- wavefront scrub (§5.5) --------------------------------------------
+
+    #[test]
+    fn wavefront_opl_is_monotonic_and_advances() {
+        let mut c = beam_and_lens();
+        c.add_singlet(0.0, 0.0, 50.0, 4.0, 12.0, 1.5168, 64.17);
+        let wf = c.trace_wavefront();
+        assert!(!wf.is_empty());
+        assert_eq!(wf.len() % 11, 0);
+        let mut advanced = false;
+        for s in wf.chunks(11) {
+            let (opl0, opl1) = (s[9], s[10]);
+            assert!(opl0 <= opl1 + 1e-3, "opl must not run backwards");
+            if opl1 > opl0 + 1e-6 {
+                advanced = true;
+            }
+        }
+        assert!(advanced, "at least one segment must carry the front forward");
+    }
+
+    // --- variation gallery (§5.6) ------------------------------------------
+
+    #[test]
+    fn node_trace_and_summary() {
+        let mut c = beam_and_lens();
+        c.add_singlet(0.0, 0.0, 50.0, 4.0, 12.0, 1.5168, 64.17);
+        c.add_detector(52.0, -7.0, 52.0, 7.0, 48);
+        c.history_reset("scene");
+        let id = c.current_history_node();
+        let segs = c.trace_node_colored(id);
+        assert!(!segs.is_empty() && segs.len() % 9 == 0);
+        let summary = c.node_summary_json(id);
+        assert!(summary.contains("\"elements\":1"));
+        assert!(summary.contains("\"detectors\":1"));
+        // The saved node's detector traces on the reference path.
+        let det = c.node_detector_json(id, 0);
+        assert!(det.contains("\"hits\""));
+        assert_eq!(c.trace_node_colored(9999).len(), 0); // invalid id → empty
+    }
 }

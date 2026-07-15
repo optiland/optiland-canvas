@@ -21,7 +21,7 @@ type V2 = { x: number; y: number };
 type Tool = "select" | "draw" | "pin";
 type Rung = { level: number; name: string; dof: number; residual_um: number; rms_um: number; curve: number[] };
 type Fit = { chosen: number; tol_um: number; rungs: Rung[] };
-type Overlay = { id: number; x: number; y: number; rot_deg: number; locked: boolean; kind: string };
+type Overlay = { id: number; x: number; y: number; rot_deg: number; locked: boolean; kind: string; layer: number };
 type Snap = { x: number; y: number; snaps: string[]; guideX: number | null; guideY: number | null };
 
 export interface AppCtx {
@@ -35,6 +35,13 @@ export interface AppCtx {
   render: () => void;   // main.ts renderView
   refresh: () => void;  // main.ts refreshReference (f64 detector numbers, on idle)
   demoLensId: number;
+  // --- M4 hooks (§5.2/§5.6). Optional so M3 stays usable standalone. ---
+  /// Snapshot the settled scene into the undo tree (§5.2). Deduped in Rust.
+  commit?: (label: string) => void;
+  /// Layer show/hide + onion-skin policy for the element outlines (§5.6).
+  layerVisible?: (layerId: number) => boolean;
+  layerOpacity?: (layerId: number) => number;
+  onionSkin?: () => boolean;
 }
 
 const DRAW_GLASS = { nd: 1.5168, vd: 64.17 }; // freehand optics default to N-BK7 crown
@@ -49,7 +56,11 @@ const STEP: Record<string, number> = {
   half_ap1: 0.25, half_ap2: 0.25, conic_k1: 0.05, conic_k2: 0.05,
 };
 
-export function initM3(app: AppCtx): { overlay: (ctx: CanvasRenderingContext2D) => void } {
+export function initM3(app: AppCtx): {
+  overlay: (ctx: CanvasRenderingContext2D) => void;
+  sync: () => void;
+  getSelected: () => number;
+} {
   const { scene, view } = app;
   let tool: Tool = "select";
   let selected = app.demoLensId; // -1 = nothing selected
@@ -71,6 +82,19 @@ export function initM3(app: AppCtx): { overlay: (ctx: CanvasRenderingContext2D) 
   const overlays = (): Overlay[] => JSON.parse(scene.elementsOverlayJson());
   const overlayOf = (id: number): Overlay | undefined => overlays().find((o) => o.id === id);
 
+  // ---- M4 layer policy + undo-commit shims (no-ops when unwired) --------
+  const layerShown = (id: number) => (app.layerVisible ? app.layerVisible(id) : true);
+  const layerAlpha = (id: number) => (app.layerOpacity ? app.layerOpacity(id) : 1);
+  const onion = () => (app.onionSkin ? app.onionSkin() : false);
+  const commit = (label: string) => app.commit?.(label);
+  // Collapse a burst of continuous edits (a field scrub, a slider drag) into a
+  // single undo-tree node ~450 ms after the last change (§5.2).
+  let commitTimer: number | undefined;
+  function commitSoon(label: string, ms = 450) {
+    if (commitTimer) clearTimeout(commitTimer);
+    commitTimer = window.setTimeout(() => { commitTimer = undefined; commit(label); }, ms);
+  }
+
   function pointInPoly(wx: number, wy: number, poly: number[]): boolean {
     let inside = false;
     for (let i = 0, j = poly.length - 2; i < poly.length; j = i, i += 2) {
@@ -80,9 +104,11 @@ export function initM3(app: AppCtx): { overlay: (ctx: CanvasRenderingContext2D) 
     return inside;
   }
 
-  // Nearest element whose body contains the world point, else the nearest centre.
+  // Nearest element whose body contains the world point, else the nearest
+  // centre. Elements on hidden layers aren't pickable — make the layer visible
+  // to edit it (§5.6).
   function pick(wx: number, wy: number): number {
-    const ovs = overlays();
+    const ovs = overlays().filter((o) => layerShown(o.layer));
     for (const o of ovs) {
       const poly = outlineOf(o.id);
       if (poly.length >= 6 && pointInPoly(wx, wy, poly)) return o.id;
@@ -154,7 +180,7 @@ export function initM3(app: AppCtx): { overlay: (ctx: CanvasRenderingContext2D) 
     const dx = arrow === "ArrowLeft" ? -s : arrow === "ArrowRight" ? s : 0;
     const dy = arrow === "ArrowUp" ? s : arrow === "ArrowDown" ? -s : 0;
     scene.setElementPos(selected, o.x + dx, o.y + dy);
-    afterSceneEdit();
+    afterSceneEdit("nudge");
   }
 
   // ================= element lifecycle (delete / copy / paste) ==========
@@ -167,16 +193,16 @@ export function initM3(app: AppCtx): { overlay: (ctx: CanvasRenderingContext2D) 
     closeCard(del);
     for (const c of cards) if (c.id > del) c.id -= 1;
     deselect();
-    afterSceneEdit();
+    afterSceneEdit("delete");
   }
   function pasteClipboard() {
     if (!clipboard) return;
     pasteN++;
     const off = gridOn() ? gridStep() : 5;
     const id = scene.pasteElement(clipboard, off * pasteN, -off * pasteN);
-    if (id >= 0) { selected = id; openCard(id); afterSceneEdit(); }
+    if (id >= 0) { selected = id; openCard(id); afterSceneEdit("paste"); }
   }
-  function afterSceneEdit() { renderAllCards(); positionAllCards(); app.render(); app.refresh(); }
+  function afterSceneEdit(label = "edit") { renderAllCards(); positionAllCards(); app.render(); app.refresh(); commit(label); }
 
   // ================= view: zoom + pan ===================================
   let pan: { x: number; y: number } | null = null;
@@ -199,7 +225,7 @@ export function initM3(app: AppCtx): { overlay: (ctx: CanvasRenderingContext2D) 
     const p = app.toWorld(e.clientX, e.clientY);
     if (tool === "pin") {
       const id = pick(p.x, p.y);
-      if (id >= 0) { scene.setElementLocked(id, !scene.isElementLocked(id)); selected = id; renderCardOf(id); app.render(); }
+      if (id >= 0) { scene.setElementLocked(id, !scene.isElementLocked(id)); selected = id; renderCardOf(id); app.render(); commit("lock"); }
       return;
     }
     // select tool — the rotation handle lives *outside* the body, so grab it
@@ -265,10 +291,12 @@ export function initM3(app: AppCtx): { overlay: (ctx: CanvasRenderingContext2D) 
     }
     if (tool === "draw") return endDraw(e);
     if (!drag) return;
+    const mode = drag.mode;
     drag = null; lastSnap = null; gridMark = null;
     try { view.releasePointerCapture(e.pointerId); } catch { /* ignore */ }
     app.render();
     app.refresh(); // numbers settle on release (§4.1)
+    commit(mode === "rotate" ? "rotate" : "move"); // undo-tree snapshot (§5.2)
   };
   view.addEventListener("pointerup", endDrag);
   view.addEventListener("pointercancel", endDrag);
@@ -336,6 +364,7 @@ export function initM3(app: AppCtx): { overlay: (ctx: CanvasRenderingContext2D) 
     cancelDraw();
     if (id >= 0) { selected = id; setTool("select"); }
     app.render(); app.refresh();
+    if (id >= 0) commit("draw"); // undo-tree snapshot (§5.2)
   };
   el("fitCancel").onclick = () => { cancelDraw(); app.render(); };
   function cancelDraw() {
@@ -435,12 +464,13 @@ export function initM3(app: AppCtx): { overlay: (ctx: CanvasRenderingContext2D) 
     header.addEventListener("pointercancel", endCardDrag);
     q<HTMLInputElement>(".c-lock").addEventListener("change", (e) => {
       scene.setElementLocked(card.id, (e.target as HTMLInputElement).checked);
-      renderCard(card); app.render();
+      renderCard(card); app.render(); commit("lock");
     });
     q<HTMLInputElement>(".c-fitslider").addEventListener("input", (e) => {
       const res = scene.setElementFitRung(card.id, Number((e.target as HTMLInputElement).value));
       if (res >= 0) q(".c-fitlabel").textContent = `residual ${res.toFixed(2)} µm`;
       app.render(); app.refresh(); // ← rays visibly change as you slide (§5.3)
+      commitSoon("fit complexity");
     });
     card.root.querySelectorAll<HTMLInputElement>("input[data-name]").forEach((input) => {
       const name = input.dataset.name!;
@@ -451,19 +481,19 @@ export function initM3(app: AppCtx): { overlay: (ctx: CanvasRenderingContext2D) 
         if (e.key === "Escape") { input.value = before; input.blur(); commitCard(card); }
         e.stopPropagation(); // keep field keys out of the global shortcuts
       });
-      input.addEventListener("input", () => commitCard(card));
+      input.addEventListener("input", () => { commitCard(card); commitSoon("edit params"); });
       input.addEventListener("wheel", (e) => { // hover-scroll scrubs (§5.2)
         e.preventDefault();
         const dir = e.deltaY < 0 ? 1 : -1;
         input.value = String(Number((Number(input.value) + dir * step * (e.shiftKey ? 10 : 1)).toFixed(6)));
-        commitCard(card);
+        commitCard(card); commitSoon("edit params");
       }, { passive: false });
     });
     card.root.querySelectorAll<HTMLButtonElement>("button.pin[data-name]").forEach((btn) => {
       const name = btn.dataset.name!;
       btn.addEventListener("click", () => {
         scene.setParamPinned(card.id, name, !scene.isParamPinned(card.id, name));
-        renderCard(card);
+        renderCard(card); commit("pin");
       });
     });
   }
@@ -569,21 +599,32 @@ export function initM3(app: AppCtx): { overlay: (ctx: CanvasRenderingContext2D) 
     drawGrid(ctx);
 
     // 1. every element outline, faint — so a drawn optic is actually visible.
+    //    Layer policy (§5.6): a hidden layer's optics don't trace; draw them
+    //    only as onion-skin ghosts (and only when that toggle is on). A visible
+    //    layer's outlines are dimmed by the layer's opacity.
     for (const o of overlays()) {
       const poly = outlineOf(o.id);
       if (poly.length < 6) continue;
+      const shown = layerShown(o.layer);
+      if (!shown && !onion()) continue;
       const sel = o.id === selected;
       ctx.beginPath();
       const a = app.toScreen({ x: poly[0], y: poly[1] });
       ctx.moveTo(a.x, a.y);
       for (let i = 2; i < poly.length; i += 2) { const s = app.toScreen({ x: poly[i], y: poly[i + 1] }); ctx.lineTo(s.x, s.y); }
-      if (o.locked) {
+      if (!shown) {
+        // Onion-skin ghost of an alternate architecture (§5.6).
+        ctx.setLineDash([2, 3]);
+        ctx.strokeStyle = "rgba(150,175,210,0.28)";
+        ctx.lineWidth = 1;
+      } else if (o.locked) {
         ctx.setLineDash([5, 4]);
-        ctx.strokeStyle = "rgba(150,160,180,0.4)"; // ghosted (§5.1)
+        ctx.strokeStyle = `rgba(150,160,180,${0.4 * layerAlpha(o.layer)})`; // ghosted (§5.1)
         ctx.lineWidth = 1.2;
       } else {
         ctx.setLineDash([]);
-        ctx.strokeStyle = sel ? "rgba(127,214,255,0.95)" : "rgba(160,190,225,0.35)";
+        const al = layerAlpha(o.layer);
+        ctx.strokeStyle = sel ? `rgba(127,214,255,${0.95 * al})` : `rgba(160,190,225,${0.35 * al})`;
         ctx.lineWidth = sel ? 2 : 1;
       }
       ctx.stroke();
@@ -661,8 +702,18 @@ export function initM3(app: AppCtx): { overlay: (ctx: CanvasRenderingContext2D) 
     ctx.restore();
   }
 
+  // Re-sync UI to the scene after an external mutation the module didn't drive
+  // (undo/redo/jump, a layer edit): clamp the selection and refresh open cards
+  // (renderCard self-closes any whose element vanished).
+  function sync() {
+    const n = scene.elementCount();
+    if (selected >= n) selected = n > 0 ? n - 1 : -1;
+    renderAllCards();
+    positionAllCards();
+  }
+
   setTool("select");
-  return { overlay };
+  return { overlay, sync, getSelected: () => selected };
 }
 
 function line(ctx: CanvasRenderingContext2D, x0: number, y0: number, x1: number, y1: number) {

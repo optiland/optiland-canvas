@@ -6,7 +6,7 @@ Rust → WebAssembly → WebGPU. Part of the [Optiland](https://github.com/optil
 
 > **The one rule: there is never a "run" button.** Move a lens and the light moves. Scrub a glass value and the chromatic spread breathes. Drag a mirror to a grazing angle and total internal reflection lights up while your finger is still down. Every trade-off resolves toward sub-16 ms feedback; exact numbers settle a moment after you let go, computed by an f64 reference tracer.
 
-**Status:** M0–M3 complete and green, under active development (see the [roadmap](#roadmap)).
+**Status:** M0–M4 complete and green, under active development (see the [roadmap](#roadmap)).
 
 ---
 
@@ -29,6 +29,12 @@ Optiland Canvas is a tool for the *ideation* phase of optical design — the par
 - **Draw a surface freehand** and it's fit to a parametric curve (`line → arc → conic → asphere → spline`) with a **complexity slider** that trades manufacturability against fit residual in real time.
 - Every parameter has an on-canvas handle **and** a numeric twin — drag the handle or scrub the number, and the light follows. No Apply button, no modal dialogs.
 - Pop-up inspector cards (several at once, one per element), an adjustable grid with snapping, copy/paste/delete, per-parameter and whole-element pinning, plus zoom & pan.
+
+**Workflow**
+- **Layers** with show/hide and per-layer opacity; **onion-skin** hidden layers to compare candidate architectures superimposed, and flip between them.
+- A **non-linear undo tree**: every settled edit snapshots the scene, branches are visible in a sidebar, and you can jump to any of them (not just a flat undo stack).
+- A **variation gallery**: save designs as live, independently-traced thumbnails and compare them on the same detector, then click to load one.
+- **Wavefront scrub**: a timeline that draws rays only up to a propagation time *t* (clipped by cumulative optical path length), so you can watch the front sweep through the system.
 
 **Under the hood**
 - **Two-tier tracer:** a fast f32 path (GPU compute via `wgpu`, with a CPU fallback) draws the picture; an exact f64 reference computes every displayed *number*. Numbers never come from the fast path.
@@ -135,7 +141,7 @@ Each milestone ships something you can open and play with.
 - ✅ **M1 — It moves.** GPU/CPU interactive tracer; drag a lens, light follows at 60 fps.
 - ✅ **M2 — It's optics.** Glass catalog, Abbe picker, dispersion, spectral rendering, ghosts, TIR, live detectors.
 - ✅ **M3 — It's precise.** Freehand→fit with a complexity slider, numeric inspector, grid, snapping, clipboard, pinning, zoom/pan.
-- ⬜ **M4 — It's a workflow.** Layers, onion-skinning, undo tree, variation gallery, wavefront scrub.
+- ✅ **M4 — It's a workflow.** Layers with onion-skinning, a non-linear undo tree, a live variation gallery, and wavefront scrub.
 - ⬜ **M5 — It's an Optiland tool.** Frozen `.ocanvas` format, round-trip import/export, published PyO3 bindings.
 - ⬜ **M6 — It's fast.** Performance hardening; WebGL2 / CPU fallback path.
 - ⬜ **M7 — It's a canvas.** GRIN painting — brush strokes that *are* the optics.

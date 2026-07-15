@@ -7,6 +7,7 @@
 
 import init, { Canvas } from "../pkg/oc_wasm.js";
 import { initM3 } from "./m3";
+import { initM4, type M4 } from "./m4";
 
 const SCALE = 6.5; // px per mm
 type V2 = { x: number; y: number };
@@ -43,7 +44,24 @@ async function main() {
 
   // M3 module (draw / inspect / snap / pin). It owns element manipulation on the
   // canvas; assigned near the end once renderView/refreshReference exist.
-  let m3: { overlay: (ctx: CanvasRenderingContext2D) => void } | null = null;
+  let m3: { overlay: (ctx: CanvasRenderingContext2D) => void; sync: () => void; getSelected: () => number } | null = null;
+  // M4 module (layers / undo tree / wavefront scrub / variation gallery).
+  let m4: M4 | null = null;
+
+  // Layer cache the m3 overlay reads each frame (avoids re-parsing layer JSON per
+  // element); refreshed whenever a layer changes. Also feeds onion-skinning.
+  type LayerInfo = { id: number; visible: boolean; opacity: number };
+  let layerCache: LayerInfo[] = JSON.parse(scene.layersJson());
+  const refreshLayerCache = () => { layerCache = JSON.parse(scene.layersJson()); };
+  const onionBox = document.getElementById("onionBox") as HTMLInputElement;
+
+  // Snapshot the settled scene into the undo tree (§5.2). Deduped in Rust, so
+  // it is safe to call from every settle point; a real change also invalidates
+  // the wavefront cache and repaints the M4 panels.
+  function autoCommit(label: string) {
+    const id = scene.commit(label);
+    if (id >= 0) m4?.onSceneChanged();
+  }
 
   const glasses: Glass[] = JSON.parse(scene.abbeGlassesJson());
   const hull = Array.from(scene.abbeHull()); // [vd, nd, ...]
@@ -169,7 +187,11 @@ async function main() {
   // --- interactive view -------------------------------------------------
   function renderView() {
     const t0 = performance.now();
-    const segs = scene.traceColored(); // 9 floats/segment: ax ay bx by r g b flux flags
+    // 9 floats/segment: ax ay bx by r g b flux flags. In wavefront-scrub mode
+    // (§5.5) the segments come from the reference tracer, clipped at the scrub
+    // time; otherwise the interactive f32 path draws the live picture.
+    const wavefront = m4?.wavefrontActive() ?? false;
+    const segs = wavefront ? m4!.wavefrontSegments() : scene.traceColored();
     const traceMs = performance.now() - t0;
     const gOpacity = Number(ghostOpacity.value) / 100;
     const showTir = tirBox.checked;
@@ -276,9 +298,12 @@ async function main() {
     // freehand fit preview. It owns on-canvas manipulation, so the old fixed
     // lens-handle ellipse is retired in its favour.
     m3?.overlay(ctx);
+    // M4 overlay: the sweeping wavefront front (§5.5), drawn on top.
+    m4?.overlay(ctx);
 
+    const mode = wavefront ? " · wavefront scrub" : "";
     const ms = performance.now() - t0;
-    stat.textContent = `${count} segs · ${ms.toFixed(1)} ms (trace ${traceMs.toFixed(1)}) · ${committed.name} nd ${committed.nd.toFixed(4)} V ${committed.vd.toFixed(1)}`;
+    stat.textContent = `${count} segs · ${ms.toFixed(1)} ms (trace ${traceMs.toFixed(1)}) · ${committed.name} nd ${committed.nd.toFixed(4)} V ${committed.vd.toFixed(1)}${mode}`;
   }
 
   // --- Abbe picker (§5.4) -----------------------------------------------
@@ -378,6 +403,7 @@ async function main() {
       applyGlass(snap ?? { name: "custom", nd, vd });
       renderView();
       refreshReference();
+      autoCommit("glass"); // undo-tree snapshot (§5.2)
     }
   });
   abbe.addEventListener("pointerleave", () => {
@@ -408,13 +434,13 @@ async function main() {
   }
 
   // --- controls ----------------------------------------------------------
-  ghostsBox.addEventListener("change", () => { scene.setGhosts(ghostsBox.checked); renderView(); });
+  ghostsBox.addEventListener("change", () => { scene.setGhosts(ghostsBox.checked); m4?.onSceneChanged(); renderView(); });
   ghostOpacity.addEventListener("input", renderView);
   tirBox.addEventListener("change", renderView);
   // Ray density: source 0 is the beam. Live retrace while sliding; the reference
   // dock (heavier) recomputes only on release.
   density.addEventListener("input", () => { scene.setSourceRays(0, Number(density.value)); renderView(); });
-  density.addEventListener("change", refreshReference);
+  density.addEventListener("change", () => { refreshReference(); autoCommit("ray density"); });
 
   // --- drag the lens (fallback; M3 module takes over when loaded) --------
   let dragging = false;
@@ -457,7 +483,27 @@ async function main() {
     render: renderView,
     refresh: refreshReference,
     demoLensId: lensId,
+    // M4 hooks (§5.2/§5.6).
+    commit: autoCommit,
+    layerVisible: (id) => layerCache[id]?.visible ?? true,
+    layerOpacity: (id) => layerCache[id]?.opacity ?? 1,
+    onionSkin: () => onionBox.checked,
   });
+  m4 = initM4({
+    scene,
+    view,
+    toScreen,
+    render: renderView,
+    refresh: refreshReference,
+    commit: autoCommit,
+    getSelected: () => m3!.getSelected(),
+    syncM3: () => m3!.sync(),
+    refreshLayers: refreshLayerCache,
+  });
+  // Freeze the demo scene as the undo-tree root so undo doesn't walk back into
+  // the empty start document (§5.2).
+  scene.historyReset("scene");
+  m4.refreshPanels();
   drawAbbe();
   renderView();
   refreshReference();

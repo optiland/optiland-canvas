@@ -68,12 +68,19 @@ impl TraceConfig {
 }
 
 /// A traced ray segment, for rendering (flux-weighted alpha, §5.5).
+///
+/// `opl0`/`opl1` are the cumulative optical path length (Σ nᵢ·dᵢ, in mm) at the
+/// segment's start and end — the propagation "clock" the wavefront scrub reads
+/// (§5.5). Since propagation time is OPL/c, clipping every segment at a common
+/// OPL draws the wavefront at that instant.
 #[derive(Debug, Clone, Copy)]
 pub struct Segment {
     pub a: Vec2,
     pub b: Vec2,
     pub flux: f64,
     pub lambda_um: f64,
+    pub opl0: f64,
+    pub opl1: f64,
 }
 
 /// Accumulated detector readout (§3.3).
@@ -295,6 +302,8 @@ fn trace_one(
                     b: end,
                     flux,
                     lambda_um: w.lambda,
+                    opl0: w.opl,
+                    opl1: w.opl + n_here * t,
                 });
                 record_detector(acc, di, u, flux, w.opl + n_here * t);
                 continue;
@@ -308,19 +317,23 @@ fn trace_one(
                 b: w.ray.at(cfg.bounds),
                 flux: w.flux,
                 lambda_um: w.lambda,
+                opl0: w.opl,
+                opl1: w.opl + n_here * cfg.bounds,
             });
             continue;
         };
 
         // Attenuate over the traversed path, then record the segment.
         let flux_at_hit = w.flux * beer_lambert(alpha, hit.t);
+        let opl_at_hit = w.opl + n_here * hit.t;
         acc.segments.push(Segment {
             a: w.ray.origin,
             b: hit.point,
             flux: flux_at_hit,
             lambda_um: w.lambda,
+            opl0: w.opl,
+            opl1: opl_at_hit,
         });
-        let opl_at_hit = w.opl + n_here * hit.t;
 
         // Orient the normal to oppose the incident direction.
         let mut n = hit.normal;

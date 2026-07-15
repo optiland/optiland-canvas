@@ -119,7 +119,10 @@ impl Canvas {
         let history = History::single(scene.to_json(), Vec::new(), 0, "start");
         Canvas {
             scene,
-            max_depth: 10,
+            // Matches the reference tracer's default (§4.2) so the interactive
+            // picture and the f64 numbers reach the same depth — 24 bounces is
+            // ~12 two-surface lenses in series before the depth cap truncates.
+            max_depth: 24,
             ghosts: false,
             fitted: HashMap::new(),
             param_pins: HashSet::new(),
@@ -384,6 +387,7 @@ impl Canvas {
         }
         let cfg = TraceConfig {
             ghosts: self.ghosts,
+            max_depth: self.max_depth,
             ..TraceConfig::default()
         };
         let res = ref_trace(&self.visible_scene(), &cfg);
@@ -1168,6 +1172,7 @@ impl Canvas {
     pub fn trace_wavefront(&self) -> Vec<f32> {
         let cfg = TraceConfig {
             ghosts: self.ghosts,
+            max_depth: self.max_depth,
             ..TraceConfig::default()
         };
         let res = ref_trace(&self.visible_scene(), &cfg);
@@ -1205,6 +1210,7 @@ impl Canvas {
         let emitted: Vec<_> = scene.sources.iter().flat_map(|s| s.emit()).collect();
         let cfg = TraceConfig {
             ghosts: false,
+            max_depth: self.max_depth,
             ..TraceConfig::default()
         };
         let mut out: Vec<f32> = vec![emitted.len() as f32];
@@ -1259,6 +1265,7 @@ impl Canvas {
         }
         let cfg = TraceConfig {
             ghosts: self.ghosts,
+            max_depth: self.max_depth,
             ..TraceConfig::default()
         };
         let res = ref_trace(&scene, &cfg);
@@ -1395,7 +1402,11 @@ impl Default for Canvas {
 fn colored_segments(scene: &Scene, max_depth: u32, ghosts: bool) -> Vec<f32> {
     let opts = BuildOpts {
         ghosts,
-        max_segs: if ghosts { 24 } else { 12 },
+        // The per-ray segment budget must scale with the depth cap, or it
+        // becomes a hidden second limit: a straight (no-ghost) path through N
+        // lenses is 2N+1 segments, so a fixed budget would truncate rays long
+        // before `max_depth` does. Ghosts branch, so they get extra headroom.
+        max_segs: if ghosts { max_depth * 2 + 8 } else { max_depth + 6 },
         flux_eps: 1e-4,
     };
     let gs = GpuScene::build_with(scene, opts);

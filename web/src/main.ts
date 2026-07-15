@@ -29,10 +29,14 @@ async function main() {
   const ghostOpacity = document.getElementById("ghostOpacity") as HTMLInputElement;
   const tirBox = document.getElementById("tir") as HTMLInputElement;
   const density = document.getElementById("density") as HTMLInputElement;
+  const maxDepth = document.getElementById("maxDepth") as HTMLInputElement;
 
   // --- scene -------------------------------------------------------------
   const scene = new Canvas();
-  scene.setMaxDepth(10);
+  // Bounce-depth cap D (§4.2). 24 ≈ 12 two-surface lenses in series; a ray that
+  // would exceed it is not spawned, so the picture stops there. Raise it in the
+  // UI for deep systems (folded paths, many elements) or ghost hunting.
+  scene.setMaxDepth(Number(maxDepth.value) || 24);
   const committed: Glass = { name: "N-BK7", nd: 1.5168, vd: 64.17 };
   const lensId = scene.addSinglet(0, 0, 50, 4, 12, committed.nd, committed.vd);
   // Spectral count only affects dispersion smoothness (in the collimated beam
@@ -437,6 +441,13 @@ async function main() {
   ghostsBox.addEventListener("change", () => { scene.setGhosts(ghostsBox.checked); m4?.onSceneChanged(); renderView(); });
   ghostOpacity.addEventListener("input", renderView);
   tirBox.addEventListener("change", renderView);
+  // Bounce-depth cap: retrace live; the reference dock + wavefront recompute too.
+  maxDepth.addEventListener("change", () => {
+    scene.setMaxDepth(Number(maxDepth.value) || 24);
+    m4?.onSceneChanged(); // invalidate the wavefront (its depth changed)
+    renderView();
+    refreshReference();
+  });
   // Ray density: source 0 is the beam. Live retrace while sliding; the reference
   // dock (heavier) recomputes only on release.
   density.addEventListener("input", () => { scene.setSourceRays(0, Number(density.value)); renderView(); });

@@ -23,6 +23,7 @@ pollster = { version = "0.3", optional = true }
 
 [dev-dependencies]
 oc-trace.workspace = true
+serde_json.workspace = true
 
 [[example]]
 name = "gpu_probe"

@@ -39,6 +39,15 @@ impl GpuTracer {
                 compatible_surface: None,
             }))
         })?;
+        Self::from_adapter(&adapter)
+    }
+
+    /// Build a tracer on a *specific* adapter. This is what per-device
+    /// benchmarking and the performance-regression gate use to exercise every
+    /// adapter `wgpu` enumerates (discrete GPU, integrated, software fallback),
+    /// not just the one `new()` would auto-select. Returns `None` if the adapter
+    /// cannot provide a compute device.
+    pub fn from_adapter(adapter: &wgpu::Adapter) -> Option<Self> {
         let adapter_info = adapter.get_info();
 
         let (device, queue) = pollster::block_on(adapter.request_device(

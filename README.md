@@ -75,6 +75,23 @@ The fast (f32) and exact (f64) tracers are cross-validated on every `cargo test`
 
 The reference tracer also agrees with analytic solutions — Snell's law, the TIR critical angle, thin-lens focus, the parabolic mirror, and Fresnel R/T at normal and Brewster incidence — to between 10⁻⁶ and 10⁻¹².
 
+A **performance-regression gate** (`cargo test -p oc-gpu --release --test perf_regression`) keeps every path — f64 CPU, f32 CPU, and f32 GPU on each `wgpu` adapter — from regressing against a committed baseline. CPU costs are machine-normalized so the baseline is portable; real GPUs must additionally hold the ≤ 8 ms @ 2k×8 budget.
+
+## Validated against Optiland
+
+Beyond the internal f32/f64 cross-check, the f64 reference tracer's **forward trace is validated against the main [Optiland](https://github.com/optiland/optiland) engine** — the 3D sequential tracer this canvas hands designs off to. Matched rotationally-symmetric systems are traced in both and their final ray **position** and **direction** compared meridional-ray by meridional-ray (canvas `+x` ↔ Optiland `+z`):
+
+| Case (constant index unless noted) | Worst Δ direction | Worst Δ position |
+|---|---|---|
+| spheres & planes — biconvex, plano-convex, meniscus | ≤ 5 × 10⁻¹⁶ | ≤ 2 × 10⁻¹⁵ mm |
+| conic (parabola, k = −1) | 6 × 10⁻¹⁶ | 2 × 10⁻¹⁵ mm |
+| air-spaced & cemented doublets | 1 × 10⁻¹⁵ | 2 × 10⁻¹⁵ mm |
+| mirror (reflection) | 2 × 10⁻¹⁶ | 0 |
+| N-BK7 dispersion (F/d/C) | 4 × 10⁻¹⁶ | ~10⁻¹⁵ mm |
+| even asphere (r⁴, r⁶) | 4 × 10⁻¹¹ | 6 × 10⁻⁹ mm |
+
+The two engines are numerically identical on the forward trace: vector Snell's-law refraction and reflection agree to machine precision, and the N-BK7 Sellmeier index is bit-identical. Even aspheres agree to ~10⁻⁹ because both sides run an independent Newton solver seeded by the analytic conic — the reference finds the intersection *point* to machine precision but takes its surface normal by finite difference. (Positions are compared after removing the reference tracer's deliberate 10⁻⁷ mm ray-spawn offset.) See [`validation/`](validation/) to reproduce.
+
 ## Architecture
 
 A Cargo workspace of small crates plus a TypeScript shell:

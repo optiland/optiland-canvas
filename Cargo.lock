@@ -612,6 +612,7 @@ dependencies = [
  "oc-core",
  "oc-trace",
  "pollster",
+ "serde_json",
  "wgpu",
 ]
 

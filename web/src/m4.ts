@@ -136,21 +136,27 @@ export function initM4(app: App4): M4 {
   onionBox.onchange = () => app.render();
 
   // ======================= undo tree (§5.2) =============================
+  // Rendered as a small "subway map": every dot is a saved state, the gold dot
+  // is where you are, the gold line is how you got here (the lineage from the
+  // start), and a fork appears whenever you edit after an undo — so nothing is
+  // ever lost. Hover a dot to read its label; click to jump there.
   const histCanvas = el<HTMLCanvasElement>("histCanvas");
   const hctx = histCanvas.getContext("2d")!;
   const histLabel = el("histLabel");
-  const DX = 26, DY = 24, R = 6, PAD = 14; // tree layout metrics (px)
-  let nodePos: Map<number, V2> = new Map();
+  const undoBtn = el<HTMLButtonElement>("undoBtn");
+  const redoBtn = el<HTMLButtonElement>("redoBtn");
+  const DX = 24, DY = 26, R = 6, PAD = 16; // tree layout metrics (px)
+  let nodePos: Map<number, V2> = new Map(); // grid coords (col, row)
+  let nodeScreen: Map<number, V2> = new Map(); // pixel centres, for hit-testing
+  let hovered = -1;
 
   // Tidy pre-order layout: row = depth from root, column = pre-order visit index.
   function layoutTree(h: Hist) {
     nodePos = new Map();
-    const depth = new Map<number, number>();
     const root = h.nodes.find((n) => n.parent < 0);
     if (!root) return { w: 0, rows: 0 };
     let col = 0, maxCol = 0, maxRow = 0;
     const visit = (id: number, d: number) => {
-      depth.set(id, d);
       const n = h.nodes[id];
       if (n.children.length === 0) {
         nodePos.set(id, { x: col, y: d });
@@ -169,57 +175,84 @@ export function initM4(app: App4): M4 {
     return { w: maxCol, rows: maxRow };
   }
 
+  // The chain of nodes from the root down to `id` — the "you are here" lineage.
+  function lineage(h: Hist, id: number): Set<number> {
+    const path = new Set<number>();
+    let cur = id;
+    while (cur >= 0 && h.nodes[cur]) { path.add(cur); cur = h.nodes[cur].parent; }
+    return path;
+  }
+
   function renderHistory() {
     const h: Hist = JSON.parse(scene.historyJson());
     const { w, rows } = layoutTree(h);
-    const width = PAD * 2 + w * DX + 2 * R;
-    const height = PAD * 2 + rows * DY + 2 * R;
     const dpr = window.devicePixelRatio || 1;
-    histCanvas.width = Math.max(width, 180) * dpr;
-    histCanvas.height = Math.max(height, 40) * dpr;
-    histCanvas.style.width = `${Math.max(width, 180)}px`;
-    histCanvas.style.height = `${Math.max(height, 40)}px`;
+    const cssW = Math.max(PAD * 2 + w * DX + 2 * R, 190);
+    const cssH = Math.max(PAD * 2 + rows * DY + 2 * R, 44);
+    histCanvas.width = cssW * dpr; histCanvas.height = cssH * dpr;
+    histCanvas.style.width = `${cssW}px`; histCanvas.style.height = `${cssH}px`;
     hctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    hctx.clearRect(0, 0, histCanvas.width, histCanvas.height);
+    hctx.clearRect(0, 0, cssW, cssH);
+    hctx.font = "9px ui-monospace, monospace";
     const at = (p: V2): V2 => ({ x: PAD + p.x * DX + R, y: PAD + p.y * DY + R });
+    nodeScreen = new Map();
+    for (const [id, p] of nodePos) nodeScreen.set(id, at(p));
+    const path = lineage(h, h.current);
 
-    // edges
-    hctx.strokeStyle = "rgba(127,214,255,0.35)";
-    hctx.lineWidth = 1.2;
+    // edges — the current lineage brighter than the branches you left behind.
     for (const n of h.nodes) {
       if (n.parent < 0) continue;
-      const a = at(nodePos.get(n.parent)!), b = at(nodePos.get(n.id)!);
+      const a = nodeScreen.get(n.parent)!, b = nodeScreen.get(n.id)!;
+      const onPath = path.has(n.id) && path.has(n.parent);
+      hctx.strokeStyle = onPath ? "rgba(255,214,120,0.7)" : "rgba(127,214,255,0.28)";
+      hctx.lineWidth = onPath ? 1.7 : 1.1;
       hctx.beginPath(); hctx.moveTo(a.x, a.y); hctx.lineTo(b.x, b.y); hctx.stroke();
     }
-    // nodes
+    // nodes + sequence numbers
     for (const n of h.nodes) {
-      const p = at(nodePos.get(n.id)!);
+      const p = nodeScreen.get(n.id)!;
       const cur = n.id === h.current;
+      if (n.id === hovered) {
+        hctx.beginPath(); hctx.arc(p.x, p.y, R + 3, 0, Math.PI * 2);
+        hctx.strokeStyle = "rgba(232,246,255,0.85)"; hctx.lineWidth = 1; hctx.stroke();
+      }
       hctx.beginPath(); hctx.arc(p.x, p.y, cur ? R : R - 1.5, 0, Math.PI * 2);
-      hctx.fillStyle = cur ? "#ffd678" : "#1d4e6b";
+      hctx.fillStyle = cur ? "#ffd678" : path.has(n.id) ? "#2a6f96" : "#163049";
       hctx.strokeStyle = cur ? "#ffd678" : "rgba(127,214,255,0.6)";
-      hctx.fill(); hctx.lineWidth = 1.5; hctx.stroke();
+      hctx.fill(); hctx.lineWidth = 1.4; hctx.stroke();
+      hctx.fillStyle = "rgba(205,214,228,0.5)";
+      hctx.fillText(String(n.seq), p.x + R + 2, p.y + 3);
     }
-    const c = h.nodes[h.current];
-    histLabel.textContent = c ? `#${c.seq} ${c.label}` : "";
+    const show = hovered >= 0 ? h.nodes[hovered] : h.nodes[h.current];
+    histLabel.textContent = show ? `${hovered >= 0 ? "jump to" : "at"} #${show.seq} · ${show.label}` : "";
+    undoBtn.disabled = !scene.canUndo();
+    redoBtn.disabled = !scene.canRedo();
   }
 
-  histCanvas.addEventListener("click", (e) => {
-    const h: Hist = JSON.parse(scene.historyJson());
-    const rect = histCanvas.getBoundingClientRect();
-    const mx = e.clientX - rect.left, my = e.clientY - rect.top;
-    const at = (p: V2): V2 => ({ x: PAD + p.x * DX + R, y: PAD + p.y * DY + R });
-    let best = -1, bestD = 12 * 12;
-    for (const n of h.nodes) {
-      const p = at(nodePos.get(n.id)!);
+  function nodeAtPixel(mx: number, my: number): number {
+    let best = -1, bestD = 13 * 13;
+    for (const [id, p] of nodeScreen) {
       const d = (p.x - mx) ** 2 + (p.y - my) ** 2;
-      if (d < bestD) { bestD = d; best = n.id; }
+      if (d < bestD) { bestD = d; best = id; }
     }
-    if (best >= 0 && best !== h.current) { scene.historyJumpTo(best); afterRestore(); }
+    return best;
+  }
+  const histXY = (e: MouseEvent): [number, number] => {
+    const r = histCanvas.getBoundingClientRect();
+    return [e.clientX - r.left, e.clientY - r.top];
+  };
+  histCanvas.addEventListener("mousemove", (e) => {
+    const id = nodeAtPixel(...histXY(e));
+    if (id !== hovered) { hovered = id; histCanvas.style.cursor = id >= 0 ? "pointer" : "default"; renderHistory(); }
+  });
+  histCanvas.addEventListener("mouseleave", () => { if (hovered !== -1) { hovered = -1; renderHistory(); } });
+  histCanvas.addEventListener("click", (e) => {
+    const id = nodeAtPixel(...histXY(e));
+    if (id >= 0 && id !== scene.currentHistoryNode()) { scene.historyJumpTo(id); afterRestore(); }
   });
 
-  el<HTMLButtonElement>("undoBtn").onclick = () => { if (scene.undo()) afterRestore(); };
-  el<HTMLButtonElement>("redoBtn").onclick = () => { if (scene.redo()) afterRestore(); };
+  undoBtn.onclick = () => { if (scene.undo()) afterRestore(); };
+  redoBtn.onclick = () => { if (scene.redo()) afterRestore(); };
 
   // Restore path shared by undo / redo / jump: the scene changed under the whole
   // UI, so re-read layers, re-sync m3, invalidate the wavefront, repaint.
@@ -334,11 +367,12 @@ export function initM4(app: App4): M4 {
   const wfLabel = el("wfLabel");
   const wfBar = el("wavefront");
 
+  type WfVert = { x: number; y: number; opl: number };
   let wfRaw: Float32Array | null = null; // 11 floats/seg from traceWavefront
   let wfMax = 0; // largest opl1 (mm) — the timeline's end
   let wfDirty = true;
   let wfT = 0; // scrub position (mm of OPL)
-  let wfFront: V2[] = []; // world points of rays still propagating (the front)
+  let wfRays: WfVert[][] = []; // per-ray primary polylines w/ cumulative OPL
   let playing = false;
   let lastTs = 0;
 
@@ -347,6 +381,7 @@ export function initM4(app: App4): M4 {
   function ensureWf() {
     if (!wfDirty && wfRaw) return;
     wfRaw = scene.traceWavefront();
+    wfRays = parseCurves(scene.wavefrontCurves());
     let m = 0;
     for (let i = 10; i < wfRaw.length; i += 11) if (wfRaw[i] > m && isFinite(wfRaw[i])) m = wfRaw[i];
     // Ignore the huge scene-exit tails so the slider spans the useful range.
@@ -355,6 +390,35 @@ export function initM4(app: App4): M4 {
     wfSlider.max = wfMax.toFixed(3);
     if (wfT > wfMax || wfT <= 0) wfT = wfMax;
     wfSlider.value = String(wfT);
+  }
+
+  // Decode `[nrays, len, (x,y,opl)×len, …]` into per-ray vertex lists.
+  function parseCurves(a: Float32Array): WfVert[][] {
+    const rays: WfVert[][] = [];
+    let i = 0;
+    const nrays = a[i++] | 0;
+    for (let r = 0; r < nrays && i < a.length; r++) {
+      const len = a[i++] | 0;
+      const pts: WfVert[] = [];
+      for (let k = 0; k < len; k++) { pts.push({ x: a[i], y: a[i + 1], opl: a[i + 2] }); i += 3; }
+      rays.push(pts);
+    }
+    return rays;
+  }
+
+  // The point where a ray's primary path reaches OPL = t (null once it is past
+  // the ray's end — that light has already gone by).
+  function pointAtOpl(ray: WfVert[], t: number): V2 | null {
+    if (ray.length === 0) return null;
+    if (t <= ray[0].opl) return { x: ray[0].x, y: ray[0].y };
+    for (let i = 0; i < ray.length - 1; i++) {
+      const a = ray[i], b = ray[i + 1];
+      if (t >= a.opl && t <= b.opl) {
+        const f = b.opl > a.opl ? (t - a.opl) / (b.opl - a.opl) : 0;
+        return { x: a.x + f * (b.x - a.x), y: a.y + f * (b.y - a.y) };
+      }
+    }
+    return null;
   }
 
   // The 95th-percentile-ish opl among segments whose end actually hits geometry
@@ -372,13 +436,13 @@ export function initM4(app: App4): M4 {
     return ends[Math.min(ends.length - 1, Math.floor(ends.length * 0.98))];
   }
 
-  // Clip every segment at OPL = wfT → 9-float render segments, and collect the
-  // active front points for the overlay.
+  // Clip every segment at OPL = wfT → 9-float render segments (the rays drawn
+  // only up to propagation time t). The wavefront *curve* itself is drawn in
+  // overlay() from the per-ray polylines.
   function wavefrontSegments(): Float32Array {
     ensureWf();
     const raw = wfRaw!;
     const out: number[] = [];
-    wfFront = [];
     for (let i = 0; i + 10 < raw.length; i += 11) {
       const opl0 = raw[i + 9], opl1 = raw[i + 10];
       if (opl0 > wfT) continue; // the front hasn't reached this segment yet
@@ -387,7 +451,6 @@ export function initM4(app: App4): M4 {
       const ax = raw[i], ay = raw[i + 1];
       const ex = ax + frac * (raw[i + 2] - ax), ey = ay + frac * (raw[i + 3] - ay);
       out.push(ax, ay, ex, ey, raw[i + 4], raw[i + 5], raw[i + 6], raw[i + 7], 0);
-      if (frac < 1 && Math.hypot(ex - ax, ey - ay) < 500) wfFront.push({ x: ex, y: ey });
     }
     updateWfLabel();
     return new Float32Array(out);
@@ -430,13 +493,31 @@ export function initM4(app: App4): M4 {
 
   // ===================== overlay + lifecycle ============================
   function overlay(ctx: CanvasRenderingContext2D) {
-    if (!wavefrontActive() || wfFront.length === 0) return;
-    // Draw the sweeping front: a bright dot at each ray's current tip.
+    if (!wavefrontActive() || wfRays.length === 0) return;
+    // The wavefront is the surface of constant OPL: join every ray's OPL = wfT
+    // point across the fan. It is flat in the collimated beam and curves as the
+    // rays converge/aberrate — the picture *is* the physics (§5.5).
+    const pts: Array<V2 | null> = wfRays.map((ray) => pointAtOpl(ray, wfT));
     ctx.save();
-    ctx.fillStyle = "rgba(255,238,180,0.95)";
-    for (const p of wfFront) {
+    // Connect consecutive active rays (break the line across any that have
+    // already passed, so no false chord jumps a gap).
+    ctx.strokeStyle = "rgba(255,238,180,0.9)";
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    let pen = false;
+    for (const p of pts) {
+      if (!p) { pen = false; continue; }
       const s = app.toScreen(p);
-      ctx.beginPath(); ctx.arc(s.x, s.y, 2.2, 0, Math.PI * 2); ctx.fill();
+      if (pen) ctx.lineTo(s.x, s.y);
+      else { ctx.moveTo(s.x, s.y); pen = true; }
+    }
+    ctx.stroke();
+    // A dot at each front point for emphasis.
+    ctx.fillStyle = "rgba(255,238,180,0.95)";
+    for (const p of pts) {
+      if (!p) continue;
+      const s = app.toScreen(p);
+      ctx.beginPath(); ctx.arc(s.x, s.y, 1.8, 0, Math.PI * 2); ctx.fill();
     }
     ctx.restore();
   }

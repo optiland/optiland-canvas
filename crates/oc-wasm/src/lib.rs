@@ -1191,6 +1191,48 @@ impl Canvas {
         out
     }
 
+    /// Per-launch-ray **primary path** with cumulative OPL, for drawing the
+    /// wavefront as a *connected curve* — the surface of constant optical path
+    /// (§5.5). Because a wavefront is the locus of equal OPL, joining each ray's
+    /// OPL = t point across the fan is literally the wavefront at time t; it is
+    /// curved wherever the rays converge or aberrate. Flat f32 encoding:
+    /// `[nrays, len₀, (x, y, opl)×len₀, len₁, (x, y, opl)×len₁, …]`, rays in fan
+    /// order. Ghosts are off here (the primary path defines the front); the shell
+    /// links each ray's OPL = t point to its neighbour's.
+    #[wasm_bindgen(js_name = wavefrontCurves)]
+    pub fn wavefront_curves(&self) -> Vec<f32> {
+        let mut scene = self.visible_scene().into_owned();
+        let emitted: Vec<_> = scene.sources.iter().flat_map(|s| s.emit()).collect();
+        let cfg = TraceConfig {
+            ghosts: false,
+            ..TraceConfig::default()
+        };
+        let mut out: Vec<f32> = vec![emitted.len() as f32];
+        for er in &emitted {
+            let angle = er.ray.dir.y.atan2(er.ray.dir.x);
+            // Trace just this one ray by swapping in a single-ray point source.
+            scene.sources = vec![Source {
+                kind: SourceKind::Point { half_angle: 0.0 },
+                transform: Isometry2::new(er.ray.origin, angle),
+                spectrum: Spectrum::Monochromatic(er.lambda_um),
+                flux: er.flux,
+                rays: 1,
+            }];
+            let mut segs = ref_trace(&scene, &cfg).segments;
+            segs.sort_by(|a, b| a.opl0.partial_cmp(&b.opl0).unwrap_or(std::cmp::Ordering::Equal));
+            // Polyline: the first segment's start, then every segment's end.
+            let n = if segs.is_empty() { 0 } else { segs.len() + 1 };
+            out.push(n as f32);
+            if let Some(s0) = segs.first() {
+                out.extend_from_slice(&[s0.a.x as f32, s0.a.y as f32, s0.opl0 as f32]);
+            }
+            for s in &segs {
+                out.extend_from_slice(&[s.b.x as f32, s.b.y as f32, s.opl1 as f32]);
+            }
+        }
+        out
+    }
+
     // --- variation gallery (§5.6) ------------------------------------------
 
     /// Interactive (f32) trace of a saved history node, for a live gallery
@@ -1657,5 +1699,29 @@ mod m4_tests {
         let det = c.node_detector_json(id, 0);
         assert!(det.contains("\"hits\""));
         assert_eq!(c.trace_node_colored(9999).len(), 0); // invalid id → empty
+    }
+
+    #[test]
+    fn wavefront_curves_encode_monotonic_paths() {
+        let mut c = beam_and_lens(); // collimated source, 5 rays
+        c.add_singlet(0.0, 0.0, 50.0, 4.0, 12.0, 1.5168, 64.17);
+        let a = c.wavefront_curves();
+        assert!(!a.is_empty());
+        let nrays = a[0] as usize;
+        assert_eq!(nrays, 5, "one polyline per launch ray");
+        let mut i = 1usize;
+        for _ in 0..nrays {
+            let len = a[i] as usize;
+            i += 1;
+            assert!(len >= 2, "each ray path has at least a start and an end");
+            let mut prev = f32::NEG_INFINITY;
+            for _ in 0..len {
+                let opl = a[i + 2];
+                assert!(opl >= prev - 1e-3, "OPL along a ray path must not decrease");
+                prev = opl;
+                i += 3;
+            }
+        }
+        assert_eq!(i, a.len(), "the flat encoding is consumed exactly");
     }
 }

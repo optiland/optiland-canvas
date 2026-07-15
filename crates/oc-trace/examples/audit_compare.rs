@@ -171,9 +171,11 @@ fn build_mirror(radius: f64, conic: f64, half_ap: f64) -> Element {
 }
 
 /// Trace a single ray through `elements` and return the exit segment as
-/// (origin, unit direction). The exit segment is the one whose start point is
-/// furthest along +x (the last physical interface the ray leaves).
-fn trace_exit(elements: &[Element], lambda_um: f64, origin: Vec2, dir: Vec2) -> (Vec2, Vec2) {
+/// (origin, unit direction, opl-at-exit). The exit segment is the one whose
+/// start point is furthest along +x (the last physical interface the ray
+/// leaves); `opl` is the accumulated optical path length Σ nᵢ·dᵢ up to it — the
+/// wavefront clock, comparable to Optiland's `RealRays.opd`.
+fn trace_exit(elements: &[Element], lambda_um: f64, origin: Vec2, dir: Vec2) -> (Vec2, Vec2, f64) {
     let mut scene = Scene::new();
     for e in elements {
         scene.add_element(e.clone());
@@ -196,7 +198,16 @@ fn trace_exit(elements: &[Element], lambda_um: f64, origin: Vec2, dir: Vec2) -> 
         .max_by(|a, b| a.a.x.partial_cmp(&b.a.x).unwrap())
         .expect("at least one segment");
     let d = (s.b - s.a).normalize();
-    (s.a, d)
+    (s.a, d, s.opl0)
+}
+
+/// OPL from launch to the image plane `x = image_x`: the exit-surface OPL plus
+/// the residual air (n = 1) path to the plane.
+fn opl_to_image(o: Vec2, d: Vec2, opl_exit: f64, image_x: f64) -> f64 {
+    if d.x.abs() < 1e-15 {
+        return opl_exit;
+    }
+    opl_exit + (image_x - o.x) / d.x
 }
 
 fn plane_crossing(o: Vec2, d: Vec2, x_plane: f64) -> Option<f64> {
@@ -244,13 +255,14 @@ fn main() {
             let ang = rayv["angle_deg"].as_f64().unwrap() * PI / 180.0;
             let origin = Vec2::new(z_start, y);
             let dir = Vec2::new(ang.cos(), ang.sin());
-            let (o, d) = trace_exit(&elements, LAMBDA_D, origin, dir);
+            let (o, d, opl) = trace_exit(&elements, LAMBDA_D, origin, dir);
             let img_y = plane_crossing(o, d, image_z);
             rays_out.push(json!({
                 "y_in": y, "angle_deg": rayv["angle_deg"],
                 "exit_x": o.x, "exit_y": o.y,
                 "dir_x": d.x, "dir_y": d.y,
                 "img_y": img_y,
+                "opl_img": opl_to_image(o, d, opl, image_z),
             }));
         }
         out_systems.push(json!({"name": name, "rays": rays_out}));
@@ -298,13 +310,14 @@ fn main() {
                 let ang = rayv["angle_deg"].as_f64().unwrap() * PI / 180.0;
                 let origin = Vec2::new(z_start, y);
                 let dir = Vec2::new(ang.cos(), ang.sin());
-                let (o, d) = trace_exit(&elements, lambda, origin, dir);
+                let (o, d, opl) = trace_exit(&elements, lambda, origin, dir);
                 let img_y = plane_crossing(o, d, image_z);
                 rays_out.push(json!({
                     "lambda_um": lambda, "y_in": y, "angle_deg": rayv["angle_deg"],
                     "exit_x": o.x, "exit_y": o.y,
                     "dir_x": d.x, "dir_y": d.y,
                     "img_y": img_y,
+                    "opl_img": opl_to_image(o, d, opl, image_z),
                 }));
             }
         }

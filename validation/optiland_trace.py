@@ -92,6 +92,9 @@ def trace_rays(opt, exit_idx, image_idx, z_start, rays_spec, wavelength):
     exit_z, exit_y = a1(ex.z), a1(ex.y)
     exit_N, exit_M = a1(ex.N), a1(ex.M)
     img_y = a1(im.y)
+    # Accumulated optical path length at the image plane (RealRays.opd, which
+    # grows by |t|*n_pre at each surface) — the wavefront clock.
+    img_opl = a1(im.opd)
 
     out = []
     for i, rspec in enumerate(rays_spec):
@@ -104,6 +107,7 @@ def trace_rays(opt, exit_idx, image_idx, z_start, rays_spec, wavelength):
                 "dir_x": exit_N[i],
                 "dir_y": exit_M[i],
                 "img_y": img_y[i],
+                "opl_img": img_opl[i],
             }
         )
     return out

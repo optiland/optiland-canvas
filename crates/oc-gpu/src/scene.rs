@@ -90,7 +90,8 @@ pub struct GpuSeg {
     pub _pad: u32,
 }
 
-/// Trace parameters (uniform buffer). Matches `Params` in the shader.
+/// Trace parameters (uniform buffer). Matches `Params` in the shader. Padded to
+/// 48 bytes so the struct is 16-byte-aligned for the uniform address space.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct GpuParams {
@@ -101,7 +102,14 @@ pub struct GpuParams {
     pub ambient: f32,
     pub bounds: f32,
     pub flux_eps: f32,
+    /// Ghost layer on/off (`1`/`0`). When on, ghosts are followed up to
+    /// `max_ghost` reflection generations.
     pub ghosts: u32,
+    /// Ghost reflection-generation cap `G` (§4.2): how many nested Fresnel
+    /// back-reflections to trace. The primary path is *not* counted here — its
+    /// length is the system's surface count and is bounded only by `max_depth`.
+    pub max_ghost: u32,
+    pub _pad: [u32; 3],
 }
 
 /// The full uploadable scene.
@@ -115,6 +123,8 @@ pub struct GpuScene {
     pub max_segs: u32,
     pub ghosts: bool,
     pub flux_eps: f32,
+    /// Ghost reflection-generation cap (see [`GpuParams::max_ghost`]).
+    pub max_ghost: u32,
 }
 
 fn line_prim(a: Vec2, b: Vec2) -> GpuPrim {
@@ -153,6 +163,8 @@ pub struct BuildOpts {
     /// Segment budget per launch ray.
     pub max_segs: u32,
     pub flux_eps: f32,
+    /// Ghost reflection-generation cap (see [`GpuParams::max_ghost`]).
+    pub max_ghost: u32,
 }
 
 impl Default for BuildOpts {
@@ -161,6 +173,7 @@ impl Default for BuildOpts {
             ghosts: false,
             max_segs: 12,
             flux_eps: 1e-4,
+            max_ghost: 2,
         }
     }
 }
@@ -232,6 +245,7 @@ impl GpuScene {
             max_segs: opts.max_segs.max(1),
             ghosts: opts.ghosts,
             flux_eps: opts.flux_eps,
+            max_ghost: opts.max_ghost,
         }
     }
 
@@ -245,6 +259,8 @@ impl GpuScene {
             bounds: self.bounds,
             flux_eps: self.flux_eps,
             ghosts: self.ghosts as u32,
+            max_ghost: self.max_ghost,
+            _pad: [0; 3],
         }
     }
 }

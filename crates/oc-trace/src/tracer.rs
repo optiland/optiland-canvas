@@ -32,6 +32,10 @@ pub struct TraceConfig {
     /// Spawn weak Fresnel back-reflections (ghosts) at transmitting interfaces.
     /// TIR and mirror reflections are always followed regardless of this flag.
     pub ghosts: bool,
+    /// Ghost reflection-generation cap `G` (§4.2): how many nested Fresnel
+    /// back-reflections to follow. The primary transmitted path is not counted —
+    /// its length is the system's surface count, bounded only by `max_depth`.
+    pub max_ghost_bounces: u32,
     /// Russian-roulette flux fraction below which ghost branches are randomly
     /// killed (unbiased). `0.0` disables RR — the default for the *reference*
     /// tracer, which must be deterministic.
@@ -48,6 +52,10 @@ impl Default for TraceConfig {
             max_depth: 24,
             flux_eps: 1e-4,
             ghosts: true,
+            // The reference tracer is the exact one, so by default it follows
+            // ghosts as far as the depth cap allows (energy-conserving). The
+            // interactive path overrides this with a small, user-set cap (§4.2).
+            max_ghost_bounces: 64,
             rr_cutoff: 0.0,
             bounds: 1.0e4,
             max_branches: 100_000,
@@ -68,12 +76,19 @@ impl TraceConfig {
 }
 
 /// A traced ray segment, for rendering (flux-weighted alpha, §5.5).
+///
+/// `opl0`/`opl1` are the cumulative optical path length (Σ nᵢ·dᵢ, in mm) at the
+/// segment's start and end — the propagation "clock" the wavefront scrub reads
+/// (§5.5). Since propagation time is OPL/c, clipping every segment at a common
+/// OPL draws the wavefront at that instant.
 #[derive(Debug, Clone, Copy)]
 pub struct Segment {
     pub a: Vec2,
     pub b: Vec2,
     pub flux: f64,
     pub lambda_um: f64,
+    pub opl0: f64,
+    pub opl1: f64,
 }
 
 /// Accumulated detector readout (§3.3).
@@ -203,6 +218,9 @@ struct RayWork {
     lambda: f64,
     flux: f64,
     depth: u32,
+    /// Ghost reflection generations in this branch's ancestry (§4.2). Only a
+    /// Fresnel back-reflection increments it; the primary path keeps its parent's.
+    gdepth: u32,
     /// Accumulated optical path length so far.
     opl: f64,
 }
@@ -243,6 +261,7 @@ fn trace_one(
         lambda: er.lambda_um,
         flux: er.flux,
         depth: 0,
+        gdepth: 0,
         opl: 0.0,
     });
 
@@ -295,6 +314,8 @@ fn trace_one(
                     b: end,
                     flux,
                     lambda_um: w.lambda,
+                    opl0: w.opl,
+                    opl1: w.opl + n_here * t,
                 });
                 record_detector(acc, di, u, flux, w.opl + n_here * t);
                 continue;
@@ -308,19 +329,23 @@ fn trace_one(
                 b: w.ray.at(cfg.bounds),
                 flux: w.flux,
                 lambda_um: w.lambda,
+                opl0: w.opl,
+                opl1: w.opl + n_here * cfg.bounds,
             });
             continue;
         };
 
         // Attenuate over the traversed path, then record the segment.
         let flux_at_hit = w.flux * beer_lambert(alpha, hit.t);
+        let opl_at_hit = w.opl + n_here * hit.t;
         acc.segments.push(Segment {
             a: w.ray.origin,
             b: hit.point,
             flux: flux_at_hit,
             lambda_um: w.lambda,
+            opl0: w.opl,
+            opl1: opl_at_hit,
         });
-        let opl_at_hit = w.opl + n_here * hit.t;
 
         // Orient the normal to oppose the incident direction.
         let mut n = hit.normal;
@@ -356,6 +381,7 @@ fn trace_one(
                 w.lambda,
                 flux_at_hit * refl,
                 w.depth + 1,
+                w.gdepth,
                 opl_at_hit,
                 min_flux,
                 true, // primary path
@@ -380,6 +406,7 @@ fn trace_one(
                     w.lambda,
                     flux_at_hit,
                     w.depth + 1,
+                    w.gdepth,
                     opl_at_hit,
                     min_flux,
                     true,
@@ -398,12 +425,14 @@ fn trace_one(
                     w.lambda,
                     flux_at_hit * t,
                     w.depth + 1,
+                    w.gdepth,
                     opl_at_hit,
                     min_flux,
                     true,
                 );
-                // Reflected branch (ghost) — only if ghosts are enabled.
-                if cfg.ghosts && r > 0.0 {
+                // Reflected branch (ghost) — only if ghosts are enabled and we
+                // are within the ghost-generation budget (§4.2).
+                if cfg.ghosts && r > 0.0 && w.gdepth < cfg.max_ghost_bounces {
                     let dir_r = reflect(w.ray.dir, n);
                     push_branch(
                         &mut stack,
@@ -414,6 +443,7 @@ fn trace_one(
                         w.lambda,
                         flux_at_hit * r,
                         w.depth + 1,
+                        w.gdepth + 1,
                         opl_at_hit,
                         min_flux,
                         false,
@@ -438,6 +468,7 @@ fn push_branch(
     lambda: f64,
     mut flux: f64,
     depth: u32,
+    gdepth: u32,
     opl: f64,
     min_flux: f64,
     primary: bool,
@@ -459,6 +490,7 @@ fn push_branch(
         lambda,
         flux,
         depth,
+        gdepth,
         opl,
     });
 }

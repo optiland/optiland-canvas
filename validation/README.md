@@ -1,10 +1,21 @@
-# Forward-trace validation against Optiland
+# Forward-trace & wavefront validation against Optiland
 
 Cross-checks the `oc-trace` f64 reference tracer against the main
 [Optiland](https://github.com/optiland/optiland) engine (the 3D sequential ray
 tracer this canvas hands designs off to). Matched rotationally-symmetric systems
-are traced in both engines and the final ray **position** and **direction** are
-compared meridional-ray by meridional-ray.
+are traced in both engines and the final ray **position**, **direction**, and
+**optical path length** are compared meridional-ray by meridional-ray.
+
+The OPL check is what validates the M4 wavefront scrub: a wavefront is a surface
+of constant optical path, so the wavefront aberration is the **OPD** — each ray's
+OPL to the image plane relative to the axial ray. The canvas accumulates
+`Σ nᵢ·dᵢ` (`Segment::opl0/opl1`); Optiland accumulates the same in
+`RealRays.opd`. Taking OPL relative to the axial ray cancels the reference
+tracer's deliberate 1e-7 mm ray-spawn offset (a wavefront is defined only up to a
+constant piston), so the `d_OPD` column agrees to ~1e-14 mm on spheres and
+~1e-8 mm on the even asphere (whose normal is finite-differenced). The
+self-contained `cargo test -p oc-trace --test wavefront` bakes two of these
+Optiland OPD sets as golden values.
 
 Axis convention: canvas `+x` ↔ Optiland `+z`, transverse `y` ↔ `y`. Geometry and
 interface physics are isolated from glass-catalog differences by tracing at the

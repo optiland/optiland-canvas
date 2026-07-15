@@ -2,12 +2,16 @@
 //! and reads back the segment buffer. Works headless (no surface) on a real GPU
 //! or the software fallback adapter.
 //!
-//! M1 rebuilds buffers per trace for simplicity; a persistent-buffer, per-frame
-//! dispatch (the actual interactive loop) is a perf task for M6.
+//! Buffers are **persistent**: the GPU-side scene/ray/segment/staging buffers and
+//! the bind group are cached on the tracer and reused across `trace()` calls,
+//! growing only when the scene outgrows them. In the interactive drag loop the
+//! scene and ray count are stable, so after the first frame every trace is pure
+//! `write_buffer` + dispatch + read-back with no per-frame allocation. (This is
+//! the persistent-buffer perf task the M1 code left as a TODO.)
 
-use crate::scene::{GpuElem, GpuPrim, GpuRay, GpuScene, GpuSeg};
-use bytemuck::{cast_slice, Zeroable};
-use wgpu::util::DeviceExt;
+use crate::scene::{GpuElem, GpuParams, GpuPrim, GpuRay, GpuScene, GpuSeg};
+use bytemuck::cast_slice;
+use std::cell::RefCell;
 
 /// A ready-to-use compute device and pipeline.
 pub struct GpuTracer {
@@ -15,8 +19,28 @@ pub struct GpuTracer {
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
     layout: wgpu::BindGroupLayout,
+    /// Persistent GPU buffers + bind group, reused (and grown) across traces.
+    buffers: RefCell<Option<Buffers>>,
     /// Info about the adapter that was selected (for diagnostics/tests).
     pub adapter_info: wgpu::AdapterInfo,
+}
+
+/// Cached GPU buffers. `cap_*` are the current allocated capacities (in element
+/// counts, except `cap_stage_bytes`); a buffer is reallocated only when the
+/// scene needs more than it holds.
+struct Buffers {
+    params: wgpu::Buffer,
+    prims: wgpu::Buffer,
+    elems: wgpu::Buffer,
+    rays: wgpu::Buffer,
+    segs: wgpu::Buffer,
+    staging: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+    cap_prims: usize,
+    cap_elems: usize,
+    cap_rays: usize,
+    cap_segs: usize,
+    cap_stage_bytes: usize,
 }
 
 impl GpuTracer {
@@ -97,78 +121,117 @@ impl GpuTracer {
             queue,
             pipeline,
             layout,
+            buffers: RefCell::new(None),
             adapter_info,
         })
     }
 
     /// Trace `scene` for up to `max_depth` bounces. Returns an
-    /// `n_rays * (max_depth + 1)` segment array (same layout as the CPU path).
+    /// `n_rays * max_segs` segment array (same layout as the CPU path).
+    ///
+    /// Reuses cached GPU buffers across calls; only a scene that outgrows a
+    /// buffer triggers a reallocation (and a bind-group rebuild).
     pub fn trace(&self, scene: &GpuScene, max_depth: u32) -> Vec<GpuSeg> {
         let params = scene.params(max_depth);
         let n_segs = (params.n_rays * params.max_segs) as usize;
         if n_segs == 0 {
             return Vec::new();
         }
-
-        let params_buf = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("params"),
-                contents: cast_slice(&[params]),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-        let prims_buf = storage_init(&self.device, "prims", &scene.prims, GpuPrim::zeroed());
-        let elems_buf = storage_init(&self.device, "elems", &scene.elems, GpuElem::zeroed());
-        let rays_buf = storage_init(&self.device, "rays", &scene.rays, GpuRay::zeroed());
-
         let seg_bytes = (n_segs * std::mem::size_of::<GpuSeg>()) as wgpu::BufferAddress;
-        let segs_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("segs"),
-            size: seg_bytes,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_SRC
-                | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("staging"),
-            size: seg_bytes,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
 
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("trace bg"),
-            layout: &self.layout,
-            entries: &[
-                bind(0, &params_buf),
-                bind(1, &prims_buf),
-                bind(2, &elems_buf),
-                bind(3, &rays_buf),
-                bind(4, &segs_buf),
-            ],
-        });
+        // Needed capacities (wgpu forbids zero-sized buffers, so clamp to >= 1).
+        let need_prims = scene.prims.len().max(1);
+        let need_elems = scene.elems.len().max(1);
+        let need_rays = scene.rays.len().max(1);
+
+        let mut slot = self.buffers.borrow_mut();
+        if slot.is_none() {
+            let params_buf = uniform_buf(&self.device, std::mem::size_of::<GpuParams>());
+            let prims = storage_buf(&self.device, "prims", need_prims * std::mem::size_of::<GpuPrim>());
+            let elems = storage_buf(&self.device, "elems", need_elems * std::mem::size_of::<GpuElem>());
+            let rays = storage_buf(&self.device, "rays", need_rays * std::mem::size_of::<GpuRay>());
+            let segs = seg_buf(&self.device, seg_bytes);
+            let staging = staging_buf(&self.device, seg_bytes);
+            let bind_group = self.make_bind_group(&params_buf, &prims, &elems, &rays, &segs);
+            *slot = Some(Buffers {
+                params: params_buf,
+                prims,
+                elems,
+                rays,
+                segs,
+                staging,
+                bind_group,
+                cap_prims: need_prims,
+                cap_elems: need_elems,
+                cap_rays: need_rays,
+                cap_segs: n_segs,
+                cap_stage_bytes: seg_bytes as usize,
+            });
+        }
+        let b = slot.as_mut().unwrap();
+
+        // Grow any buffer the scene has outgrown; rebuild the bind group only if
+        // a storage buffer identity actually changed.
+        let mut rebuild_bg = false;
+        if need_prims > b.cap_prims {
+            b.prims = storage_buf(&self.device, "prims", need_prims * std::mem::size_of::<GpuPrim>());
+            b.cap_prims = need_prims;
+            rebuild_bg = true;
+        }
+        if need_elems > b.cap_elems {
+            b.elems = storage_buf(&self.device, "elems", need_elems * std::mem::size_of::<GpuElem>());
+            b.cap_elems = need_elems;
+            rebuild_bg = true;
+        }
+        if need_rays > b.cap_rays {
+            b.rays = storage_buf(&self.device, "rays", need_rays * std::mem::size_of::<GpuRay>());
+            b.cap_rays = need_rays;
+            rebuild_bg = true;
+        }
+        if n_segs > b.cap_segs {
+            b.segs = seg_buf(&self.device, seg_bytes);
+            b.cap_segs = n_segs;
+            rebuild_bg = true;
+        }
+        if seg_bytes as usize > b.cap_stage_bytes {
+            b.staging = staging_buf(&self.device, seg_bytes);
+            b.cap_stage_bytes = seg_bytes as usize;
+        }
+        if rebuild_bg {
+            b.bind_group = self.make_bind_group(&b.params, &b.prims, &b.elems, &b.rays, &b.segs);
+        }
+
+        // Upload the current scene into the (reused) buffers.
+        self.queue.write_buffer(&b.params, 0, cast_slice(&[params]));
+        if !scene.prims.is_empty() {
+            self.queue.write_buffer(&b.prims, 0, cast_slice(&scene.prims));
+        }
+        if !scene.elems.is_empty() {
+            self.queue.write_buffer(&b.elems, 0, cast_slice(&scene.elems));
+        }
+        if !scene.rays.is_empty() {
+            self.queue.write_buffer(&b.rays, 0, cast_slice(&scene.rays));
+        }
 
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        // Clear so unused segment slots read back as invalid (flags = 0).
-        encoder.clear_buffer(&segs_buf, 0, None);
+        // Clear only the range we read back, so unused slots read as invalid.
+        encoder.clear_buffer(&b.segs, 0, Some(seg_bytes));
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("trace pass"),
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            let groups = params.n_rays.div_ceil(64);
-            pass.dispatch_workgroups(groups, 1, 1);
+            pass.set_bind_group(0, &b.bind_group, &[]);
+            pass.dispatch_workgroups(params.n_rays.div_ceil(64), 1, 1);
         }
-        encoder.copy_buffer_to_buffer(&segs_buf, 0, &staging, 0, seg_bytes);
+        encoder.copy_buffer_to_buffer(&b.segs, 0, &b.staging, 0, seg_bytes);
         self.queue.submit(Some(encoder.finish()));
 
-        // Read back.
-        let slice = staging.slice(..);
+        // Read back only the used range (the staging buffer may be larger).
+        let slice = b.staging.slice(0..seg_bytes);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
@@ -177,10 +240,31 @@ impl GpuTracer {
         rx.recv().unwrap().unwrap();
 
         let data = slice.get_mapped_range();
-        let out: Vec<GpuSeg> = cast_slice::<u8, GpuSeg>(&data).to_vec();
+        let out: Vec<GpuSeg> = cast_slice::<u8, GpuSeg>(&data)[..n_segs].to_vec();
         drop(data);
-        staging.unmap();
+        b.staging.unmap();
         out
+    }
+
+    fn make_bind_group(
+        &self,
+        params: &wgpu::Buffer,
+        prims: &wgpu::Buffer,
+        elems: &wgpu::Buffer,
+        rays: &wgpu::Buffer,
+        segs: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("trace bg"),
+            layout: &self.layout,
+            entries: &[
+                bind(0, params),
+                bind(1, prims),
+                bind(2, elems),
+                bind(3, rays),
+                bind(4, segs),
+            ],
+        })
     }
 }
 
@@ -217,23 +301,44 @@ fn bind(binding: u32, buf: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
     }
 }
 
-/// Create a read-only storage buffer, padding empty vectors to one element
-/// (wgpu forbids zero-sized buffers).
-fn storage_init<T: bytemuck::Pod>(
-    device: &wgpu::Device,
-    label: &str,
-    data: &[T],
-    pad: T,
-) -> wgpu::Buffer {
-    let one = [pad];
-    let bytes: &[u8] = if data.is_empty() {
-        cast_slice(&one)
-    } else {
-        cast_slice(data)
-    };
-    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+/// A uniform buffer of `bytes`, writable via `queue.write_buffer`.
+fn uniform_buf(device: &wgpu::Device, bytes: usize) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("params"),
+        size: bytes as wgpu::BufferAddress,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+/// A read-only storage buffer, writable via `queue.write_buffer`.
+fn storage_buf(device: &wgpu::Device, label: &str, bytes: usize) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
-        contents: bytes,
-        usage: wgpu::BufferUsages::STORAGE,
+        size: bytes.max(1) as wgpu::BufferAddress,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+/// The read-write segment output buffer.
+fn seg_buf(device: &wgpu::Device, bytes: wgpu::BufferAddress) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("segs"),
+        size: bytes,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_SRC
+            | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+/// The CPU-mappable read-back buffer.
+fn staging_buf(device: &wgpu::Device, bytes: wgpu::BufferAddress) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("staging"),
+        size: bytes,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
     })
 }

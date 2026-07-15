@@ -282,8 +282,17 @@ struct Work {
     o: Vec2,
     d: Vec2,
     flux: f32,
+    /// Total interface interactions on this branch (capped by `max_depth`).
     depth: u32,
-    ghost: bool,
+    /// Ghost reflection generations in this branch's ancestry (capped by
+    /// `scene.max_ghost`). The primary/transmitted/TIR/mirror path keeps its
+    /// parent's `gdepth`; only a Fresnel back-reflection increments it.
+    gdepth: u32,
+    /// Refractive index of the medium this ray travels in, carried on the ray
+    /// (like a current-material id) instead of re-deriving it by a full-scene
+    /// region test at the top of every bounce. Must stay in lockstep with
+    /// `shader.wgsl`.
+    medium: f32,
 }
 
 /// Trace all launch rays on the CPU in f32; returns a `n_rays * max_segs`
@@ -302,7 +311,8 @@ pub fn trace(scene: &GpuScene, max_depth: u32) -> Vec<GpuSeg> {
             d: Vec2::X,
             flux: 0.0,
             depth: 0,
-            ghost: false,
+            gdepth: 0,
+            medium: 0.0,
         }; STACK];
         let mut sp = 0usize;
         let push = |stack: &mut [Work; STACK], sp: &mut usize, w: Work| {
@@ -314,15 +324,21 @@ pub fn trace(scene: &GpuScene, max_depth: u32) -> Vec<GpuSeg> {
                 *sp += 1;
             }
         };
+        let launch_o = Vec2::new(r.ox, r.oy);
+        let launch_d = Vec2::new(r.dx, r.dy).normalize();
+        // Only the launch ray needs a from-scratch medium lookup.
+        let launch_medium =
+            element_index(scene, region_elem(scene, launch_o + EPS_M * launch_d), lambda);
         push(
             &mut stack,
             &mut sp,
             Work {
-                o: Vec2::new(r.ox, r.oy),
-                d: Vec2::new(r.dx, r.dy).normalize(),
+                o: launch_o,
+                d: launch_d,
                 flux: r.flux,
                 depth: 0,
-                ghost: false,
+                gdepth: 0,
+                medium: launch_medium,
             },
         );
 
@@ -334,7 +350,7 @@ pub fn trace(scene: &GpuScene, max_depth: u32) -> Vec<GpuSeg> {
                 continue;
             }
             let (o, d) = (w.o, w.d);
-            let n_here = element_index(scene, region_elem(scene, o + EPS_M * d), lambda);
+            let n_here = w.medium;
 
             let mut best_t = scene.bounds;
             let mut best_pi = usize::MAX;
@@ -351,7 +367,7 @@ pub fn trace(scene: &GpuScene, max_depth: u32) -> Vec<GpuSeg> {
                 }
             }
 
-            let gflag = if w.ghost { SEG_GHOST } else { 0 };
+            let gflag = if w.gdepth > 0 { SEG_GHOST } else { 0 };
 
             if best_elem < 0 {
                 let b = o + best_t * d;
@@ -387,6 +403,7 @@ pub fn trace(scene: &GpuScene, max_depth: u32) -> Vec<GpuSeg> {
 
             if mirror >= 0.0 {
                 let dr = reflectv(d, nrm);
+                // Reflection stays in the current medium.
                 push(
                     &mut stack,
                     &mut sp,
@@ -395,7 +412,8 @@ pub fn trace(scene: &GpuScene, max_depth: u32) -> Vec<GpuSeg> {
                         d: dr,
                         flux: w.flux * mirror,
                         depth: w.depth + 1,
-                        ghost: w.ghost,
+                        gdepth: w.gdepth,
+                        medium: w.medium,
                     },
                 );
                 continue;
@@ -406,6 +424,7 @@ pub fn trace(scene: &GpuScene, max_depth: u32) -> Vec<GpuSeg> {
             let dr = reflectv(d, nrm);
             match refract(d, nrm, n1, n2) {
                 None => {
+                    // Total internal reflection: reflected ray stays in n_here.
                     out[si].flags |= SEG_TIR;
                     push(
                         &mut stack,
@@ -415,13 +434,15 @@ pub fn trace(scene: &GpuScene, max_depth: u32) -> Vec<GpuSeg> {
                             d: dr,
                             flux: w.flux,
                             depth: w.depth + 1,
-                            ghost: w.ghost,
+                            gdepth: w.gdepth,
+                            medium: w.medium,
                         },
                     );
                 }
                 Some(dt) => {
                     let cosi = -nrm.dot(d);
                     let rr = reflectance(cosi, n1, n2).clamp(0.0, 1.0);
+                    // Transmitted ray enters the far medium (n2).
                     push(
                         &mut stack,
                         &mut sp,
@@ -430,10 +451,13 @@ pub fn trace(scene: &GpuScene, max_depth: u32) -> Vec<GpuSeg> {
                             d: dt,
                             flux: w.flux * (1.0 - rr),
                             depth: w.depth + 1,
-                            ghost: w.ghost,
+                            gdepth: w.gdepth,
+                            medium: n2,
                         },
                     );
-                    if scene.ghosts && rr > 0.0 {
+                    if scene.ghosts && rr > 0.0 && w.gdepth < scene.max_ghost {
+                        // Ghost (back-reflection) stays in n_here; one more
+                        // reflection generation (§4.2).
                         push(
                             &mut stack,
                             &mut sp,
@@ -442,7 +466,8 @@ pub fn trace(scene: &GpuScene, max_depth: u32) -> Vec<GpuSeg> {
                                 d: dr,
                                 flux: w.flux * rr,
                                 depth: w.depth + 1,
-                                ghost: true,
+                                gdepth: w.gdepth + 1,
+                                medium: w.medium,
                             },
                         );
                     }

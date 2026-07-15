@@ -98,7 +98,11 @@ fn param_code(name: &str) -> Option<u8> {
 #[wasm_bindgen]
 pub struct Canvas {
     scene: Scene,
-    max_depth: u32,
+    /// Ghost reflection-generation cap `G` (§4.2) — the only bounce knob the UI
+    /// exposes. The primary transmitted path is *not* limited by a magic number:
+    /// its depth is auto-sized to the scene's surface count (see
+    /// [`auto_max_depth`]), so adding elements never truncates the rays.
+    max_ghost: u32,
     ghosts: bool,
     /// Freehand-fitted elements, keyed by element id (§5.3).
     fitted: HashMap<u32, FittedSurface>,
@@ -119,10 +123,10 @@ impl Canvas {
         let history = History::single(scene.to_json(), Vec::new(), 0, "start");
         Canvas {
             scene,
-            // Matches the reference tracer's default (§4.2) so the interactive
-            // picture and the f64 numbers reach the same depth — 24 bounces is
-            // ~12 two-surface lenses in series before the depth cap truncates.
-            max_depth: 24,
+            // Two ghost generations by default: enough for the classic
+            // two-surface ghost image (light reflects twice, then reaches the
+            // detector), still cheap. Raise it to hunt deeper stray light (§4.2).
+            max_ghost: 2,
             ghosts: false,
             fitted: HashMap::new(),
             param_pins: HashSet::new(),
@@ -133,9 +137,18 @@ impl Canvas {
 
     // --- configuration -----------------------------------------------------
 
-    #[wasm_bindgen(js_name = setMaxDepth)]
-    pub fn set_max_depth(&mut self, depth: u32) {
-        self.max_depth = depth.clamp(1, 32);
+    /// Set the ghost reflection-generation cap `G` (§4.2): how many nested
+    /// Fresnel back-reflections to follow. `0` = none, `1` = single ghosts, `2`
+    /// = ghosts-of-ghosts, … This is the ray-explosion knob; the number of
+    /// *elements* is unlimited (the primary path auto-sizes to the scene).
+    #[wasm_bindgen(js_name = setMaxGhostBounces)]
+    pub fn set_max_ghost_bounces(&mut self, g: u32) {
+        self.max_ghost = g.min(8);
+    }
+
+    #[wasm_bindgen(js_name = maxGhostBounces)]
+    pub fn max_ghost_bounces(&self) -> u32 {
+        self.max_ghost
     }
 
     /// Toggle the ghost layer (Fresnel back-reflections, §5.5).
@@ -360,14 +373,21 @@ impl Canvas {
     /// ray's wavelength; `flags` bit1 = TIR, bit2 = ghost.
     #[wasm_bindgen(js_name = traceColored)]
     pub fn trace_colored(&self) -> Vec<f32> {
-        colored_segments(&self.visible_scene(), self.max_depth, self.ghosts)
+        colored_segments(&self.visible_scene(), self.ghosts, self.max_ghost)
     }
 
     /// Legacy M1 trace: flat `[ax, ay, bx, by, flux]` per segment.
     pub fn trace(&self) -> Vec<f32> {
         let vs = self.visible_scene();
-        let gs = GpuScene::build_with(&vs, BuildOpts::default());
-        let per_ray = trace_cpu(&gs, self.max_depth);
+        let d = auto_max_depth(&vs, 0, false);
+        let gs = GpuScene::build_with(
+            &vs,
+            BuildOpts {
+                max_segs: d + 8,
+                ..BuildOpts::default()
+            },
+        );
+        let per_ray = trace_cpu(&gs, d);
         let mut out = Vec::new();
         for segs in &per_ray {
             for s in segs {
@@ -385,12 +405,14 @@ impl Canvas {
         if idx >= self.scene.detectors.len() {
             return "null".to_string();
         }
+        let vs = self.visible_scene();
         let cfg = TraceConfig {
             ghosts: self.ghosts,
-            max_depth: self.max_depth,
+            max_depth: auto_max_depth(&vs, self.max_ghost, self.ghosts),
+            max_ghost_bounces: self.max_ghost,
             ..TraceConfig::default()
         };
-        let res = ref_trace(&self.visible_scene(), &cfg);
+        let res = ref_trace(&vs, &cfg);
         let d = &res.detectors[idx];
         let bins: Vec<String> = d.bins.iter().map(|v| format!("{v}")).collect();
         let centroid = d.centroid_u().map_or("null".into(), |v| format!("{v}"));
@@ -1170,12 +1192,14 @@ impl Canvas {
     /// `traceColored`).
     #[wasm_bindgen(js_name = traceWavefront)]
     pub fn trace_wavefront(&self) -> Vec<f32> {
+        let vs = self.visible_scene();
         let cfg = TraceConfig {
             ghosts: self.ghosts,
-            max_depth: self.max_depth,
+            max_depth: auto_max_depth(&vs, self.max_ghost, self.ghosts),
+            max_ghost_bounces: self.max_ghost,
             ..TraceConfig::default()
         };
-        let res = ref_trace(&self.visible_scene(), &cfg);
+        let res = ref_trace(&vs, &cfg);
         let mut out = Vec::with_capacity(res.segments.len() * 11);
         for s in &res.segments {
             let [r, g, b] = wavelength_um_to_linear(s.lambda_um as f32);
@@ -1209,8 +1233,8 @@ impl Canvas {
         let mut scene = self.visible_scene().into_owned();
         let emitted: Vec<_> = scene.sources.iter().flat_map(|s| s.emit()).collect();
         let cfg = TraceConfig {
-            ghosts: false,
-            max_depth: self.max_depth,
+            ghosts: false, // the primary path defines the front
+            max_depth: auto_max_depth(&scene, 0, false),
             ..TraceConfig::default()
         };
         let mut out: Vec<f32> = vec![emitted.len() as f32];
@@ -1247,7 +1271,7 @@ impl Canvas {
     #[wasm_bindgen(js_name = traceNodeColored)]
     pub fn trace_node_colored(&self, id: u32) -> Vec<f32> {
         match self.node_scene(id) {
-            Some(scene) => colored_segments(&scene, self.max_depth, self.ghosts),
+            Some(scene) => colored_segments(&scene, self.ghosts, self.max_ghost),
             None => Vec::new(),
         }
     }
@@ -1265,7 +1289,8 @@ impl Canvas {
         }
         let cfg = TraceConfig {
             ghosts: self.ghosts,
-            max_depth: self.max_depth,
+            max_depth: auto_max_depth(&scene, self.max_ghost, self.ghosts),
+            max_ghost_bounces: self.max_ghost,
             ..TraceConfig::default()
         };
         let res = ref_trace(&scene, &cfg);
@@ -1395,19 +1420,36 @@ impl Default for Canvas {
 
 // --- free helpers ----------------------------------------------------------
 
+/// The interaction depth cap `D`, auto-sized to the scene. A primary transmitted
+/// ray crosses each surface once, so its path length is just the scene's surface
+/// count — not a magic number. Ghost generations may re-traverse, so budget
+/// `(G+1)×` the surfaces; a floor keeps simple folded scenes (a few mirrors)
+/// usable and a ceiling bounds the per-ray buffer. This is why the number of
+/// elements is unlimited while ghost bounces stay a small explicit knob (§4.2).
+fn auto_max_depth(scene: &Scene, max_ghost: u32, ghosts: bool) -> u32 {
+    let surfaces: u32 = scene.elements.iter().map(|e| e.boundary.len() as u32).sum();
+    let g = if ghosts { max_ghost } else { 0 };
+    surfaces
+        .saturating_mul(g + 1)
+        .saturating_add(16)
+        .clamp(32, 1024)
+}
+
 /// Trace a scene on the interactive f32 path and pack colored segments — 9
 /// floats each `[ax, ay, bx, by, r, g, b, flux, flags]`, in linear light (the
 /// caller accumulates additively then tonemaps). Shared by the live view and
-/// the variation-gallery thumbnails so both render identically.
-fn colored_segments(scene: &Scene, max_depth: u32, ghosts: bool) -> Vec<f32> {
+/// the variation-gallery thumbnails so both render identically. Depth and the
+/// per-ray segment budget are auto-sized to the scene so element count never
+/// truncates the rays.
+fn colored_segments(scene: &Scene, ghosts: bool, max_ghost: u32) -> Vec<f32> {
+    let max_depth = auto_max_depth(scene, max_ghost, ghosts);
     let opts = BuildOpts {
         ghosts,
-        // The per-ray segment budget must scale with the depth cap, or it
-        // becomes a hidden second limit: a straight (no-ghost) path through N
-        // lenses is 2N+1 segments, so a fixed budget would truncate rays long
-        // before `max_depth` does. Ghosts branch, so they get extra headroom.
-        max_segs: if ghosts { max_depth * 2 + 8 } else { max_depth + 6 },
+        // The per-ray segment budget tracks the depth cap, or it becomes a
+        // hidden second limit (a path is ~depth segments long).
+        max_segs: max_depth + 8,
         flux_eps: 1e-4,
+        max_ghost,
     };
     let gs = GpuScene::build_with(scene, opts);
     let per_ray = trace_cpu(&gs, max_depth);

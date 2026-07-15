@@ -477,6 +477,7 @@ fn ghost_reflectance_matches_fresnel() {
             ghosts: true,
             max_segs: 24,
             flux_eps: 1e-6,
+            max_ghost: 1,
         },
     );
     let per_ray = trace_cpu(&gs, 16);

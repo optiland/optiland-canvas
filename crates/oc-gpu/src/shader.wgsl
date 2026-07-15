@@ -42,6 +42,8 @@ struct Params {
     bounds: f32,
     flux_eps: f32,
     ghosts: u32,
+    max_ghost: u32,     // ghost reflection-generation cap G (§4.2)
+    _p0: u32, _p1: u32, _p2: u32,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -246,15 +248,19 @@ fn refract(d: vec2<f32>, n: vec2<f32>, n1: f32, n2: f32) -> vec4<f32> {
 
 fn reflectv(d: vec2<f32>, n: vec2<f32>) -> vec2<f32> { return d - 2.0 * dot(d, n) * n; }
 
-// Per-thread ray stack.
-struct Work { o: vec2<f32>, d: vec2<f32>, flux: f32, depth: u32, ghost: u32 };
+// Per-thread ray stack. `medium` is the refractive index of the medium the ray
+// travels in, carried on the ray (like a current-material id) instead of
+// re-deriving it with a full-scene point-in-region test at the top of every
+// bounce. A child ray inherits its medium from the interface that spawned it, so
+// only the launch ray needs a from-scratch region lookup.
+struct Work { o: vec2<f32>, d: vec2<f32>, flux: f32, depth: u32, gdepth: u32, medium: f32 };
 var<private> stack: array<Work, 48>;
 var<private> sp: u32;
 
-fn push(o: vec2<f32>, d: vec2<f32>, flux: f32, depth: u32, ghost: u32, min_flux: f32) {
+fn push(o: vec2<f32>, d: vec2<f32>, flux: f32, depth: u32, gdepth: u32, medium: f32, min_flux: f32) {
     if (depth >= params.max_depth || flux < min_flux) { return; }
     if (sp < 48u) {
-        stack[sp] = Work(o, d, flux, depth, ghost);
+        stack[sp] = Work(o, d, flux, depth, gdepth, medium);
         sp = sp + 1u;
     }
 }
@@ -270,7 +276,10 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>) {
     let min_flux = params.flux_eps * r.flux;
 
     sp = 0u;
-    stack[0] = Work(vec2<f32>(r.ox, r.oy), normalize(vec2<f32>(r.dx, r.dy)), r.flux, 0u, 0u);
+    let launch_o = vec2<f32>(r.ox, r.oy);
+    let launch_d = normalize(vec2<f32>(r.dx, r.dy));
+    let launch_medium = element_index(region_elem(launch_o + EPS_M * launch_d), lambda);
+    stack[0] = Work(launch_o, launch_d, r.flux, 0u, 0u, launch_medium);
     sp = 1u;
 
     var seg_count = 0u;
@@ -282,7 +291,7 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         let o = w.o;
         let d = w.d;
-        let n_here = element_index(region_elem(o + EPS_M * d), lambda);
+        let n_here = w.medium;
 
         var best_t = params.bounds;
         var best_pi = 0xffffffffu;
@@ -300,7 +309,7 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
 
         var gflag = 0u;
-        if (w.ghost == 1u) { gflag = SEG_GHOST; }
+        if (w.gdepth > 0u) { gflag = SEG_GHOST; }
 
         if (best_elem < 0) {
             let b = o + best_t * d;
@@ -330,7 +339,8 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         if (mirror >= 0.0) {
             let dr = reflectv(d, nrm);
-            push(hit + EPS_O * dr, dr, w.flux * mirror, w.depth + 1u, w.ghost, min_flux);
+            // Reflection stays in the current medium.
+            push(hit + EPS_O * dr, dr, w.flux * mirror, w.depth + 1u, w.gdepth, w.medium, min_flux);
             continue;
         }
 
@@ -340,15 +350,17 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>) {
         let dr = reflectv(d, nrm);
         if (res.z < 0.5) {
             // Total internal reflection: primary path reflects; flag the surface.
+            // Reflected ray stays in the current medium.
             segs[si].flags = segs[si].flags | SEG_TIR;
-            push(hit + EPS_O * dr, dr, w.flux, w.depth + 1u, w.ghost, min_flux);
+            push(hit + EPS_O * dr, dr, w.flux, w.depth + 1u, w.gdepth, w.medium, min_flux);
         } else {
             let cosi = -dot(nrm, d);
             let rr = clamp(reflectance(cosi, n1, n2), 0.0, 1.0);
             let dt = vec2<f32>(res.x, res.y);
-            push(hit + EPS_O * dt, dt, w.flux * (1.0 - rr), w.depth + 1u, w.ghost, min_flux);
-            if (params.ghosts == 1u && rr > 0.0) {
-                push(hit + EPS_O * dr, dr, w.flux * rr, w.depth + 1u, 1u, min_flux);
+            // Transmitted ray enters the far medium (n2); ghost reflects back into n_here.
+            push(hit + EPS_O * dt, dt, w.flux * (1.0 - rr), w.depth + 1u, w.gdepth, n2, min_flux);
+            if (params.ghosts == 1u && rr > 0.0 && w.gdepth < params.max_ghost) {
+                push(hit + EPS_O * dr, dr, w.flux * rr, w.depth + 1u, w.gdepth + 1u, w.medium, min_flux);
             }
         }
     }

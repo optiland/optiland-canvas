@@ -526,6 +526,67 @@ mod tests {
         assert!(!e.contains(Vec2::new(0.0, 5.0)));
     }
 
+    /// A disc bounded by a single full-turn arc.
+    fn circle_element(center: Vec2, r: f64) -> Element {
+        Element::new(
+            ElementId(0),
+            vec![Edge::Arc {
+                center,
+                r,
+                a0: 0.0,
+                a1: std::f64::consts::TAU,
+            }],
+            Material::AbbePoint { nd: 1.5, vd: 60.0 },
+        )
+    }
+
+    #[test]
+    fn one_edge_circle_contains_correctly() {
+        // A circle is a legitimate closed boundary: a ray from inside crosses it
+        // exactly once. This is the containment half of full-turn arc support —
+        // with the sweep folded to zero the boundary vanishes and the disc stops
+        // holding any medium at all, so a lens built from one arc would trace as
+        // air while still being drawn on screen.
+        let e = circle_element(Vec2::ZERO, 3.0);
+        assert!(e.contains(Vec2::ZERO), "the centre is inside");
+        assert!(e.contains(Vec2::new(2.9, 0.0)));
+        assert!(e.contains(Vec2::new(0.0, -2.9)));
+        assert!(!e.contains(Vec2::new(3.1, 0.0)));
+        assert!(!e.contains(Vec2::new(-5.0, 0.0)), "outside, ray crosses twice");
+        assert!(!e.contains(Vec2::new(9.0, 9.0)));
+    }
+
+    #[test]
+    fn one_edge_circle_resolves_as_a_medium() {
+        // Containment is how the tracer decides which medium a point is in, so a
+        // circle must actually carry its glass.
+        let mut scene = Scene::new();
+        scene.add_element(circle_element(Vec2::ZERO, 3.0));
+        let inside = scene.region_index(scene.region_at(Vec2::ZERO), crate::material::LAMBDA_D);
+        assert!((inside - 1.5).abs() < 1e-9, "expected the disc's glass, got {inside}");
+        let outside = scene.region_index(scene.region_at(Vec2::new(9.0, 0.0)), crate::material::LAMBDA_D);
+        assert!((outside - 1.0).abs() < 1e-12, "expected ambient, got {outside}");
+    }
+
+    #[test]
+    fn one_edge_circle_survives_an_ocanvas_round_trip() {
+        // TAU must come back as TAU: the format stores the raw angles, so the
+        // circle is only preserved if the serialized f64 round-trips exactly.
+        let mut scene = Scene::new();
+        scene.add_element(circle_element(Vec2::new(1.0, -2.0), 3.0));
+        let back = Scene::from_json(&scene.to_json()).expect("round-trips");
+
+        assert_eq!(back.elements[0].boundary, scene.elements[0].boundary);
+        match back.elements[0].boundary[0] {
+            Edge::Arc { a0, a1, .. } => {
+                assert_eq!(a1 - a0, std::f64::consts::TAU, "the sweep must survive")
+            }
+            ref other => panic!("expected an arc, got {other:?}"),
+        }
+        // And it is still a circle after reloading, not just bit-identical.
+        assert!(back.elements[0].contains(Vec2::new(1.0, -2.0)));
+    }
+
     #[test]
     fn region_priority_wins() {
         let mut scene = Scene::new();

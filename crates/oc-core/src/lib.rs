@@ -10,6 +10,7 @@
 pub mod geom;
 pub mod material;
 pub mod scene;
+pub mod seq;
 pub mod vec;
 
 pub use geom::{Aabb, ConicParams, Edge, EdgeHit, Ray};
@@ -20,6 +21,7 @@ pub use material::{
 pub use scene::{
     spherical_edge, Detector, DetectorId, Element, ElementHit, ElementId, EmittedRay, Environment,
     Layer, LayerId, Region, Scene, Source, SourceId, SourceKind, Spectrum, SurfaceProps,
-    SurfaceSpec,
+    SurfaceSpec, OCANVAS_FORMAT, OCANVAS_VERSION,
 };
+pub use seq::{FieldType, SeqAperture, SeqMaterial, SeqSurface, SeqSystem};
 pub use vec::{perp, Isometry2, Vec2};

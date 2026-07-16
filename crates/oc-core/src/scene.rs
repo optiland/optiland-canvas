@@ -340,9 +340,32 @@ pub enum Region<'a> {
     In(&'a Element),
 }
 
-/// The full scene document.
+/// The magic string tagging a document as `.ocanvas` (§6).
+pub const OCANVAS_FORMAT: &str = "ocanvas";
+/// The frozen `.ocanvas` schema version. Bumped only on a breaking change;
+/// every reader must accept every version `<=` its own (see `docs/ocanvas-format.md`).
+pub const OCANVAS_VERSION: u32 = 1;
+
+fn default_format() -> String {
+    OCANVAS_FORMAT.to_string()
+}
+fn default_version() -> u32 {
+    OCANVAS_VERSION
+}
+
+/// The full scene document — the serialized form *is* the `.ocanvas` file (§6).
+///
+/// The leading `format`/`version` pair is the stability contract: it is written
+/// on every save and, being `#[serde(default)]`, an older file that predates the
+/// tag still loads (defaulting to v1). See [`Scene::check_version`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Scene {
+    /// Always `"ocanvas"`; identifies the document kind.
+    #[serde(default = "default_format")]
+    pub format: String,
+    /// Schema version. Current writer emits [`OCANVAS_VERSION`].
+    #[serde(default = "default_version")]
+    pub version: u32,
     pub elements: Vec<Element>,
     pub sources: Vec<Source>,
     pub detectors: Vec<Detector>,
@@ -360,6 +383,8 @@ impl Default for Scene {
 impl Scene {
     pub fn new() -> Self {
         Self {
+            format: default_format(),
+            version: OCANVAS_VERSION,
             elements: Vec::new(),
             sources: Vec::new(),
             detectors: Vec::new(),
@@ -407,14 +432,41 @@ impl Scene {
         }
     }
 
-    /// Serialize to pretty `.ocanvas` JSON.
+    /// Serialize to pretty `.ocanvas` JSON. Always stamps the current
+    /// `format`/`version` header.
     pub fn to_json(&self) -> String {
-        serde_json::to_string_pretty(self).expect("scene serializes")
+        let mut doc = self.clone();
+        doc.format = default_format();
+        doc.version = OCANVAS_VERSION;
+        serde_json::to_string_pretty(&doc).expect("scene serializes")
     }
 
-    /// Deserialize from `.ocanvas` JSON.
+    /// Deserialize from `.ocanvas` JSON. Files predating the version tag load as
+    /// v1 (via `serde` defaults); a future-version file is rejected with a clear
+    /// error rather than silently mis-parsed.
     pub fn from_json(s: &str) -> serde_json::Result<Self> {
-        serde_json::from_str(s)
+        let scene: Scene = serde_json::from_str(s)?;
+        scene.check_version().map_err(serde::de::Error::custom)?;
+        Ok(scene)
+    }
+
+    /// Reject documents this build cannot faithfully read: a wrong `format`
+    /// magic or a `version` newer than [`OCANVAS_VERSION`].
+    pub fn check_version(&self) -> Result<(), String> {
+        if self.format != OCANVAS_FORMAT {
+            return Err(format!(
+                "not an .ocanvas document: format = {:?} (expected {:?})",
+                self.format, OCANVAS_FORMAT
+            ));
+        }
+        if self.version > OCANVAS_VERSION {
+            return Err(format!(
+                ".ocanvas version {} is newer than this build supports (v{}); \
+                 upgrade optiland-canvas to read it",
+                self.version, OCANVAS_VERSION
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -521,6 +573,46 @@ mod tests {
         let back = Scene::from_json(&json).unwrap();
         assert_eq!(back.elements.len(), 1);
         assert_eq!(back.sources.len(), 1);
+    }
+
+    #[test]
+    fn json_carries_format_header() {
+        let json = Scene::new().to_json();
+        // The stability tag is the first thing in the document.
+        assert!(json.contains("\"format\": \"ocanvas\""), "{json}");
+        assert!(json.contains("\"version\": 1"));
+    }
+
+    #[test]
+    fn legacy_untagged_json_loads_as_v1() {
+        // A pre-freeze document has no format/version fields.
+        let legacy = r#"{
+            "elements": [], "sources": [], "detectors": [],
+            "env": {"ambient_index": 1.0, "wavelengths": [[0.58756, 1.0]]},
+            "layers": [{"name": "Layer 0", "visible": true, "opacity": 1.0}],
+            "catalog": {"glasses": []}
+        }"#;
+        let scene = Scene::from_json(legacy).expect("legacy loads");
+        assert_eq!(scene.format, OCANVAS_FORMAT);
+        assert_eq!(scene.version, 1);
+    }
+
+    #[test]
+    fn future_version_is_rejected() {
+        let mut scene = Scene::new();
+        scene.version = OCANVAS_VERSION + 1;
+        // Serialize the raw struct (bypassing to_json's re-stamp).
+        let json = serde_json::to_string(&scene).unwrap();
+        let err = Scene::from_json(&json).unwrap_err().to_string();
+        assert!(err.contains("newer than this build"), "{err}");
+    }
+
+    #[test]
+    fn wrong_format_magic_is_rejected() {
+        let json = r#"{"format": "zemax", "version": 1, "elements": [], "sources": [],
+            "detectors": [], "env": {"ambient_index": 1.0, "wavelengths": []},
+            "layers": [], "catalog": {"glasses": []}}"#;
+        assert!(Scene::from_json(json).is_err());
     }
 
     #[test]

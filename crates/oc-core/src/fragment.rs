@@ -847,6 +847,53 @@ mod tests {
         assert_eq!(scene.catalog.len(), catalog_before);
     }
 
+    #[test]
+    fn a_fragment_that_travelled_through_ocanvas_still_merges() {
+        // The way every real module fragment arrives: authored, serialized, read
+        // back, then inserted. Its glasses have been through the file format, and
+        // they are compared against the destination's by equality — so a parser
+        // that returned a float one ULP off would make a module unplaceable in the
+        // catalogue it was built from. FusedSilica really did: its Sellmeier `c`
+        // terms are computed rather than written as literals, and serde_json's
+        // default best-effort parse changed them. Hence `float_roundtrip`.
+        //
+        // Every builtin glass, not only that one: the next computed coefficient
+        // should fail here rather than in someone's setup.
+        let names: Vec<String> = Scene::new()
+            .catalog
+            .iter()
+            .map(|(_, g)| g.name.clone())
+            .collect();
+
+        for name in names {
+            let mut authored = Scene::new();
+            let id = authored.catalog.find(&name).expect("a builtin glass");
+            authored.add_element(Element::new(
+                ElementId(0),
+                square(1.0),
+                Material::Catalog(id),
+            ));
+
+            let reloaded = Scene::from_json(&authored.to_json()).expect("valid .ocanvas");
+            let fragment = SceneFragment::from_scene(&reloaded).expect("readable as a fragment");
+
+            let mut dest = Scene::new();
+            let inserted = dest
+                .insert_fragment(&fragment, Transform2::IDENTITY)
+                .unwrap_or_else(|e| panic!("a {name} module must be placeable: {e}"));
+
+            // And it merged onto the destination's own entry rather than growing
+            // the catalogue with a near-duplicate.
+            assert_eq!(dest.catalog.len(), Scene::new().catalog.len(), "{name}");
+            match dest.elements[inserted.elements[0].index()].material {
+                Material::Catalog(g) => {
+                    assert_eq!(dest.catalog.get(g).map(|g| g.name.as_str()), Some(name.as_str()))
+                }
+                ref m => panic!("expected catalogue glass, got {m:?}"),
+            }
+        }
+    }
+
     // --- Malformed carried glasses -----------------------------------------
 
     /// `made_up_glass`, then broken by `f`.

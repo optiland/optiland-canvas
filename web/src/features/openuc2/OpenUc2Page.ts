@@ -89,6 +89,26 @@ type BomLine = {
 
 type Bom = { lines: BomLine[]; total_eur: number; custom_object_count: number };
 
+/// What a generated module's optics were built from. Mirrors `parametersJson`.
+type Params = {
+  generator: string;
+  /// The parameters that actually reach the geometry. Only these are editable
+  /// (§15.7); a field that changes nothing is worse than no field.
+  editable: string[];
+  values: Record<string, number | string>;
+  overridden: string[];
+  paraxial: Paraxial | null;
+};
+
+/// The lensmaker's equation for the current numbers, computed without the tracer.
+type Paraxial = {
+  efl_mm: number;
+  bfd_mm: number;
+  rear_focus_x_mm: number;
+  nd: number;
+  lambda_um: number;
+};
+
 type Footprint = {
   instance_id: string;
   color: string;
@@ -762,6 +782,134 @@ export async function initOpenUc2(): Promise<void> {
     portBox.replaceChildren(...rows);
   }
 
+  /// The module inspector (§15.7).
+  ///
+  /// Only a module with a typed generator gets editable fields, because only its
+  /// parameters reach the geometry. For anything else the numbers are shown
+  /// read-only and say so — a lens that reads 50 mm while tracing 100 would be
+  /// worse than no field at all.
+  function renderInspector() {
+    const box = document.getElementById("uc2Inspector")!;
+    const id = uc2.selectedInstance();
+    if (!id) {
+      box.replaceChildren(note("nothing selected", "dim"));
+      return;
+    }
+    const inst = instances().find((i) => i.instance_id === id);
+    if (!inst) {
+      box.replaceChildren(note("nothing selected", "dim"));
+      return;
+    }
+
+    const rows: HTMLElement[] = [];
+    const head = document.createElement("div");
+    head.textContent = `${inst.name}`;
+    head.title = `${inst.module_id} · ${id}`;
+    rows.push(head);
+    rows.push(
+      note(
+        `cell [${inst.anchor_grid.join(", ")}] · rotated ${inst.rotation_quadrants * 90}°`,
+        "dim",
+      ),
+    );
+
+    const params = JSON.parse(uc2.parametersJson(id)) as Params | null;
+    if (!params) {
+      rows.push(
+        note("its optics are a stored fragment, so there is nothing to configure", "dim"),
+      );
+      box.replaceChildren(...rows);
+      return;
+    }
+
+    for (const key of params.editable) {
+      rows.push(paramRow(id, key, params));
+    }
+    if (params.paraxial) rows.push(predict(params.paraxial));
+    box.replaceChildren(...rows);
+  }
+
+  /// One editable parameter.
+  function paramRow(id: string, key: string, params: Params): HTMLElement {
+    const row = document.createElement("div");
+    row.className = params.overridden.includes(key) ? "uc2-param uc2-over" : "uc2-param";
+    const label = document.createElement("label");
+    label.textContent = key.replace(/_mm$/, "").replace(/_/g, " ");
+    row.append(label);
+
+    const raw = params.values[key];
+    if (typeof raw === "string") {
+      // `material`, or a plane radius — JSON has no infinity, so `"inf"` is how a
+      // flat surface travels. Not editable here: a glass picker and a
+      // finite/plane toggle are their own controls, and a free-text field that
+      // rejected most of what you typed would be a worse one.
+      const v = document.createElement("span");
+      v.textContent = raw;
+      row.append(v);
+      return row;
+    }
+
+    const input = document.createElement("input");
+    input.type = "number";
+    input.step = "1";
+    input.value = String(raw);
+    // `change`, not `input`: the geometry is rebuilt per edit, and a refused
+    // value (a radius shorter than the semi-diameter) should be reported when you
+    // finish typing, not after the first digit.
+    input.onchange = () => {
+      const n = Number(input.value);
+      if (!Number.isFinite(n)) return;
+      try {
+        uc2.setParameter(id, key, JSON.stringify(n));
+        err.textContent = "";
+      } catch (e) {
+        fail(e);
+      }
+      refresh();
+    };
+    row.append(input);
+
+    if (params.overridden.includes(key)) {
+      const reset = document.createElement("button");
+      reset.textContent = "↺";
+      reset.title = "back to the module's design value";
+      reset.onclick = () => {
+        try {
+          uc2.clearParameter(id, key);
+          err.textContent = "";
+        } catch (e) {
+          fail(e);
+        }
+        refresh();
+      };
+      row.append(reset);
+    }
+    return row;
+  }
+
+  /// What the lensmaker's equation says this lens should do.
+  ///
+  /// The point of showing it: it is computed from the numbers above without the
+  /// tracer, so the rays on screen are an independent second answer. If the beam
+  /// crosses the axis where this says it should, both are probably right — and if
+  /// it does not, one of them is wrong and you can see which.
+  function predict(p: Paraxial): HTMLElement {
+    const el = document.createElement("div");
+    el.className = "uc2-predict";
+    const f = Number.isFinite(p.efl_mm) ? `${p.efl_mm.toFixed(2)} mm` : "∞ (no power)";
+    el.innerHTML =
+      `lensmaker: f = <b>${f}</b><br>` +
+      `back focus <b>${Number.isFinite(p.bfd_mm) ? p.bfd_mm.toFixed(2) + " mm" : "∞"}</b> ` +
+      `past the rear vertex<br>` +
+      `n = ${p.nd.toFixed(5)} at ${(p.lambda_um * 1000).toFixed(1)} nm`;
+    const why = document.createElement("div");
+    why.className = "uc2-note uc2-dim";
+    why.textContent =
+      "computed from these numbers, not traced — the rays are the independent check";
+    el.append(why);
+    return el;
+  }
+
   /// The module list (§15.8): what you would have to buy to build this.
   function renderBom(bom: Bom) {
     const box = document.getElementById("uc2Bom")!;
@@ -822,6 +970,7 @@ export async function initOpenUc2(): Promise<void> {
     );
     if (warnings.length === 0) warnBox.replaceChildren(note("nothing to report", "dim"));
 
+    renderInspector();
     renderPorts(JSON.parse(uc2.portsJson()) as Port[]);
     renderBom(JSON.parse(uc2.bomJson()) as Bom);
 

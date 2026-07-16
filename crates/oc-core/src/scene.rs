@@ -637,6 +637,66 @@ mod tests {
     }
 
     #[test]
+    fn every_glass_survives_a_round_trip_bit_for_bit() {
+        // `.ocanvas` is the contract other tools build on, so a float that goes
+        // out must come back as the *same* float, not a near one.
+        //
+        // This is not hypothetical. serde_json's parser is best-effort without the
+        // `float_roundtrip` feature, and FusedSilica's Sellmeier `c` terms are
+        // computed (`0.1162414²`) rather than written as literals, so they landed
+        // one ULP away on the way back in. Dispersion is compared by equality when
+        // a fragment merges into a scene, so the effect was that a fused-silica
+        // module could not be placed at all: it was refused as a glass conflict
+        // with the very catalogue it came from.
+        let scene = Scene::new();
+        let back = Scene::from_json(&scene.to_json()).unwrap();
+        assert_eq!(back.catalog.len(), scene.catalog.len());
+
+        for (id, glass) in scene.catalog.iter() {
+            let other = back.catalog.get(id).expect("same ids");
+            assert_eq!(other.name, glass.name);
+            for i in 0..3 {
+                assert_eq!(
+                    other.sell.b[i].to_bits(),
+                    glass.sell.b[i].to_bits(),
+                    "{} b[{i}]: {} came back as {}",
+                    glass.name,
+                    glass.sell.b[i],
+                    other.sell.b[i]
+                );
+                assert_eq!(
+                    other.sell.c[i].to_bits(),
+                    glass.sell.c[i].to_bits(),
+                    "{} c[{i}]: {} came back as {}",
+                    glass.name,
+                    glass.sell.c[i],
+                    other.sell.c[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_reloaded_scenes_glass_still_matches_the_builtin_catalogue() {
+        // The consequence, from the outside: an element's glass must still be the
+        // same glass after a trip through a file, or a fragment carrying it cannot
+        // be merged into anything.
+        let scene = Scene::new();
+        let back = Scene::from_json(&scene.to_json()).unwrap();
+        for name in ["N-BK7", "FusedSilica", "N-SF11"] {
+            let Some(a) = scene.catalog.find(name).and_then(|i| scene.catalog.get(i)) else {
+                continue;
+            };
+            let b = back
+                .catalog
+                .find(name)
+                .and_then(|i| back.catalog.get(i))
+                .unwrap_or_else(|| panic!("{name} survives the round trip"));
+            assert_eq!(a.sell, b.sell, "{name} dispersion changed in transit");
+        }
+    }
+
+    #[test]
     fn json_carries_format_header() {
         let json = Scene::new().to_json();
         // The stability tag is the first thing in the document.

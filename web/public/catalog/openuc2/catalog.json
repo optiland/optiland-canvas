@@ -26,6 +26,21 @@
       "tags": ["lens", "singlet", "nbk7"],
       "color": "#7CC142",
       "footprint": {"anchor_cell": [0, 0, 0], "cells": [[0, 0, 0]]},
+      "generator": "singlet",
+      "parameters": {
+        "static": {
+          "material": "N-BK7",
+          "diameter_mm": 24.0,
+          "center_thickness_mm": 5.0,
+          "radius_1_mm": 100.0,
+          "radius_2_mm": -100.0
+        },
+        "variable": {
+          "radius_1_mm": {"min": -1000.0, "max": 1000.0},
+          "radius_2_mm": {"min": -1000.0, "max": 1000.0},
+          "center_thickness_mm": {"min": 1.0, "max": 20.0}
+        }
+      },
       "ports": [
         {"id": "optical-in", "type": "optical", "role": "input", "face": "-X",
           "pose": {"position_mm": [-25.0, 0.0, 25.0], "direction": [-1.0, 0.0, 0.0]}},
@@ -33,7 +48,7 @@
           "pose": {"position_mm": [25.0, 0.0, 25.0], "direction": [1.0, 0.0, 0.0]}}
       ],
       "capabilities": {"layout": "ready", "optical": "validated", "cad": "reference", "control": "absent"},
-      "assets": {"icon": "assets/lens.svg", "canvas_fragment": "assets/lens.ocanvas"},
+      "assets": {"icon": "assets/lens.svg"},
       "commercial": {"vendor": "Example Vendor", "sku": "EXAMPLE-LENS-01", "price_eur": 24.0},
       "source_path": "modules/lenses/lens-pcx-nbk7-1x1/module.yaml"
     },

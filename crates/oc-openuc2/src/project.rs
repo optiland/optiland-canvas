@@ -28,6 +28,7 @@ use oc_core::{
 use crate::catalog::{Catalog, Capabilities, Footprint, ModuleEntry, ModuleRef};
 use crate::coordinates::{GridProfile, Quadrant};
 use crate::errors::{Error, PlacementError, ProjectWarning};
+use crate::generator::Generator;
 use crate::history::History;
 use crate::ports::{self, PlacedPort, PortSource};
 use crate::setup::{InstanceFallback, OpenUc2Setup, Placement, SetupInstance};
@@ -652,7 +653,7 @@ impl OpenUc2Project {
         // a bad fragment, and a setup entry with no objects would be a module the
         // user can see but not select.
         if self.should_materialize(&inst) {
-            let placed = self.materialize_one(&inst).map_err(PlacementError::Fragment)?;
+            let placed = self.materialize_one(&inst).map_err(PlacementError::from)?;
             if let Some(m) = placed {
                 self.instances.insert(instance_id.clone(), m);
             }
@@ -806,24 +807,73 @@ impl OpenUc2Project {
 
     /// Set a parameter override.
     ///
-    /// Recorded and carried into the BOM, but not yet bound to geometry: no
-    /// module in the MVP regenerates its optics from a parameter, and pretending
-    /// otherwise would show a lens that reads 50 mm and traces 25.
+    /// For a module with a typed generator (§9.5) this **rebuilds its optics**:
+    /// the value reaches the geometry, and the rays follow. For any other module
+    /// the value is recorded and carried into the BOM but changes no ray — no
+    /// stored fragment regenerates itself, and a lens that read 50 mm while
+    /// tracing 25 would be worse than no field at all (§15.7).
+    ///
+    /// Atomic. A value the generator refuses — a radius shorter than the
+    /// semi-diameter, a glass nobody has — leaves the setup and the scene exactly
+    /// as they were, so a half-typed number in a UI cannot destroy a layout.
     pub fn set_parameter_override(
         &mut self,
         instance: &str,
         key: &str,
         value: serde_json::Value,
     ) -> Result<(), Error> {
-        if self.setup.instance(instance).is_none() {
-            return Err(Error::UnknownInstance(instance.to_string()));
+        let inst = self
+            .setup
+            .instance(instance)
+            .ok_or_else(|| Error::UnknownInstance(instance.to_string()))?;
+
+        // Try the build before committing anything, so a refused value is a
+        // refusal and not a broken scene.
+        let generated = self
+            .catalog
+            .resolve(&inst.module_ref())
+            .map(|e| e.generator.is_some())
+            .unwrap_or(false);
+        if generated {
+            let mut probe = inst.clone();
+            probe.parameter_overrides.insert(key.to_string(), value.clone());
+            let entry = self.catalog.resolve(&probe.module_ref()).expect("resolved above");
+            self.fragment_for_instance(&probe, entry)?;
+        }
+
+        let before = self.before();
+        self.setup
+            .instance_mut(instance)
+            .expect("checked above")
+            .parameter_overrides
+            .insert(key.to_string(), value);
+        if generated {
+            // The geometry is derived from the parameters, so the honest way to
+            // change it is to regenerate. Ids change, which is why every retained
+            // one goes through the rebuild rather than being patched.
+            self.rematerialize()?;
+        }
+        self.recompute_warnings();
+        self.record(before);
+        Ok(())
+    }
+
+    /// Drop an override, returning the parameter to the descriptor's value.
+    pub fn clear_parameter_override(&mut self, instance: &str, key: &str) -> Result<(), Error> {
+        let inst = self
+            .setup
+            .instance(instance)
+            .ok_or_else(|| Error::UnknownInstance(instance.to_string()))?;
+        if !inst.parameter_overrides.contains_key(key) {
+            return Ok(());
         }
         let before = self.before();
-        let i = self
-            .setup
+        self.setup
             .instance_mut(instance)
-            .ok_or_else(|| Error::UnknownInstance(instance.to_string()))?;
-        i.parameter_overrides.insert(key.to_string(), value);
+            .expect("checked above")
+            .parameter_overrides
+            .remove(key);
+        self.rematerialize()?;
         self.record(before);
         Ok(())
     }
@@ -857,16 +907,13 @@ impl OpenUc2Project {
 
     /// Insert one instance's fragment. `Ok(None)` means the module resolved but
     /// has nothing optical to place, which is normal for a structural cube.
-    fn materialize_one(
-        &mut self,
-        inst: &SetupInstance,
-    ) -> Result<Option<MaterializedInstance>, oc_core::FragmentError> {
+    fn materialize_one(&mut self, inst: &SetupInstance) -> Result<Option<MaterializedInstance>, Error> {
         let module = inst.module_ref();
         let Some(entry) = self.catalog.resolve(&module) else {
             return Ok(None);
         };
         let module_id = entry.id.clone();
-        let Some(fragment) = self.catalog.fragment_for(entry).cloned() else {
+        let Some(fragment) = self.fragment_for_instance(inst, entry)? else {
             return Ok(None);
         };
         let rot = Quadrant::from_quarter_turns(inst.placement.rotation_quadrants)
@@ -878,6 +925,45 @@ impl OpenUc2Project {
             module_id,
             inserted,
         }))
+    }
+
+    /// This instance's optics: built from its parameters, or the catalogue's
+    /// stored fragment.
+    ///
+    /// A generated module's geometry is per *instance*, not per module, because
+    /// two copies of one product may be configured differently — which is exactly
+    /// why the catalogue cannot cache it.
+    fn fragment_for_instance(
+        &self,
+        inst: &SetupInstance,
+        entry: &ModuleEntry,
+    ) -> Result<Option<SceneFragment>, Error> {
+        if let Some(name) = &entry.generator {
+            let g = Generator::from_name(name)?;
+            return Ok(Some(g.build(&resolved_parameters(entry, inst))?));
+        }
+        Ok(self.catalog.fragment_for(entry).cloned())
+    }
+
+    /// The parameters a generated instance is actually built from.
+    ///
+    /// Read-only: it is what [`set_parameter_override`](Self::set_parameter_override)
+    /// has already produced, and is here so a UI can show the numbers the geometry
+    /// came from rather than the descriptor's untouched defaults.
+    pub fn resolved_parameters(
+        &self,
+        instance: &str,
+    ) -> Option<BTreeMap<String, serde_json::Value>> {
+        let inst = self.setup.instance(instance)?;
+        let entry = self.catalog.resolve(&inst.module_ref())?;
+        Some(resolved_parameters(entry, inst))
+    }
+
+    /// The typed generator behind an instance, if its module has one.
+    pub fn generator_of(&self, instance: &str) -> Option<Generator> {
+        let inst = self.setup.instance(instance)?;
+        let entry = self.catalog.resolve(&inst.module_ref())?;
+        Generator::from_name(entry.generator.as_deref()?).ok()
     }
 
     /// Rebuild the scene from the setup.
@@ -986,8 +1072,14 @@ impl OpenUc2Project {
             };
             let module_id = entry.id.clone();
             let caps: Capabilities = entry.capabilities.clone();
-            let declares_fragment = entry.assets.canvas_fragment.is_some();
+            let declares_optics = self.catalog.declares_optics(entry);
+            let generated = entry.generator.is_some();
             let missing_asset = self.catalog.fragment_asset_missing(entry).map(str::to_string);
+            let overridden: Vec<String> = if generated {
+                inst.parameter_overrides.keys().cloned().collect()
+            } else {
+                Vec::new()
+            };
 
             if inst.placement.anchor_grid[2] != active {
                 out.push(ProjectWarning::InactiveLayer {
@@ -1006,11 +1098,21 @@ impl OpenUc2Project {
                 });
                 continue;
             }
-            if !caps.has_optics() || !declares_fragment {
+            if !caps.has_optics() || !declares_optics {
                 out.push(ProjectWarning::LayoutOnly {
                     instance: id.clone(),
                     module_id: module_id.clone(),
                     optical: caps.optical.clone(),
+                });
+            } else if !overridden.is_empty() {
+                // Reported instead of the `validated` badge, not beside it: this
+                // instance is a lens the module's reference never covered, and
+                // saying "validated" about it would be the claim this whole
+                // fidelity scheme exists to refuse.
+                out.push(ProjectWarning::ReconfiguredOptics {
+                    instance: id.clone(),
+                    module_id: module_id.clone(),
+                    keys: overridden,
                 });
             } else if !caps.optics_validated() {
                 out.push(ProjectWarning::IdealizedOptics {
@@ -1181,6 +1283,23 @@ fn remap_inserted(f: &InsertedFragment, remap: &IdRemap) -> InsertedFragment {
             .filter_map(|i| remap.detector(*i))
             .collect(),
     }
+}
+
+/// A module's declared parameters with this instance's overrides applied.
+///
+/// The descriptor's `static` values are the design; an override is this
+/// instance's departure from it. Overrides win, and an override of a key the
+/// descriptor never declared is still applied — the generator validates what it
+/// is handed, and a silently dropped key would be a field that does nothing.
+fn resolved_parameters(
+    e: &ModuleEntry,
+    inst: &SetupInstance,
+) -> BTreeMap<String, serde_json::Value> {
+    let mut p = e.parameters.static_.clone();
+    for (k, v) in &inst.parameter_overrides {
+        p.insert(k.clone(), v.clone());
+    }
+    p
 }
 
 fn fallback_for(e: &ModuleEntry) -> InstanceFallback {
@@ -1752,6 +1871,208 @@ mod tests {
         assert_eq!(p.setup().instances.len(), 2);
     }
 
+    // --- Generated optics (§9.5, §15.7) ------------------------------------
+
+    /// The front radius of the one element in the scene.
+    fn front_radius(p: &OpenUc2Project) -> f64 {
+        match p.scene().elements[0].boundary[0] {
+            oc_core::Edge::Conic(c) => 1.0 / c.c,
+            ref e => panic!("expected a conic front surface, got {e:?}"),
+        }
+    }
+
+    #[test]
+    fn changing_a_parameter_rebuilds_the_geometry() {
+        // The binding, end to end: a number goes in and the glass changes shape.
+        // Without this the field would be a lie — a lens reading 50 and tracing
+        // 100 (§15.7).
+        let mut p = project();
+        let a = p.place_module(&lens(), [0, 0, 0], Quadrant::R0).unwrap();
+        assert!((front_radius(&p) - 100.0).abs() < 1e-9);
+
+        p.set_parameter_override(&a, "radius_1_mm", serde_json::json!(50.0))
+            .unwrap();
+        assert!((front_radius(&p) - 50.0).abs() < 1e-9, "the surface followed");
+    }
+
+    #[test]
+    fn a_stronger_lens_bends_light_harder() {
+        // The thing a user is actually checking when they turn the radius down.
+        use oc_trace::{trace, TraceConfig};
+        let cfg = TraceConfig {
+            bounds: 400.0,
+            ..TraceConfig::default()
+        };
+        let mut p = project();
+        p.place_module(&source(), [0, 0, 0], Quadrant::R0).unwrap();
+        let a = p.place_module(&lens(), [1, 0, 0], Quadrant::R0).unwrap();
+
+        // The steepest angle any ray is bent to, before and after.
+        let steepest = |p: &OpenUc2Project| -> f64 {
+            trace(p.scene(), &cfg)
+                .segments
+                .iter()
+                .map(|s| {
+                    let d = (s.b - s.a).normalize();
+                    d.y.abs()
+                })
+                .fold(0.0, f64::max)
+        };
+        let before = steepest(&p);
+        p.set_parameter_override(&a, "radius_1_mm", serde_json::json!(40.0))
+            .unwrap();
+        let after = steepest(&p);
+        assert!(after > before, "R 100 -> 40 bent {before} -> {after}");
+    }
+
+    #[test]
+    fn a_refused_parameter_leaves_the_scene_alone() {
+        // A half-typed number in a UI must not cost anyone their layout. R = 5 on
+        // a 24 mm lens is deeper than a hemisphere, and the generator says so.
+        let mut p = project();
+        let a = p.place_module(&lens(), [0, 0, 0], Quadrant::R0).unwrap();
+        let before = p.scene().to_json();
+
+        let err = p
+            .set_parameter_override(&a, "radius_1_mm", serde_json::json!(5.0))
+            .unwrap_err();
+        assert!(format!("{err}").contains("semi-diameter"), "{err}");
+        assert_eq!(p.scene().to_json(), before, "nothing moved");
+        assert!(
+            p.setup().instance(&a).unwrap().parameter_overrides.is_empty(),
+            "and nothing was recorded"
+        );
+        // A refusal is not an edit: the one step on the stack is the placement, so
+        // undoing once takes the module away rather than un-refusing anything.
+        p.undo().unwrap();
+        assert!(p.setup().instances.is_empty());
+        assert!(!p.can_undo());
+    }
+
+    #[test]
+    fn a_reconfigured_module_stops_claiming_it_is_validated() {
+        // The module is `optical: validated`, but that compared a *specific*
+        // lens. Change the radius and the comparison is about something else.
+        let mut p = project();
+        let a = p.place_module(&lens(), [0, 0, 0], Quadrant::R0).unwrap();
+        assert!(p.warnings().is_empty(), "as authored, it is validated");
+
+        p.set_parameter_override(&a, "radius_1_mm", serde_json::json!(75.0))
+            .unwrap();
+        assert!(
+            matches!(
+                p.warnings(),
+                [ProjectWarning::ReconfiguredOptics { keys, .. }] if keys == &["radius_1_mm"]
+            ),
+            "{:?}",
+            p.warnings()
+        );
+    }
+
+    #[test]
+    fn a_parameter_change_is_undoable() {
+        let mut p = project();
+        let a = p.place_module(&lens(), [0, 0, 0], Quadrant::R0).unwrap();
+        p.set_parameter_override(&a, "radius_1_mm", serde_json::json!(50.0))
+            .unwrap();
+        assert!((front_radius(&p) - 50.0).abs() < 1e-9);
+
+        p.undo().unwrap();
+        assert!((front_radius(&p) - 100.0).abs() < 1e-9, "the glass came back");
+        assert!(p.warnings().is_empty(), "and so did its validation");
+    }
+
+    #[test]
+    fn dragging_a_parameter_slider_is_one_undo_step() {
+        // A slider fires on every pixel. Same contract as a drag (§15.6).
+        let mut p = project();
+        let a = p.place_module(&lens(), [0, 0, 0], Quadrant::R0).unwrap();
+        p.begin_gesture();
+        for r in [90.0, 80.0, 70.0, 60.0] {
+            p.set_parameter_override(&a, "radius_1_mm", serde_json::json!(r))
+                .unwrap();
+        }
+        p.end_gesture();
+
+        p.undo().unwrap();
+        assert!((front_radius(&p) - 100.0).abs() < 1e-9, "back to the design");
+        // One step for the whole slider drag: the step under it is the placement,
+        // not the value before the last pixel.
+        p.undo().unwrap();
+        assert!(p.setup().instances.is_empty());
+        assert!(!p.can_undo());
+    }
+
+    #[test]
+    fn clearing_an_override_returns_the_descriptors_lens() {
+        let mut p = project();
+        let a = p.place_module(&lens(), [0, 0, 0], Quadrant::R0).unwrap();
+        p.set_parameter_override(&a, "radius_1_mm", serde_json::json!(50.0))
+            .unwrap();
+        p.clear_parameter_override(&a, "radius_1_mm").unwrap();
+
+        assert!((front_radius(&p) - 100.0).abs() < 1e-9);
+        assert!(p.warnings().is_empty(), "it is the validated lens again");
+    }
+
+    #[test]
+    fn resolved_parameters_show_what_the_geometry_was_built_from() {
+        let mut p = project();
+        let a = p.place_module(&lens(), [0, 0, 0], Quadrant::R0).unwrap();
+        p.set_parameter_override(&a, "radius_1_mm", serde_json::json!(50.0))
+            .unwrap();
+
+        let r = p.resolved_parameters(&a).unwrap();
+        assert_eq!(r["radius_1_mm"], serde_json::json!(50.0), "the override");
+        assert_eq!(r["radius_2_mm"], serde_json::json!(-100.0), "the design");
+        assert_eq!(p.generator_of(&a), Some(crate::Generator::Singlet));
+    }
+
+    #[test]
+    fn a_parameter_on_a_stored_fragment_module_changes_no_geometry() {
+        // The mirror has no generator. §15.7: recording the value is fine, but it
+        // must not look like it did something.
+        let mut p = project();
+        let a = p.place_module(&mirror(), [0, 0, 0], Quadrant::R0).unwrap();
+        let before = p.scene().to_json();
+        p.set_parameter_override(&a, "radius_1_mm", serde_json::json!(50.0))
+            .unwrap();
+
+        assert_eq!(p.scene().to_json(), before);
+        assert_eq!(p.generator_of(&a), None);
+        // ...and it is not reported as reconfigured optics, because the optics
+        // were never configured by it.
+        assert!(
+            !p.warnings()
+                .iter()
+                .any(|w| matches!(w, ProjectWarning::ReconfiguredOptics { .. })),
+            "{:?}",
+            p.warnings()
+        );
+    }
+
+    #[test]
+    fn two_copies_of_one_module_can_be_configured_differently() {
+        // Which is why a generated fragment is per instance and cannot be cached
+        // on the catalogue.
+        let mut p = project();
+        let a = p.place_module(&lens(), [0, 0, 0], Quadrant::R0).unwrap();
+        let b = p.place_module(&lens(), [1, 0, 0], Quadrant::R0).unwrap();
+        p.set_parameter_override(&a, "radius_1_mm", serde_json::json!(50.0))
+            .unwrap();
+
+        let radius = |i: &str| match p.scene().elements[p.instance(i).unwrap().inserted.elements[0].index()]
+            .boundary[0]
+        {
+            oc_core::Edge::Conic(c) => 1.0 / c.c,
+            ref e => panic!("{e:?}"),
+        };
+        assert!((radius(&a) - 50.0).abs() < 1e-9);
+        assert!((radius(&b) - 100.0).abs() < 1e-9, "b keeps the design");
+        // And they are two BOM lines, because they are configured differently.
+        assert_eq!(p.bom().lines.len(), 2);
+    }
+
     // --- BOM (§15.8) -------------------------------------------------------
 
     #[test]
@@ -2087,16 +2408,26 @@ mod tests {
 
     #[test]
     fn a_declared_fragment_whose_asset_is_missing_is_reported() {
-        // The catalogue says the lens has optics, but the asset was never
+        // The catalogue says the mirror has optics, but the asset was never
         // attached. Silence here would look exactly like a layout-only module.
         let cat = Catalog::from_json(&minimal_catalog_json()).unwrap();
         let mut p = OpenUc2Project::new(cat, GridProfile::openuc2_core_50()).unwrap();
-        p.place_module(&lens(), [0, 0, 0], Quadrant::R0).unwrap();
+        p.place_module(&mirror(), [0, 0, 0], Quadrant::R0).unwrap();
         assert!(p.scene().elements.is_empty());
         assert!(matches!(
             p.warnings(),
-            [ProjectWarning::MissingFragmentAsset { asset, .. }] if asset == "assets/lens.ocanvas"
+            [ProjectWarning::MissingFragmentAsset { asset, .. }] if asset == "assets/mirror.ocanvas"
         ));
+    }
+
+    #[test]
+    fn a_generated_module_places_from_an_unattached_catalogue() {
+        // Nothing to attach: the lens is built from the catalogue's own numbers.
+        let cat = Catalog::from_json(&minimal_catalog_json()).unwrap();
+        let mut p = OpenUc2Project::new(cat, GridProfile::openuc2_core_50()).unwrap();
+        p.place_module(&lens(), [0, 0, 0], Quadrant::R0).unwrap();
+        assert_eq!(p.scene().elements.len(), 1, "generated, not fetched");
+        assert!(p.warnings().is_empty(), "{:?}", p.warnings());
     }
 
     #[test]

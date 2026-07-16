@@ -271,6 +271,62 @@ test("exporting .ocanvas hands over a scene and says what it cannot carry", asyn
   await expect(page.locator("#uc2Warn")).toContainText("idealized");
 });
 
+test("changing the singlet's radius bends the rays and updates the prediction", async ({
+  page,
+}) => {
+  // The parametric path (§9.5): the lens module has a typed generator, so its
+  // radius reaches the geometry. The lensmaker figure beside it is computed
+  // without the tracer, which is what makes the rays an independent check on it.
+  await page.click("#uc2Demo");
+  const lens = await cell(page, 1, 0);
+  await page.mouse.click(lens.x, lens.y);
+  await expect(page.locator(".uc2-row.uc2-sel")).toContainText("N-BK7 singlet");
+
+  const inspector = page.locator("#uc2Inspector");
+  await expect(inspector).toContainText("f = 97.58 mm");
+
+  const radius = page.locator(".uc2-param", { hasText: "radius 1" }).locator("input");
+  await radius.fill("60");
+  await radius.dispatchEvent("change");
+
+  // A shorter radius is a stronger lens: the focal length must come down.
+  await expect(inspector).toContainText("f = 73.34 mm");
+  // ...and the module stops claiming a validation that compared another lens.
+  await expect(page.locator("#uc2Warn")).toContainText("rebuilt from changed radius_1_mm");
+
+  // Back to the descriptor's design, and the claim comes back with it.
+  await page.locator(".uc2-param", { hasText: "radius 1" }).locator("button").click();
+  await expect(inspector).toContainText("f = 97.58 mm");
+  await expect(page.locator("#uc2Warn")).not.toContainText("rebuilt from changed");
+});
+
+test("a radius the generator refuses changes nothing and says why", async ({ page }) => {
+  // R = 5 on a 24 mm lens is deeper than a hemisphere: the sag goes imaginary,
+  // and a clamped shape would trace happily while being no sphere at all.
+  await page.click("#uc2Demo");
+  const lens = await cell(page, 1, 0);
+  await page.mouse.click(lens.x, lens.y);
+  const inspector = page.locator("#uc2Inspector");
+  await expect(inspector).toContainText("f = 97.58 mm");
+
+  const radius = page.locator(".uc2-param", { hasText: "radius 1" }).locator("input");
+  await radius.fill("5");
+  await radius.dispatchEvent("change");
+
+  await expect(page.locator("#uc2Err")).toContainText("semi-diameter");
+  await expect(inspector).toContainText("f = 97.58 mm", { timeout: 2000 });
+});
+
+test("a stored-fragment module offers no editable parameters", async ({ page }) => {
+  // §15.7: only parameters with implemented bindings may be editable. The mirror
+  // has no generator, so it gets no fields rather than fields that do nothing.
+  await page.click("#uc2Demo");
+  const mirror = await cell(page, 2, 0);
+  await page.mouse.click(mirror.x, mirror.y);
+  await expect(page.locator("#uc2Inspector")).toContainText("nothing to configure");
+  await expect(page.locator("#uc2Inspector .uc2-param")).toHaveCount(0);
+});
+
 test("the module list downloads as CSV", async ({ page }) => {
   await page.click("#uc2Demo");
   const started = page.waitForEvent("download");

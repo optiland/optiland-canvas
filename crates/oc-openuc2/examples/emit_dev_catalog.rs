@@ -28,9 +28,11 @@ fn main() -> std::io::Result<()> {
     fs::create_dir_all(&assets)?;
 
     fs::write(out.join("catalog.json"), test_support::minimal_catalog_json())?;
+    // No lens asset: the singlet is generated from its parameters (§9.5), so it
+    // has no fragment to serve. The rest are stored fragments, which keeps both
+    // paths live.
     for (name, body) in [
         ("source.ocanvas", test_support::source_fragment()),
-        ("lens.ocanvas", test_support::lens_fragment()),
         ("mirror.ocanvas", test_support::mirror_fragment()),
         ("detector.ocanvas", test_support::detector_fragment()),
         ("aperture.ocanvas", test_support::aperture_fragment()),

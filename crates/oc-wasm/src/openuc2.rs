@@ -15,6 +15,7 @@
 
 use oc_fit::sample_edge;
 use oc_openuc2::{
+    generator::{Generator, SingletParams},
     Catalog, GridProfile, ModuleRef, OpenUc2Project, Quadrant, SceneObjectId,
 };
 use wasm_bindgen::prelude::*;
@@ -176,6 +177,71 @@ impl OpenUc2 {
     #[wasm_bindgen(js_name = setActiveLayer)]
     pub fn set_active_layer(&mut self, layer: i32) -> Result<(), JsValue> {
         self.project_mut()?.set_active_layer(layer).map_err(js_err)
+    }
+
+    // --- Generated optics (§9.5, §15.7) ------------------------------------
+
+    /// What an instance's optics were built from, and what may be changed.
+    ///
+    /// `{generator, editable: [...], values: {...}, paraxial: {...}}`, or `null`
+    /// for a module whose optics are a stored fragment. `editable` is the
+    /// generator's own list, so the UI can only offer fields that actually reach
+    /// the geometry (§15.7).
+    ///
+    /// `paraxial` is the lensmaker's equation for the *current* numbers, computed
+    /// without the tracer. It is here so the picture can be checked against
+    /// arithmetic rather than admired: if the rays cross the axis where this says
+    /// they should, both are probably right.
+    #[wasm_bindgen(js_name = parametersJson)]
+    pub fn parameters_json(&self, instance: &str) -> String {
+        let Some(p) = self.project.as_ref() else {
+            return "null".into();
+        };
+        let (Some(g), Some(values)) = (p.generator_of(instance), p.resolved_parameters(instance))
+        else {
+            return "null".into();
+        };
+        let paraxial = match g {
+            Generator::Singlet => SingletParams::from_json(&values)
+                .and_then(|s| s.paraxial())
+                .ok()
+                .and_then(|x| serde_json::to_value(x).ok()),
+        };
+        let overridden: Vec<&str> = p
+            .setup()
+            .instance(instance)
+            .map(|i| i.parameter_overrides.keys().map(|s| s.as_str()).collect())
+            .unwrap_or_default();
+
+        serde_json::json!({
+            "generator": g.name(),
+            "editable": g.parameter_names(),
+            "values": values,
+            "overridden": overridden,
+            "paraxial": paraxial,
+        })
+        .to_string()
+    }
+
+    /// Change one parameter. Rebuilds the module's optics; the rays follow.
+    ///
+    /// The value arrives as JSON text so a number and the string `"inf"` — a
+    /// plane, which JSON cannot hold as a number — travel the same way.
+    #[wasm_bindgen(js_name = setParameter)]
+    pub fn set_parameter(&mut self, instance: &str, key: &str, value_json: &str) -> Result<(), JsValue> {
+        let value: serde_json::Value = serde_json::from_str(value_json)
+            .map_err(|e| JsValue::from_str(&format!("{value_json:?} is not JSON: {e}")))?;
+        self.project_mut()?
+            .set_parameter_override(instance, key, value)
+            .map_err(js_err)
+    }
+
+    /// Drop an override, returning the parameter to the descriptor's design.
+    #[wasm_bindgen(js_name = clearParameter)]
+    pub fn clear_parameter(&mut self, instance: &str, key: &str) -> Result<(), JsValue> {
+        self.project_mut()?
+            .clear_parameter_override(instance, key)
+            .map_err(js_err)
     }
 
     // --- Picking and snapping (§15.6) --------------------------------------

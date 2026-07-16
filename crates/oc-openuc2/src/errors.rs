@@ -20,6 +20,15 @@ pub enum Error {
     Fragment(FragmentError),
     /// A placement was refused.
     Placement(PlacementError),
+    /// A descriptor names a generator this build does not have (§9.5).
+    ///
+    /// Never a fallback: the set of builders is closed and reviewed, and quietly
+    /// substituting a different one would build somebody else's lens.
+    UnknownGenerator(String),
+    /// A generated module's parameters do not describe the thing they claim to.
+    Parameter(String),
+    /// A parameter names a glass the builtin catalogue does not have.
+    UnknownGlass(String),
 }
 
 /// Why a module could not go where it was asked to go.
@@ -52,6 +61,15 @@ impl fmt::Display for Error {
             Error::Rotation(e) => write!(f, "{e}"),
             Error::Fragment(e) => write!(f, "{e}"),
             Error::Placement(e) => write!(f, "{e}"),
+            Error::UnknownGenerator(name) => write!(
+                f,
+                "this build has no {name:?} generator; a descriptor may only name a builder \
+                 that exists (§9.5)"
+            ),
+            Error::Parameter(m) => write!(f, "{m}"),
+            Error::UnknownGlass(name) => {
+                write!(f, "the glass catalogue has no {name:?}")
+            }
         }
     }
 }
@@ -155,6 +173,19 @@ pub enum ProjectWarning {
         module_id: String,
         asset: String,
     },
+    /// This instance's optics were rebuilt from parameters the user changed, so
+    /// the module's `validated` badge no longer describes what is in the scene.
+    ///
+    /// A validation compares a *specific configuration* against a reference
+    /// (§9.5). Change a radius and that comparison is about a different lens. The
+    /// geometry is still built by reviewed code and still traces correctly — what
+    /// is gone is the evidence that it matches anything.
+    ReconfiguredOptics {
+        instance: String,
+        module_id: String,
+        /// The overridden parameter names, sorted.
+        keys: Vec<String>,
+    },
 }
 
 impl fmt::Display for ProjectWarning {
@@ -196,6 +227,16 @@ impl fmt::Display for ProjectWarning {
                 f,
                 "{instance}: {module_id} is on layer {layer} and the trace covers layer \
                  {active_layer}; Canvas traces one layer at a time, so it is context only"
+            ),
+            ProjectWarning::ReconfiguredOptics {
+                instance,
+                module_id,
+                keys,
+            } => write!(
+                f,
+                "{instance}: {module_id} optics were rebuilt from changed {}; the module's \
+                 validation compared a different configuration, so it no longer covers this one",
+                keys.join(", ")
             ),
             ProjectWarning::MissingFragmentAsset {
                 instance,

@@ -31,7 +31,16 @@ incomplete modules are never hidden by default.
 | `validated` | compared against a reference model within a recorded tolerance. |
 
 `validated` refers to the module **as the descriptor configures it**. Override a
-parameter and that comparison no longer applies to your instance.
+parameter and that comparison no longer applies to your instance: the module stops
+reporting `validated` and reports `ReconfiguredOptics` instead, naming what you
+changed. The geometry is still built by reviewed code and still traces correctly.
+What is gone is the evidence that it matches a reference — because it now
+describes a different lens than the one anyone compared.
+
+A generated module ([module-fragments.md](module-fragments.md)) also reports the
+lensmaker's equation for its current numbers, computed without the tracer. That is
+not decoration: it is a second, independent answer, so the rays can be checked
+against arithmetic instead of admired.
 
 ## Where the numbers come from
 

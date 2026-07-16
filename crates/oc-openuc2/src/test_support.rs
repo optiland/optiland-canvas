@@ -61,7 +61,16 @@ pub fn source_fragment() -> String {
     scene.to_json()
 }
 
-/// A biconvex N-BK7 singlet centred on the module anchor.
+/// A biconvex N-BK7 singlet centred on the module anchor, authored by hand.
+///
+/// The lens module is **generated** now (§9.5): the catalogue gives the singlet
+/// generator `R1 = 100`, `R2 = -100`, `t = 5`, `⌀24`, and its optics are built
+/// from those numbers so a user can change one and watch the rays follow.
+///
+/// This function stays as the independent hand-authored reference that
+/// `the_generated_lens_is_the_lens_the_fixture_always_had` compares the generator
+/// against, byte for byte. It is what makes the switch to a generator provably a
+/// no-op rather than a hope.
 ///
 /// Deliberately a `Material::Catalog` glass: the fragment carries the builtin
 /// catalogue's N-BK7, so placing it exercises the glass-id remap that a naive
@@ -204,12 +213,13 @@ pub fn folded_singlet_demo() -> crate::OpenUc2Project {
 }
 
 /// A catalogue over the pilot modules, with fragment assets attached.
+///
+/// The lens needs no asset: it is generated. Both paths are live here on purpose
+/// — the source, mirror, and detector are stored fragments — so neither can rot.
 pub fn pilot_catalog() -> crate::Catalog {
     let mut cat = crate::Catalog::from_json(&minimal_catalog_json()).expect("fixture parses");
     cat.attach_fragment("assets/source.ocanvas", &source_fragment())
         .expect("source fragment");
-    cat.attach_fragment("assets/lens.ocanvas", &lens_fragment())
-        .expect("lens fragment");
     cat.attach_fragment("assets/mirror.ocanvas", &mirror_fragment())
         .expect("mirror fragment");
     cat.attach_fragment("assets/detector.ocanvas", &detector_fragment())
@@ -251,6 +261,21 @@ pub fn minimal_catalog_json() -> String {
       "tags": ["lens", "singlet", "nbk7"],
       "color": "#7CC142",
       "footprint": {{"anchor_cell": [0, 0, 0], "cells": [[0, 0, 0]]}},
+      "generator": "singlet",
+      "parameters": {{
+        "static": {{
+          "material": "N-BK7",
+          "diameter_mm": 24.0,
+          "center_thickness_mm": 5.0,
+          "radius_1_mm": 100.0,
+          "radius_2_mm": -100.0
+        }},
+        "variable": {{
+          "radius_1_mm": {{"min": -1000.0, "max": 1000.0}},
+          "radius_2_mm": {{"min": -1000.0, "max": 1000.0}},
+          "center_thickness_mm": {{"min": 1.0, "max": 20.0}}
+        }}
+      }},
       "ports": [
         {{"id": "optical-in", "type": "optical", "role": "input", "face": "-X",
           "pose": {{"position_mm": [-25.0, 0.0, 25.0], "direction": [-1.0, 0.0, 0.0]}}}},
@@ -258,7 +283,7 @@ pub fn minimal_catalog_json() -> String {
           "pose": {{"position_mm": [25.0, 0.0, 25.0], "direction": [1.0, 0.0, 0.0]}}}}
       ],
       "capabilities": {{"layout": "ready", "optical": "validated", "cad": "reference", "control": "absent"}},
-      "assets": {{"icon": "assets/lens.svg", "canvas_fragment": "assets/lens.ocanvas"}},
+      "assets": {{"icon": "assets/lens.svg"}},
       "commercial": {{"vendor": "Example Vendor", "sku": "EXAMPLE-LENS-01", "price_eur": 24.0}},
       "source_path": "modules/lenses/lens-pcx-nbk7-1x1/module.yaml"
     }},

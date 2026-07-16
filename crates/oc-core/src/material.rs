@@ -181,6 +181,35 @@ impl GlassCatalog {
             .map(|i| GlassId(i as u32))
     }
 
+    /// Merge `glass` into this catalog, returning the id it resolves to.
+    ///
+    /// Glasses are identified by **name**, case-insensitively, to match
+    /// [`GlassCatalog::find`]. A name already present with identical dispersion
+    /// reuses its existing id; a new name is appended.
+    ///
+    /// Returns `None` when the name is already present with *different*
+    /// dispersion data. Two different glasses sharing a name cannot be merged
+    /// without silently changing the optics of one of them, so the caller must
+    /// surface the conflict rather than pick a winner.
+    ///
+    /// This exists because [`Material::Catalog`] stores a positional [`GlassId`]:
+    /// combining scenes that were authored against different catalogs *must*
+    /// remap those ids, or `GlassId(2)` in one catalog silently becomes an
+    /// unrelated glass in the other.
+    pub fn intern(&mut self, glass: &Glass) -> Option<GlassId> {
+        match self.find(&glass.name) {
+            // `nd`/`vd` are caches derived from `sell`, so dispersion identity is
+            // decided by the Sellmeier coefficients alone.
+            Some(id) if self.glasses[id.0 as usize].sell == glass.sell => Some(id),
+            Some(_) => None,
+            None => {
+                let id = GlassId(self.glasses.len() as u32);
+                self.glasses.push(glass.clone());
+                Some(id)
+            }
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.glasses.len()
     }
@@ -323,6 +352,60 @@ impl Material {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn glass(name: &str, b0: f64) -> Glass {
+        let sell = Sellmeier {
+            b: [b0, 0.2, 1.0],
+            c: [0.006, 0.02, 103.0],
+        };
+        Glass {
+            name: name.to_string(),
+            nd: sell.index(LAMBDA_D),
+            vd: abbe_number(&sell),
+            sell,
+        }
+    }
+
+    #[test]
+    fn intern_reuses_an_identical_named_glass() {
+        let mut cat = GlassCatalog::builtin();
+        let before = cat.len();
+        let nbk7 = cat.get(cat.find("N-BK7").unwrap()).unwrap().clone();
+        // Re-interning the same glass must not grow the catalog or move the id.
+        assert_eq!(cat.intern(&nbk7), cat.find("N-BK7"));
+        assert_eq!(cat.len(), before);
+    }
+
+    #[test]
+    fn intern_matches_find_case_insensitively() {
+        let mut cat = GlassCatalog::builtin();
+        let before = cat.len();
+        let mut lower = cat.get(cat.find("N-BK7").unwrap()).unwrap().clone();
+        lower.name = "n-bk7".to_string();
+        assert_eq!(cat.intern(&lower), cat.find("N-BK7"));
+        assert_eq!(cat.len(), before, "case variant must not duplicate");
+    }
+
+    #[test]
+    fn intern_appends_a_new_glass() {
+        let mut cat = GlassCatalog::builtin();
+        let before = cat.len();
+        let id = cat.intern(&glass("MADE-UP", 1.1)).expect("new name interns");
+        assert_eq!(id.0 as usize, before);
+        assert_eq!(cat.len(), before + 1);
+        assert_eq!(cat.get(id).unwrap().name, "MADE-UP");
+    }
+
+    #[test]
+    fn intern_rejects_a_name_collision_with_different_dispersion() {
+        let mut cat = GlassCatalog::builtin();
+        cat.intern(&glass("HOUSE-CROWN", 1.1)).unwrap();
+        let before = cat.len();
+        // Same name, different Sellmeier data: merging either way would silently
+        // change one scene's optics, so this must be reported, not resolved.
+        assert_eq!(cat.intern(&glass("HOUSE-CROWN", 1.3)), None);
+        assert_eq!(cat.len(), before, "a rejected intern must not mutate");
+    }
 
     #[test]
     fn cauchy_reproduces_abbe_pair() {

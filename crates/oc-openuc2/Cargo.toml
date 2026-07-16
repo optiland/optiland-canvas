@@ -1,0 +1,23 @@
+[package]
+name = "oc-openuc2"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "openUC2/OptiKit adapter for Optiland Canvas: catalogue, setup, and module placement."
+
+[dependencies]
+oc-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[features]
+# Exposes `test_support`'s in-memory pilot catalogue. Enabled for this crate's
+# own tests via the dev-dependency below, so integration tests can build a
+# project through the public API without each one re-authoring the fixture.
+test-support = []
+
+[dev-dependencies]
+oc-trace = { workspace = true }
+oc-openuc2 = { path = ".", features = ["test-support"] }

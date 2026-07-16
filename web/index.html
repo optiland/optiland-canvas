@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Optiland Canvas — M4</title>
+    <title>Optiland Canvas — M5</title>
     <style>
       :root { color-scheme: dark; }
       html, body { margin: 0; height: 100%; overflow: hidden; background: #06080d; color: #cdd6e4;
@@ -107,8 +107,8 @@
     <canvas id="view"></canvas>
 
     <div class="panel" id="hud">
-      <div><b>Optiland Canvas</b> — M4 "it's a workflow"</div>
-      <div>drag the lens · hover the Abbe map · layers, history &amp; wavefront →</div>
+      <div><b>Optiland Canvas</b> — M5 "it's an Optiland tool"</div>
+      <div>drag the lens · hover the Abbe map · save/open .ocanvas, layers, history &amp; wavefront →</div>
       <div id="stat"></div>
     </div>
 
@@ -138,6 +138,16 @@
 
     <!-- M4: layers · undo tree · variation gallery -->
     <div class="panel" id="m4dock">
+      <!-- M5: the Optiland handoff (§6) — save/open the frozen .ocanvas format -->
+      <div class="m4-sec">
+        <h4>Scene <span class="h4-sub">— .ocanvas → Optiland</span></h4>
+        <div class="m4row">
+          <button class="m4btn" id="saveScene" title="Download this design as an .ocanvas file — the handoff to Optiland (optiland_canvas.to_optic)">⤓ save .ocanvas</button>
+          <button class="m4btn" id="openScene" title="Open an .ocanvas file">⤒ open</button>
+          <input type="file" id="openSceneFile" accept=".ocanvas,application/json" hidden />
+        </div>
+        <div id="sceneMsg" class="m4hint">Save exports the frozen, versioned .ocanvas; hand it to Optiland in Python.</div>
+      </div>
       <div class="m4-sec">
         <h4>Layers</h4>
         <div id="layerList"></div>

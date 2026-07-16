@@ -439,6 +439,24 @@ impl Canvas {
         self.scene.to_json()
     }
 
+    /// Replace the whole scene from an `.ocanvas` document (the "Open…" action).
+    /// The JSON is version-checked (a future-version file is rejected), then the
+    /// scene, pins, active layer, and freehand-fit state are reset and the undo
+    /// history is re-rooted so undo cannot walk back into the previous document.
+    /// Throws with a readable message if the document is not loadable.
+    #[wasm_bindgen(js_name = loadJSON)]
+    pub fn load_json(&mut self, json: &str) -> Result<(), JsError> {
+        let scene = Scene::from_json(json).map_err(|e| JsError::new(&e.to_string()))?;
+        self.scene = scene;
+        self.fitted.clear();
+        self.param_pins.clear();
+        self.active_layer = self
+            .active_layer
+            .min(self.scene.layers.len().saturating_sub(1) as u32);
+        self.history = History::single(self.scene.to_json(), self.pins_sorted(), self.active_layer, "open");
+        Ok(())
+    }
+
     // === M3: freehand → fit (§5.3) =========================================
 
     /// Fit a freehand stroke (`flat_xy` = `[x0,y0,x1,y1,...]`, world mm) against

@@ -7,6 +7,14 @@ web/node_modules
 web/pkg
 web/dist
 
+# python (oc-py bindings)
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+crates/oc-py/build/
+crates/oc-py/dist/
+
 # OS / editor cruft
 .DS_Store
 Thumbs.db

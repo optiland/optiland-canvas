@@ -1,0 +1,35 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "optiland-canvas"
+version = "0.0.1"
+description = "Optiland Canvas ⇄ Optiland: round-trip .ocanvas scenes to an Optiland Optic."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT OR Apache-2.0" }
+authors = [{ name = "Optiland Canvas contributors" }]
+keywords = ["optics", "ray-tracing", "optiland", "optical-design"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+dependencies = []
+
+[project.optional-dependencies]
+# The Optiland bridge (to_optic / from_optic) needs Optiland itself; the native
+# `.ocanvas` ⇄ prescription functions do not.
+optiland = ["optiland>=0.6"]
+test = ["optiland>=0.6", "pytest", "numpy"]
+
+[project.urls]
+Repository = "https://github.com/optiland/optiland-canvas"
+
+[tool.maturin]
+# Mixed Rust/Python layout: pure-Python package under python/, native ext inside.
+python-source = "python"
+module-name = "optiland_canvas._native"
+features = ["pyo3/extension-module"]
+manifest-path = "Cargo.toml"

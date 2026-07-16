@@ -516,6 +516,51 @@ async function main() {
   // the empty start document (§5.2).
   scene.historyReset("scene");
   m4.refreshPanels();
+
+  // --- M5: save / open .ocanvas — the Optiland handoff (§6) ---------------
+  // Save downloads the frozen .ocanvas document; Open loads one back (Rust
+  // version-checks it and re-roots the undo history). This closes the loop for a
+  // non-Python user: sketch here, save, then `optiland_canvas.to_optic(file)`.
+  const saveBtn = document.getElementById("saveScene") as HTMLButtonElement;
+  const openBtn = document.getElementById("openScene") as HTMLButtonElement;
+  const openFile = document.getElementById("openSceneFile") as HTMLInputElement;
+  const sceneMsg = document.getElementById("sceneMsg")!;
+  const flash = (msg: string, ok = true) => {
+    sceneMsg.textContent = msg;
+    sceneMsg.style.color = ok ? "#7fffa0" : "#ff8a6b";
+  };
+
+  saveBtn.addEventListener("click", () => {
+    const json = scene.toJSON();
+    const url = URL.createObjectURL(new Blob([json], { type: "application/json" }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `scene-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.ocanvas`;
+    a.click();
+    URL.revokeObjectURL(url);
+    flash(`saved ${a.download} · ${(json.length / 1024).toFixed(1)} kB`);
+  });
+
+  openBtn.addEventListener("click", () => openFile.click());
+  openFile.addEventListener("change", async () => {
+    const file = openFile.files?.[0];
+    if (!file) return;
+    try {
+      scene.loadJSON(await file.text()); // version-checked in Rust; throws on bad input
+      refreshLayerCache();
+      m3?.sync();
+      m4?.onSceneChanged(); // invalidate the wavefront cache + repaint M4 panels
+      drawAbbe();
+      renderView();
+      refreshReference();
+      flash(`opened ${file.name} · ${scene.elementCount()} element(s)`);
+    } catch (err) {
+      flash(`could not open ${file.name}: ${err}`, false);
+    } finally {
+      openFile.value = ""; // let the same file be re-opened
+    }
+  });
+
   drawAbbe();
   renderView();
   refreshReference();

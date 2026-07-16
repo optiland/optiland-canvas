@@ -7,12 +7,16 @@
 //! Everything is f64. Wavelengths are in micrometres. The serialized [`Scene`]
 //! *is* the `.ocanvas` document format.
 
+pub mod fragment;
 pub mod geom;
 pub mod material;
 pub mod scene;
 pub mod seq;
 pub mod vec;
 
+pub use fragment::{
+    FragmentError, IdRemap, InsertedFragment, ObjectIdSet, SceneFragment, Transform2,
+};
 pub use geom::{Aabb, ConicParams, Edge, EdgeHit, Ray};
 pub use material::{
     abbe_number, convex_hull, point_in_hull, reference_glasses, AbbeGlass, Cauchy, Glass,

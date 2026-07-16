@@ -79,11 +79,30 @@ pub enum Edge {
         a: Vec2,
         b: Vec2,
     },
+    /// A circular arc, swept CCW from `a0` to `a1`.
+    ///
+    /// The sweep is the **unwrapped** difference `a1 - a0`, and that difference —
+    /// not the angles themselves — is what the edge means:
+    ///
+    /// - `a1 == a0` is an **empty** sweep. It is not an implicit circle.
+    /// - `a1 == a0 + TAU` is a **full circle**, and is how to write one as a
+    ///   single closed edge.
+    /// - `|a1 - a0| >= TAU` likewise covers every angle.
+    /// - Anything between sweeps CCW from `a0` by `(a1 - a0).rem_euclid(TAU)`.
+    ///
+    /// The angles need no normalization and may be negative or arbitrarily
+    /// large: `a0 = -PI, a1 = 0` and `a0 = PI, a1 = TAU` describe the same
+    /// half-circle. Only the difference is read.
+    ///
+    /// A one-edge circle is a valid closed boundary: a ray from inside crosses it
+    /// once, so [`crate::scene::Element::contains`] resolves it correctly.
     Arc {
         center: Vec2,
         r: f64,
-        /// Start/end angles (radians). Swept CCW from `a0` to `a1`.
+        /// Start angle (radians).
         a0: f64,
+        /// End angle (radians). See the variant docs: `a0 + TAU` is a circle,
+        /// `a0` itself is empty.
         a1: f64,
     },
     Conic(ConicParams),
@@ -156,6 +175,24 @@ impl Aabb {
 }
 
 impl Edge {
+    /// Is this an [`Edge::Arc`] sweeping a complete circle?
+    ///
+    /// Exposed for validators rather than for tracing. A one-edge full circle is
+    /// only read as a circle by builds that take the sweep from the unwrapped
+    /// `a1 - a0`; an older build folds the full turn onto zero and sees a single
+    /// point (see `docs/ocanvas-format.md`). A tool that must stay compatible
+    /// with those builds should reject the representation rather than rewrite it,
+    /// and calling this keeps its notion of "full turn" identical to the
+    /// tracer's instead of re-deriving the epsilon.
+    pub fn is_full_turn_arc(&self) -> bool {
+        match self {
+            Edge::Arc { a0, a1, .. } => {
+                (a1 - a0).abs() >= std::f64::consts::TAU - FULL_TURN_EPS
+            }
+            _ => false,
+        }
+    }
+
     /// Conservative local-frame bounding box for this edge.
     pub fn local_aabb(&self) -> Aabb {
         let mut bb = Aabb::EMPTY;
@@ -226,12 +263,37 @@ fn line_intersect<F: FnMut(EdgeHit)>(a: Vec2, b: Vec2, ray: &Ray, tmin: f64, pus
     }
 }
 
+/// A sweep within this of a full turn covers every angle.
+///
+/// Generous on purpose. `a1 = a0 + TAU` is the natural way to write a circle and
+/// need not recover exactly `TAU`: for a large `a0` the subtraction rounds, so
+/// the sweep can land an ULP of `a0` either side. Meanwhile an arc that stops a
+/// nanoradian short of closing is not something anyone draws, and at any
+/// plausible radius that gap is orders of magnitude below a wavelength.
+const FULL_TURN_EPS: f64 = 1e-9;
+
 /// Is `ang` within the CCW sweep from `a0` to `a1`?
+///
+/// The sweep is the **unwrapped** difference `a1 - a0`. Reducing it modulo `TAU`
+/// before testing its size would fold a full turn onto zero — `TAU.rem_euclid(TAU)`
+/// is `0` — and collapse a circle into a single point. The unwrapped difference
+/// is the only thing that tells `a1 == a0` (an empty sweep) apart from
+/// `a1 == a0 + TAU` (a complete one), since both reduce to the same residue.
+///
+/// This also matches what `oc-fit`'s `sample_edge` has always done: it walks
+/// `a0 + (a1 - a0) * t` unwrapped, so it draws `0..TAU` as a full circle. Before
+/// this, such an edge was rendered as a circle but traced as a point, and light
+/// passed straight through the shape on screen.
 fn angle_in_sweep(ang: f64, a0: f64, a1: f64) -> bool {
     let tau = std::f64::consts::TAU;
-    let norm = |x: f64| x.rem_euclid(tau);
-    let span = norm(a1 - a0);
-    let rel = norm(ang - a0);
+    let sweep = a1 - a0;
+    if sweep.abs() >= tau - FULL_TURN_EPS {
+        return true;
+    }
+    // Sub-turn sweeps reduce safely: the residue is the sweep itself, and a
+    // negative `sweep` keeps its existing meaning of sweeping CCW by `TAU - |s|`.
+    let span = sweep.rem_euclid(tau);
+    let rel = (ang - a0).rem_euclid(tau);
     rel <= span + 1e-12
 }
 
@@ -524,5 +586,184 @@ mod tests {
         let hits = collect(&edge, &ray);
         assert_eq!(hits.len(), 1);
         assert!((hits[0].point - Vec2::new(0.0, 3.0)).length() < 1e-12);
+    }
+
+    // --- Full-turn arc semantics -------------------------------------------
+
+    fn circle(a0: f64, a1: f64) -> Edge {
+        Edge::Arc {
+            center: Vec2::ZERO,
+            r: 3.0,
+            a0,
+            a1,
+        }
+    }
+
+    #[test]
+    fn a_full_turn_arc_is_a_circle() {
+        use std::f64::consts::TAU;
+        // A ray through the centre must produce *both* intersections. Reducing
+        // the sweep modulo TAU first would fold the full turn onto zero and drop
+        // every hit but the one at angle a0.
+        let ray = Ray::new(Vec2::new(-5.0, 0.0), Vec2::new(1.0, 0.0));
+        let hits = collect(&circle(0.0, TAU), &ray);
+        assert_eq!(hits.len(), 2, "expected entry and exit, got {hits:?}");
+        let mut ts: Vec<f64> = hits.iter().map(|h| h.t).collect();
+        ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert!((ts[0] - 2.0).abs() < 1e-12, "entry at x=-3");
+        assert!((ts[1] - 8.0).abs() < 1e-12, "exit at x=+3");
+    }
+
+    #[test]
+    fn a_full_turn_arc_accepts_every_angle() {
+        use std::f64::consts::TAU;
+        let edge = circle(0.0, TAU);
+        // Fire inward from all around; each ray must find both crossings.
+        for i in 0..16 {
+            let a = TAU * i as f64 / 16.0;
+            let from = Vec2::new(9.0 * a.cos(), 9.0 * a.sin());
+            let ray = Ray::new(from, -from.normalize());
+            assert_eq!(
+                collect(&edge, &ray).len(),
+                2,
+                "ray from angle {a} found the wrong number of crossings"
+            );
+        }
+    }
+
+    #[test]
+    fn a_full_turn_is_a_circle_from_any_start_angle() {
+        use std::f64::consts::TAU;
+        let ray = Ray::new(Vec2::new(-5.0, 0.0), Vec2::new(1.0, 0.0));
+        // The sweep is the difference, so the start angle is irrelevant. 100.0 also
+        // checks the epsilon: (100.0 + TAU) - 100.0 does not recover TAU exactly.
+        for a0 in [0.0, 1.234, -2.5, 100.0] {
+            assert_eq!(
+                collect(&circle(a0, a0 + TAU), &ray).len(),
+                2,
+                "a0 = {a0} should still be a circle"
+            );
+        }
+    }
+
+    #[test]
+    fn more_than_a_full_turn_is_a_circle() {
+        use std::f64::consts::{PI, TAU};
+        let ray = Ray::new(Vec2::new(-5.0, 0.0), Vec2::new(1.0, 0.0));
+        assert_eq!(collect(&circle(0.0, 3.0 * PI), &ray).len(), 2);
+        // A full turn the other way still covers every angle.
+        assert_eq!(collect(&circle(0.0, -TAU), &ray).len(), 2);
+    }
+
+    #[test]
+    fn a_zero_sweep_arc_is_not_an_implicit_circle() {
+        // The whole point of reading the unwrapped difference: `a1 == a0` and
+        // `a1 == a0 + TAU` share a residue but must not share a meaning.
+        let ray = Ray::new(Vec2::new(-5.0, 0.0), Vec2::new(1.0, 0.0));
+        let hits = collect(&circle(0.0, 0.0), &ray);
+        assert_eq!(hits.len(), 1, "only the angle-0 point is in an empty sweep");
+        assert!((hits[0].point - Vec2::new(3.0, 0.0)).length() < 1e-12);
+
+        // A ray missing that single point finds nothing.
+        let across = Ray::new(Vec2::new(0.0, -5.0), Vec2::new(0.0, 1.0));
+        assert!(collect(&circle(0.0, 0.0), &across).is_empty());
+    }
+
+    #[test]
+    fn partial_arcs_are_unchanged() {
+        use std::f64::consts::{FRAC_PI_2, PI, TAU};
+        let up = Ray::new(Vec2::new(0.0, -5.0), Vec2::new(0.0, 1.0));
+        let right = Ray::new(Vec2::new(-5.0, 0.0), Vec2::new(1.0, 0.0));
+
+        // Upper half: crossed once going up, and the +x point is on its boundary.
+        assert_eq!(collect(&circle(0.0, PI), &up).len(), 1);
+        // Lower half: the upward ray meets it at (0,-3).
+        let lower = collect(&circle(PI, TAU), &up);
+        assert_eq!(lower.len(), 1);
+        assert!((lower[0].point - Vec2::new(0.0, -3.0)).length() < 1e-12);
+        // Quarter arc in the second quadrant: the +x-going ray meets only (-3,0).
+        let quarter = collect(&circle(FRAC_PI_2, PI), &right);
+        assert_eq!(quarter.len(), 1);
+        assert!((quarter[0].point - Vec2::new(-3.0, 0.0)).length() < 1e-12);
+        // A negative sub-turn sweep keeps its old meaning: CCW by TAU - |s|.
+        // Here sweep = -PI, so this is the lower half, same as circle(PI, TAU).
+        let negative = collect(&circle(PI, 0.0), &up);
+        assert_eq!(negative.len(), 1);
+        assert!((negative[0].point - Vec2::new(0.0, -3.0)).length() < 1e-12);
+    }
+
+    #[test]
+    fn antipodal_endpoints_a_full_turn_apart_are_a_circle() {
+        use std::f64::consts::PI;
+        // `a0 = PI, a1 = -PI` is a difference of exactly -TAU, so it is a circle
+        // rather than the empty sweep the old modulo produced. The endpoints are
+        // the same point, which is precisely why the difference has to decide.
+        let ray = Ray::new(Vec2::new(-5.0, 0.0), Vec2::new(1.0, 0.0));
+        assert_eq!(collect(&circle(PI, -PI), &ray).len(), 2);
+    }
+
+    #[test]
+    fn is_full_turn_arc_agrees_with_the_tracer() {
+        use std::f64::consts::{PI, TAU};
+
+        // Note this is *not* "a ray through the centre finds two hits": a 331°
+        // arc also contains both ends of a vertical chord. What actually defines
+        // a full turn is that no angle is left out.
+        let admits_every_angle = |edge: &Edge| {
+            (0..72).all(|i| {
+                let a = TAU * i as f64 / 72.0;
+                let from = Vec2::new(9.0 * a.cos(), 9.0 * a.sin());
+                collect(edge, &Ray::new(from, -from.normalize())).len() == 2
+            })
+        };
+
+        // The predicate exists so a validator's notion of "full turn" cannot
+        // drift from the tracer's. Every spelling it accepts must be a circle.
+        for (a0, a1) in [
+            (0.0, TAU),
+            (1.234, 1.234 + TAU),
+            (100.0, 100.0 + TAU),
+            (0.0, -TAU),
+            (PI, -PI),
+            (0.0, 3.0 * PI),
+        ] {
+            let edge = circle(a0, a1);
+            assert!(edge.is_full_turn_arc(), "a0={a0}, a1={a1} should read as full");
+            assert!(
+                admits_every_angle(&edge),
+                "a0={a0}, a1={a1} reads as full but excludes an angle"
+            );
+        }
+
+        // And every sweep it rejects must really leave a gap. Each gap here is far
+        // wider than the 5° sampling step.
+        for (a0, a1) in [(0.0, 0.0), (0.0, PI), (PI, 0.0), (0.0, TAU - 0.5)] {
+            let edge = circle(a0, a1);
+            assert!(
+                !edge.is_full_turn_arc(),
+                "a0={a0}, a1={a1} should not read as full"
+            );
+            assert!(
+                !admits_every_angle(&edge),
+                "a0={a0}, a1={a1} reads as partial but admits every angle"
+            );
+        }
+
+        // Non-arcs are never full turns.
+        assert!(!Edge::Line {
+            a: Vec2::ZERO,
+            b: Vec2::X
+        }
+        .is_full_turn_arc());
+    }
+
+    #[test]
+    fn a_full_turn_arc_bounds_the_whole_circle() {
+        use std::f64::consts::TAU;
+        // `local_aabb` was already conservative for arcs; confirm a circle is not
+        // bounded by its (coincident) endpoints.
+        let bb = circle(0.0, TAU).local_aabb();
+        assert!((bb.min - Vec2::new(-3.0, -3.0)).length() < 1e-12);
+        assert!((bb.max - Vec2::new(3.0, 3.0)).length() < 1e-12);
     }
 }

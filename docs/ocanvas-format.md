@@ -34,6 +34,21 @@ The rules, enforced by [`Scene::check_version`](../crates/oc-core/src/scene.rs):
 
 Writers always emit the header (`Scene::to_json` stamps it on every save).
 
+### Reader note: full-turn arcs
+
+`version` stays at 1, but one edge changed meaning rather than shape. Builds
+before the full-turn arc fix reduced an arc's sweep modulo `TAU` before using it,
+which folds a full turn onto zero, so they read `Arc { a0: 0, a1: TAU }` as a
+single point instead of a circle. The field layout is identical either way, so
+such a document loads cleanly on both and simply traces differently.
+
+No version bump: the old reading made a full-turn arc a degenerate point that
+traced as nothing, so no document could have depended on it deliberately. But a
+tool that must stay compatible with an older Canvas should not *emit* a one-edge
+circle. `Edge::is_full_turn_arc` identifies the representation for validators
+that need to reject it; the portable spelling is two semicircular arcs, which
+every build reads the same way.
+
 ## Top-level shape
 
 | Field | Type | Meaning |
@@ -58,7 +73,10 @@ rigid `transform` (`{rot, pos}`), a `priority` (nesting resolution, §4.2), a
 `locked` flag, and a `layer`. Edge variants:
 
 - `Line { a, b }` — a straight segment (e.g. a ground lens rim).
-- `Arc { center, r, a0, a1 }` — a circular arc swept CCW.
+- `Arc { center, r, a0, a1 }` — a circular arc swept CCW from `a0` to `a1`. The
+  sweep is the **unwrapped** difference `a1 - a0`, so `a1 = a0 + TAU` is a full
+  circle and `a1 = a0` is an empty sweep, not an implicit circle. The angles need
+  no normalization; only their difference is read.
 - `Conic { vertex, axis, c, k, half_ap }` — a conic-of-revolution meridian:
   curvature `c = 1/R`, conic constant `k`, clear semi-aperture `half_ap`.
 - `Asphere { base, coeffs }` — a `Conic` plus even terms `Σ coeffs[i]·y^(2i+4)`

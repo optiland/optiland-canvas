@@ -341,13 +341,8 @@ fn line_block() -> Element {
     Element::new(ElementId(0), boundary, glass())
 }
 
-/// A disc: exercises `Edge::Arc`, whose sweep angles are absolute and so would
-/// be the first thing to break under a naive per-geometry rotation.
-///
-/// Built from two semicircles rather than one `a0 = 0, a1 = TAU` edge. A single
-/// full-turn arc does not describe a circle: `angle_in_sweep` computes
-/// `span = (a1 - a0).rem_euclid(TAU)`, and `TAU.rem_euclid(TAU)` is `0`, so such
-/// an edge admits only rays crossing at angle ~0 — a point, not a disc.
+/// A disc built from two semicircles: exercises `Edge::Arc` sweep handling
+/// across a seam, where the two edges meet at absolute angles.
 fn arc_disc() -> Element {
     use std::f64::consts::{PI, TAU};
     Element::new(
@@ -366,6 +361,25 @@ fn arc_disc() -> Element {
                 a1: TAU,
             },
         ],
+        glass(),
+    )
+}
+
+/// A disc bounded by a single full-turn arc.
+///
+/// The one-edge circle is the representation a catalogue module would naturally
+/// use for a round optic, and its sweep angles are absolute, so it is the first
+/// thing a naive per-geometry rotation would break. Placement carries it in the
+/// element transform instead, leaving `a0`/`a1` untouched.
+fn full_circle_disc() -> Element {
+    Element::new(
+        ElementId(0),
+        vec![Edge::Arc {
+            center: Vec2::ZERO,
+            r: 10.0,
+            a0: 0.0,
+            a1: std::f64::consts::TAU,
+        }],
         glass(),
     )
 }
@@ -502,6 +516,31 @@ fn line_geometry_places_rigidly() {
 #[test]
 fn arc_geometry_places_rigidly() {
     assert_rigid_invariance(&module(vec![arc_disc()]), "arc disc", EXACT);
+}
+
+#[test]
+fn a_one_edge_circle_places_rigidly() {
+    assert_rigid_invariance(&module(vec![full_circle_disc()]), "full-circle disc", EXACT);
+}
+
+#[test]
+fn a_placed_one_edge_circle_is_still_a_circle() {
+    // The invariance check above compares a placed circle against a placed
+    // circle, so it would also hold if placement quietly turned both into the
+    // degenerate point the old sweep produced. Pin the absolute behaviour: a
+    // placed circle refracts light and holds its medium at its new centre.
+    let fragment = module(vec![full_circle_disc()]);
+    let t = Isometry2::new(Vec2::new(120.0, -60.0), 0.7);
+    let mut scene = Scene::new();
+    scene.insert_fragment(&fragment, t).unwrap();
+
+    assert!(
+        scene.elements[0].contains(t.transform_point(Vec2::ZERO)),
+        "the disc must still hold its medium at the placed centre"
+    );
+    let out = trace(&scene, &config());
+    assert!(out.detectors[0].hits > 0, "no light reached the detector");
+    assert!(out.detectors[0].total_flux > 0.0);
 }
 
 #[test]

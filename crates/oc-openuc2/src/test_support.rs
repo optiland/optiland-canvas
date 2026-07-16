@@ -16,6 +16,19 @@
 //! a three-line collimated source, an N-BK7 singlet, a 45° fold mirror, a line
 //! detector across the module's own axis, an aperture, and an empty cube that
 //! carries no optics at all.
+//!
+//! # Port convention
+//!
+//! Ports follow §6.1 and §9.4 rather than anything invented here: `+X_uc2` is the
+//! nominal forward optical direction, so a module takes light in through its `-X`
+//! face and sends it out through `+X`, and `pose.direction` is the **outward**
+//! normal. The fold mirror is the one asymmetric case — it turns `+x` onto `-y`,
+//! so its output is on the `-Y` face.
+//!
+//! On a 50 mm grid this makes adjacent cubes mate by construction: a `+X` port at
+//! `x = +25` and its neighbour's `-X` port at `x = -25` land on the same cell
+//! boundary facing each other. The empty cube declares no ports, because a
+//! structural part has no optical connector to declare.
 
 use oc_core::{
     spherical_edge, Detector, Edge, Element, ElementId, Isometry2, Material, Scene, Source,
@@ -223,6 +236,10 @@ pub fn minimal_catalog_json() -> String {
       "group": "light-sources",
       "tags": ["source", "collimated"],
       "footprint": {{"anchor_cell": [0, 0, 0], "cells": [[0, 0, 0]]}},
+      "ports": [
+        {{"id": "optical-out", "type": "optical", "role": "output", "face": "+X",
+          "pose": {{"position_mm": [25.0, 0.0, 25.0], "direction": [1.0, 0.0, 0.0]}}}}
+      ],
       "capabilities": {{"layout": "ready", "optical": "idealized", "cad": "absent", "control": "absent"}},
       "assets": {{"canvas_fragment": "assets/source.ocanvas"}},
       "commercial": {{"vendor": "Example Vendor", "sku": "EXAMPLE-SRC-01", "price_eur": 40.0}}
@@ -236,6 +253,12 @@ pub fn minimal_catalog_json() -> String {
       "group": "mirrors",
       "tags": ["mirror", "fold"],
       "footprint": {{"anchor_cell": [0, 0, 0], "cells": [[0, 0, 0]]}},
+      "ports": [
+        {{"id": "optical-in", "type": "optical", "role": "input", "face": "-X",
+          "pose": {{"position_mm": [-25.0, 0.0, 25.0], "direction": [-1.0, 0.0, 0.0]}}}},
+        {{"id": "optical-out", "type": "optical", "role": "output", "face": "-Y",
+          "pose": {{"position_mm": [0.0, -25.0, 25.0], "direction": [0.0, -1.0, 0.0]}}}}
+      ],
       "capabilities": {{"layout": "ready", "optical": "validated", "cad": "reference", "control": "absent"}},
       "assets": {{"canvas_fragment": "assets/mirror.ocanvas"}},
       "commercial": {{"vendor": "Example Vendor", "sku": "EXAMPLE-MIR-01", "price_eur": 18.0}}
@@ -249,6 +272,10 @@ pub fn minimal_catalog_json() -> String {
       "group": "detectors",
       "tags": ["detector", "camera"],
       "footprint": {{"anchor_cell": [0, 0, 0], "cells": [[0, 0, 0]]}},
+      "ports": [
+        {{"id": "optical-in", "type": "optical", "role": "input", "face": "-X",
+          "pose": {{"position_mm": [-25.0, 0.0, 25.0], "direction": [-1.0, 0.0, 0.0]}}}}
+      ],
       "capabilities": {{"layout": "ready", "optical": "idealized", "cad": "absent", "control": "configured"}},
       "assets": {{"canvas_fragment": "assets/detector.ocanvas"}},
       "commercial": {{"vendor": "Example Vendor", "sku": "EXAMPLE-CAM-01", "price_eur": 120.0}}

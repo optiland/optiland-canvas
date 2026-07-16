@@ -55,6 +55,22 @@
       .uc2-note { font-size: 11px; line-height: 1.4; margin: 3px 0; opacity: 0.9; }
       .uc2-row { display: flex; align-items: center; gap: 4px; margin: 3px 0; }
       .uc2-row span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .uc2-card { cursor: grab; }
+      .uc2-card:active { cursor: grabbing; }
+      .uc2-card.uc2-dragging { opacity: 0.5; }
+      .uc2-row.uc2-sel { background: #14304a; border-radius: 4px; }
+      .uc2-bar { display: flex; align-items: center; gap: 4px; margin-bottom: 6px;
+                 font-size: 11px; }
+      .uc2-bar label { opacity: 0.7; }
+      .uc2-sp { flex: 1; }
+      #uc2LayerNum { min-width: 14px; text-align: center; }
+      #uc2 button:disabled { opacity: 0.35; cursor: default; }
+      #uc2 button:disabled:hover { background: #12203a; }
+      .uc2-tog { display: flex; align-items: center; gap: 5px; font-size: 11px;
+                 margin: 2px 0; cursor: pointer; }
+      .uc2-tog input { margin: 0; }
+      #uc2Ports { font-size: 11px; opacity: 0.8; line-height: 1.5; }
+      #uc2Hint { margin-top: 4px; }
       #uc2Src { font-size: 11px; opacity: 0.8; margin-bottom: 6px; line-height: 1.4; }
       #uc2Cov { font-size: 11px; opacity: 0.75; line-height: 1.5; }
       #uc2Err { color: #ff9b8a; font-size: 11px; min-height: 14px; margin-top: 4px; }
@@ -279,16 +295,33 @@
         <div id="uc2List"></div>
       </div>
       <div id="uc2side" class="panel">
-        <h3>catalogue coverage</h3>
-        <div id="uc2Cov"></div>
-        <h4>placed</h4>
+        <h3>layout</h3>
+        <div class="uc2-bar">
+          <label for="uc2Layer">layer</label>
+          <button id="uc2LayerDown" title="the layer below">−</button>
+          <span id="uc2LayerNum">0</span>
+          <button id="uc2LayerUp" title="the layer above">+</button>
+          <span class="uc2-sp"></span>
+          <button id="uc2Undo" title="undo (Ctrl+Z)">undo</button>
+          <button id="uc2Redo" title="redo (Ctrl+Shift+Z)">redo</button>
+        </div>
         <button id="uc2Demo">build the folded-singlet demo</button>
         <div id="uc2Layout"></div>
         <div id="uc2Err"></div>
+        <div id="uc2Hint" class="uc2-note uc2-dim">
+          drag a card onto the grid · drag to move · R rotates · Del removes ·
+          Ctrl+D duplicates
+        </div>
+        <h4>overlays</h4>
+        <div id="uc2Overlays"></div>
         <h4>reference numbers (f64)</h4>
         <div id="uc2Nums"></div>
+        <h4>ports</h4>
+        <div id="uc2Ports"></div>
         <h4>fidelity</h4>
         <div id="uc2Warn"></div>
+        <h4>catalogue coverage</h4>
+        <div id="uc2Cov"></div>
       </div>
     </div>
   </body>

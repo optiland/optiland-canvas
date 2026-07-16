@@ -13,12 +13,14 @@
 //! Canvas uses. Both modes therefore draw rays through one code path, and the
 //! rule that displayed numbers come from f64 holds here for free (§4.1).
 
+use oc_fit::sample_edge;
 use oc_openuc2::{
-    Catalog, GridProfile, ModuleRef, OpenUc2Project, Quadrant,
+    Catalog, GridProfile, ModuleRef, OpenUc2Project, Quadrant, SceneObjectId,
 };
 use wasm_bindgen::prelude::*;
 
 use crate::{auto_max_depth, colored_segments};
+use oc_core::{Material, Vec2};
 use oc_trace::{trace as ref_trace, TraceConfig};
 
 /// The openUC2 mode's handle.
@@ -43,6 +45,18 @@ impl Default for OpenUc2 {
 /// the UI can say what went wrong instead of printing a Rust `Debug`.
 fn js_err(e: impl std::fmt::Display) -> JsValue {
     JsValue::from_str(&e.to_string())
+}
+
+/// What an element is made of, for the overlay to colour by.
+///
+/// Presentation only: how a shape is drawn never decides how it traces.
+fn material_name(m: &Material) -> &'static str {
+    match m {
+        Material::Mirror { .. } => "mirror",
+        Material::Absorber => "absorber",
+        Material::Catalog(_) => "glass",
+        _ => "other",
+    }
 }
 
 #[wasm_bindgen]
@@ -162,6 +176,143 @@ impl OpenUc2 {
     #[wasm_bindgen(js_name = setActiveLayer)]
     pub fn set_active_layer(&mut self, layer: i32) -> Result<(), JsValue> {
         self.project_mut()?.set_active_layer(layer).map_err(js_err)
+    }
+
+    // --- Picking and snapping (§15.6) --------------------------------------
+
+    /// The grid cell a Canvas point falls in, on the active layer.
+    ///
+    /// The snap lives here because the pitch is grid-profile data (§6.4), not a
+    /// constant. A browser that divided by its own 50 would be wrong the moment a
+    /// setup used a different profile, and would be wrong silently.
+    #[wasm_bindgen(js_name = cellAt)]
+    pub fn cell_at(&self, x: f64, y: f64) -> Vec<i32> {
+        match self.project.as_ref() {
+            Some(p) => p.grid().cell_at(Vec2::new(x, y), p.active_layer()).to_vec(),
+            None => vec![0, 0, 0],
+        }
+    }
+
+    /// The instance standing on a cell, or `""` for none.
+    #[wasm_bindgen(js_name = instanceAtCell)]
+    pub fn instance_at_cell(&self, gx: i32, gy: i32, gz: i32) -> String {
+        self.project
+            .as_ref()
+            .and_then(|p| p.instance_at_cell([gx, gy, gz]))
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// Select the module on a cell. Returns its id, or `""` when the click landed
+    /// on empty grid, which clears the selection.
+    #[wasm_bindgen(js_name = selectAtCell)]
+    pub fn select_at_cell(&mut self, gx: i32, gy: i32, gz: i32) -> Result<String, JsValue> {
+        Ok(self
+            .project_mut()?
+            .select_at_cell([gx, gy, gz])
+            .unwrap_or_default()
+            .to_string())
+    }
+
+    /// Select a module by name, for a caller that already knows which one it
+    /// means. Returns `""` if there is no such instance.
+    #[wasm_bindgen(js_name = selectInstance)]
+    pub fn select_instance_by_id(&mut self, instance: &str) -> Result<String, JsValue> {
+        Ok(self
+            .project_mut()?
+            .select_instance(instance)
+            .unwrap_or_default()
+            .to_string())
+    }
+
+    /// The active grid profile, so the UI can draw cells at the right pitch
+    /// rather than assuming the default one.
+    #[wasm_bindgen(js_name = gridJson)]
+    pub fn grid_json(&self) -> String {
+        match self.project.as_ref() {
+            Some(p) => serde_json::to_string(p.grid()).unwrap_or_else(|_| "null".into()),
+            None => "null".into(),
+        }
+    }
+
+    #[wasm_bindgen(js_name = selectedInstance)]
+    pub fn selected_instance(&self) -> String {
+        self.project
+            .as_ref()
+            .and_then(|p| p.selected_instance())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[wasm_bindgen(js_name = clearSelection)]
+    pub fn clear_selection(&mut self) {
+        if let Some(p) = self.project.as_mut() {
+            p.clear_selection();
+        }
+    }
+
+    /// Which instance would block moving `instance` to a cell, or `""` for none.
+    ///
+    /// A question, not an attempt: the drag preview asks it on every pointer move
+    /// and must not move anything to find out.
+    #[wasm_bindgen(js_name = blockerFor)]
+    pub fn blocker_for(&self, instance: &str, gx: i32, gy: i32, gz: i32) -> String {
+        self.project
+            .as_ref()
+            .and_then(|p| p.blocker_for(instance, [gx, gy, gz]))
+            .unwrap_or_default()
+    }
+
+    /// Which instance would block a *copy* of `instance` at a cell.
+    ///
+    /// The original blocks here and does not in `blockerFor`: looking for
+    /// somewhere to duplicate to has to ask this one, or it will offer a cell the
+    /// original is standing on.
+    #[wasm_bindgen(js_name = blockerForCopy)]
+    pub fn blocker_for_copy(&self, instance: &str, gx: i32, gy: i32, gz: i32) -> String {
+        self.project
+            .as_ref()
+            .and_then(|p| p.blocker_for_copy(instance, [gx, gy, gz]))
+            .unwrap_or_default()
+    }
+
+    // --- History (§14.8) ---------------------------------------------------
+
+    /// Begin one settled operation: everything until `endGesture` is one undo
+    /// step. Wrap a drag in this, or every pointer move becomes its own step.
+    #[wasm_bindgen(js_name = beginGesture)]
+    pub fn begin_gesture(&mut self) {
+        if let Some(p) = self.project.as_mut() {
+            p.begin_gesture();
+        }
+    }
+
+    #[wasm_bindgen(js_name = endGesture)]
+    pub fn end_gesture(&mut self) {
+        if let Some(p) = self.project.as_mut() {
+            p.end_gesture();
+        }
+    }
+
+    /// Step back one settled operation. `false` when there was nothing to undo.
+    #[wasm_bindgen]
+    pub fn undo(&mut self) -> Result<bool, JsValue> {
+        self.project_mut()?.undo().map_err(js_err)
+    }
+
+    #[wasm_bindgen]
+    pub fn redo(&mut self) -> Result<bool, JsValue> {
+        self.project_mut()?.redo().map_err(js_err)
+    }
+
+    #[wasm_bindgen(js_name = canUndo)]
+    pub fn can_undo(&self) -> bool {
+        self.project.as_ref().is_some_and(|p| p.can_undo())
+    }
+
+    #[wasm_bindgen(js_name = canRedo)]
+    pub fn can_redo(&self) -> bool {
+        self.project.as_ref().is_some_and(|p| p.can_redo())
     }
 
     #[wasm_bindgen(js_name = activeLayer)]
@@ -309,6 +460,83 @@ impl OpenUc2 {
                 }))
             })
             .collect();
+        serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into())
+    }
+
+    /// Every placed port and what it is or is not connected to (§14.6).
+    ///
+    /// Advisory: nothing here reaches the tracer. It is what lets the UI say that
+    /// a cube is one cell out or mounted facing away, which no other overlay can.
+    #[wasm_bindgen(js_name = portsJson)]
+    pub fn ports_json(&self) -> String {
+        let Some(p) = self.project.as_ref() else {
+            return "[]".into();
+        };
+        serde_json::to_string(&p.ports()).unwrap_or_else(|_| "[]".into())
+    }
+
+    /// The optical geometry, as world-space polylines with their owners.
+    ///
+    /// This is the *optics* overlay (§15.5), which is a different thing from the
+    /// footprint: the footprint is where the cube is, this is what the light
+    /// actually meets. Only the active layer has objects at all, so this is
+    /// already layer-filtered by construction.
+    ///
+    /// Rebuilt per call, because a drag moves the geometry every frame. It is a
+    /// handful of elements at a few dozen samples each; the trace it accompanies
+    /// costs far more.
+    #[wasm_bindgen(js_name = opticalOverlayJson)]
+    pub fn optical_overlay_json(&self) -> String {
+        let Some(p) = self.project.as_ref() else {
+            return "[]".into();
+        };
+        let scene = p.scene();
+        let owner = |o: SceneObjectId| p.owner_of(o).unwrap_or_default().to_string();
+        let mut rows: Vec<serde_json::Value> = Vec::new();
+
+        for (i, e) in scene.elements.iter().enumerate() {
+            // Sampled and transformed the same way the freeform route draws an
+            // element, so a curved surface looks like itself rather than like the
+            // chord across it.
+            let mut pts: Vec<f64> = Vec::new();
+            for edge in &e.boundary {
+                for q in sample_edge(edge, 24) {
+                    let w = e.transform.transform_point(q);
+                    pts.push(w.x);
+                    pts.push(w.y);
+                }
+            }
+            if pts.len() >= 2 {
+                pts.push(pts[0]);
+                pts.push(pts[1]);
+            }
+            rows.push(serde_json::json!({
+                "kind": "element",
+                "id": i,
+                "instance": owner(SceneObjectId::Element(i as u32)),
+                "material": material_name(&e.material),
+                "points": pts,
+            }));
+        }
+        for (i, d) in scene.detectors.iter().enumerate() {
+            rows.push(serde_json::json!({
+                "kind": "detector",
+                "id": i,
+                "instance": owner(SceneObjectId::Detector(i as u32)),
+                "points": [d.a.x, d.a.y, d.b.x, d.b.y],
+            }));
+        }
+        for (i, s) in scene.sources.iter().enumerate() {
+            let o = s.transform.pos;
+            let dir = s.transform.rotate(Vec2::X);
+            rows.push(serde_json::json!({
+                "kind": "source",
+                "id": i,
+                "instance": owner(SceneObjectId::Source(i as u32)),
+                "points": [o.x, o.y],
+                "direction": [dir.x, dir.y],
+            }));
+        }
         serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into())
     }
 

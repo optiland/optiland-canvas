@@ -9,13 +9,20 @@
 //!           source  -->  singlet  -->  45° mirror
 //!                                          |
 //!                                          v  (folded onto -y)
-//!                                      detector  [2,-1,0], rotated 90°
+//!                                      detector  [2,-1,0], rotated 270°
 //! ```
 //!
 //! The detector module is rotated on purpose: its sensor is authored across the
 //! module's own axis, so catching a folded beam requires the placement rotation
 //! to reach the detector's endpoints. A module whose optics did not rotate with
 //! it would miss the beam entirely.
+//!
+//! It is rotated *270°* rather than 90° because of where its window is. A bare
+//! line detector has no sides, so both rotations lay the same sensor across the
+//! same beam and trace identically — but the module takes light in through its
+//! `-X` face, and only 270° turns that face toward the mirror. At 90° the camera
+//! is mounted backwards: the numbers come out right and the port graph reports
+//! its input unconnected, which is precisely the mistake ports exist to catch.
 
 use oc_openuc2::test_support::*;
 use oc_openuc2::{
@@ -45,7 +52,7 @@ fn folded_singlet() -> OpenUc2Project {
     p.place_module(
         &ModuleRef::new(DETECTOR_UUID, "1.0.0"),
         [2, -1, 0],
-        Quadrant::R90,
+        Quadrant::R270,
     )
     .expect("detector");
     p
@@ -137,11 +144,11 @@ fn the_detector_modules_endpoints_follow_its_placement() {
         .map(|i| i.instance_id.clone())
         .expect("the detector instance");
 
-    // Rotated 90°, the sensor lies across the folded beam: horizontal at y = -50,
+    // Rotated 270°, the sensor lies across the folded beam: horizontal at y = -50,
     // spanning the module's cell.
     let d = p.scene().detectors[0].clone();
-    assert!((d.a - oc_core::Vec2::new(120.0, -50.0)).length() < 1e-12, "{d:?}");
-    assert!((d.b - oc_core::Vec2::new(80.0, -50.0)).length() < 1e-12, "{d:?}");
+    assert!((d.a - oc_core::Vec2::new(80.0, -50.0)).length() < 1e-12, "{d:?}");
+    assert!((d.b - oc_core::Vec2::new(120.0, -50.0)).length() < 1e-12, "{d:?}");
     let across = trace(p.scene(), &config()).detectors[0].total_flux;
 
     // Unrotated, the very same module's sensor runs along the beam instead:
@@ -157,6 +164,53 @@ fn the_detector_modules_endpoints_follow_its_placement() {
         across > 2.0 * along,
         "across the beam collected {across}, along it {along}"
     );
+}
+
+#[test]
+fn every_port_in_the_demo_is_connected() {
+    // The chain is source -> lens -> mirror -> detector, and on a 50 mm grid each
+    // pair of neighbours mates on the cell boundary between them. Six ports, three
+    // connections, nothing left over.
+    let p = folded_singlet();
+    let ports = p.ports();
+    assert_eq!(ports.len(), 6);
+    assert!(
+        ports.iter().all(|q| q.status.is_connected()),
+        "unconnected: {:?}",
+        ports
+            .iter()
+            .filter(|q| !q.status.is_connected())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn a_camera_mounted_backwards_is_reported_but_still_traces() {
+    // 90° instead of 270°. A bare line detector has no sides, so the beam lands on
+    // it exactly as before — the flux is identical, and nothing about the picture
+    // or the numbers looks wrong. The port graph is the only thing that can say
+    // the module is facing away from the light.
+    let mut p = folded_singlet();
+    let detector = p
+        .setup()
+        .instances
+        .iter()
+        .find(|i| i.fallback.module_id == "detector-line-1x1")
+        .map(|i| i.instance_id.clone())
+        .expect("the detector instance");
+
+    let before = trace(p.scene(), &config()).detectors[0].total_flux;
+    p.rotate_module(&detector, Quadrant::R90).unwrap();
+    let after = trace(p.scene(), &config()).detectors[0].total_flux;
+    assert_eq!(before, after, "the physics cannot tell the difference");
+
+    let free: Vec<_> = p
+        .ports()
+        .into_iter()
+        .filter(|q| !q.status.is_connected())
+        .collect();
+    assert_eq!(free.len(), 2, "the mirror's output and the camera's window");
+    assert!(free.iter().any(|q| q.instance == detector));
 }
 
 #[test]

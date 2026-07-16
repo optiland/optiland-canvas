@@ -330,6 +330,47 @@ impl OpenUc2 {
         Ok(p.export_flat_ocanvas().map_err(js_err)?.ocanvas)
     }
 
+    /// The flattened `.ocanvas` *and* what is not faithful about it.
+    ///
+    /// `{ocanvas, warnings: [{kind, text}]}`. The caveats travel beside the file
+    /// rather than inside it, because `.ocanvas` v1 has nowhere to put them and
+    /// inventing a field would couple the generic format to openUC2 (§5.3, §12.4).
+    /// Exporting without showing them would hand someone a scene whose idealized
+    /// parts look like measured ones (§15.9).
+    #[wasm_bindgen(js_name = exportFlatOcanvasJson)]
+    pub fn export_flat_ocanvas_json(&self) -> Result<String, JsValue> {
+        let p = self
+            .project
+            .as_ref()
+            .ok_or_else(|| JsValue::from_str("no project"))?;
+        let export = p.export_flat_ocanvas().map_err(js_err)?;
+        let warnings: Vec<_> = export
+            .warnings
+            .iter()
+            .map(|w| {
+                let mut v = serde_json::to_value(w).unwrap_or(serde_json::Value::Null);
+                if let Some(o) = v.as_object_mut() {
+                    o.insert("text".into(), serde_json::Value::String(w.to_string()));
+                }
+                v
+            })
+            .collect();
+        Ok(serde_json::json!({
+            "ocanvas": export.ocanvas,
+            "warnings": warnings,
+        })
+        .to_string())
+    }
+
+    /// The module list as CSV (§15.8).
+    #[wasm_bindgen(js_name = bomCsv)]
+    pub fn bom_csv(&self) -> String {
+        self.project
+            .as_ref()
+            .map(|p| p.bom().to_csv())
+            .unwrap_or_default()
+    }
+
     // --- Views (read-only, derived) ----------------------------------------
 
     /// Every catalogue module, flattened for the library list.

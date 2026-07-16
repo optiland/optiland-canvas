@@ -70,6 +70,12 @@
                  margin: 2px 0; cursor: pointer; }
       .uc2-tog input { margin: 0; }
       #uc2Ports { font-size: 11px; opacity: 0.8; line-height: 1.5; }
+      #uc2Bom { font-size: 11px; line-height: 1.5; }
+      .uc2-bom { display: flex; gap: 6px; }
+      .uc2-bom-q { opacity: 0.6; min-width: 16px; }
+      .uc2-bom-n { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .uc2-bom-p { opacity: 0.7; }
+      .uc2-bom-t { border-top: 1px solid #24344d; margin-top: 4px; padding-top: 4px; }
       #uc2Hint { margin-top: 4px; }
       #uc2Src { font-size: 11px; opacity: 0.8; margin-bottom: 6px; line-height: 1.4; }
       #uc2Cov { font-size: 11px; opacity: 0.75; line-height: 1.5; }
@@ -305,6 +311,14 @@
           <button id="uc2Undo" title="undo (Ctrl+Z)">undo</button>
           <button id="uc2Redo" title="redo (Ctrl+Shift+Z)">redo</button>
         </div>
+        <div class="uc2-bar">
+          <button id="uc2Save" title="save this setup as .uc2canvas">save</button>
+          <button id="uc2Open" title="open a .uc2canvas setup">open</button>
+          <button id="uc2ExportOcanvas" title="flatten to .ocanvas for Optiland">
+            export .ocanvas
+          </button>
+          <input id="uc2File" type="file" accept=".uc2canvas,.json" hidden />
+        </div>
         <button id="uc2Demo">build the folded-singlet demo</button>
         <div id="uc2Layout"></div>
         <div id="uc2Err"></div>
@@ -320,6 +334,12 @@
         <div id="uc2Ports"></div>
         <h4>fidelity</h4>
         <div id="uc2Warn"></div>
+        <h4>module list</h4>
+        <div class="uc2-bar">
+          <button id="uc2BomCsv" title="download the module list as CSV">CSV</button>
+          <button id="uc2BomJson" title="download the module list as JSON">JSON</button>
+        </div>
+        <div id="uc2Bom"></div>
         <h4>catalogue coverage</h4>
         <div id="uc2Cov"></div>
       </div>

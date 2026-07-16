@@ -25,9 +25,7 @@
 //! its input unconnected, which is precisely the mistake ports exist to catch.
 
 use oc_openuc2::test_support::*;
-use oc_openuc2::{
-    GridProfile, ModuleRef, OpenUc2Project, ProjectWarning, Quadrant, SceneObjectId,
-};
+use oc_openuc2::{OpenUc2Project, ProjectWarning, Quadrant, SceneObjectId};
 use oc_trace::{trace, TraceConfig};
 
 /// Bounded to the scene: the demo spans ~150 mm, and the 1e4 mm default would
@@ -40,22 +38,25 @@ fn config() -> TraceConfig {
 }
 
 /// Assemble the demo from the catalogue.
+///
+/// The same definition the committed `.uc2canvas` fixture is emitted from, so
+/// everything asserted here is asserted about the file a user actually opens.
 fn folded_singlet() -> OpenUc2Project {
-    let mut p = OpenUc2Project::new(pilot_catalog(), GridProfile::openuc2_core_50())
-        .expect("empty project");
-    p.place_module(&ModuleRef::new(SOURCE_UUID, "1.0.0"), [0, 0, 0], Quadrant::R0)
-        .expect("source");
-    p.place_module(&ModuleRef::new(LENS_UUID, "1.0.0"), [1, 0, 0], Quadrant::R0)
-        .expect("lens");
-    p.place_module(&ModuleRef::new(MIRROR_UUID, "1.0.0"), [2, 0, 0], Quadrant::R0)
-        .expect("mirror");
-    p.place_module(
-        &ModuleRef::new(DETECTOR_UUID, "1.0.0"),
-        [2, -1, 0],
-        Quadrant::R270,
-    )
-    .expect("detector");
-    p
+    folded_singlet_demo()
+}
+
+/// The committed demo setup (§16.4).
+fn committed_demo() -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/openuc2/folded-singlet-demo.uc2canvas");
+    std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "the committed demo is missing at {}: {e}\n\
+             regenerate it with:\n  cargo run -p oc-openuc2 --example emit_folded_singlet \
+             --features test-support -- examples/openuc2/folded-singlet-demo.uc2canvas",
+            path.display()
+        )
+    })
 }
 
 #[test]
@@ -211,6 +212,33 @@ fn a_camera_mounted_backwards_is_reported_but_still_traces() {
         .collect();
     assert_eq!(free.len(), 2, "the mirror's output and the camera's window");
     assert!(free.iter().any(|q| q.instance == detector));
+}
+
+#[test]
+fn the_committed_demo_still_matches_the_code() {
+    // The fixture is generated, not hand-written, so this is what stops it drifting
+    // away from the demo every other test here proves works. If this fails, the
+    // emitter needs re-running rather than the file needs editing.
+    assert_eq!(
+        committed_demo(),
+        folded_singlet().save(),
+        "examples/openuc2/folded-singlet-demo.uc2canvas is stale; re-run \
+         `cargo run -p oc-openuc2 --example emit_folded_singlet --features test-support \
+         -- examples/openuc2/folded-singlet-demo.uc2canvas`"
+    );
+}
+
+#[test]
+fn the_committed_demo_opens_and_traces() {
+    // The user-facing path: open the file, get the light. Nothing here builds the
+    // demo in code — it comes off disk, resolves against the catalogue, and traces.
+    let p = OpenUc2Project::load(pilot_catalog(), &committed_demo()).expect("the demo opens");
+    assert_eq!(p.setup().instances.len(), 4);
+
+    let out = trace(p.scene(), &config());
+    assert!(out.detectors[0].hits >= 21, "the demo's light reaches its detector");
+    assert!(p.ports().iter().all(|q| q.status.is_connected()));
+    assert_eq!(p.bom().lines.len(), 4);
 }
 
 #[test]

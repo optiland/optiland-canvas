@@ -77,6 +77,12 @@ pub struct BomLine {
     /// False when the catalogue could not resolve the pin, in which case the
     /// commercial fields are whatever the setup remembered.
     pub resolved: bool,
+    /// What is not ready about this product (§15.8).
+    ///
+    /// A BOM is the one view someone reads before spending money, so a module
+    /// that is layout-only or optically idealized has to say so *here* and not
+    /// only in a panel somewhere else.
+    pub readiness: Vec<String>,
 }
 
 /// The aggregated module list.
@@ -86,6 +92,44 @@ pub struct Bom {
     pub total_eur: f64,
     /// Custom Canvas objects are not products and are counted separately (§5.7).
     pub custom_object_count: usize,
+}
+
+impl Bom {
+    /// The module list as CSV (§15.8).
+    ///
+    /// Written here rather than in the browser because escaping is the whole job
+    /// and getting it wrong corrupts a file someone orders parts from: a module
+    /// name with a comma in it would silently shift every later column.
+    pub fn to_csv(&self) -> String {
+        let mut out = String::from(
+            "quantity,name,module_id,version,vendor,sku,unit_price_eur,subtotal_eur,readiness\n",
+        );
+        for l in &self.lines {
+            let cells = [
+                l.quantity.to_string(),
+                l.name.clone(),
+                l.module_id.clone(),
+                l.version.clone(),
+                l.vendor.clone(),
+                l.sku.clone(),
+                format!("{:.2}", l.unit_price_eur),
+                format!("{:.2}", l.subtotal_eur),
+                l.readiness.join("; "),
+            ];
+            out.push_str(&cells.map(|c| csv_cell(&c)).join(","));
+            out.push('\n');
+        }
+        out
+    }
+}
+
+/// Quote a CSV cell if it could otherwise break the row.
+fn csv_cell(s: &str) -> String {
+    if s.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
 }
 
 /// A flattened scene, with whatever fidelity caveats apply to it.
@@ -981,6 +1025,37 @@ impl OpenUc2Project {
 
     // --- Products ----------------------------------------------------------
 
+    /// What a buyer should know about a line before ordering it.
+    ///
+    /// Deliberately about the *product*, not the instance: a BOM line is one
+    /// product however many are placed, so "this one is on an inactive layer" has
+    /// no place here even though it is a real warning elsewhere.
+    fn readiness_of(&self, e: &ModuleEntry, inst: &SetupInstance) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(asset) = self.catalog.fragment_asset_missing(e) {
+            out.push(format!("optics declared but the asset is missing ({asset})"));
+        } else if !e.capabilities.has_optics() || e.assets.canvas_fragment.is_none() {
+            out.push(format!(
+                "layout only: no Canvas optics ({})",
+                e.capabilities.optical
+            ));
+        } else if !e.capabilities.optics_validated() {
+            out.push(format!(
+                "optics are {}, not validated against a reference",
+                e.capabilities.optical
+            ));
+        }
+        if e.capabilities.cad == "absent" {
+            out.push("no CAD".to_string());
+        }
+        if !inst.parameter_overrides.is_empty() {
+            let mut keys: Vec<&str> = inst.parameter_overrides.keys().map(|s| s.as_str()).collect();
+            keys.sort_unstable();
+            out.push(format!("configured: {}", keys.join(", ")));
+        }
+        out
+    }
+
     /// Aggregate enabled instances into a module list.
     ///
     /// Keyed by `(uuid, version, parameter_overrides)`: two instances of the same
@@ -1027,6 +1102,7 @@ impl OpenUc2Project {
                         unit_price_eur: unit,
                         subtotal_eur: unit * quantity as f64,
                         resolved: true,
+                        readiness: self.readiness_of(e, inst),
                     }
                 }
                 None => BomLine {
@@ -1039,6 +1115,10 @@ impl OpenUc2Project {
                     unit_price_eur: 0.0,
                     subtotal_eur: 0.0,
                     resolved: false,
+                    readiness: vec![format!(
+                        "unresolved: the catalogue has no {} at version {}",
+                        inst.module_uuid, inst.module_version
+                    )],
                 },
             })
             .collect();
@@ -1670,6 +1750,91 @@ mod tests {
 
         assert_eq!(p.scene().to_json(), scene_before, "a query mutates nothing");
         assert_eq!(p.setup().instances.len(), 2);
+    }
+
+    // --- BOM (§15.8) -------------------------------------------------------
+
+    #[test]
+    fn the_bom_csv_has_a_header_and_a_row_per_line() {
+        let mut p = project();
+        p.place_module(&lens(), [0, 0, 0], Quadrant::R0).unwrap();
+        p.place_module(&lens(), [1, 0, 0], Quadrant::R0).unwrap();
+        p.place_module(&cube(), [2, 0, 0], Quadrant::R0).unwrap();
+
+        let csv = p.bom().to_csv();
+        let rows: Vec<&str> = csv.lines().collect();
+        assert_eq!(rows.len(), 3, "header plus two products");
+        assert!(rows[0].starts_with("quantity,name,module_id"));
+        // Two lenses aggregate into one line of quantity 2.
+        assert!(rows.iter().any(|r| r.starts_with("2,")), "{csv}");
+        assert!(rows.iter().any(|r| r.contains("EXAMPLE-CUBE-01")), "{csv}");
+    }
+
+    #[test]
+    fn a_comma_in_a_module_name_does_not_shift_the_columns() {
+        // The reason this is generated in Rust and not in the browser: a name with
+        // a comma in it would silently move the price into the SKU column of a
+        // file someone orders parts from.
+        let mut doc: serde_json::Value = serde_json::from_str(&minimal_catalog_json()).unwrap();
+        doc["modules"][0]["name"] = serde_json::json!("Lens, 25.4 mm, \"wide\"");
+        let cat = Catalog::from_json(&doc.to_string()).unwrap();
+        let mut p = OpenUc2Project::new(cat, GridProfile::openuc2_core_50()).unwrap();
+        p.place_module(&lens(), [0, 0, 0], Quadrant::R0).unwrap();
+
+        let csv = p.bom().to_csv();
+        let row = csv.lines().nth(1).unwrap();
+        assert!(
+            row.contains("\"Lens, 25.4 mm, \"\"wide\"\"\""),
+            "quoted and escaped: {row}"
+        );
+        // The header's column count is what the row must still have.
+        let header_cols = csv.lines().next().unwrap().split(',').count();
+        assert_eq!(split_csv(row).len(), header_cols, "{row}");
+    }
+
+    /// A minimal RFC-4180 reader, so the escaping test checks the bytes against
+    /// something other than the writer that produced them.
+    fn split_csv(row: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let (mut cur, mut quoted, mut chars) = (String::new(), false, row.chars().peekable());
+        while let Some(c) = chars.next() {
+            match c {
+                '"' if quoted && chars.peek() == Some(&'"') => {
+                    cur.push('"');
+                    chars.next();
+                }
+                '"' => quoted = !quoted,
+                ',' if !quoted => out.push(std::mem::take(&mut cur)),
+                _ => cur.push(c),
+            }
+        }
+        out.push(cur);
+        out
+    }
+
+    #[test]
+    fn a_layout_only_product_says_so_in_the_bom() {
+        // The BOM is the view someone reads before spending money.
+        let mut p = project();
+        p.place_module(&cube(), [0, 0, 0], Quadrant::R0).unwrap();
+        let bom = p.bom();
+        assert!(
+            bom.lines[0].readiness.iter().any(|r| r.contains("layout only")),
+            "{:?}",
+            bom.lines[0].readiness
+        );
+    }
+
+    #[test]
+    fn an_unresolved_product_says_so_in_the_bom() {
+        let p = OpenUc2Project::load(pilot_catalog(), &setup_with_missing_module()).unwrap();
+        let bom = p.bom();
+        assert!(!bom.lines[0].resolved);
+        assert!(
+            bom.lines[0].readiness.iter().any(|r| r.contains("unresolved")),
+            "{:?}",
+            bom.lines[0].readiness
+        );
     }
 
     // --- History (§14.8) ---------------------------------------------------

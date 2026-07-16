@@ -5,5 +5,12 @@
 *.sh   text eol=lf
 *.wgsl text eol=lf
 
+# Scene and setup documents are generated, byte-deterministic artifacts, and the
+# emitters write LF. Without this a Windows checkout rewrites them to CRLF and
+# `the_committed_demo_still_matches_the_code` compares CRLF-from-disk against
+# LF-from-serde and fails on a fresh clone.
+*.ocanvas   text eol=lf
+*.uc2canvas text eol=lf
+
 # Treat the wasm blob (if ever committed) and other binaries as binary.
 *.wasm binary

@@ -11,6 +11,11 @@ web/node_modules
 web/pkg
 web/dist
 
+# browser test output
+web/test-results
+web/playwright-report
+web/.playwright
+
 # python (oc-py bindings)
 __pycache__/
 *.pyc

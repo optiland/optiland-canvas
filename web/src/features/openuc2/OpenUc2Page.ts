@@ -73,6 +73,22 @@ type Instance = {
 
 type Warning = { kind: string; text: string; instance?: string };
 
+/// One aggregated product. Mirrors `BomLine`.
+type BomLine = {
+  quantity: number;
+  module_id: string;
+  name: string;
+  version: string;
+  vendor: string;
+  sku: string;
+  unit_price_eur: number;
+  subtotal_eur: number;
+  resolved: boolean;
+  readiness: string[];
+};
+
+type Bom = { lines: BomLine[]; total_eur: number; custom_object_count: number };
+
 type Footprint = {
   instance_id: string;
   color: string;
@@ -212,9 +228,11 @@ export async function initOpenUc2(): Promise<void> {
   renderProvenance(uc2);
   renderCoverage(coverage);
 
-  // The profile the project actually opened on, read once: it is fixed for the
-  // life of a setup (§12.3), so re-reading it per frame would buy nothing.
-  const grid = JSON.parse(uc2.gridJson()) as Grid;
+  // The profile the project actually opened on. Fixed for the life of a setup
+  // (§12.3), so it is read here rather than per frame — but re-read whenever a
+  // different setup is opened, because that setup names its own profile and a
+  // stale pitch would draw the grid and the drop preview in the wrong places.
+  let grid = JSON.parse(uc2.gridJson()) as Grid;
 
   // --- library -----------------------------------------------------------
 
@@ -514,6 +532,90 @@ export async function initOpenUc2(): Promise<void> {
   (document.getElementById("uc2Undo") as HTMLButtonElement).onclick = undo;
   (document.getElementById("uc2Redo") as HTMLButtonElement).onclick = redo;
 
+  // --- files (§15.9) -----------------------------------------------------
+
+  /// Hand the user a file. Nothing leaves the browser: every export is built in
+  /// Rust and downloaded from memory, so a setup is never uploaded anywhere.
+  function download(name: string, body: string, mime: string) {
+    const url = URL.createObjectURL(new Blob([body], { type: mime }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = name;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  /// A filename from the setup's own name, or the demo's.
+  function stem(): string {
+    const name = (JSON.parse(uc2.saveSetup())?.metadata?.name as string) || "openuc2-setup";
+    return name.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") ||
+      "openuc2-setup";
+  }
+
+  (document.getElementById("uc2Save") as HTMLButtonElement).onclick = () => {
+    // The setup, not the scene: this is the file that remembers which products
+    // are assembled and where (§5.3). The .ocanvas export is the other button.
+    download(`${stem()}.uc2canvas`, uc2.saveSetup(), "application/json");
+  };
+
+  const filePicker = document.getElementById("uc2File") as HTMLInputElement;
+  (document.getElementById("uc2Open") as HTMLButtonElement).onclick = () => filePicker.click();
+  filePicker.onchange = async () => {
+    const f = filePicker.files?.[0];
+    if (!f) return;
+    try {
+      uc2.loadSetup(await f.text());
+      // The opened setup names its own grid profile, which need not be the one
+      // the empty project started on.
+      grid = JSON.parse(uc2.gridJson()) as Grid;
+      err.textContent = "";
+    } catch (e) {
+      // A setup for a catalogue this build does not have is a normal answer, not
+      // a crash: it names modules by pinned uuid and version (§12.3).
+      fail(e);
+    }
+    // The picker keeps its value, so re-opening the same file would do nothing.
+    filePicker.value = "";
+    refresh();
+  };
+
+  (document.getElementById("uc2ExportOcanvas") as HTMLButtonElement).onclick = () => {
+    try {
+      const out = JSON.parse(uc2.exportFlatOcanvasJson()) as {
+        ocanvas: string;
+        warnings: Warning[];
+      };
+      download(`${stem()}.ocanvas`, out.ocanvas, "application/json");
+      // §15.9: show the report *with* the export. The file cannot carry these —
+      // .ocanvas v1 has nowhere to put them — so this is the only place they are
+      // said, and a flattened scene's idealized parts must not pass for measured.
+      err.textContent = "";
+      exportReport(out.warnings);
+    } catch (e) {
+      fail(e);
+    }
+  };
+
+  /// What the exported file does not tell you.
+  function exportReport(warnings: Warning[]) {
+    const box = document.getElementById("uc2Warn")!;
+    const rows: HTMLElement[] = [
+      note(
+        warnings.length === 0
+          ? "exported: every placed module's optics are validated"
+          : `exported, with ${warnings.length} fidelity caveat${warnings.length > 1 ? "s" : ""} — the .ocanvas cannot carry these:`,
+        warnings.length === 0 ? "good" : "warn",
+      ),
+      ...warnings.map((w) => note(w.text, "warn")),
+    ];
+    box.replaceChildren(...rows);
+  }
+
+  (document.getElementById("uc2BomCsv") as HTMLButtonElement).onclick = () =>
+    download(`${stem()}-bom.csv`, uc2.bomCsv(), "text/csv");
+  (document.getElementById("uc2BomJson") as HTMLButtonElement).onclick = () =>
+    download(`${stem()}-bom.json`, uc2.bomJson(), "application/json");
+
   // --- layers ------------------------------------------------------------
 
   const layerNum = document.getElementById("uc2LayerNum")!;
@@ -660,6 +762,52 @@ export async function initOpenUc2(): Promise<void> {
     portBox.replaceChildren(...rows);
   }
 
+  /// The module list (§15.8): what you would have to buy to build this.
+  function renderBom(bom: Bom) {
+    const box = document.getElementById("uc2Bom")!;
+    const rows: HTMLElement[] = [];
+    for (const l of bom.lines) {
+      const row = document.createElement("div");
+      row.className = "uc2-bom";
+      const q = document.createElement("span");
+      q.className = "uc2-bom-q";
+      q.textContent = `${l.quantity}×`;
+      const n = document.createElement("span");
+      n.className = "uc2-bom-n";
+      n.textContent = l.name;
+      n.title = `${l.module_id} ${l.version}${l.sku ? ` · ${l.sku}` : ""}`;
+      if (!l.resolved) n.className += " uc2-bad";
+      const p = document.createElement("span");
+      p.className = "uc2-bom-p";
+      p.textContent = `€${l.subtotal_eur.toFixed(2)}`;
+      row.append(q, n, p);
+      rows.push(row);
+      // Readiness rides with the line, because the module list is the one view
+      // someone reads before spending money.
+      for (const r of l.readiness) rows.push(note(r, "warn"));
+    }
+    if (bom.lines.length === 0) rows.push(note("nothing placed yet", "dim"));
+
+    const total = document.createElement("div");
+    total.className = "uc2-bom uc2-bom-t";
+    const tl = document.createElement("span");
+    tl.className = "uc2-bom-n";
+    tl.textContent = "total";
+    const tv = document.createElement("span");
+    tv.className = "uc2-bom-p";
+    tv.textContent = `€${bom.total_eur.toFixed(2)}`;
+    total.append(tl, tv);
+    rows.push(total);
+
+    // Custom objects are not products and never enter the total (§5.7).
+    if (bom.custom_object_count > 0) {
+      rows.push(
+        note(`custom / not in BOM: ${bom.custom_object_count} drawn object(s)`, "dim"),
+      );
+    }
+    box.replaceChildren(...rows);
+  }
+
   /// Re-read everything and settle the numbers. One settled operation, one call.
   function refresh() {
     const rows = instances();
@@ -675,6 +823,7 @@ export async function initOpenUc2(): Promise<void> {
     if (warnings.length === 0) warnBox.replaceChildren(note("nothing to report", "dim"));
 
     renderPorts(JSON.parse(uc2.portsJson()) as Port[]);
+    renderBom(JSON.parse(uc2.bomJson()) as Bom);
 
     // Numbers come from the f64 reference path, never the interactive f32 one —
     // which is also why this is not in `frame()`.

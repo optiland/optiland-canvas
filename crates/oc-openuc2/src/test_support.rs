@@ -168,6 +168,41 @@ pub fn aperture_fragment() -> String {
     scene.to_json()
 }
 
+/// The folded-singlet demo (§16.4), assembled from [`pilot_catalog`].
+///
+/// ```text
+///   grid    [0,0,0]      [1,0,0]       [2,0,0]
+///           source  -->  singlet  -->  45° mirror
+///                                          |
+///                                          v  (folded onto -y)
+///                                      detector  [2,-1,0], rotated 270°
+/// ```
+///
+/// One definition, three consumers: the committed `.uc2canvas` fixture is
+/// emitted from this, the integration tests assert against it, and a test checks
+/// the emitted file still reproduces it. A demo that was hand-written in a file
+/// could drift from the demo the tests prove works.
+///
+/// The detector is turned 270° rather than 90° because of where its window is: a
+/// bare line detector has no sides, so both rotations lay the same sensor across
+/// the same beam and trace identically, but the module takes light in through its
+/// `-X` face and only 270° turns that face toward the mirror.
+pub fn folded_singlet_demo() -> crate::OpenUc2Project {
+    use crate::{GridProfile, ModuleRef, OpenUc2Project, Quadrant};
+    let mut p =
+        OpenUc2Project::new(pilot_catalog(), GridProfile::openuc2_core_50()).expect("empty project");
+    for (uuid, anchor, rot) in [
+        (SOURCE_UUID, [0, 0, 0], Quadrant::R0),
+        (LENS_UUID, [1, 0, 0], Quadrant::R0),
+        (MIRROR_UUID, [2, 0, 0], Quadrant::R0),
+        (DETECTOR_UUID, [2, -1, 0], Quadrant::R270),
+    ] {
+        p.place_module(&ModuleRef::new(uuid, "1.0.0"), anchor, rot)
+            .expect("pilot module places");
+    }
+    p
+}
+
 /// A catalogue over the pilot modules, with fragment assets attached.
 pub fn pilot_catalog() -> crate::Catalog {
     let mut cat = crate::Catalog::from_json(&minimal_catalog_json()).expect("fixture parses");

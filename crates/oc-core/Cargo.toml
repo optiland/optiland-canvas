@@ -7,6 +7,14 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+# The canonical 3D scene model (docs/architecture/canonical-3d-kernel.md).
+# Off by default and stays off until PR 3D-02 has a Scene3 worth loading: with
+# the flag clear this crate is byte-for-byte the 2D engine it was, so the
+# migration cannot regress the browser while it is in progress.
+scene3 = []
+
 [dependencies]
 glam.workspace = true
 serde.workspace = true

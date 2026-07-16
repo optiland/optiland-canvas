@@ -7,6 +7,15 @@
 //! Everything is f64. Wavelengths are in micrometres. The serialized [`Scene`]
 //! *is* the `.ocanvas` document format.
 
+//! ## The 3D migration
+//!
+//! The canonical scene is becoming 3D, and the 2D Canvas a view over it
+//! (`docs/architecture/canonical-3d-kernel.md`). That work lands behind the
+//! off-by-default **`scene3`** feature, so the default build is exactly the 2D
+//! engine it was. Nothing below `scene3` is wired into the browser yet.
+
+#[cfg(feature = "scene3")]
+pub mod coordinates;
 pub mod fragment;
 pub mod geom;
 pub mod material;

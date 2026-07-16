@@ -13,6 +13,18 @@ default = ["gpu"]
 # no-WebGPU fallback / web-worker path, and anything targeting wasm without
 # WebGPU wiring).
 gpu = ["dep:wgpu", "dep:pollster"]
+# The full-3D preview path: f32 CPU (PR 3D-07) and WGSL (PR 3D-08).
+#
+# Not a newer `gpu`, and not implied by it. `gpu` selects a *backend* (wgpu vs
+# the CPU mirror); `gpu3` selects the *dimensionality* of the scene being
+# previewed. The four combinations are all meaningful, and `gpu3` without `gpu`
+# is the one that matters most: it is the CPU f32 oracle the shader is
+# validated against.
+#
+# Off by default. §12.1 of the contract is explicit that the 2D preview stays
+# the default until the 3D path passes both the acceptance suite and the
+# performance gate.
+gpu3 = ["oc-core/scene3"]
 
 [dependencies]
 oc-core.workspace = true

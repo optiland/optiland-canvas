@@ -18,6 +18,14 @@ Right-handed, millimetres:
 | `+Y_uc2` | lateral, in the module/grid plane |
 | `+Z_uc2` | vertical; layer stacking |
 
+> **This is also the canonical Canvas world frame.** The 3D migration adopts
+> these exact axes as Canvas `X/Y/Z`
+> ([architecture/coordinates.md](../architecture/coordinates.md)), so there is no
+> openUC2-to-Canvas rotation and never was. `uc2_to_canvas` drops `z` because the
+> tracer is 2D, not because the frames disagree. That drop is what PR 3D-01
+> removes, at which point `oc-openuc2` calls the shared conversions in `oc-core`
+> instead of keeping its own copy. Until then, everything on this page is current.
+
 ## Mappings
 
 Canvas, for the horizontal trace plane:

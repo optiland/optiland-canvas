@@ -7,9 +7,9 @@ assumption. Why, and what it costs, is [ADR
 0001](adr/0001-scene3-is-canonical-2d-is-a-view.md). This page is the contract
 the migration is held to.
 
-**Status: PR 3D-00 of 12.** Nothing here traces yet. Every 3D module named below
-is behind an off-by-default feature flag, and the default build is exactly the
-2D engine described in the README. See [migration state](#migration-state).
+**Status: PR 3D-01 of 12.** Nothing here traces yet. The 3D scene model and
+tracer are behind off-by-default feature flags, and the shipped engine is exactly
+the 2D one the README describes. See [migration state](#migration-state).
 
 ## One kernel
 
@@ -140,13 +140,22 @@ which is the rule the detector histogram already follows today.
 
 ## Migration state
 
-Everything 3D is behind a feature flag that is **off by default**, so the
-default build is byte-for-byte the current engine and the migration cannot
-regress the browser while it is in progress.
+The migration splits in two, and the line between them is what ships.
+
+The **math** layer (`oc_core::vec3`, `oc_core::id`, `oc_core::coordinates`) is
+always compiled. It is additive and self-contained: no existing type changed, and
+the only 2D caller is `oc-openuc2`, which uses `coordinates` because §3.7 allows
+exactly one conversion module. Gating it would have forced `oc-openuc2` to keep a
+duplicate axis mapping, which is the drift that rule exists to prevent.
+
+The **model** layer (`Scene3`, 3D geometry, the 3D tracer, the 3D preview) is
+behind a feature flag that is **off by default**, so the shipped engine cannot
+reach a half-built scene model and the migration cannot regress the browser while
+it is in progress.
 
 | Flag | Crate | Gates |
 |---|---|---|
-| `scene3` | `oc-core` | the canonical 3D scene model, geometry, coordinates |
+| `scene3` | `oc-core` | the canonical 3D scene model and geometry |
 | `trace3` | `oc-trace` | the f64 full-3D reference tracer (implies `scene3`) |
 | `gpu3` | `oc-gpu` | the full-3D preview, f32 CPU and WGSL (implies `scene3`) |
 
@@ -158,8 +167,8 @@ it is the CPU f32 oracle the shader is validated against.
 | PR | Delivers | State |
 |---|---|---|
 | 3D-00 | this contract, the ADR, coordinate docs, test scaffolding, flags | **done** |
-| 3D-01 | f64 3D math, stable ids, coordinate conversion | next |
-| 3D-02 | `Scene3` schema, `.ocanvas` v2, v1 migration | |
+| 3D-01 | f64 3D math, stable ids, coordinate conversion | **done** |
+| 3D-02 | `Scene3` schema, `.ocanvas` v2, v1 migration | next |
 | 3D-03 | 3D analytic geometry and containment | |
 | 3D-04 | the f64 full-3D reference tracer | |
 | 3D-05 | the exact planar reducer and legacy compatibility | |

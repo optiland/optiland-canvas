@@ -19,15 +19,9 @@
 //! The default Canvas view is the plane `Z = 0`, screen horizontal `+X`, screen
 //! vertical `+Y`. This is the frame `oc-openuc2` already calls canonical, so
 //! openUC2's `+X_uc2/+Y_uc2/+Z_uc2` and Canvas world `X/Y/Z` are the same axes
-//! under different names.
-//!
-//! # Status
-//!
-//! **Stub.** PR 3D-00 fixes the contract and the tests; PR 3D-01 implements the
-//! bodies. Everything here is behind the off-by-default `scene3` feature, so the
-//! default workspace neither builds nor runs it.
+//! under different names, and `oc-openuc2` converts by calling this module.
 
-use glam::DVec3 as Vec3;
+use crate::vec3::Vec3;
 
 /// Canvas → Optiland.
 ///
@@ -55,8 +49,7 @@ use glam::DVec3 as Vec3;
 /// directions, and normals** alike. Points are additionally in millimetres on
 /// both sides, so there is no scale factor.
 pub fn canvas_to_optiland(canvas: Vec3) -> Vec3 {
-    let _ = canvas;
-    unimplemented!("PR 3D-01 implements the Canvas → Optiland mapping")
+    Vec3::new(-canvas.z, canvas.y, canvas.x)
 }
 
 /// Optiland → Canvas, the exact inverse of [`canvas_to_optiland`]:
@@ -67,8 +60,7 @@ pub fn canvas_to_optiland(canvas: Vec3) -> Vec3 {
 /// canvas.z = -optiland.x
 /// ```
 pub fn optiland_to_canvas(optiland: Vec3) -> Vec3 {
-    let _ = optiland;
-    unimplemented!("PR 3D-01 implements the Optiland → Canvas mapping")
+    Vec3::new(optiland.z, optiland.y, -optiland.x)
 }
 
 /// Canvas → Three.js.
@@ -85,8 +77,7 @@ pub fn optiland_to_canvas(optiland: Vec3) -> Vec3 {
 /// This is the mapping `oc-openuc2` already ships as `uc2_to_three`, unchanged.
 /// It is a cyclic permutation, so it too has determinant `+1`.
 pub fn canvas_to_three(canvas: Vec3) -> Vec3 {
-    let _ = canvas;
-    unimplemented!("PR 3D-01 implements the Canvas → Three.js mapping")
+    Vec3::new(canvas.y, canvas.z, canvas.x)
 }
 
 /// Three.js → Canvas, the exact inverse of [`canvas_to_three`]:
@@ -97,8 +88,7 @@ pub fn canvas_to_three(canvas: Vec3) -> Vec3 {
 /// canvas.z = three.y
 /// ```
 pub fn three_to_canvas(three: Vec3) -> Vec3 {
-    let _ = three;
-    unimplemented!("PR 3D-01 implements the Three.js → Canvas mapping")
+    Vec3::new(three.z, three.x, three.y)
 }
 
 #[cfg(test)]

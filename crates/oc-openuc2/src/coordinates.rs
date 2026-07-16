@@ -1,9 +1,9 @@
-//! The canonical openUC2 frame, and the only place axes are swapped (§6).
+//! The openUC2 frame, the grid, and module placement (§6).
 //!
 //! Coordinate ambiguity is a release blocker: the physical icon, the CAD, the
 //! ports, the optical geometry, and the rays all have to land in the same place.
-//! So every mapping between frames lives here as a named function, and nothing
-//! anywhere else is allowed to reorder an axis inline.
+//! So every mapping between frames is a named function, and nothing anywhere
+//! else is allowed to reorder an axis inline.
 //!
 //! # The frames
 //!
@@ -15,15 +15,22 @@
 //! | `+Y` | lateral, in the module/grid plane |
 //! | `+Z` | vertical, and the layer stacking direction |
 //!
-//! Canvas is the `XY` plane of that frame, unchanged: `canvas.x = X_uc2`,
-//! `canvas.y = Y_uc2`. `Z_uc2` is *not* a Canvas coordinate — the tracer is 2D,
-//! so height is carried by the selected layer and by port pose metadata.
+//! **These are the canonical Canvas world axes.** `oc-core`'s 3D migration
+//! adopted this exact frame, so openUC2 and Canvas world differ by nothing at
+//! all, and the conversions between Canvas and an external frame now live in one
+//! place for the whole workspace:
+//! [`oc_core::coordinates`](../../oc_core/coordinates/index.html), described in
+//! `docs/architecture/coordinates.md`. This module keeps what is genuinely
+//! openUC2's: the grid, quadrant rotation, and placement.
 //!
-//! Three.js keeps its own convention (`+Y` up, `+Z` nominally forward), which is
-//! a relabelling of the same right-handed frame:
-//! `X_three = Y_uc2`, `Y_three = Z_uc2`, `Z_three = X_uc2`.
+//! Canvas the *view* is the `XY` plane of that frame: `canvas.x = X_uc2`,
+//! `canvas.y = Y_uc2`. `Z_uc2` is not a 2D Canvas coordinate, so height is
+//! carried by the selected layer and by port pose metadata. That projection is
+//! the one thing here that drops information, and it goes away when the 3D scene
+//! model lands.
 
-use oc_core::{Isometry2, Vec2};
+use oc_core::coordinates::{canvas_to_three, three_to_canvas};
+use oc_core::{Isometry2, Vec2, Vec3};
 use serde::{Deserialize, Serialize};
 
 /// A point in the canonical openUC2 frame, in millimetres.
@@ -56,6 +63,20 @@ impl Uc2Point {
     pub fn is_finite(self) -> bool {
         self.x.is_finite() && self.y.is_finite() && self.z.is_finite()
     }
+
+    /// As a Canvas world point.
+    ///
+    /// A change of Rust type, not of coordinates: the two frames are the same
+    /// axes under different names, so there is nothing to convert.
+    pub fn to_canvas_world(self) -> Vec3 {
+        Vec3::new(self.x, self.y, self.z)
+    }
+
+    /// From a Canvas world point. The inverse of [`Self::to_canvas_world`], and
+    /// equally a no-op on the numbers.
+    pub fn from_canvas_world(v: Vec3) -> Self {
+        Self::new(v.x, v.y, v.z)
+    }
 }
 
 /// A point in the Three.js mechanical frame, in millimetres.
@@ -76,25 +97,34 @@ impl ThreePoint {
     }
 }
 
-/// openUC2 → Canvas. Drops `z`: the tracer is 2D and height is a layer, not a
-/// coordinate.
+/// openUC2 → the 2D Canvas view. Drops `z`: the tracer is 2D and height is a
+/// layer, not a coordinate.
+///
+/// Not an axis swap. The frames agree, so this is the projection onto the
+/// `Z = 0` view plane, and the only lossy step in this module.
 pub fn uc2_to_canvas(p: Uc2Point) -> Vec2 {
     Vec2::new(p.x, p.y)
 }
 
-/// Canvas → openUC2, restoring the height the 2D scene never carried.
+/// The 2D Canvas view → openUC2, restoring the height the 2D scene never
+/// carried.
 pub fn canvas_to_uc2(v: Vec2, z: f64) -> Uc2Point {
     Uc2Point::new(v.x, v.y, z)
 }
 
 /// openUC2 → Three.js: `X_three = Y_uc2`, `Y_three = Z_uc2`, `Z_three = X_uc2`.
+///
+/// Delegates to [`oc_core::coordinates::canvas_to_three`]. The mapping is
+/// unchanged; what changed is that there is now one copy of it in the workspace
+/// instead of one per crate that needs it (§3.7).
 pub fn uc2_to_three(p: Uc2Point) -> ThreePoint {
-    ThreePoint::new(p.y, p.z, p.x)
+    let t = canvas_to_three(p.to_canvas_world());
+    ThreePoint::new(t.x, t.y, t.z)
 }
 
 /// Three.js → openUC2, the exact inverse of [`uc2_to_three`].
 pub fn three_to_uc2(t: ThreePoint) -> Uc2Point {
-    Uc2Point::new(t.z, t.x, t.y)
+    Uc2Point::from_canvas_world(three_to_canvas(Vec3::new(t.x, t.y, t.z)))
 }
 
 /// A whole-quadrant module rotation about its anchor-cell centre.
@@ -303,6 +333,42 @@ mod tests {
     }
 
     #[test]
+    fn the_openuc2_frame_is_the_canvas_world_frame() {
+        // Not a conversion, an identity. If this ever needed real arithmetic,
+        // one of the two frames would have moved and every module in the
+        // catalogue would be in the wrong place.
+        let p = Uc2Point::new(100.0, 150.0, 55.0);
+        assert_eq!(p.to_canvas_world(), Vec3::new(100.0, 150.0, 55.0));
+        assert_eq!(Uc2Point::from_canvas_world(p.to_canvas_world()), p);
+        // And the 2D view is that frame's XY plane, which is what `uc2_to_canvas`
+        // drops z to reach.
+        assert_eq!(
+            uc2_to_canvas(p),
+            oc_core::Plane3::XY.to_local(p.to_canvas_world())
+        );
+    }
+
+    #[test]
+    fn uc2_to_three_agrees_with_the_shared_conversion() {
+        // The drift guard. This module used to own a second copy of the mapping;
+        // it now delegates, and this asserts the delegation is faithful for the
+        // pinned point the spec fixes (§6.5) and for arbitrary ones.
+        for p in [
+            Uc2Point::new(100.0, 150.0, 55.0),
+            Uc2Point::new(-3.5, 0.0, 12.25),
+            Uc2Point::ZERO,
+            Uc2Point::new(1e-3, -1e4, 7.0),
+        ] {
+            let shared = canvas_to_three(p.to_canvas_world());
+            assert_eq!(
+                uc2_to_three(p).to_mm(),
+                [shared.x, shared.y, shared.z],
+                "{p:?}"
+            );
+        }
+    }
+
+    #[test]
     fn the_three_mapping_is_a_relabelling_not_a_reflection() {
         // Both frames are right-handed, so the mapping must preserve handedness.
         // A cyclic axis permutation does; swapping two axes would not, and would
@@ -366,8 +432,8 @@ mod tests {
         for q in [Quadrant::R0, Quadrant::R90, Quadrant::R180, Quadrant::R270] {
             for cell in [[1, 0, 0], [2, 3, 0], [-1, 2, 0]] {
                 let by_cell = uc2_to_canvas(grid.cell_origin(q.rotate_cell(cell)));
-                let by_angle =
-                    Isometry2::new(Vec2::ZERO, q.radians()).transform_point(uc2_to_canvas(grid.cell_origin(cell)));
+                let by_angle = Isometry2::new(Vec2::ZERO, q.radians())
+                    .transform_point(uc2_to_canvas(grid.cell_origin(cell)));
                 assert!(
                     (by_cell - by_angle).length() < 1e-12,
                     "{q:?} {cell:?}: {by_cell:?} vs {by_angle:?}"

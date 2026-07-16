@@ -18,13 +18,16 @@ Right-handed, millimetres:
 | `+Y_uc2` | lateral, in the module/grid plane |
 | `+Z_uc2` | vertical; layer stacking |
 
-> **This is also the canonical Canvas world frame.** The 3D migration adopts
+> **This is also the canonical Canvas world frame.** The 3D migration adopted
 > these exact axes as Canvas `X/Y/Z`
 > ([architecture/coordinates.md](../architecture/coordinates.md)), so there is no
 > openUC2-to-Canvas rotation and never was. `uc2_to_canvas` drops `z` because the
-> tracer is 2D, not because the frames disagree. That drop is what PR 3D-01
-> removes, at which point `oc-openuc2` calls the shared conversions in `oc-core`
-> instead of keeping its own copy. Until then, everything on this page is current.
+> tracer is 2D, not because the frames disagree, and it keeps doing so until the
+> 3D scene model lands.
+>
+> The Three.js mapping below now **delegates** to `oc_core::coordinates`, which
+> is the workspace's single conversion module. The mapping is unchanged and the
+> pinned point still holds; what is gone is the second copy of it.
 
 ## Mappings
 

@@ -18,7 +18,8 @@ without a reason.
 
 | File | Feature | PR | Holds |
 |---|---|---|---|
-| [`oc-core/src/coordinates.rs`](../../crates/oc-core/src/coordinates.rs) | `scene3` | 3D-01 | frame mappings: round trip, handedness, meridional compatibility |
+| [`oc-core/src/coordinates.rs`](../../crates/oc-core/src/coordinates.rs) | always on | 3D-01 ✅ | frame mappings: round trip, handedness, meridional compatibility |
+| [`oc-core/src/vec3.rs`](../../crates/oc-core/src/vec3.rs) | always on | 3D-01 ✅ | `Isometry3` compose/inverse/round-trip, quaternion validation and canonicalization, `Ray3` normalization, conservative `Aabb3` |
 | [`oc-core/tests/scene3.rs`](../../crates/oc-core/tests/scene3.rs) | `scene3` | 3D-02 | v2 schema, validation, v1 migration, id stability |
 | [`oc-core/tests/geom3.rs`](../../crates/oc-core/tests/geom3.rs) | `scene3` | 3D-03 | analytic intersection, analytic normals, containment, AABBs, fuzz |
 | [`oc-trace/tests/analytic3.rs`](../../crates/oc-trace/tests/analytic3.rs) | `trace3` | 3D-04 | 3D optical fixtures; the proof the engine is not merely meridional |

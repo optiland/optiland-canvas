@@ -647,6 +647,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "oc-openuc2"
+version = "0.0.1"
+dependencies = [
+ "oc-core",
+ "oc-openuc2",
+ "oc-trace",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "oc-py"
 version = "0.0.1"
 dependencies = [

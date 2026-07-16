@@ -59,8 +59,8 @@ pub mod setup;
 pub mod test_support;
 
 pub use catalog::{
-    Assets, Capabilities, Catalog, CatalogDoc, CatalogSource, Commercial, Footprint, ModuleEntry,
-    ModuleRef, Parameters, Port, PortPose, CATALOG_FORMAT,
+    Assets, Capabilities, Catalog, CatalogDoc, CatalogSource, Commercial, Coverage, Footprint,
+    ModuleEntry, ModuleRef, ModuleView, Parameters, Port, PortPose, CATALOG_FORMAT,
 };
 pub use coordinates::{
     canvas_to_uc2, three_to_uc2, uc2_to_canvas, uc2_to_three, GridProfile, InvalidQuadrant,

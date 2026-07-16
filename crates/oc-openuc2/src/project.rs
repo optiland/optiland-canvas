@@ -34,7 +34,8 @@ use crate::setup::{InstanceFallback, OpenUc2Setup, Placement, SetupInstance};
 ///
 /// One key across all three kinds, because ownership is a property of the object
 /// and not of its type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
+#[serde(tag = "kind", content = "id", rename_all = "snake_case")]
 pub enum SceneObjectId {
     Element(u32),
     Source(u32),
@@ -61,7 +62,7 @@ impl MaterializedInstance {
 }
 
 /// A BOM line: one product, however many times it appears.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct BomLine {
     pub quantity: usize,
     pub module_id: String,
@@ -77,7 +78,7 @@ pub struct BomLine {
 }
 
 /// The aggregated module list.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct Bom {
     pub lines: Vec<BomLine>,
     pub total_eur: f64,
@@ -1325,7 +1326,7 @@ mod tests {
         let mut p = project();
         p.place_module(&lens(), [0, 0, 0], Quadrant::R0).unwrap();
         let setup = OpenUc2Setup::from_json(&p.save()).unwrap();
-        assert_eq!(setup.catalog.repository, "openUC2/openUC2-optikit-modules");
+        assert_eq!(setup.catalog.repository, "example/optiland-canvas-dev-fixture");
         assert_eq!(setup.catalog.commit, "0000000000000000000000000000000000000000");
         assert_eq!(setup.catalog.grid_profile, "openuc2-core-50");
     }
@@ -1367,7 +1368,7 @@ mod tests {
         assert_eq!(lens_line.quantity, 2);
         assert_eq!(lens_line.unit_price_eur, 24.0);
         assert_eq!(lens_line.subtotal_eur, 48.0);
-        assert_eq!(lens_line.sku, "UC2-LENS-01");
+        assert_eq!(lens_line.sku, "EXAMPLE-LENS-01");
         assert_eq!(bom.total_eur, 48.0 + 6.0);
     }
 

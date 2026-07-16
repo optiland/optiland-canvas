@@ -1,6 +1,10 @@
 /target
+# Scenes are scratch output, except where they are content: the committed
+# examples, and the module fragments the openUC2 catalogue serves to the browser
+# (without these the catalogue loads but every module reports missing optics).
 *.ocanvas
 !examples/**/*.ocanvas
+!web/public/catalog/**/*.ocanvas
 
 # web shell
 web/node_modules

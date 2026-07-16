@@ -1,5 +1,13 @@
 //! A small in-memory catalogue with the pilot module roles (§16.2).
 //!
+//! **This is invented data, not the openUC2 catalogue.** The UUIDs, vendor, part
+//! numbers, and prices are placeholders, and C3 ships this same fixture to the
+//! browser so the UI has something to show before the module repository's
+//! compiler (M1) exists. Anything that looks like a real part number here would
+//! be mistaken for one, so nothing does: the vendor is `Example Vendor`, the
+//! SKUs are `EXAMPLE-*`, and the source commit is all zeros, which reads as
+//! unpinned everywhere a real catalogue would carry a sha.
+//!
 //! Fragments are built as real [`Scene`]s and serialized, so a test travels the
 //! same path a shipped module does: `.ocanvas` text in, parsed to a fragment,
 //! placed. Nothing here shortcuts into the adapter's internals.
@@ -171,7 +179,7 @@ pub fn minimal_catalog_json() -> String {
   "format": "openuc2-canvas-catalog",
   "version": "1.0.0",
   "source": {{
-    "repository": "openUC2/openUC2-optikit-modules",
+    "repository": "example/optiland-canvas-dev-fixture",
     "commit": "0000000000000000000000000000000000000000"
   }},
   "descriptor_schema_version": "2.0.0",
@@ -203,7 +211,7 @@ pub fn minimal_catalog_json() -> String {
       ],
       "capabilities": {{"layout": "ready", "optical": "validated", "cad": "reference", "control": "absent"}},
       "assets": {{"icon": "assets/lens.svg", "canvas_fragment": "assets/lens.ocanvas"}},
-      "commercial": {{"vendor": "openUC2", "sku": "UC2-LENS-01", "price_eur": 24.0}},
+      "commercial": {{"vendor": "Example Vendor", "sku": "EXAMPLE-LENS-01", "price_eur": 24.0}},
       "source_path": "modules/lenses/lens-pcx-nbk7-1x1/module.yaml"
     }},
     {{
@@ -217,7 +225,7 @@ pub fn minimal_catalog_json() -> String {
       "footprint": {{"anchor_cell": [0, 0, 0], "cells": [[0, 0, 0]]}},
       "capabilities": {{"layout": "ready", "optical": "idealized", "cad": "absent", "control": "absent"}},
       "assets": {{"canvas_fragment": "assets/source.ocanvas"}},
-      "commercial": {{"vendor": "openUC2", "sku": "UC2-SRC-01", "price_eur": 40.0}}
+      "commercial": {{"vendor": "Example Vendor", "sku": "EXAMPLE-SRC-01", "price_eur": 40.0}}
     }},
     {{
       "id": "mirror-flat-45-1x1",
@@ -230,7 +238,7 @@ pub fn minimal_catalog_json() -> String {
       "footprint": {{"anchor_cell": [0, 0, 0], "cells": [[0, 0, 0]]}},
       "capabilities": {{"layout": "ready", "optical": "validated", "cad": "reference", "control": "absent"}},
       "assets": {{"canvas_fragment": "assets/mirror.ocanvas"}},
-      "commercial": {{"vendor": "openUC2", "sku": "UC2-MIR-01", "price_eur": 18.0}}
+      "commercial": {{"vendor": "Example Vendor", "sku": "EXAMPLE-MIR-01", "price_eur": 18.0}}
     }},
     {{
       "id": "detector-line-1x1",
@@ -243,7 +251,7 @@ pub fn minimal_catalog_json() -> String {
       "footprint": {{"anchor_cell": [0, 0, 0], "cells": [[0, 0, 0]]}},
       "capabilities": {{"layout": "ready", "optical": "idealized", "cad": "absent", "control": "configured"}},
       "assets": {{"canvas_fragment": "assets/detector.ocanvas"}},
-      "commercial": {{"vendor": "openUC2", "sku": "UC2-CAM-01", "price_eur": 120.0}}
+      "commercial": {{"vendor": "Example Vendor", "sku": "EXAMPLE-CAM-01", "price_eur": 120.0}}
     }},
     {{
       "id": "cube-empty-1x1",
@@ -256,7 +264,7 @@ pub fn minimal_catalog_json() -> String {
       "footprint": {{"anchor_cell": [0, 0, 0], "cells": [[0, 0, 0]]}},
       "capabilities": {{"layout": "ready", "optical": "absent", "cad": "manufacturing", "control": "absent"}},
       "assets": {{"icon": "assets/cube.svg"}},
-      "commercial": {{"vendor": "openUC2", "sku": "UC2-CUBE-01", "price_eur": 6.0}}
+      "commercial": {{"vendor": "Example Vendor", "sku": "EXAMPLE-CUBE-01", "price_eur": 6.0}}
     }}
   ]
 }}"##
@@ -274,6 +282,6 @@ pub fn two_cell_module_json(uuid: &str) -> serde_json::Value {
         "footprint": {"anchor_cell": [0, 0, 0], "cells": [[0, 0, 0], [1, 0, 0]]},
         "capabilities": {"layout": "ready", "optical": "absent", "cad": "absent", "control": "absent"},
         "assets": {},
-        "commercial": {"vendor": "openUC2", "sku": "UC2-RAIL-2", "price_eur": 9.0}
+        "commercial": {"vendor": "Example Vendor", "sku": "EXAMPLE-RAIL-2", "price_eur": 9.0}
     })
 }

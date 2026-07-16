@@ -21,6 +21,9 @@ use oc_gpu::{color::wavelength_um_to_linear, scene::GpuScene, trace_cpu, BuildOp
 use oc_trace::{trace as ref_trace, TraceConfig};
 use wasm_bindgen::prelude::*;
 
+/// The openUC2 mode (§15.2). The freeform Canvas above does not know it exists.
+pub mod openuc2;
+
 /// State kept for an element drawn freehand: its fitted ladder (§5.3) so the
 /// complexity slider can re-swap the front surface with no refit, plus the
 /// extrusion depth used to close the body.

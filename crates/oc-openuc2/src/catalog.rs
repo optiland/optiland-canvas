@@ -347,6 +347,128 @@ impl Catalog {
             Some(path)
         }
     }
+
+    /// What this catalogue does and does not cover (§11.4).
+    ///
+    /// Catalogue completeness is not optical completeness (§5.5), and the point
+    /// of showing this is that the gap stays visible instead of being discovered
+    /// module by module. Counts are kept per declared value rather than
+    /// bucketed into ready/not-ready: collapsing them is exactly how a
+    /// layout-only cube starts looking simulated.
+    pub fn coverage(&self) -> Coverage {
+        let mut c = Coverage {
+            total: self.modules().len(),
+            ..Default::default()
+        };
+        for m in self.modules() {
+            if m.capabilities.layout == "ready" {
+                c.layout_ready += 1;
+            }
+            *c.optical.entry(m.capabilities.optical.clone()).or_default() += 1;
+            *c.cad.entry(m.capabilities.cad.clone()).or_default() += 1;
+            *c.control.entry(m.capabilities.control.clone()).or_default() += 1;
+            *c.categories.entry(m.category.clone()).or_default() += 1;
+
+            match (&m.assets.canvas_fragment, self.fragment_asset_missing(m)) {
+                (Some(_), None) => c.traceable += 1,
+                (Some(_), Some(_)) => c.declared_fragment_asset_missing += 1,
+                (None, _) => c.no_fragment_declared += 1,
+            }
+            if m.assets.icon.is_none() {
+                c.missing_icon += 1;
+            }
+        }
+        c
+    }
+}
+
+/// A catalogue coverage summary.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Coverage {
+    pub total: usize,
+    pub layout_ready: usize,
+    /// Counts per declared `optical` value: `absent`, `placeholder`,
+    /// `idealized`, `validated`.
+    pub optical: BTreeMap<String, usize>,
+    pub cad: BTreeMap<String, usize>,
+    pub control: BTreeMap<String, usize>,
+    pub categories: BTreeMap<String, usize>,
+    /// Modules that declare a fragment and whose asset is loaded, so they can
+    /// actually contribute to a trace.
+    pub traceable: usize,
+    /// Modules that declare a fragment whose asset is not loaded. Distinct from
+    /// having no optics: this is a module that *should* trace and cannot.
+    pub declared_fragment_asset_missing: usize,
+    pub no_fragment_declared: usize,
+    pub missing_icon: usize,
+}
+
+/// One module, flattened for a browser list.
+///
+/// Read-only derived data: the browser renders from this and never becomes a
+/// second source of truth for what a module is (§5.1). It carries only what a
+/// card and a filter need.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ModuleView<'a> {
+    pub id: &'a str,
+    pub uuid: &'a str,
+    pub version: &'a str,
+    pub name: &'a str,
+    pub category: &'a str,
+    pub group: Option<&'a str>,
+    pub description: Option<&'a str>,
+    pub tags: &'a [String],
+    pub color: Option<&'a str>,
+    pub capabilities: &'a Capabilities,
+    pub vendor: &'a str,
+    pub sku: &'a str,
+    pub price_eur: f64,
+    pub icon: Option<&'a str>,
+    /// Footprint extent in cells, `[x, y]`, for "1x1" style labels.
+    pub footprint_cells: [i32; 2],
+    pub cell_count: usize,
+    /// True when this module can contribute optics right now.
+    pub traceable: bool,
+    /// Set when the module declares optics whose asset never loaded, which a
+    /// card must distinguish from having no optics at all.
+    pub fragment_asset_missing: Option<&'a str>,
+}
+
+impl Catalog {
+    /// Every module, flattened for the browser.
+    pub fn view(&self) -> Vec<ModuleView<'_>> {
+        self.modules()
+            .iter()
+            .map(|m| {
+                let missing = self.fragment_asset_missing(m);
+                let (mut w, mut h) = (0, 0);
+                for c in m.footprint.offsets() {
+                    w = w.max(c[0] + 1);
+                    h = h.max(c[1] + 1);
+                }
+                ModuleView {
+                    id: &m.id,
+                    uuid: &m.uuid,
+                    version: &m.version,
+                    name: &m.name,
+                    category: &m.category,
+                    group: m.group.as_deref(),
+                    description: m.description.as_deref(),
+                    tags: &m.tags,
+                    color: m.color.as_deref(),
+                    capabilities: &m.capabilities,
+                    vendor: &m.commercial.vendor,
+                    sku: &m.commercial.sku,
+                    price_eur: m.commercial.price_eur,
+                    icon: m.assets.icon.as_deref(),
+                    footprint_cells: [w.max(1), h.max(1)],
+                    cell_count: m.footprint.cells.len(),
+                    traceable: m.assets.canvas_fragment.is_some() && missing.is_none(),
+                    fragment_asset_missing: missing,
+                }
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -358,7 +480,7 @@ mod tests {
     fn a_catalogue_parses_and_indexes() {
         let cat = Catalog::from_json(&minimal_catalog_json()).unwrap();
         assert_eq!(cat.modules().len(), 5);
-        assert_eq!(cat.source().unwrap().repository, "openUC2/openUC2-optikit-modules");
+        assert_eq!(cat.source().unwrap().repository, "example/optiland-canvas-dev-fixture");
         assert!(cat.grid_profile("openuc2-core-50").is_some());
     }
 
@@ -421,6 +543,80 @@ mod tests {
         let lens = cat.resolve(&ModuleRef::new(LENS_UUID, "1.0.0")).unwrap();
         assert!(lens.capabilities.has_optics());
         assert!(lens.capabilities.optics_validated());
+    }
+
+    #[test]
+    fn coverage_keeps_the_capability_axes_apart() {
+        let cat = crate::test_support::pilot_catalog();
+        let c = cat.coverage();
+        assert_eq!(c.total, 5);
+        assert_eq!(c.layout_ready, 5, "every pilot module is placeable");
+        // But only two are optically validated, and one has no optics at all.
+        assert_eq!(c.optical.get("validated"), Some(&2));
+        assert_eq!(c.optical.get("idealized"), Some(&2));
+        assert_eq!(c.optical.get("absent"), Some(&1));
+        // Readiness on one axis says nothing about another: the cube is
+        // manufacturing-ready CAD and has no optics whatsoever.
+        assert_eq!(c.cad.get("manufacturing"), Some(&1));
+        assert_eq!(c.control.get("configured"), Some(&1));
+    }
+
+    #[test]
+    fn coverage_separates_no_optics_from_unloaded_optics() {
+        // A module with no fragment and a module whose fragment failed to load
+        // both contribute nothing to a trace, and a report that merged them would
+        // hide a broken catalogue behind a legitimate one.
+        let cat = crate::test_support::pilot_catalog();
+        let c = cat.coverage();
+        assert_eq!(c.traceable, 4);
+        assert_eq!(c.no_fragment_declared, 1, "the empty cube");
+        assert_eq!(c.declared_fragment_asset_missing, 0);
+
+        // The same catalogue with nothing attached: four modules that should
+        // trace and cannot.
+        let bare = Catalog::from_json(&minimal_catalog_json()).unwrap();
+        let c = bare.coverage();
+        assert_eq!(c.traceable, 0);
+        assert_eq!(c.declared_fragment_asset_missing, 4);
+        assert_eq!(c.no_fragment_declared, 1, "still just the cube");
+    }
+
+    #[test]
+    fn the_view_marks_what_can_actually_trace() {
+        let cat = crate::test_support::pilot_catalog();
+        let view = cat.view();
+        let lens = view.iter().find(|m| m.id == "lens-pcx-nbk7-1x1").unwrap();
+        assert!(lens.traceable);
+        assert_eq!(lens.fragment_asset_missing, None);
+        assert_eq!(lens.footprint_cells, [1, 1]);
+
+        let cube = view.iter().find(|m| m.id == "cube-empty-1x1").unwrap();
+        assert!(!cube.traceable, "layout-only");
+        assert_eq!(cube.fragment_asset_missing, None, "it never claimed optics");
+    }
+
+    #[test]
+    fn the_view_reports_a_declared_fragment_that_did_not_load() {
+        // The card has to tell these apart: "no optics" is a fact about the
+        // module, "optics missing" is a fact about the build.
+        let bare = Catalog::from_json(&minimal_catalog_json()).unwrap();
+        let view = bare.view();
+        let lens = view.iter().find(|m| m.id == "lens-pcx-nbk7-1x1").unwrap();
+        assert!(!lens.traceable);
+        assert_eq!(lens.fragment_asset_missing, Some("assets/lens.ocanvas"));
+    }
+
+    #[test]
+    fn the_view_measures_a_multi_cell_footprint() {
+        let mut doc: serde_json::Value = serde_json::from_str(&minimal_catalog_json()).unwrap();
+        doc["modules"]
+            .as_array_mut()
+            .unwrap()
+            .push(crate::test_support::two_cell_module_json("u-rail"));
+        let cat = Catalog::from_json(&doc.to_string()).unwrap();
+        let rail = cat.view().into_iter().find(|m| m.id == "rail-2x1").unwrap();
+        assert_eq!(rail.footprint_cells, [2, 1]);
+        assert_eq!(rail.cell_count, 2);
     }
 
     #[test]

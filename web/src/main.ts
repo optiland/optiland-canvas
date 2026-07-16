@@ -8,6 +8,8 @@
 import init, { Canvas } from "../pkg/oc_wasm.js";
 import { initM3 } from "./m3";
 import { initM4, type M4 } from "./m4";
+import { RayLayer } from "./rays";
+import { initOpenUc2 } from "./features/openuc2/OpenUc2Page";
 
 const SCALE = 6.5; // px per mm
 type V2 = { x: number; y: number };
@@ -15,6 +17,20 @@ type Glass = { name: string; nd: number; vd: number };
 
 async function main() {
   await init();
+
+  // Switching modes rebuilds the page. Each mode wires its own listeners to the
+  // one shared canvas, so tearing the other one down cleanly is more trouble
+  // than a reload is worth — and without this, typing the route into the address
+  // bar changes the hash and does nothing visible.
+  window.addEventListener("hashchange", () => location.reload());
+
+  // The openUC2 mode is a route, not a fork: it shares this page's canvas and
+  // the same RayLayer. The freeform Canvas below is untouched and stays the
+  // default (§15.1).
+  if (location.hash.startsWith("#openuc2")) {
+    await initOpenUc2();
+    return;
+  }
 
   const view = document.getElementById("view") as HTMLCanvasElement;
   const ctx = view.getContext("2d")!;
@@ -106,88 +122,8 @@ async function main() {
   // physically separate, you get coloured fringes; and Reinhard tonemapping maps
   // the huge dynamic range (a focus is enormously brighter than a stray ray)
   // into [0,1] without the blow-out that plagues un-tonemapped additive.
-  const rayCanvas = document.createElement("canvas");
-  const rayCtx = rayCanvas.getContext("2d")!;
-  let hdr = new Float32Array(0);
-  let img: ImageData | null = null;
-  let bufW = 0, bufH = 0;
-  // Dirty-rectangle tracking (device px): the lit region this frame (cx*) and
-  // last frame (lb*). Clearing, tonemapping and uploading only this rectangle —
-  // instead of the whole screen every frame — is what keeps it responsive on a
-  // hi-DPI panel where the full buffer is millions of pixels.
-  let cx0 = 0, cy0 = 0, cx1 = -1, cy1 = -1;
-  let lbx0 = 0, lby0 = 0, lbx1 = -1, lby1 = -1;
+  const rays = new RayLayer();
   const EXPOSURE = 1.0;
-
-  // Reinhard tonemap x/(1+x) ∈ [0,1) followed by linear→sRGB, baked into a LUT
-  // so the per-pixel present loop stays cheap.
-  const l2s = (c: number) => (c <= 0.0031308 ? 12.92 * c : 1.055 * Math.pow(c, 1 / 2.4) - 0.055);
-  const TONE = new Uint8ClampedArray(1025);
-  for (let i = 0; i <= 1024; i++) TONE[i] = Math.round(l2s(i / 1024) * 255);
-
-  function ensureBuffers(W: number, H: number) {
-    if (W === bufW && H === bufH) return;
-    bufW = W; bufH = H;
-    rayCanvas.width = W; rayCanvas.height = H;
-    hdr = new Float32Array(W * H * 3);
-    img = rayCtx.createImageData(W, H);
-    lbx1 = -1; lby1 = -1; // fresh buffers → no stale lit region
-  }
-
-  // Antialiased additive line (Xiaolin Wu). Coordinates are in device pixels;
-  // `r,g,b` are the flux-weighted linear contribution. Each column deposits
-  // total coverage 1 split across the two straddling pixels, so brightness per
-  // unit length is constant and edges are smooth.
-  function plot(x: number, y: number, r: number, g: number, b: number, c: number) {
-    if (c <= 0 || x < 0 || x >= bufW || y < 0 || y >= bufH) return;
-    const k = (y * bufW + x) * 3;
-    hdr[k] += r * c;
-    hdr[k + 1] += g * c;
-    hdr[k + 2] += b * c;
-    if (x < cx0) cx0 = x;
-    if (x > cx1) cx1 = x;
-    if (y < cy0) cy0 = y;
-    if (y > cy1) cy1 = y;
-  }
-  function addLine(x0: number, y0: number, x1: number, y1: number, r: number, g: number, b: number) {
-    // Clip to the buffer first (Liang–Barsky). Exit rays run to the scene
-    // bounds — tens of thousands of pixels off-screen — so rasterizing the
-    // unclipped span would burn the whole frame on no-op iterations.
-    const dx0 = x1 - x0, dy0 = y1 - y0;
-    let t0 = 0, t1 = 1;
-    const edges = [[-dx0, x0], [dx0, bufW - 1 - x0], [-dy0, y0], [dy0, bufH - 1 - y0]];
-    for (const [p, q] of edges) {
-      if (p === 0) {
-        if (q < 0) return; // parallel and outside
-      } else {
-        const t = q / p;
-        if (p < 0) { if (t > t1) return; if (t > t0) t0 = t; }
-        else { if (t < t0) return; if (t < t1) t1 = t; }
-      }
-    }
-    x1 = x0 + t1 * dx0; y1 = y0 + t1 * dy0;
-    x0 = x0 + t0 * dx0; y0 = y0 + t0 * dy0;
-
-    let steep = Math.abs(y1 - y0) > Math.abs(x1 - x0);
-    if (steep) { [x0, y0] = [y0, x0]; [x1, y1] = [y1, x1]; }
-    if (x0 > x1) { [x0, x1] = [x1, x0]; [y0, y1] = [y1, y0]; }
-    const dx = x1 - x0;
-    const grad = dx === 0 ? 1 : (y1 - y0) / dx;
-    const ix0 = Math.round(x0), ix1 = Math.round(x1);
-    let intery = y0 + grad * (ix0 - x0 + 0.5);
-    for (let x = ix0; x <= ix1; x++) {
-      const y = Math.floor(intery);
-      const f = intery - y;
-      if (steep) {
-        plot(y, x, r, g, b, 1 - f);
-        plot(y + 1, x, r, g, b, f);
-      } else {
-        plot(x, y, r, g, b, 1 - f);
-        plot(x, y + 1, r, g, b, f);
-      }
-      intery += grad;
-    }
-  }
 
   // --- interactive view -------------------------------------------------
   function renderView() {
@@ -201,64 +137,14 @@ async function main() {
     const gOpacity = Number(ghostOpacity.value) / 100;
     const showTir = tirBox.checked;
     const W = w(), H = h();
-    // Accumulate at device resolution so the ray layer is 1:1 with the display
-    // (no upscale blur); rasterize with antialiasing (no stair-stepping).
     const dpr = window.devicePixelRatio || 1;
-    const DW = Math.round(W * dpr), DH = Math.round(H * dpr);
-    ensureBuffers(DW, DH);
-    // Zero only last frame's lit region (not the whole buffer), then open a
-    // fresh current box that plot() grows.
-    for (let y = lby0; y <= lby1; y++) {
-      let k = (y * bufW + lbx0) * 3;
-      for (let x = lbx0; x <= lbx1; x++, k += 3) { hdr[k] = 0; hdr[k + 1] = 0; hdr[k + 2] = 0; }
-    }
-    cx0 = bufW; cy0 = bufH; cx1 = -1; cy1 = -1;
-
-    // Flux fraction relative to a fresh launch ray (all launch rays start equal),
-    // so brightness is energy, not ray count.
-    let maxFlux = 1e-9;
-    for (let i = 7; i < segs.length; i += 9) if (segs[i] > maxFlux) maxFlux = segs[i];
-
-    let count = 0;
-    const tirDots: V2[] = [];
-    for (let i = 0; i + 8 < segs.length; i += 9) {
-      const flags = Math.round(segs[i + 8]);
-      const ghost = (flags & 4) !== 0;
-      const frac = Math.min(1, segs[i + 7] / maxFlux);
-      // Ghosts are a dim (~4% energy) layer with their own opacity control (§5.5).
-      const wgt = (ghost ? frac * gOpacity * 8 : frac) * EXPOSURE;
-      if (wgt < 1e-4) continue;
-      const a = toScreen({ x: segs[i], y: segs[i + 1] });
-      const b = toScreen({ x: segs[i + 2], y: segs[i + 3] });
-      // rasterize in device px; keep CSS-space endpoint for overlay markers
-      addLine(a.x * dpr, a.y * dpr, b.x * dpr, b.y * dpr, segs[i + 4] * wgt, segs[i + 5] * wgt, segs[i + 6] * wgt);
-      if ((flags & 2) !== 0 && showTir) tirDots.push(b);
-      count++;
-    }
-
-    // Tonemap over the union of this frame's and last frame's lit boxes: lit
-    // pixels get written, pixels that went dark get cleared to transparent.
-    const px = img!.data;
-    let ux0 = bufW, uy0 = bufH, ux1 = -1, uy1 = -1;
-    if (cx1 >= cx0) { ux0 = Math.min(ux0, cx0); uy0 = Math.min(uy0, cy0); ux1 = Math.max(ux1, cx1); uy1 = Math.max(uy1, cy1); }
-    if (lbx1 >= lbx0) { ux0 = Math.min(ux0, lbx0); uy0 = Math.min(uy0, lby0); ux1 = Math.max(ux1, lbx1); uy1 = Math.max(uy1, lby1); }
-    if (ux1 >= ux0) {
-      for (let y = uy0; y <= uy1; y++) {
-        let k = (y * bufW + ux0) * 3;
-        let p = (y * bufW + ux0) * 4;
-        for (let x = ux0; x <= ux1; x++, k += 3, p += 4) {
-          const r = hdr[k], g = hdr[k + 1], b = hdr[k + 2];
-          if (r === 0 && g === 0 && b === 0) { px[p + 3] = 0; continue; }
-          px[p] = TONE[(r / (1 + r) * 1024) | 0];
-          px[p + 1] = TONE[(g / (1 + g) * 1024) | 0];
-          px[p + 2] = TONE[(b / (1 + b) * 1024) | 0];
-          px[p + 3] = 255;
-        }
-      }
-      rayCtx.putImageData(img!, 0, 0, ux0, uy0, ux1 - ux0 + 1, uy1 - uy0 + 1);
-    }
-    // Remember this frame's lit box so next frame can clear exactly it.
-    lbx0 = cx0; lby0 = cy0; lbx1 = cx1; lby1 = cy1;
+    const { count, tirDots } = rays.draw(segs, toScreen, {
+      ghostOpacity: gOpacity,
+      exposure: EXPOSURE,
+      dpr,
+      width: W,
+      height: H,
+    });
 
     // Compose: dark background, faint axis + detector, then add the ray layer.
     ctx.fillStyle = "#06080d";
@@ -285,7 +171,7 @@ async function main() {
     ctx.save();
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.globalCompositeOperation = "lighter";
-    ctx.drawImage(rayCanvas, 0, 0);
+    ctx.drawImage(rays.canvas, 0, 0);
     ctx.restore();
 
     // TIR highlight: a ring where a surface is in total internal reflection.

@@ -1,0 +1,93 @@
+{
+  "format": "openuc2-canvas-catalog",
+  "version": "1.0.0",
+  "source": {
+    "repository": "example/optiland-canvas-dev-fixture",
+    "commit": "0000000000000000000000000000000000000000"
+  },
+  "descriptor_schema_version": "2.0.0",
+  "grid_profiles": [
+    {
+      "id": "openuc2-core-50",
+      "pitch_mm": [50.0, 50.0, 55.0],
+      "cell_size_mm": [50.0, 50.0, 50.0],
+      "mounting_plane_offset_mm": 5.0,
+      "allowed_rotations_deg": [0, 90, 180, 270]
+    }
+  ],
+  "modules": [
+    {
+      "id": "lens-pcx-nbk7-1x1",
+      "uuid": "11111111-1111-4111-8111-000000000002",
+      "version": "1.0.0",
+      "name": "N-BK7 singlet lens module",
+      "category": "lens",
+      "group": "lenses",
+      "tags": ["lens", "singlet", "nbk7"],
+      "color": "#7CC142",
+      "footprint": {"anchor_cell": [0, 0, 0], "cells": [[0, 0, 0]]},
+      "ports": [
+        {"id": "optical-in", "type": "optical", "role": "input", "face": "-X",
+          "pose": {"position_mm": [-25.0, 0.0, 25.0], "direction": [-1.0, 0.0, 0.0]}},
+        {"id": "optical-out", "type": "optical", "role": "output", "face": "+X",
+          "pose": {"position_mm": [25.0, 0.0, 25.0], "direction": [1.0, 0.0, 0.0]}}
+      ],
+      "capabilities": {"layout": "ready", "optical": "validated", "cad": "reference", "control": "absent"},
+      "assets": {"icon": "assets/lens.svg", "canvas_fragment": "assets/lens.ocanvas"},
+      "commercial": {"vendor": "Example Vendor", "sku": "EXAMPLE-LENS-01", "price_eur": 24.0},
+      "source_path": "modules/lenses/lens-pcx-nbk7-1x1/module.yaml"
+    },
+    {
+      "id": "source-collimated-3line-1x1",
+      "uuid": "11111111-1111-4111-8111-000000000001",
+      "version": "1.0.0",
+      "name": "Three-line collimated source module",
+      "category": "light-source",
+      "group": "light-sources",
+      "tags": ["source", "collimated"],
+      "footprint": {"anchor_cell": [0, 0, 0], "cells": [[0, 0, 0]]},
+      "capabilities": {"layout": "ready", "optical": "idealized", "cad": "absent", "control": "absent"},
+      "assets": {"canvas_fragment": "assets/source.ocanvas"},
+      "commercial": {"vendor": "Example Vendor", "sku": "EXAMPLE-SRC-01", "price_eur": 40.0}
+    },
+    {
+      "id": "mirror-flat-45-1x1",
+      "uuid": "11111111-1111-4111-8111-000000000003",
+      "version": "1.0.0",
+      "name": "45 degree fold mirror module",
+      "category": "mirror",
+      "group": "mirrors",
+      "tags": ["mirror", "fold"],
+      "footprint": {"anchor_cell": [0, 0, 0], "cells": [[0, 0, 0]]},
+      "capabilities": {"layout": "ready", "optical": "validated", "cad": "reference", "control": "absent"},
+      "assets": {"canvas_fragment": "assets/mirror.ocanvas"},
+      "commercial": {"vendor": "Example Vendor", "sku": "EXAMPLE-MIR-01", "price_eur": 18.0}
+    },
+    {
+      "id": "detector-line-1x1",
+      "uuid": "11111111-1111-4111-8111-000000000004",
+      "version": "1.0.0",
+      "name": "Camera cross-section module",
+      "category": "detector",
+      "group": "detectors",
+      "tags": ["detector", "camera"],
+      "footprint": {"anchor_cell": [0, 0, 0], "cells": [[0, 0, 0]]},
+      "capabilities": {"layout": "ready", "optical": "idealized", "cad": "absent", "control": "configured"},
+      "assets": {"canvas_fragment": "assets/detector.ocanvas"},
+      "commercial": {"vendor": "Example Vendor", "sku": "EXAMPLE-CAM-01", "price_eur": 120.0}
+    },
+    {
+      "id": "cube-empty-1x1",
+      "uuid": "11111111-1111-4111-8111-000000000005",
+      "version": "1.0.0",
+      "name": "Empty structural cube",
+      "category": "mount",
+      "group": "structure",
+      "tags": ["cube", "structure"],
+      "footprint": {"anchor_cell": [0, 0, 0], "cells": [[0, 0, 0]]},
+      "capabilities": {"layout": "ready", "optical": "absent", "cad": "manufacturing", "control": "absent"},
+      "assets": {"icon": "assets/cube.svg"},
+      "commercial": {"vendor": "Example Vendor", "sku": "EXAMPLE-CUBE-01", "price_eur": 6.0}
+    }
+  ]
+}

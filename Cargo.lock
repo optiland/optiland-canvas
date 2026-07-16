@@ -683,6 +683,7 @@ dependencies = [
  "oc-core",
  "oc-fit",
  "oc-gpu",
+ "oc-openuc2",
  "oc-trace",
  "serde_json",
  "wasm-bindgen",

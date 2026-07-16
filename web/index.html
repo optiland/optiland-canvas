@@ -26,6 +26,41 @@
       label.row { display: flex; align-items: center; gap: 6px; margin: 4px 0; }
       input[type="range"] { flex: 1; }
 
+
+      /* --- openUC2 mode (#openuc2) --- */
+      #uc2 { display: none; }
+      #uc2lib { top: 12px; left: 14px; width: 300px; max-height: calc(100vh - 24px);
+        overflow-y: auto; }
+      #uc2side { top: 12px; right: 14px; width: 270px; max-height: calc(100vh - 24px);
+        overflow-y: auto; }
+      #uc2 h3 { margin: 0 0 6px; font-size: 12px; color: #7fd6ff; }
+      #uc2 h4 { margin: 10px 0 4px; font-size: 11px; color: #8aa1b8; text-transform: uppercase;
+        letter-spacing: 0.06em; }
+      #uc2 input[type="text"], #uc2 select { width: 100%; box-sizing: border-box; background: #0b1220;
+        color: #cdd6e4; border: 1px solid #24344d; border-radius: 5px; padding: 4px 6px; font: inherit; }
+      #uc2 select { margin-top: 4px; }
+      #uc2 button { background: #12203a; color: #cdd6e4; border: 1px solid #24344d; border-radius: 5px;
+        padding: 2px 8px; cursor: pointer; font: inherit; }
+      #uc2 button:hover { background: #1d4e6b; }
+      .uc2-card { border: 1px solid #1e2a3d; border-left: 3px solid #4a6a8a; border-radius: 6px;
+        padding: 6px 8px; margin: 6px 0; background: rgba(8,12,20,0.6); }
+      .uc2-card-t { color: #e8f6ff; }
+      .uc2-card-m { opacity: 0.6; font-size: 11px; margin-bottom: 4px; }
+      .uc2-badges { display: flex; flex-wrap: wrap; gap: 3px; margin-bottom: 4px; }
+      .uc2-badge { font-size: 10px; padding: 1px 5px; border-radius: 3px; border: 1px solid; }
+      .uc2-good { color: #7fe0a0; border-color: #2c5c40; }
+      .uc2-warn { color: #e8c46a; border-color: #5c4c22; }
+      .uc2-bad  { color: #ff9b8a; border-color: #6b3028; }
+      .uc2-dim  { color: #8aa1b8; border-color: #24344d; }
+      .uc2-note { font-size: 11px; line-height: 1.4; margin: 3px 0; opacity: 0.9; }
+      .uc2-row { display: flex; align-items: center; gap: 4px; margin: 3px 0; }
+      .uc2-row span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      #uc2Src { font-size: 11px; opacity: 0.8; margin-bottom: 6px; line-height: 1.4; }
+      #uc2Cov { font-size: 11px; opacity: 0.75; line-height: 1.5; }
+      #uc2Err { color: #ff9b8a; font-size: 11px; min-height: 14px; margin-top: 4px; }
+      #uc2Nums { font-size: 11px; opacity: 0.8; margin-top: 4px; }
+      #uc2Status { font-size: 11px; opacity: 0.7; }
+
       /* --- M3 "it's precise" --- */
       #tools { top: 12px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 8px; }
       #tools button { background: #12203a; color: #cdd6e4; border: 1px solid #24344d; border-radius: 6px;
@@ -224,5 +259,37 @@
     </div>
 
     <script type="module" src="/src/main.ts"></script>
+
+    <!-- openUC2 mode (§15). Hidden unless the route is #openuc2. -->
+    <div id="uc2">
+      <div id="uc2lib" class="panel">
+        <h3>openUC2 modules</h3>
+        <div id="uc2Src"></div>
+        <input id="uc2Search" type="text" placeholder="search name, id, vendor, SKU, tag" />
+        <select id="uc2Category">
+          <option value="*">all categories</option>
+        </select>
+        <select id="uc2Capability">
+          <option value="*">all readiness</option>
+          <option value="traceable">has optics</option>
+          <option value="validated">optically validated</option>
+          <option value="layout-only">layout only</option>
+        </select>
+        <div id="uc2Status"></div>
+        <div id="uc2List"></div>
+      </div>
+      <div id="uc2side" class="panel">
+        <h3>catalogue coverage</h3>
+        <div id="uc2Cov"></div>
+        <h4>placed</h4>
+        <button id="uc2Demo">build the folded-singlet demo</button>
+        <div id="uc2Layout"></div>
+        <div id="uc2Err"></div>
+        <h4>reference numbers (f64)</h4>
+        <div id="uc2Nums"></div>
+        <h4>fidelity</h4>
+        <div id="uc2Warn"></div>
+      </div>
+    </div>
   </body>
 </html>

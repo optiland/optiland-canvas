@@ -121,12 +121,23 @@ pub struct PortPose {
     pub direction: [f64; 3],
 }
 
-/// Module parameters. Values stay JSON: the adapter does not interpret them, and
+/// Module parameters. Values stay JSON: the adapter never evaluates them, and
 /// §9.5 forbids executing anything a descriptor carries.
+///
+/// A typed generator reads them (§9.5 `builtin-generator`); for every other
+/// module they are documentation plus a BOM key.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Parameters {
-    #[serde(default)]
+    /// The descriptor's design values.
+    ///
+    /// `rename`, not just a trailing underscore to dodge the keyword: without it
+    /// serde looks for a key spelled `static_`, the catalogue's `static` block is
+    /// silently dropped, and a generated module comes out with no parameters at
+    /// all.
+    #[serde(default, rename = "static")]
     pub static_: BTreeMap<String, serde_json::Value>,
+    /// Which parameters a user may change, and within what bounds. Advisory: the
+    /// generator validates whatever it is handed regardless.
     #[serde(default)]
     pub variable: BTreeMap<String, serde_json::Value>,
 }
@@ -179,6 +190,14 @@ pub struct ModuleEntry {
     pub ports: Vec<Port>,
     #[serde(default)]
     pub parameters: Parameters,
+    /// A typed generator's name, when this module's optics are *built* from its
+    /// parameters rather than read from a stored fragment (§9.5
+    /// `builtin-generator`).
+    ///
+    /// A module has a fragment or a generator, never both: two sources for one
+    /// module's geometry is two answers to the same question.
+    #[serde(default)]
+    pub generator: Option<String>,
     pub capabilities: Capabilities,
     #[serde(default)]
     pub assets: Assets,
@@ -338,6 +357,25 @@ impl Catalog {
         self.fragments.get(path)
     }
 
+    /// Does this module claim optics at all — stored or generated?
+    ///
+    /// The one place that question is answered, so the coverage report, the card
+    /// list, and the per-instance warnings cannot disagree about it.
+    pub fn declares_optics(&self, entry: &ModuleEntry) -> bool {
+        entry.generator.is_some() || entry.assets.canvas_fragment.is_some()
+    }
+
+    /// Can this module contribute geometry *right now*?
+    ///
+    /// A generated module always can: its optics are built from numbers already
+    /// in the catalogue, so there is no asset to go missing.
+    pub fn traceable(&self, entry: &ModuleEntry) -> bool {
+        if entry.generator.is_some() {
+            return true;
+        }
+        entry.assets.canvas_fragment.is_some() && self.fragment_asset_missing(entry).is_none()
+    }
+
     /// Does this module declare a fragment whose asset is missing?
     pub fn fragment_asset_missing<'a>(&self, entry: &'a ModuleEntry) -> Option<&'a str> {
         let path = entry.assets.canvas_fragment.as_deref()?;
@@ -369,10 +407,18 @@ impl Catalog {
             *c.control.entry(m.capabilities.control.clone()).or_default() += 1;
             *c.categories.entry(m.category.clone()).or_default() += 1;
 
-            match (&m.assets.canvas_fragment, self.fragment_asset_missing(m)) {
-                (Some(_), None) => c.traceable += 1,
-                (Some(_), Some(_)) => c.declared_fragment_asset_missing += 1,
-                (None, _) => c.no_fragment_declared += 1,
+            // Three distinct things a naive count would merge: optics that work,
+            // optics whose asset did not load (a fact about the build), and no
+            // optics declared (a fact about the module). Generated optics are
+            // always the first: they are built from numbers, not fetched.
+            if m.generator.is_some() {
+                c.traceable += 1;
+            } else {
+                match (&m.assets.canvas_fragment, self.fragment_asset_missing(m)) {
+                    (Some(_), None) => c.traceable += 1,
+                    (Some(_), Some(_)) => c.declared_fragment_asset_missing += 1,
+                    (None, _) => c.no_fragment_declared += 1,
+                }
             }
             if m.assets.icon.is_none() {
                 c.missing_icon += 1;
@@ -427,6 +473,10 @@ pub struct ModuleView<'a> {
     /// Footprint extent in cells, `[x, y]`, for "1x1" style labels.
     pub footprint_cells: [i32; 2],
     pub cell_count: usize,
+    /// The typed generator building this module's optics, if any (§9.5). A UI may
+    /// offer editable parameters only for a module that has one, because only
+    /// those parameters reach the geometry (§15.7).
+    pub generator: Option<&'a str>,
     /// True when this module can contribute optics right now.
     pub traceable: bool,
     /// Set when the module declares optics whose asset never loaded, which a
@@ -463,7 +513,8 @@ impl Catalog {
                     icon: m.assets.icon.as_deref(),
                     footprint_cells: [w.max(1), h.max(1)],
                     cell_count: m.footprint.cells.len(),
-                    traceable: m.assets.canvas_fragment.is_some() && missing.is_none(),
+                    traceable: self.traceable(m),
+                    generator: m.generator.as_deref(),
                     fragment_asset_missing: missing,
                 }
             })
@@ -572,12 +623,13 @@ mod tests {
         assert_eq!(c.no_fragment_declared, 1, "the empty cube");
         assert_eq!(c.declared_fragment_asset_missing, 0);
 
-        // The same catalogue with nothing attached: four modules that should
-        // trace and cannot.
+        // The same catalogue with nothing attached: the three stored-fragment
+        // modules should trace and cannot. The lens still can — it is generated,
+        // so it has no asset to go missing.
         let bare = Catalog::from_json(&minimal_catalog_json()).unwrap();
         let c = bare.coverage();
-        assert_eq!(c.traceable, 0);
-        assert_eq!(c.declared_fragment_asset_missing, 4);
+        assert_eq!(c.traceable, 1, "the generated lens needs no asset");
+        assert_eq!(c.declared_fragment_asset_missing, 3);
         assert_eq!(c.no_fragment_declared, 1, "still just the cube");
     }
 
@@ -601,9 +653,21 @@ mod tests {
         // module, "optics missing" is a fact about the build.
         let bare = Catalog::from_json(&minimal_catalog_json()).unwrap();
         let view = bare.view();
+        let mirror = view.iter().find(|m| m.id == "mirror-flat-45-1x1").unwrap();
+        assert!(!mirror.traceable);
+        assert_eq!(mirror.fragment_asset_missing, Some("assets/mirror.ocanvas"));
+    }
+
+    #[test]
+    fn a_generated_module_needs_no_asset_to_be_traceable() {
+        // Its optics are built from numbers already in the catalogue, so there is
+        // nothing to fetch and nothing to go missing (§9.5).
+        let bare = Catalog::from_json(&minimal_catalog_json()).unwrap();
+        let view = bare.view();
         let lens = view.iter().find(|m| m.id == "lens-pcx-nbk7-1x1").unwrap();
-        assert!(!lens.traceable);
-        assert_eq!(lens.fragment_asset_missing, Some("assets/lens.ocanvas"));
+        assert_eq!(lens.generator, Some("singlet"));
+        assert!(lens.traceable, "nothing was attached, and it still traces");
+        assert_eq!(lens.fragment_asset_missing, None);
     }
 
     #[test]

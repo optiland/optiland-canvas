@@ -147,12 +147,36 @@ crates/
   oc-trace   reference tracer — CPU, f64, exact (the source of truth)
   oc-gpu     interactive tracer — wgpu compute (f32) + CPU-f32 fallback
   oc-fit     freehand stroke → parametric surface fitting
+  oc-openuc2 openUC2/OptiKit adapter — catalogue, setup, module placement
   oc-wasm    wasm-bindgen bindings; the browser's handle to the scene
   oc-py      PyO3 bindings; .ocanvas ⇄ Optiland Optic round-trip
 web/         Vite + TypeScript UI shell
 ```
 
 Everything is f64 in the core; wavelengths are in micrometres. The kernel is a library first — if the UI disappeared, the crates would still be worth using on their own.
+
+## openUC2 mode
+
+At `#openuc2`: browse a catalogue of [openUC2](https://openuc2.com) modules, drag
+them onto the 50 mm grid, and trace the light through them. The freeform Canvas is
+untouched and remains the default route.
+
+`oc-core` never learns what a cube is. openUC2 is an adapter on top of the generic
+core, and what it needed from the core — scene fragments, rigid batch transforms,
+scene-table merging, removal remaps — was added generically. Canvas is still 2D,
+one layer is traced at a time, and every number still comes from the f64 tracer.
+
+Start with [`docs/openuc2/architecture.md`](docs/openuc2/architecture.md), or open
+[the folded-singlet demo](examples/openuc2/README.md):
+
+| | |
+|---|---|
+| [architecture.md](docs/openuc2/architecture.md) | the design, and what is true of the engine |
+| [coordinates.md](docs/openuc2/coordinates.md) | the canonical frame and the grid |
+| [catalogue.md](docs/openuc2/catalogue.md) | how the catalogue is built and pinned |
+| [setup-format.md](docs/openuc2/setup-format.md) | `.uc2canvas` and the flat `.ocanvas` export |
+| [module-fragments.md](docs/openuc2/module-fragments.md) | a module's optics, and the id hazards |
+| [fidelity.md](docs/openuc2/fidelity.md) | **what this engine will not claim** |
 
 ## Contributing
 

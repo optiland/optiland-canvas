@@ -16,6 +16,19 @@
 //! a three-line collimated source, an N-BK7 singlet, a 45° fold mirror, a line
 //! detector across the module's own axis, an aperture, and an empty cube that
 //! carries no optics at all.
+//!
+//! # Port convention
+//!
+//! Ports follow §6.1 and §9.4 rather than anything invented here: `+X_uc2` is the
+//! nominal forward optical direction, so a module takes light in through its `-X`
+//! face and sends it out through `+X`, and `pose.direction` is the **outward**
+//! normal. The fold mirror is the one asymmetric case — it turns `+x` onto `-y`,
+//! so its output is on the `-Y` face.
+//!
+//! On a 50 mm grid this makes adjacent cubes mate by construction: a `+X` port at
+//! `x = +25` and its neighbour's `-X` port at `x = -25` land on the same cell
+//! boundary facing each other. The empty cube declares no ports, because a
+//! structural part has no optical connector to declare.
 
 use oc_core::{
     spherical_edge, Detector, Edge, Element, ElementId, Isometry2, Material, Scene, Source,
@@ -48,7 +61,16 @@ pub fn source_fragment() -> String {
     scene.to_json()
 }
 
-/// A biconvex N-BK7 singlet centred on the module anchor.
+/// A biconvex N-BK7 singlet centred on the module anchor, authored by hand.
+///
+/// The lens module is **generated** now (§9.5): the catalogue gives the singlet
+/// generator `R1 = 100`, `R2 = -100`, `t = 5`, `⌀24`, and its optics are built
+/// from those numbers so a user can change one and watch the rays follow.
+///
+/// This function stays as the independent hand-authored reference that
+/// `the_generated_lens_is_the_lens_the_fixture_always_had` compares the generator
+/// against, byte for byte. It is what makes the switch to a generator provably a
+/// no-op rather than a hope.
 ///
 /// Deliberately a `Material::Catalog` glass: the fragment carries the builtin
 /// catalogue's N-BK7, so placing it exercises the glass-id remap that a naive
@@ -155,13 +177,49 @@ pub fn aperture_fragment() -> String {
     scene.to_json()
 }
 
+/// The folded-singlet demo (§16.4), assembled from [`pilot_catalog`].
+///
+/// ```text
+///   grid    [0,0,0]      [1,0,0]       [2,0,0]
+///           source  -->  singlet  -->  45° mirror
+///                                          |
+///                                          v  (folded onto -y)
+///                                      detector  [2,-1,0], rotated 270°
+/// ```
+///
+/// One definition, three consumers: the committed `.uc2canvas` fixture is
+/// emitted from this, the integration tests assert against it, and a test checks
+/// the emitted file still reproduces it. A demo that was hand-written in a file
+/// could drift from the demo the tests prove works.
+///
+/// The detector is turned 270° rather than 90° because of where its window is: a
+/// bare line detector has no sides, so both rotations lay the same sensor across
+/// the same beam and trace identically, but the module takes light in through its
+/// `-X` face and only 270° turns that face toward the mirror.
+pub fn folded_singlet_demo() -> crate::OpenUc2Project {
+    use crate::{GridProfile, ModuleRef, OpenUc2Project, Quadrant};
+    let mut p =
+        OpenUc2Project::new(pilot_catalog(), GridProfile::openuc2_core_50()).expect("empty project");
+    for (uuid, anchor, rot) in [
+        (SOURCE_UUID, [0, 0, 0], Quadrant::R0),
+        (LENS_UUID, [1, 0, 0], Quadrant::R0),
+        (MIRROR_UUID, [2, 0, 0], Quadrant::R0),
+        (DETECTOR_UUID, [2, -1, 0], Quadrant::R270),
+    ] {
+        p.place_module(&ModuleRef::new(uuid, "1.0.0"), anchor, rot)
+            .expect("pilot module places");
+    }
+    p
+}
+
 /// A catalogue over the pilot modules, with fragment assets attached.
+///
+/// The lens needs no asset: it is generated. Both paths are live here on purpose
+/// — the source, mirror, and detector are stored fragments — so neither can rot.
 pub fn pilot_catalog() -> crate::Catalog {
     let mut cat = crate::Catalog::from_json(&minimal_catalog_json()).expect("fixture parses");
     cat.attach_fragment("assets/source.ocanvas", &source_fragment())
         .expect("source fragment");
-    cat.attach_fragment("assets/lens.ocanvas", &lens_fragment())
-        .expect("lens fragment");
     cat.attach_fragment("assets/mirror.ocanvas", &mirror_fragment())
         .expect("mirror fragment");
     cat.attach_fragment("assets/detector.ocanvas", &detector_fragment())
@@ -203,6 +261,21 @@ pub fn minimal_catalog_json() -> String {
       "tags": ["lens", "singlet", "nbk7"],
       "color": "#7CC142",
       "footprint": {{"anchor_cell": [0, 0, 0], "cells": [[0, 0, 0]]}},
+      "generator": "singlet",
+      "parameters": {{
+        "static": {{
+          "material": "N-BK7",
+          "diameter_mm": 24.0,
+          "center_thickness_mm": 5.0,
+          "radius_1_mm": 100.0,
+          "radius_2_mm": -100.0
+        }},
+        "variable": {{
+          "radius_1_mm": {{"min": -1000.0, "max": 1000.0}},
+          "radius_2_mm": {{"min": -1000.0, "max": 1000.0}},
+          "center_thickness_mm": {{"min": 1.0, "max": 20.0}}
+        }}
+      }},
       "ports": [
         {{"id": "optical-in", "type": "optical", "role": "input", "face": "-X",
           "pose": {{"position_mm": [-25.0, 0.0, 25.0], "direction": [-1.0, 0.0, 0.0]}}}},
@@ -210,7 +283,7 @@ pub fn minimal_catalog_json() -> String {
           "pose": {{"position_mm": [25.0, 0.0, 25.0], "direction": [1.0, 0.0, 0.0]}}}}
       ],
       "capabilities": {{"layout": "ready", "optical": "validated", "cad": "reference", "control": "absent"}},
-      "assets": {{"icon": "assets/lens.svg", "canvas_fragment": "assets/lens.ocanvas"}},
+      "assets": {{"icon": "assets/lens.svg"}},
       "commercial": {{"vendor": "Example Vendor", "sku": "EXAMPLE-LENS-01", "price_eur": 24.0}},
       "source_path": "modules/lenses/lens-pcx-nbk7-1x1/module.yaml"
     }},
@@ -223,6 +296,10 @@ pub fn minimal_catalog_json() -> String {
       "group": "light-sources",
       "tags": ["source", "collimated"],
       "footprint": {{"anchor_cell": [0, 0, 0], "cells": [[0, 0, 0]]}},
+      "ports": [
+        {{"id": "optical-out", "type": "optical", "role": "output", "face": "+X",
+          "pose": {{"position_mm": [25.0, 0.0, 25.0], "direction": [1.0, 0.0, 0.0]}}}}
+      ],
       "capabilities": {{"layout": "ready", "optical": "idealized", "cad": "absent", "control": "absent"}},
       "assets": {{"canvas_fragment": "assets/source.ocanvas"}},
       "commercial": {{"vendor": "Example Vendor", "sku": "EXAMPLE-SRC-01", "price_eur": 40.0}}
@@ -236,6 +313,12 @@ pub fn minimal_catalog_json() -> String {
       "group": "mirrors",
       "tags": ["mirror", "fold"],
       "footprint": {{"anchor_cell": [0, 0, 0], "cells": [[0, 0, 0]]}},
+      "ports": [
+        {{"id": "optical-in", "type": "optical", "role": "input", "face": "-X",
+          "pose": {{"position_mm": [-25.0, 0.0, 25.0], "direction": [-1.0, 0.0, 0.0]}}}},
+        {{"id": "optical-out", "type": "optical", "role": "output", "face": "-Y",
+          "pose": {{"position_mm": [0.0, -25.0, 25.0], "direction": [0.0, -1.0, 0.0]}}}}
+      ],
       "capabilities": {{"layout": "ready", "optical": "validated", "cad": "reference", "control": "absent"}},
       "assets": {{"canvas_fragment": "assets/mirror.ocanvas"}},
       "commercial": {{"vendor": "Example Vendor", "sku": "EXAMPLE-MIR-01", "price_eur": 18.0}}
@@ -249,6 +332,10 @@ pub fn minimal_catalog_json() -> String {
       "group": "detectors",
       "tags": ["detector", "camera"],
       "footprint": {{"anchor_cell": [0, 0, 0], "cells": [[0, 0, 0]]}},
+      "ports": [
+        {{"id": "optical-in", "type": "optical", "role": "input", "face": "-X",
+          "pose": {{"position_mm": [-25.0, 0.0, 25.0], "direction": [-1.0, 0.0, 0.0]}}}}
+      ],
       "capabilities": {{"layout": "ready", "optical": "idealized", "cad": "absent", "control": "configured"}},
       "assets": {{"canvas_fragment": "assets/detector.ocanvas"}},
       "commercial": {{"vendor": "Example Vendor", "sku": "EXAMPLE-CAM-01", "price_eur": 120.0}}

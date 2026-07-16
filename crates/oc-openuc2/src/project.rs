@@ -28,6 +28,9 @@ use oc_core::{
 use crate::catalog::{Catalog, Capabilities, Footprint, ModuleEntry, ModuleRef};
 use crate::coordinates::{GridProfile, Quadrant};
 use crate::errors::{Error, PlacementError, ProjectWarning};
+use crate::generator::Generator;
+use crate::history::History;
+use crate::ports::{self, PlacedPort, PortSource};
 use crate::setup::{InstanceFallback, OpenUc2Setup, Placement, SetupInstance};
 
 /// A Canvas object, whichever list it lives in.
@@ -75,6 +78,12 @@ pub struct BomLine {
     /// False when the catalogue could not resolve the pin, in which case the
     /// commercial fields are whatever the setup remembered.
     pub resolved: bool,
+    /// What is not ready about this product (§15.8).
+    ///
+    /// A BOM is the one view someone reads before spending money, so a module
+    /// that is layout-only or optically idealized has to say so *here* and not
+    /// only in a panel somewhere else.
+    pub readiness: Vec<String>,
 }
 
 /// The aggregated module list.
@@ -84,6 +93,44 @@ pub struct Bom {
     pub total_eur: f64,
     /// Custom Canvas objects are not products and are counted separately (§5.7).
     pub custom_object_count: usize,
+}
+
+impl Bom {
+    /// The module list as CSV (§15.8).
+    ///
+    /// Written here rather than in the browser because escaping is the whole job
+    /// and getting it wrong corrupts a file someone orders parts from: a module
+    /// name with a comma in it would silently shift every later column.
+    pub fn to_csv(&self) -> String {
+        let mut out = String::from(
+            "quantity,name,module_id,version,vendor,sku,unit_price_eur,subtotal_eur,readiness\n",
+        );
+        for l in &self.lines {
+            let cells = [
+                l.quantity.to_string(),
+                l.name.clone(),
+                l.module_id.clone(),
+                l.version.clone(),
+                l.vendor.clone(),
+                l.sku.clone(),
+                format!("{:.2}", l.unit_price_eur),
+                format!("{:.2}", l.subtotal_eur),
+                l.readiness.join("; "),
+            ];
+            out.push_str(&cells.map(|c| csv_cell(&c)).join(","));
+            out.push('\n');
+        }
+        out
+    }
+}
+
+/// Quote a CSV cell if it could otherwise break the row.
+fn csv_cell(s: &str) -> String {
+    if s.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
 }
 
 /// A flattened scene, with whatever fidelity caveats apply to it.
@@ -110,8 +157,19 @@ pub struct OpenUc2Project {
     custom_inserted: InsertedFragment,
     instances: BTreeMap<String, MaterializedInstance>,
     ownership: HashMap<SceneObjectId, String>,
+    /// The object the user picked, when they picked one.
     selected: Option<SceneObjectId>,
+    /// The module that selection *means* (§14.7).
+    ///
+    /// Held rather than derived from `selected`, because a module is selectable
+    /// when it owns no object to point at: an empty structural cube takes up a
+    /// cell and can be picked, moved, and deleted like anything else, and a
+    /// selection that could only name geometry could never name it.
+    selected_module: Option<String>,
     warnings: Vec<ProjectWarning>,
+    /// Setups, not scenes: the scene is derived, so a snapshot of the setup is a
+    /// snapshot of everything (§14.8).
+    history: History,
 }
 
 impl OpenUc2Project {
@@ -128,7 +186,9 @@ impl OpenUc2Project {
             instances: BTreeMap::new(),
             ownership: HashMap::new(),
             selected: None,
+            selected_module: None,
             warnings: Vec::new(),
+            history: History::default(),
         };
         p.stamp_catalog_pin();
         p.rematerialize()?;
@@ -157,7 +217,9 @@ impl OpenUc2Project {
             instances: BTreeMap::new(),
             ownership: HashMap::new(),
             selected: None,
+            selected_module: None,
             warnings: Vec::new(),
+            history: History::default(),
         };
         p.rematerialize()?;
         Ok(p)
@@ -223,20 +285,259 @@ impl OpenUc2Project {
     /// the whole module (§14.7), so the useful answer is the owning instance.
     pub fn select_object(&mut self, obj: SceneObjectId) -> Option<&str> {
         self.selected = Some(obj);
-        self.owner_of(obj)
+        self.selected_module = self.owner_of(obj).map(str::to_string);
+        self.selected_instance()
+    }
+
+    /// Select a module by name.
+    ///
+    /// The primitive the other two selection paths go through. Callers that
+    /// already know the instance use this: addressing it by a cell instead would
+    /// depend on the module standing on the cell you named it by, and a footprint
+    /// is not required to include its own anchor.
+    pub fn select_instance(&mut self, instance: &str) -> Option<&str> {
+        if self.setup.instance(instance).is_none() {
+            self.clear_selection();
+            return None;
+        }
+        // Point at one of the module's objects when it has any, so the selection
+        // still survives a removal remap the way §14.4 requires.
+        self.selected = self.first_object_of(instance);
+        self.selected_module = Some(instance.to_string());
+        self.selected_instance()
+    }
+
+    /// Select the module on `cell`, or clear the selection when there is none.
+    ///
+    /// The pick path for the layout view, where a click lands on the grid rather
+    /// than on a ray. Custom objects are not modules and are never hit by this.
+    pub fn select_at_cell(&mut self, cell: [i32; 3]) -> Option<&str> {
+        match self.instance_at_cell(cell).map(str::to_string) {
+            Some(id) => self.select_instance(&id),
+            None => {
+                self.clear_selection();
+                None
+            }
+        }
     }
 
     pub fn clear_selection(&mut self) {
         self.selected = None;
+        self.selected_module = None;
     }
 
     pub fn selected_object(&self) -> Option<SceneObjectId> {
         self.selected
     }
 
-    /// The selected module, if the selected object belongs to one.
+    /// The selected module.
     pub fn selected_instance(&self) -> Option<&str> {
-        self.selected.and_then(|o| self.owner_of(o))
+        self.selected_module.as_deref()
+    }
+
+    /// Any one object an instance owns, in fragment order.
+    fn first_object_of(&self, instance: &str) -> Option<SceneObjectId> {
+        let m = self.instances.get(instance)?;
+        m.inserted
+            .elements
+            .first()
+            .map(|e| SceneObjectId::Element(e.0))
+            .or_else(|| m.inserted.sources.first().map(|s| SceneObjectId::Source(s.0)))
+            .or_else(|| {
+                m.inserted
+                    .detectors
+                    .first()
+                    .map(|d| SceneObjectId::Detector(d.0))
+            })
+    }
+
+    /// The instance occupying a grid cell, if any.
+    ///
+    /// The pick path for the layout: a module is selected by clicking where it
+    /// physically is, and a structural cube with no optics has to be as pickable
+    /// as a lens. Selecting by scene object could never reach one, because it owns
+    /// no objects to hit (§14.7).
+    pub fn instance_at_cell(&self, cell: [i32; 3]) -> Option<&str> {
+        self.setup
+            .instances
+            .iter()
+            .filter(|i| i.enabled)
+            .find(|i| {
+                let Ok(rot) = Quadrant::from_quarter_turns(i.placement.rotation_quadrants) else {
+                    return false;
+                };
+                Self::cells_for(&self.footprint_of(i), i.placement.anchor_grid, rot)
+                    .contains(&cell)
+            })
+            .map(|i| i.instance_id.as_str())
+    }
+
+    /// Which instance blocks `anchor`, if a module were placed there.
+    ///
+    /// A query, not an attempt: a drag preview asks this every pointer move and
+    /// must not mutate anything to find out. `ignore` is the instance being
+    /// dragged, which never collides with itself.
+    pub fn blocker_at(
+        &self,
+        footprint: &Footprint,
+        anchor: [i32; 3],
+        rot: Quadrant,
+        ignore: Option<&str>,
+    ) -> Option<String> {
+        let cells = Self::cells_for(footprint, anchor, rot);
+        let occupied = self.occupied(ignore);
+        cells.iter().find_map(|c| occupied.get(c).cloned())
+    }
+
+    /// Where a placed instance could not be moved to.
+    ///
+    /// The same question as [`blocker_at`](Self::blocker_at) for a module that is
+    /// already on the grid, so a drag does not have to re-resolve its footprint.
+    /// The module does not block itself: a drag that ends where it started, or
+    /// that overlaps its own old cells on the way, is not a collision.
+    pub fn blocker_for(&self, instance: &str, anchor: [i32; 3]) -> Option<String> {
+        self.blocker_for_instance(instance, anchor, Some(instance))
+    }
+
+    /// Where a *copy* of an instance could not go.
+    ///
+    /// Unlike [`blocker_for`](Self::blocker_for), the original blocks. A duplicate
+    /// is a new module and inherits no right to the cells the original is standing
+    /// on, so asking the move question here would offer a cell that
+    /// [`duplicate_module`](Self::duplicate_module) then refuses.
+    pub fn blocker_for_copy(&self, instance: &str, anchor: [i32; 3]) -> Option<String> {
+        self.blocker_for_instance(instance, anchor, None)
+    }
+
+    fn blocker_for_instance(
+        &self,
+        instance: &str,
+        anchor: [i32; 3],
+        ignore: Option<&str>,
+    ) -> Option<String> {
+        let inst = self.setup.instance(instance)?;
+        let rot = Quadrant::from_quarter_turns(inst.placement.rotation_quadrants).ok()?;
+        let footprint = self.footprint_of(inst);
+        self.blocker_at(&footprint, anchor, rot, ignore)
+    }
+
+    /// Every placed port, with what it is or is not connected to (§14.6).
+    ///
+    /// Derived on demand and advisory throughout: nothing here reaches the tracer.
+    pub fn ports(&self) -> Vec<PlacedPort> {
+        let sources: Vec<PortSource<'_>> = self
+            .setup
+            .instances
+            .iter()
+            .filter(|i| i.enabled)
+            .filter_map(|i| {
+                let entry = self.catalog.resolve(&i.module_ref())?;
+                let rotation = Quadrant::from_quarter_turns(i.placement.rotation_quadrants).ok()?;
+                Some(PortSource {
+                    instance: i.instance_id.as_str(),
+                    module_id: entry.id.as_str(),
+                    ports: &entry.ports,
+                    anchor: i.placement.anchor_grid,
+                    rotation,
+                })
+            })
+            .collect();
+        ports::graph(&self.grid, &sources)
+    }
+
+    // --- History (§14.8) ---------------------------------------------------
+
+    /// Begin one settled operation.
+    ///
+    /// Everything until [`end_gesture`](Self::end_gesture) becomes a single undo
+    /// step (§15.6). For a drag, which is one `move_module` per pointer move and
+    /// would otherwise bury every earlier edit.
+    pub fn begin_gesture(&mut self) {
+        self.history.begin_gesture();
+    }
+
+    /// Settle the open gesture. A gesture that changed nothing records nothing.
+    pub fn end_gesture(&mut self) {
+        // Cloned because the comparison needs the setup while the history is
+        // borrowed mutably; a settle happens once per drag, not once per frame.
+        let current = self.setup.clone();
+        self.history.end_gesture(&current);
+    }
+
+    pub fn can_undo(&self) -> bool {
+        self.history.can_undo()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        self.history.can_redo()
+    }
+
+    /// Step back one settled operation. `Ok(false)` when there is nothing to undo.
+    pub fn undo(&mut self) -> Result<bool, Error> {
+        let Some(previous) = self.history.peek_undo().cloned() else {
+            return Ok(false);
+        };
+        let current = self.setup.clone();
+        // Restore first: `adopt` leaves the project untouched if it fails, and the
+        // stacks must not move unless the state actually did.
+        self.adopt(previous)?;
+        self.history.commit_undo(current);
+        Ok(true)
+    }
+
+    /// Step forward one undone operation.
+    pub fn redo(&mut self) -> Result<bool, Error> {
+        let Some(next) = self.history.peek_redo().cloned() else {
+            return Ok(false);
+        };
+        let current = self.setup.clone();
+        self.adopt(next)?;
+        self.history.commit_redo(current);
+        Ok(true)
+    }
+
+    /// The state a mutation is about to change, when history needs it.
+    ///
+    /// `None` inside a gesture that already holds its snapshot, which is what
+    /// keeps a drag from cloning the setup on every pointer move.
+    fn before(&self) -> Option<OpenUc2Setup> {
+        if self.history.wants_before() {
+            Some(self.setup.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Record a successful mutation. Called only once the edit has committed: a
+    /// refused placement is not an undo step.
+    fn record(&mut self, before: Option<OpenUc2Setup>) {
+        if let Some(b) = before {
+            self.history.record(b);
+        }
+    }
+
+    /// Become `setup`, regenerating everything derived from it.
+    ///
+    /// Atomic. If the new state cannot be materialized the old one is restored,
+    /// so a failed undo leaves a working project rather than a half-applied one.
+    fn adopt(&mut self, setup: OpenUc2Setup) -> Result<(), Error> {
+        let previous = std::mem::replace(&mut self.setup, setup);
+        match self.reload_derived() {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // This state materialized once already, so putting it back cannot
+                // fail for a reason the first attempt did not already hit.
+                self.setup = previous;
+                self.reload_derived()?;
+                Err(e)
+            }
+        }
+    }
+
+    /// Rebuild everything the setup implies: the custom fragment and the scene.
+    fn reload_derived(&mut self) -> Result<(), Error> {
+        self.custom = load_custom(&self.setup)?;
+        self.rematerialize()
     }
 
     // --- Placement ---------------------------------------------------------
@@ -346,12 +647,13 @@ impl OpenUc2Project {
 
         let cells = Self::cells_for(&entry.footprint, anchor, rot);
         self.check_free(&cells, None)?;
+        let before = self.before();
 
         // Materialize before committing to the setup: insertion can still fail on
         // a bad fragment, and a setup entry with no objects would be a module the
         // user can see but not select.
         if self.should_materialize(&inst) {
-            let placed = self.materialize_one(&inst).map_err(PlacementError::Fragment)?;
+            let placed = self.materialize_one(&inst).map_err(PlacementError::from)?;
             if let Some(m) = placed {
                 self.instances.insert(instance_id.clone(), m);
             }
@@ -359,6 +661,7 @@ impl OpenUc2Project {
         self.setup.instances.push(inst);
         self.rebuild_ownership();
         self.recompute_warnings();
+        self.record(before);
         Ok(instance_id)
     }
 
@@ -404,6 +707,9 @@ impl OpenUc2Project {
         let cells = Self::cells_for(&footprint, new_anchor, new_rot);
         // Ignore this instance's own cells: a module never collides with itself.
         self.check_free(&cells, Some(instance))?;
+        // Inside a drag's gesture this clones nothing: the snapshot was taken on
+        // the first move and the rest of the drag folds into it (§15.6).
+        let before = self.before();
 
         let old_t = self.grid.placement(old_anchor, old_rot);
         let new_t = self.grid.placement(new_anchor, new_rot);
@@ -420,6 +726,7 @@ impl OpenUc2Project {
             // Crossing layers changes whether the module is in the traced plane at
             // all, so its objects must be built or dropped rather than moved.
             self.rematerialize().map_err(PlacementError::from)?;
+            self.record(before);
             return Ok(());
         }
 
@@ -431,6 +738,7 @@ impl OpenUc2Project {
                 .map_err(PlacementError::Fragment)?;
         }
         self.recompute_warnings();
+        self.record(before);
         Ok(())
     }
 
@@ -443,14 +751,21 @@ impl OpenUc2Project {
         if self.setup.instance(instance).is_none() {
             return Err(Error::UnknownInstance(instance.to_string()));
         }
+        let before = self.before();
 
         if let Some(m) = self.instances.remove(instance) {
             let remap = self.scene.remove_objects(&m.ids())?;
             self.apply_scene_id_remap(&remap);
         }
         self.setup.instances.retain(|i| i.instance_id != instance);
+        // The module is gone, so a selection naming it is gone too. A layout-only
+        // module owns no object, so the remap above could not have cleared this.
+        if self.selected_module.as_deref() == Some(instance) {
+            self.clear_selection();
+        }
         self.rebuild_ownership();
         self.recompute_warnings();
+        self.record(before);
         Ok(())
     }
 
@@ -480,37 +795,107 @@ impl OpenUc2Project {
         if self.setup.view.active_layer == layer {
             return Ok(());
         }
+        // Undoable, because the active layer is part of the snapshot: it decides
+        // what materializes. Undoing a placement made on another layer without
+        // going back to that layer would restore a module the user cannot see.
+        let before = self.before();
         self.setup.view.active_layer = layer;
-        self.rematerialize()
+        self.rematerialize()?;
+        self.record(before);
+        Ok(())
     }
 
     /// Set a parameter override.
     ///
-    /// Recorded and carried into the BOM, but not yet bound to geometry: no
-    /// module in the MVP regenerates its optics from a parameter, and pretending
-    /// otherwise would show a lens that reads 50 mm and traces 25.
+    /// For a module with a typed generator (§9.5) this **rebuilds its optics**:
+    /// the value reaches the geometry, and the rays follow. For any other module
+    /// the value is recorded and carried into the BOM but changes no ray — no
+    /// stored fragment regenerates itself, and a lens that read 50 mm while
+    /// tracing 25 would be worse than no field at all (§15.7).
+    ///
+    /// Atomic. A value the generator refuses — a radius shorter than the
+    /// semi-diameter, a glass nobody has — leaves the setup and the scene exactly
+    /// as they were, so a half-typed number in a UI cannot destroy a layout.
     pub fn set_parameter_override(
         &mut self,
         instance: &str,
         key: &str,
         value: serde_json::Value,
     ) -> Result<(), Error> {
-        let i = self
+        let inst = self
             .setup
-            .instance_mut(instance)
+            .instance(instance)
             .ok_or_else(|| Error::UnknownInstance(instance.to_string()))?;
-        i.parameter_overrides.insert(key.to_string(), value);
+
+        // Try the build before committing anything, so a refused value is a
+        // refusal and not a broken scene.
+        let generated = self
+            .catalog
+            .resolve(&inst.module_ref())
+            .map(|e| e.generator.is_some())
+            .unwrap_or(false);
+        if generated {
+            let mut probe = inst.clone();
+            probe.parameter_overrides.insert(key.to_string(), value.clone());
+            let entry = self.catalog.resolve(&probe.module_ref()).expect("resolved above");
+            self.fragment_for_instance(&probe, entry)?;
+        }
+
+        let before = self.before();
+        self.setup
+            .instance_mut(instance)
+            .expect("checked above")
+            .parameter_overrides
+            .insert(key.to_string(), value);
+        if generated {
+            // The geometry is derived from the parameters, so the honest way to
+            // change it is to regenerate. Ids change, which is why every retained
+            // one goes through the rebuild rather than being patched.
+            self.rematerialize()?;
+        }
+        self.recompute_warnings();
+        self.record(before);
+        Ok(())
+    }
+
+    /// Drop an override, returning the parameter to the descriptor's value.
+    pub fn clear_parameter_override(&mut self, instance: &str, key: &str) -> Result<(), Error> {
+        let inst = self
+            .setup
+            .instance(instance)
+            .ok_or_else(|| Error::UnknownInstance(instance.to_string()))?;
+        if !inst.parameter_overrides.contains_key(key) {
+            return Ok(());
+        }
+        let before = self.before();
+        self.setup
+            .instance_mut(instance)
+            .expect("checked above")
+            .parameter_overrides
+            .remove(key);
+        self.rematerialize()?;
+        self.record(before);
         Ok(())
     }
 
     /// Replace the custom (non-catalogue) Canvas content.
+    ///
+    /// Undoable through the same stack as module edits: §14.8 requires that
+    /// custom Canvas edits and module edits never produce divergent state, and
+    /// two histories over one project is exactly how that happens.
     pub fn set_custom_canvas(&mut self, ocanvas: &str) -> Result<(), Error> {
         let scene = Scene::from_json(ocanvas)
             .map_err(|e| Error::Format(format!("custom canvas is not a valid .ocanvas: {e}")))?;
-        self.custom = SceneFragment::from_scene(&scene)?;
-        self.setup.custom_canvas.ocanvas = serde_json::from_str(ocanvas)
+        let parsed: serde_json::Value = serde_json::from_str(ocanvas)
             .map_err(|e| Error::Format(format!("custom canvas is not valid JSON: {e}")))?;
-        self.rematerialize()
+        // Both parses are done before anything is committed, so a bad document
+        // cannot leave the fragment and the setup describing different content.
+        let before = self.before();
+        self.custom = SceneFragment::from_scene(&scene)?;
+        self.setup.custom_canvas.ocanvas = parsed;
+        self.rematerialize()?;
+        self.record(before);
+        Ok(())
     }
 
     // --- Materialization ---------------------------------------------------
@@ -522,16 +907,13 @@ impl OpenUc2Project {
 
     /// Insert one instance's fragment. `Ok(None)` means the module resolved but
     /// has nothing optical to place, which is normal for a structural cube.
-    fn materialize_one(
-        &mut self,
-        inst: &SetupInstance,
-    ) -> Result<Option<MaterializedInstance>, oc_core::FragmentError> {
+    fn materialize_one(&mut self, inst: &SetupInstance) -> Result<Option<MaterializedInstance>, Error> {
         let module = inst.module_ref();
         let Some(entry) = self.catalog.resolve(&module) else {
             return Ok(None);
         };
         let module_id = entry.id.clone();
-        let Some(fragment) = self.catalog.fragment_for(entry).cloned() else {
+        let Some(fragment) = self.fragment_for_instance(inst, entry)? else {
             return Ok(None);
         };
         let rot = Quadrant::from_quarter_turns(inst.placement.rotation_quadrants)
@@ -545,12 +927,53 @@ impl OpenUc2Project {
         }))
     }
 
+    /// This instance's optics: built from its parameters, or the catalogue's
+    /// stored fragment.
+    ///
+    /// A generated module's geometry is per *instance*, not per module, because
+    /// two copies of one product may be configured differently — which is exactly
+    /// why the catalogue cannot cache it.
+    fn fragment_for_instance(
+        &self,
+        inst: &SetupInstance,
+        entry: &ModuleEntry,
+    ) -> Result<Option<SceneFragment>, Error> {
+        if let Some(name) = &entry.generator {
+            let g = Generator::from_name(name)?;
+            return Ok(Some(g.build(&resolved_parameters(entry, inst))?));
+        }
+        Ok(self.catalog.fragment_for(entry).cloned())
+    }
+
+    /// The parameters a generated instance is actually built from.
+    ///
+    /// Read-only: it is what [`set_parameter_override`](Self::set_parameter_override)
+    /// has already produced, and is here so a UI can show the numbers the geometry
+    /// came from rather than the descriptor's untouched defaults.
+    pub fn resolved_parameters(
+        &self,
+        instance: &str,
+    ) -> Option<BTreeMap<String, serde_json::Value>> {
+        let inst = self.setup.instance(instance)?;
+        let entry = self.catalog.resolve(&inst.module_ref())?;
+        Some(resolved_parameters(entry, inst))
+    }
+
+    /// The typed generator behind an instance, if its module has one.
+    pub fn generator_of(&self, instance: &str) -> Option<Generator> {
+        let inst = self.setup.instance(instance)?;
+        let entry = self.catalog.resolve(&inst.module_ref())?;
+        Generator::from_name(entry.generator.as_deref()?).ok()
+    }
+
     /// Rebuild the scene from the setup.
     ///
     /// The scene is derived, so the honest way to change what is in it is to
-    /// regenerate it. Every id changes, so the selection is dropped rather than
-    /// remapped: the objects it referred to no longer exist in any sense that
-    /// survives a rebuild.
+    /// regenerate it. Every object id changes, so the picked *object* is dropped
+    /// rather than remapped: it no longer exists in any sense that survives a
+    /// rebuild. The picked *module* does survive, when the setup still has it —
+    /// undo, redo, and a layer switch should not silently deselect what the user
+    /// is working on.
     fn rematerialize(&mut self) -> Result<(), Error> {
         self.scene = Scene::new();
         self.instances.clear();
@@ -576,6 +999,17 @@ impl OpenUc2Project {
             }
         }
         self.rebuild_ownership();
+
+        // Re-point the surviving module selection at whatever the rebuild gave it.
+        // A module off the active layer has no objects now, which is exactly why
+        // the module and the object are tracked separately.
+        let module = self
+            .selected_module
+            .take()
+            .filter(|id| self.setup.instance(id).is_some());
+        self.selected = module.as_deref().and_then(|id| self.first_object_of(id));
+        self.selected_module = module;
+
         self.recompute_warnings();
         Ok(())
     }
@@ -638,8 +1072,14 @@ impl OpenUc2Project {
             };
             let module_id = entry.id.clone();
             let caps: Capabilities = entry.capabilities.clone();
-            let declares_fragment = entry.assets.canvas_fragment.is_some();
+            let declares_optics = self.catalog.declares_optics(entry);
+            let generated = entry.generator.is_some();
             let missing_asset = self.catalog.fragment_asset_missing(entry).map(str::to_string);
+            let overridden: Vec<String> = if generated {
+                inst.parameter_overrides.keys().cloned().collect()
+            } else {
+                Vec::new()
+            };
 
             if inst.placement.anchor_grid[2] != active {
                 out.push(ProjectWarning::InactiveLayer {
@@ -658,11 +1098,21 @@ impl OpenUc2Project {
                 });
                 continue;
             }
-            if !caps.has_optics() || !declares_fragment {
+            if !caps.has_optics() || !declares_optics {
                 out.push(ProjectWarning::LayoutOnly {
                     instance: id.clone(),
                     module_id: module_id.clone(),
                     optical: caps.optical.clone(),
+                });
+            } else if !overridden.is_empty() {
+                // Reported instead of the `validated` badge, not beside it: this
+                // instance is a lens the module's reference never covered, and
+                // saying "validated" about it would be the claim this whole
+                // fidelity scheme exists to refuse.
+                out.push(ProjectWarning::ReconfiguredOptics {
+                    instance: id.clone(),
+                    module_id: module_id.clone(),
+                    keys: overridden,
                 });
             } else if !caps.optics_validated() {
                 out.push(ProjectWarning::IdealizedOptics {
@@ -676,6 +1126,37 @@ impl OpenUc2Project {
     }
 
     // --- Products ----------------------------------------------------------
+
+    /// What a buyer should know about a line before ordering it.
+    ///
+    /// Deliberately about the *product*, not the instance: a BOM line is one
+    /// product however many are placed, so "this one is on an inactive layer" has
+    /// no place here even though it is a real warning elsewhere.
+    fn readiness_of(&self, e: &ModuleEntry, inst: &SetupInstance) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(asset) = self.catalog.fragment_asset_missing(e) {
+            out.push(format!("optics declared but the asset is missing ({asset})"));
+        } else if !e.capabilities.has_optics() || e.assets.canvas_fragment.is_none() {
+            out.push(format!(
+                "layout only: no Canvas optics ({})",
+                e.capabilities.optical
+            ));
+        } else if !e.capabilities.optics_validated() {
+            out.push(format!(
+                "optics are {}, not validated against a reference",
+                e.capabilities.optical
+            ));
+        }
+        if e.capabilities.cad == "absent" {
+            out.push("no CAD".to_string());
+        }
+        if !inst.parameter_overrides.is_empty() {
+            let mut keys: Vec<&str> = inst.parameter_overrides.keys().map(|s| s.as_str()).collect();
+            keys.sort_unstable();
+            out.push(format!("configured: {}", keys.join(", ")));
+        }
+        out
+    }
 
     /// Aggregate enabled instances into a module list.
     ///
@@ -723,6 +1204,7 @@ impl OpenUc2Project {
                         unit_price_eur: unit,
                         subtotal_eur: unit * quantity as f64,
                         resolved: true,
+                        readiness: self.readiness_of(e, inst),
                     }
                 }
                 None => BomLine {
@@ -735,6 +1217,10 @@ impl OpenUc2Project {
                     unit_price_eur: 0.0,
                     subtotal_eur: 0.0,
                     resolved: false,
+                    readiness: vec![format!(
+                        "unresolved: the catalogue has no {} at version {}",
+                        inst.module_uuid, inst.module_version
+                    )],
                 },
             })
             .collect();
@@ -797,6 +1283,23 @@ fn remap_inserted(f: &InsertedFragment, remap: &IdRemap) -> InsertedFragment {
             .filter_map(|i| remap.detector(*i))
             .collect(),
     }
+}
+
+/// A module's declared parameters with this instance's overrides applied.
+///
+/// The descriptor's `static` values are the design; an override is this
+/// instance's departure from it. Overrides win, and an override of a key the
+/// descriptor never declared is still applied — the generator validates what it
+/// is handed, and a silently dropped key would be a field that does nothing.
+fn resolved_parameters(
+    e: &ModuleEntry,
+    inst: &SetupInstance,
+) -> BTreeMap<String, serde_json::Value> {
+    let mut p = e.parameters.static_.clone();
+    for (k, v) in &inst.parameter_overrides {
+        p.insert(k.clone(), v.clone());
+    }
+    p
 }
 
 fn fallback_for(e: &ModuleEntry) -> InstanceFallback {
@@ -1216,14 +1719,645 @@ mod tests {
     }
 
     #[test]
-    fn switching_layers_clears_the_selection() {
-        // Every id changes on a rebuild, so a retained selection could only be
-        // wrong.
+    fn switching_layers_clears_the_selected_object() {
+        // Every id changes on a rebuild, so a retained *object* selection could
+        // only be wrong. The module the user picked is still theirs, though.
         let mut p = project();
-        p.place_module(&lens(), [0, 0, 0], Quadrant::R0).unwrap();
+        let a = p.place_module(&lens(), [0, 0, 0], Quadrant::R0).unwrap();
         p.select_object(SceneObjectId::Element(0));
         p.set_active_layer(1).unwrap();
+        assert_eq!(p.selected_object(), None, "the lens has no objects up here");
+        assert_eq!(p.selected_instance(), Some(a.as_str()));
+
+        // ...and coming back re-points it at the rebuilt geometry.
+        p.set_active_layer(0).unwrap();
+        assert_eq!(p.selected_object(), Some(SceneObjectId::Element(0)));
+    }
+
+    // --- Picking (§14.7) ---------------------------------------------------
+
+    #[test]
+    fn a_cell_names_the_module_standing_on_it() {
+        let mut p = project();
+        let a = p.place_module(&lens(), [2, 1, 0], Quadrant::R0).unwrap();
+        assert_eq!(p.instance_at_cell([2, 1, 0]), Some(a.as_str()));
+        assert_eq!(p.instance_at_cell([2, 2, 0]), None, "the next cell over");
+        assert_eq!(p.instance_at_cell([2, 1, 1]), None, "another layer");
+    }
+
+    #[test]
+    fn every_cell_of_a_multi_cell_module_picks_it() {
+        // A rail is one module, not two. Clicking its far end must not miss.
+        let (mut p, rail) = rail_project();
+        let id = p.place_module(&rail, [0, 0, 0], Quadrant::R90).unwrap();
+
+        // Rotated 90°, the second cell went from +x to +y.
+        assert_eq!(p.instance_at_cell([0, 0, 0]), Some(id.as_str()));
+        assert_eq!(p.instance_at_cell([0, 1, 0]), Some(id.as_str()));
+        assert_eq!(p.instance_at_cell([1, 0, 0]), None);
+    }
+
+    #[test]
+    fn a_layout_only_module_is_selectable() {
+        // An empty cube owns no scene object, so an object-addressed selection
+        // could never name it. It still occupies a cell and must pick like
+        // anything else.
+        let mut p = project();
+        let c = p.place_module(&cube(), [0, 0, 0], Quadrant::R0).unwrap();
+        assert!(p.instance(&c).is_none(), "the cube really has no objects");
+
+        assert_eq!(p.select_at_cell([0, 0, 0]), Some(c.as_str()));
+        assert_eq!(p.selected_instance(), Some(c.as_str()));
         assert_eq!(p.selected_object(), None);
+    }
+
+    #[test]
+    fn picking_an_optical_module_selects_it_by_one_of_its_objects() {
+        let mut p = project();
+        let a = p.place_module(&lens(), [1, 0, 0], Quadrant::R0).unwrap();
+        assert_eq!(p.select_at_cell([1, 0, 0]), Some(a.as_str()));
+        assert_eq!(p.selected_object(), Some(SceneObjectId::Element(0)));
+    }
+
+    #[test]
+    fn picking_empty_space_clears_the_selection() {
+        let mut p = project();
+        p.place_module(&lens(), [0, 0, 0], Quadrant::R0).unwrap();
+        p.select_at_cell([0, 0, 0]);
+        assert!(p.selected_instance().is_some());
+
+        assert_eq!(p.select_at_cell([9, 9, 0]), None);
+        assert_eq!(p.selected_instance(), None);
+        assert_eq!(p.selected_object(), None);
+    }
+
+    #[test]
+    fn deleting_a_layout_only_module_clears_its_selection() {
+        // It owns no object, so the removal remap cannot be what clears this.
+        let mut p = project();
+        let c = p.place_module(&cube(), [0, 0, 0], Quadrant::R0).unwrap();
+        p.select_at_cell([0, 0, 0]);
+        p.remove_module(&c).unwrap();
+        assert_eq!(p.selected_instance(), None);
+    }
+
+    // --- Collision preview -------------------------------------------------
+
+    #[test]
+    fn a_module_whose_anchor_cell_is_not_its_own_is_still_selectable() {
+        // `offsets()` subtracts the anchor, and nothing requires the anchor to be
+        // among the cells. Addressing a module by its anchor cell would miss this
+        // one entirely, which is why selection has an instance-named primitive.
+        let mut doc: serde_json::Value = serde_json::from_str(&minimal_catalog_json()).unwrap();
+        let mut m = two_cell_module_json("u-offset");
+        // Occupies anchor+[1,0,0] only: the anchor cell itself stays empty.
+        m["footprint"] = serde_json::json!({"anchor_cell": [0, 0, 0], "cells": [[1, 0, 0]]});
+        doc["modules"].as_array_mut().unwrap().push(m);
+        let cat = Catalog::from_json(&doc.to_string()).unwrap();
+        let mut p = OpenUc2Project::new(cat, GridProfile::openuc2_core_50()).unwrap();
+
+        let id = p
+            .place_module(&ModuleRef::new("u-offset", "1.0.0"), [0, 0, 0], Quadrant::R0)
+            .unwrap();
+        assert_eq!(p.instance_at_cell([0, 0, 0]), None, "the anchor is empty");
+        assert_eq!(p.instance_at_cell([1, 0, 0]), Some(id.as_str()));
+
+        assert_eq!(p.select_instance(&id), Some(id.as_str()));
+        assert_eq!(p.selected_instance(), Some(id.as_str()));
+    }
+
+    #[test]
+    fn selecting_a_module_that_is_gone_clears_rather_than_holds_it() {
+        let mut p = project();
+        let a = p.place_module(&lens(), [0, 0, 0], Quadrant::R0).unwrap();
+        p.select_instance(&a);
+        assert_eq!(p.select_instance("m-9999"), None);
+        assert_eq!(p.selected_instance(), None, "not left on the old module");
+    }
+
+    #[test]
+    fn a_copy_is_blocked_by_the_original_but_a_move_is_not() {
+        // The distinction the two queries exist for. A duplicate is a new module:
+        // it inherits none of the original's right to the cells it stands on, so
+        // offering it one would be offering a cell `duplicate_module` refuses.
+        let (mut p, rail) = rail_project();
+        let id = p.place_module(&rail, [0, 0, 0], Quadrant::R0).unwrap();
+        // The rail spans [0,0,0] and [1,0,0].
+        assert_eq!(p.blocker_for(&id, [1, 0, 0]), None, "moving onto itself is fine");
+        assert_eq!(
+            p.blocker_for_copy(&id, [1, 0, 0]),
+            Some(id.clone()),
+            "a copy there would overlap the original"
+        );
+        // And the query agrees with what duplicating actually does.
+        assert!(p.duplicate_module(&id, [1, 0, 0]).is_err());
+        assert_eq!(p.blocker_for_copy(&id, [2, 0, 0]), None);
+        assert!(p.duplicate_module(&id, [2, 0, 0]).is_ok());
+    }
+
+    #[test]
+    fn a_blocked_cell_names_its_occupant_without_touching_anything() {
+        let mut p = project();
+        let a = p.place_module(&lens(), [1, 0, 0], Quadrant::R0).unwrap();
+        let b = p.place_module(&lens(), [3, 0, 0], Quadrant::R0).unwrap();
+        let scene_before = p.scene().to_json();
+
+        assert_eq!(p.blocker_for(&b, [1, 0, 0]), Some(a.clone()));
+        assert_eq!(p.blocker_for(&b, [2, 0, 0]), None);
+        // A module never blocks itself: a drag that ends where it started is fine.
+        assert_eq!(p.blocker_for(&b, [3, 0, 0]), None);
+
+        assert_eq!(p.scene().to_json(), scene_before, "a query mutates nothing");
+        assert_eq!(p.setup().instances.len(), 2);
+    }
+
+    // --- Generated optics (§9.5, §15.7) ------------------------------------
+
+    /// The front radius of the one element in the scene.
+    fn front_radius(p: &OpenUc2Project) -> f64 {
+        match p.scene().elements[0].boundary[0] {
+            oc_core::Edge::Conic(c) => 1.0 / c.c,
+            ref e => panic!("expected a conic front surface, got {e:?}"),
+        }
+    }
+
+    #[test]
+    fn changing_a_parameter_rebuilds_the_geometry() {
+        // The binding, end to end: a number goes in and the glass changes shape.
+        // Without this the field would be a lie — a lens reading 50 and tracing
+        // 100 (§15.7).
+        let mut p = project();
+        let a = p.place_module(&lens(), [0, 0, 0], Quadrant::R0).unwrap();
+        assert!((front_radius(&p) - 100.0).abs() < 1e-9);
+
+        p.set_parameter_override(&a, "radius_1_mm", serde_json::json!(50.0))
+            .unwrap();
+        assert!((front_radius(&p) - 50.0).abs() < 1e-9, "the surface followed");
+    }
+
+    #[test]
+    fn a_stronger_lens_bends_light_harder() {
+        // The thing a user is actually checking when they turn the radius down.
+        use oc_trace::{trace, TraceConfig};
+        let cfg = TraceConfig {
+            bounds: 400.0,
+            ..TraceConfig::default()
+        };
+        let mut p = project();
+        p.place_module(&source(), [0, 0, 0], Quadrant::R0).unwrap();
+        let a = p.place_module(&lens(), [1, 0, 0], Quadrant::R0).unwrap();
+
+        // The steepest angle any ray is bent to, before and after.
+        let steepest = |p: &OpenUc2Project| -> f64 {
+            trace(p.scene(), &cfg)
+                .segments
+                .iter()
+                .map(|s| {
+                    let d = (s.b - s.a).normalize();
+                    d.y.abs()
+                })
+                .fold(0.0, f64::max)
+        };
+        let before = steepest(&p);
+        p.set_parameter_override(&a, "radius_1_mm", serde_json::json!(40.0))
+            .unwrap();
+        let after = steepest(&p);
+        assert!(after > before, "R 100 -> 40 bent {before} -> {after}");
+    }
+
+    #[test]
+    fn a_refused_parameter_leaves_the_scene_alone() {
+        // A half-typed number in a UI must not cost anyone their layout. R = 5 on
+        // a 24 mm lens is deeper than a hemisphere, and the generator says so.
+        let mut p = project();
+        let a = p.place_module(&lens(), [0, 0, 0], Quadrant::R0).unwrap();
+        let before = p.scene().to_json();
+
+        let err = p
+            .set_parameter_override(&a, "radius_1_mm", serde_json::json!(5.0))
+            .unwrap_err();
+        assert!(format!("{err}").contains("semi-diameter"), "{err}");
+        assert_eq!(p.scene().to_json(), before, "nothing moved");
+        assert!(
+            p.setup().instance(&a).unwrap().parameter_overrides.is_empty(),
+            "and nothing was recorded"
+        );
+        // A refusal is not an edit: the one step on the stack is the placement, so
+        // undoing once takes the module away rather than un-refusing anything.
+        p.undo().unwrap();
+        assert!(p.setup().instances.is_empty());
+        assert!(!p.can_undo());
+    }
+
+    #[test]
+    fn a_reconfigured_module_stops_claiming_it_is_validated() {
+        // The module is `optical: validated`, but that compared a *specific*
+        // lens. Change the radius and the comparison is about something else.
+        let mut p = project();
+        let a = p.place_module(&lens(), [0, 0, 0], Quadrant::R0).unwrap();
+        assert!(p.warnings().is_empty(), "as authored, it is validated");
+
+        p.set_parameter_override(&a, "radius_1_mm", serde_json::json!(75.0))
+            .unwrap();
+        assert!(
+            matches!(
+                p.warnings(),
+                [ProjectWarning::ReconfiguredOptics { keys, .. }] if keys == &["radius_1_mm"]
+            ),
+            "{:?}",
+            p.warnings()
+        );
+    }
+
+    #[test]
+    fn a_parameter_change_is_undoable() {
+        let mut p = project();
+        let a = p.place_module(&lens(), [0, 0, 0], Quadrant::R0).unwrap();
+        p.set_parameter_override(&a, "radius_1_mm", serde_json::json!(50.0))
+            .unwrap();
+        assert!((front_radius(&p) - 50.0).abs() < 1e-9);
+
+        p.undo().unwrap();
+        assert!((front_radius(&p) - 100.0).abs() < 1e-9, "the glass came back");
+        assert!(p.warnings().is_empty(), "and so did its validation");
+    }
+
+    #[test]
+    fn dragging_a_parameter_slider_is_one_undo_step() {
+        // A slider fires on every pixel. Same contract as a drag (§15.6).
+        let mut p = project();
+        let a = p.place_module(&lens(), [0, 0, 0], Quadrant::R0).unwrap();
+        p.begin_gesture();
+        for r in [90.0, 80.0, 70.0, 60.0] {
+            p.set_parameter_override(&a, "radius_1_mm", serde_json::json!(r))
+                .unwrap();
+        }
+        p.end_gesture();
+
+        p.undo().unwrap();
+        assert!((front_radius(&p) - 100.0).abs() < 1e-9, "back to the design");
+        // One step for the whole slider drag: the step under it is the placement,
+        // not the value before the last pixel.
+        p.undo().unwrap();
+        assert!(p.setup().instances.is_empty());
+        assert!(!p.can_undo());
+    }
+
+    #[test]
+    fn clearing_an_override_returns_the_descriptors_lens() {
+        let mut p = project();
+        let a = p.place_module(&lens(), [0, 0, 0], Quadrant::R0).unwrap();
+        p.set_parameter_override(&a, "radius_1_mm", serde_json::json!(50.0))
+            .unwrap();
+        p.clear_parameter_override(&a, "radius_1_mm").unwrap();
+
+        assert!((front_radius(&p) - 100.0).abs() < 1e-9);
+        assert!(p.warnings().is_empty(), "it is the validated lens again");
+    }
+
+    #[test]
+    fn resolved_parameters_show_what_the_geometry_was_built_from() {
+        let mut p = project();
+        let a = p.place_module(&lens(), [0, 0, 0], Quadrant::R0).unwrap();
+        p.set_parameter_override(&a, "radius_1_mm", serde_json::json!(50.0))
+            .unwrap();
+
+        let r = p.resolved_parameters(&a).unwrap();
+        assert_eq!(r["radius_1_mm"], serde_json::json!(50.0), "the override");
+        assert_eq!(r["radius_2_mm"], serde_json::json!(-100.0), "the design");
+        assert_eq!(p.generator_of(&a), Some(crate::Generator::Singlet));
+    }
+
+    #[test]
+    fn a_parameter_on_a_stored_fragment_module_changes_no_geometry() {
+        // The mirror has no generator. §15.7: recording the value is fine, but it
+        // must not look like it did something.
+        let mut p = project();
+        let a = p.place_module(&mirror(), [0, 0, 0], Quadrant::R0).unwrap();
+        let before = p.scene().to_json();
+        p.set_parameter_override(&a, "radius_1_mm", serde_json::json!(50.0))
+            .unwrap();
+
+        assert_eq!(p.scene().to_json(), before);
+        assert_eq!(p.generator_of(&a), None);
+        // ...and it is not reported as reconfigured optics, because the optics
+        // were never configured by it.
+        assert!(
+            !p.warnings()
+                .iter()
+                .any(|w| matches!(w, ProjectWarning::ReconfiguredOptics { .. })),
+            "{:?}",
+            p.warnings()
+        );
+    }
+
+    #[test]
+    fn two_copies_of_one_module_can_be_configured_differently() {
+        // Which is why a generated fragment is per instance and cannot be cached
+        // on the catalogue.
+        let mut p = project();
+        let a = p.place_module(&lens(), [0, 0, 0], Quadrant::R0).unwrap();
+        let b = p.place_module(&lens(), [1, 0, 0], Quadrant::R0).unwrap();
+        p.set_parameter_override(&a, "radius_1_mm", serde_json::json!(50.0))
+            .unwrap();
+
+        let radius = |i: &str| match p.scene().elements[p.instance(i).unwrap().inserted.elements[0].index()]
+            .boundary[0]
+        {
+            oc_core::Edge::Conic(c) => 1.0 / c.c,
+            ref e => panic!("{e:?}"),
+        };
+        assert!((radius(&a) - 50.0).abs() < 1e-9);
+        assert!((radius(&b) - 100.0).abs() < 1e-9, "b keeps the design");
+        // And they are two BOM lines, because they are configured differently.
+        assert_eq!(p.bom().lines.len(), 2);
+    }
+
+    // --- BOM (§15.8) -------------------------------------------------------
+
+    #[test]
+    fn the_bom_csv_has_a_header_and_a_row_per_line() {
+        let mut p = project();
+        p.place_module(&lens(), [0, 0, 0], Quadrant::R0).unwrap();
+        p.place_module(&lens(), [1, 0, 0], Quadrant::R0).unwrap();
+        p.place_module(&cube(), [2, 0, 0], Quadrant::R0).unwrap();
+
+        let csv = p.bom().to_csv();
+        let rows: Vec<&str> = csv.lines().collect();
+        assert_eq!(rows.len(), 3, "header plus two products");
+        assert!(rows[0].starts_with("quantity,name,module_id"));
+        // Two lenses aggregate into one line of quantity 2.
+        assert!(rows.iter().any(|r| r.starts_with("2,")), "{csv}");
+        assert!(rows.iter().any(|r| r.contains("EXAMPLE-CUBE-01")), "{csv}");
+    }
+
+    #[test]
+    fn a_comma_in_a_module_name_does_not_shift_the_columns() {
+        // The reason this is generated in Rust and not in the browser: a name with
+        // a comma in it would silently move the price into the SKU column of a
+        // file someone orders parts from.
+        let mut doc: serde_json::Value = serde_json::from_str(&minimal_catalog_json()).unwrap();
+        doc["modules"][0]["name"] = serde_json::json!("Lens, 25.4 mm, \"wide\"");
+        let cat = Catalog::from_json(&doc.to_string()).unwrap();
+        let mut p = OpenUc2Project::new(cat, GridProfile::openuc2_core_50()).unwrap();
+        p.place_module(&lens(), [0, 0, 0], Quadrant::R0).unwrap();
+
+        let csv = p.bom().to_csv();
+        let row = csv.lines().nth(1).unwrap();
+        assert!(
+            row.contains("\"Lens, 25.4 mm, \"\"wide\"\"\""),
+            "quoted and escaped: {row}"
+        );
+        // The header's column count is what the row must still have.
+        let header_cols = csv.lines().next().unwrap().split(',').count();
+        assert_eq!(split_csv(row).len(), header_cols, "{row}");
+    }
+
+    /// A minimal RFC-4180 reader, so the escaping test checks the bytes against
+    /// something other than the writer that produced them.
+    fn split_csv(row: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let (mut cur, mut quoted, mut chars) = (String::new(), false, row.chars().peekable());
+        while let Some(c) = chars.next() {
+            match c {
+                '"' if quoted && chars.peek() == Some(&'"') => {
+                    cur.push('"');
+                    chars.next();
+                }
+                '"' => quoted = !quoted,
+                ',' if !quoted => out.push(std::mem::take(&mut cur)),
+                _ => cur.push(c),
+            }
+        }
+        out.push(cur);
+        out
+    }
+
+    #[test]
+    fn a_layout_only_product_says_so_in_the_bom() {
+        // The BOM is the view someone reads before spending money.
+        let mut p = project();
+        p.place_module(&cube(), [0, 0, 0], Quadrant::R0).unwrap();
+        let bom = p.bom();
+        assert!(
+            bom.lines[0].readiness.iter().any(|r| r.contains("layout only")),
+            "{:?}",
+            bom.lines[0].readiness
+        );
+    }
+
+    #[test]
+    fn an_unresolved_product_says_so_in_the_bom() {
+        let p = OpenUc2Project::load(pilot_catalog(), &setup_with_missing_module()).unwrap();
+        let bom = p.bom();
+        assert!(!bom.lines[0].resolved);
+        assert!(
+            bom.lines[0].readiness.iter().any(|r| r.contains("unresolved")),
+            "{:?}",
+            bom.lines[0].readiness
+        );
+    }
+
+    // --- History (§14.8) ---------------------------------------------------
+
+    #[test]
+    fn undo_takes_back_a_placement() {
+        let mut p = project();
+        assert!(!p.can_undo(), "a new project has nothing to undo");
+
+        p.place_module(&lens(), [0, 0, 0], Quadrant::R0).unwrap();
+        assert!(p.can_undo());
+        assert_eq!(p.scene().elements.len(), 1);
+
+        assert!(p.undo().unwrap());
+        assert_eq!(p.setup().instances.len(), 0);
+        assert_eq!(p.scene().elements.len(), 0, "the geometry went with it");
+        assert!(p.can_redo());
+
+        assert!(p.redo().unwrap());
+        assert_eq!(p.setup().instances.len(), 1);
+        assert_eq!(p.scene().elements.len(), 1);
+    }
+
+    #[test]
+    fn undoing_nothing_is_not_an_error() {
+        let mut p = project();
+        assert!(!p.undo().unwrap(), "nothing to undo");
+        assert!(!p.redo().unwrap(), "nothing to redo");
+    }
+
+    #[test]
+    fn undo_restores_the_scene_exactly() {
+        // The scene is derived, so undo regenerates rather than replays. The proof
+        // is that the regenerated scene is the same bytes, not merely similar.
+        let mut p = project();
+        p.place_module(&lens(), [0, 0, 0], Quadrant::R0).unwrap();
+        let before = p.scene().to_json();
+
+        let b = p.place_module(&mirror(), [1, 0, 0], Quadrant::R0).unwrap();
+        p.rotate_module(&b, Quadrant::R90).unwrap();
+        p.undo().unwrap();
+        p.undo().unwrap();
+
+        assert_eq!(p.scene().to_json(), before);
+    }
+
+    #[test]
+    fn a_refused_placement_is_not_an_undo_step() {
+        let mut p = project();
+        p.place_module(&lens(), [0, 0, 0], Quadrant::R0).unwrap();
+        p.undo().unwrap();
+        assert!(p.can_redo());
+
+        // A collision changes nothing, so it must not consume the redo stack or
+        // add a step that undoes to the state it is already in.
+        p.place_module(&lens(), [0, 0, 0], Quadrant::R0).unwrap();
+        assert!(p.place_module(&cube(), [0, 0, 0], Quadrant::R0).is_err());
+        assert!(p.undo().unwrap());
+        assert_eq!(p.setup().instances.len(), 0, "one undo cleared the lens");
+    }
+
+    #[test]
+    fn a_drag_is_one_undo_step() {
+        // §15.6: one settled operation, one undo event. A drag is a move per
+        // pointer event, and without the gesture each would be its own step.
+        let mut p = project();
+        let a = p.place_module(&lens(), [0, 0, 0], Quadrant::R0).unwrap();
+
+        p.begin_gesture();
+        for x in 1..=6 {
+            p.move_module(&a, [x, 0, 0]).unwrap();
+        }
+        p.end_gesture();
+
+        assert_eq!(p.setup().instance(&a).unwrap().placement.anchor_grid, [6, 0, 0]);
+        p.undo().unwrap();
+        assert_eq!(
+            p.setup().instance(&a).unwrap().placement.anchor_grid,
+            [0, 0, 0],
+            "one undo returns to where the drag started, not to cell 5"
+        );
+
+        // And the step underneath the drag is the placement itself: the six moves
+        // left nothing else on the stack.
+        p.undo().unwrap();
+        assert!(p.setup().instances.is_empty());
+        assert!(!p.can_undo());
+    }
+
+    #[test]
+    fn a_drag_that_ends_where_it_started_is_not_an_edit() {
+        let mut p = project();
+        let a = p.place_module(&lens(), [0, 0, 0], Quadrant::R0).unwrap();
+        p.undo().unwrap();
+        p.redo().unwrap();
+        assert!(!p.can_redo());
+
+        p.begin_gesture();
+        p.move_module(&a, [3, 0, 0]).unwrap();
+        p.move_module(&a, [0, 0, 0]).unwrap();
+        p.end_gesture();
+
+        // Picking a module up and putting it back must not cost an undo step.
+        p.undo().unwrap();
+        assert_eq!(p.setup().instances.len(), 0, "the undo reached the placement");
+    }
+
+    #[test]
+    fn edits_outside_a_gesture_are_one_step_each() {
+        let mut p = project();
+        let a = p.place_module(&lens(), [0, 0, 0], Quadrant::R0).unwrap();
+        p.move_module(&a, [1, 0, 0]).unwrap();
+        p.rotate_module(&a, Quadrant::R90).unwrap();
+
+        p.undo().unwrap();
+        assert_eq!(p.setup().instance(&a).unwrap().placement.rotation_quadrants, 0);
+        p.undo().unwrap();
+        assert_eq!(p.setup().instance(&a).unwrap().placement.anchor_grid, [0, 0, 0]);
+        p.undo().unwrap();
+        assert!(p.setup().instances.is_empty());
+    }
+
+    #[test]
+    fn a_new_edit_after_an_undo_drops_the_redo() {
+        let mut p = project();
+        p.place_module(&lens(), [0, 0, 0], Quadrant::R0).unwrap();
+        p.place_module(&lens(), [1, 0, 0], Quadrant::R0).unwrap();
+        p.undo().unwrap();
+        assert!(p.can_redo());
+
+        p.place_module(&cube(), [5, 0, 0], Quadrant::R0).unwrap();
+        assert!(!p.can_redo(), "that future is unreachable now");
+    }
+
+    #[test]
+    fn undo_covers_removal() {
+        let mut p = project();
+        let a = p.place_module(&lens(), [0, 0, 0], Quadrant::R0).unwrap();
+        p.remove_module(&a).unwrap();
+        assert_eq!(p.scene().elements.len(), 0);
+
+        p.undo().unwrap();
+        assert_eq!(p.setup().instances.len(), 1, "the module came back");
+        assert_eq!(p.scene().elements.len(), 1, "and so did its optics");
+    }
+
+    #[test]
+    fn undo_covers_the_active_layer() {
+        // The active layer decides what materializes, so it is part of the state a
+        // snapshot has to restore.
+        let mut p = project();
+        p.place_module(&lens(), [0, 0, 0], Quadrant::R0).unwrap();
+        p.set_active_layer(1).unwrap();
+        assert_eq!(p.scene().elements.len(), 0, "the lens is on layer 0");
+
+        p.undo().unwrap();
+        assert_eq!(p.active_layer(), 0);
+        assert_eq!(p.scene().elements.len(), 1);
+    }
+
+    #[test]
+    fn a_duplicate_is_one_undo_step() {
+        // `duplicate_module` places through `place_module`, which records for it.
+        // Two steps here would mean the user undoing a copy twice.
+        let mut p = project();
+        let a = p.place_module(&lens(), [0, 0, 0], Quadrant::R0).unwrap();
+        p.duplicate_module(&a, [1, 0, 0]).unwrap();
+        assert_eq!(p.setup().instances.len(), 2);
+
+        p.undo().unwrap();
+        assert_eq!(p.setup().instances.len(), 1, "one undo, one copy gone");
+    }
+
+    // --- Ports (§14.6) -----------------------------------------------------
+
+    #[test]
+    fn a_placed_modules_ports_land_in_the_scene_frame() {
+        let mut p = project();
+        p.place_module(&lens(), [1, 0, 0], Quadrant::R0).unwrap();
+        let ports = p.ports();
+        assert_eq!(ports.len(), 2, "the lens fixture declares in and out");
+
+        let out = ports.iter().find(|q| q.port_id == "optical-out").unwrap();
+        // Cell 1 spans x = 25..75, so the +X face is at 75.
+        assert!((out.position_mm[0] - 75.0).abs() < 1e-12, "{out:?}");
+    }
+
+    #[test]
+    fn a_module_with_no_ports_contributes_none() {
+        let mut p = project();
+        p.place_module(&cube(), [0, 0, 0], Quadrant::R0).unwrap();
+        assert!(p.ports().is_empty());
+    }
+
+    #[test]
+    fn ports_follow_a_module_when_it_moves() {
+        let mut p = project();
+        let a = p.place_module(&lens(), [0, 0, 0], Quadrant::R0).unwrap();
+        let before = p.ports()[0].position_mm;
+        p.move_module(&a, [1, 0, 0]).unwrap();
+        let after = p.ports()[0].position_mm;
+        assert!((after[0] - before[0] - 50.0).abs() < 1e-12, "one cell along x");
     }
 
     // --- Unresolved modules ------------------------------------------------
@@ -1274,16 +2408,26 @@ mod tests {
 
     #[test]
     fn a_declared_fragment_whose_asset_is_missing_is_reported() {
-        // The catalogue says the lens has optics, but the asset was never
+        // The catalogue says the mirror has optics, but the asset was never
         // attached. Silence here would look exactly like a layout-only module.
         let cat = Catalog::from_json(&minimal_catalog_json()).unwrap();
         let mut p = OpenUc2Project::new(cat, GridProfile::openuc2_core_50()).unwrap();
-        p.place_module(&lens(), [0, 0, 0], Quadrant::R0).unwrap();
+        p.place_module(&mirror(), [0, 0, 0], Quadrant::R0).unwrap();
         assert!(p.scene().elements.is_empty());
         assert!(matches!(
             p.warnings(),
-            [ProjectWarning::MissingFragmentAsset { asset, .. }] if asset == "assets/lens.ocanvas"
+            [ProjectWarning::MissingFragmentAsset { asset, .. }] if asset == "assets/mirror.ocanvas"
         ));
+    }
+
+    #[test]
+    fn a_generated_module_places_from_an_unattached_catalogue() {
+        // Nothing to attach: the lens is built from the catalogue's own numbers.
+        let cat = Catalog::from_json(&minimal_catalog_json()).unwrap();
+        let mut p = OpenUc2Project::new(cat, GridProfile::openuc2_core_50()).unwrap();
+        p.place_module(&lens(), [0, 0, 0], Quadrant::R0).unwrap();
+        assert_eq!(p.scene().elements.len(), 1, "generated, not fetched");
+        assert!(p.warnings().is_empty(), "{:?}", p.warnings());
     }
 
     #[test]

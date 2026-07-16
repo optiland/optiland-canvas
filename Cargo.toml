@@ -38,7 +38,15 @@ oc-fit = { path = "crates/oc-fit" }
 oc-openuc2 = { path = "crates/oc-openuc2" }
 glam = { version = "0.29", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `float_roundtrip` because `.ocanvas` is the contract other tools build on, and
+# without it serde_json's parser is best-effort: it can return an f64 one ULP off
+# the one that was written. That is not academic. FusedSilica's Sellmeier `c`
+# terms are computed (`0.1162414²`), and the value that came back differed from
+# the builtin catalogue's — so a fused-silica module could not be placed at all,
+# because §10.3 compares a fragment's dispersion against the destination's by
+# equality and correctly refused to merge two glasses that really were different.
+# The write side was always exact; this makes the read side agree.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 rayon = "1"
 
 [profile.release]

@@ -229,6 +229,29 @@ impl GridProfile {
         )
     }
 
+    /// Which cell a Canvas point falls in, on `layer`.
+    ///
+    /// The inverse of [`cell_origin`](Self::cell_origin) in the plane, and the
+    /// snap that turns a pointer into a placement (§15.6). A cell origin is the
+    /// cell's *centre*, so this rounds rather than floors: the cell you are in is
+    /// the one whose centre is nearest, and the boundary falls halfway between.
+    ///
+    /// `z` is passed in rather than derived: height is a layer choice, and the 2D
+    /// tracer has no third coordinate to read one from.
+    pub fn cell_at(&self, canvas: Vec2, layer: i32) -> [i32; 3] {
+        let round = |v: f64, pitch: f64| -> i32 {
+            if pitch.abs() < 1e-9 || !v.is_finite() {
+                return 0;
+            }
+            (v / pitch).round() as i32
+        };
+        [
+            round(canvas.x, self.pitch_mm[0]),
+            round(canvas.y, self.pitch_mm[1]),
+            layer,
+        ]
+    }
+
     /// Is `q` permitted by this profile?
     pub fn allows(&self, q: Quadrant) -> bool {
         self.allowed_rotations_deg.contains(&q.degrees())
@@ -362,6 +385,37 @@ mod tests {
         // plane offset rides on top of it.
         assert_eq!(grid.cell_origin([0, 0, 1]), Uc2Point::new(0.0, 0.0, 60.0));
         assert_eq!(grid.cell_origin([0, 0, 2]), Uc2Point::new(0.0, 0.0, 115.0));
+    }
+
+    #[test]
+    fn a_point_snaps_to_the_cell_it_is_in() {
+        let grid = GridProfile::openuc2_core_50();
+        assert_eq!(grid.cell_at(Vec2::new(0.0, 0.0), 0), [0, 0, 0]);
+        // Anywhere inside the cell picks the cell: its centre is the origin, so
+        // it spans -25..25.
+        assert_eq!(grid.cell_at(Vec2::new(24.9, -24.9), 0), [0, 0, 0]);
+        assert_eq!(grid.cell_at(Vec2::new(100.0, 50.0), 0), [2, 1, 0]);
+        assert_eq!(grid.cell_at(Vec2::new(-100.0, -50.0), 3), [-2, -1, 3]);
+    }
+
+    #[test]
+    fn snapping_is_the_inverse_of_the_cell_origin() {
+        // The round trip that makes a drag land where it looks like it will.
+        let grid = GridProfile::openuc2_core_50();
+        for cell in [[0, 0, 0], [3, -2, 0], [-7, 11, 2]] {
+            let o = grid.cell_origin(cell);
+            let back = grid.cell_at(uc2_to_canvas(o), cell[2]);
+            assert_eq!(back, cell);
+        }
+    }
+
+    #[test]
+    fn a_non_finite_point_snaps_to_the_origin_rather_than_panicking() {
+        // A pointer event cannot produce one, but an `as i32` cast on a NaN is a
+        // silent 0 anyway; being explicit costs nothing.
+        let grid = GridProfile::openuc2_core_50();
+        assert_eq!(grid.cell_at(Vec2::new(f64::NAN, 0.0), 0), [0, 0, 0]);
+        assert_eq!(grid.cell_at(Vec2::new(f64::INFINITY, 0.0), 0), [0, 0, 0]);
     }
 
     #[test]

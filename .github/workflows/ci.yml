@@ -49,7 +49,7 @@ jobs:
         run: pytest tests -q
 
   web:
-    name: web build (wasm + typecheck)
+    name: web build (wasm + typecheck + browser)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -69,3 +69,17 @@ jobs:
       - name: build
         working-directory: web
         run: npm run build
+      - name: install browser
+        working-directory: web
+        run: npx playwright install --with-deps chromium
+      # The openUC2 route driven the way a user drives it (§19.5). Playwright
+      # serves the build above; nothing here reaches into the wasm handle.
+      - name: browser tests
+        working-directory: web
+        run: npm run test:e2e
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: web/playwright-report/
+          retention-days: 7

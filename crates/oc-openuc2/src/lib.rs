@@ -52,6 +52,9 @@
 pub mod catalog;
 pub mod coordinates;
 pub mod errors;
+pub mod generator;
+mod history;
+pub mod ports;
 pub mod project;
 pub mod setup;
 
@@ -67,6 +70,8 @@ pub use coordinates::{
     Quadrant, ThreePoint, Uc2Point,
 };
 pub use errors::{Error, PlacementError, ProjectWarning};
+pub use generator::{Generator, Paraxial, SingletParams};
+pub use ports::{Misalignment, PlacedPort, PortStatus};
 pub use project::{Bom, BomLine, FlatExport, MaterializedInstance, OpenUc2Project, SceneObjectId};
 pub use setup::{
     CatalogPin, CustomCanvas, InstanceFallback, OpenUc2Setup, Placement, SetupInstance,

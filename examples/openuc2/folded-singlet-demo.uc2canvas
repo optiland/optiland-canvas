@@ -1,0 +1,137 @@
+{
+  "format": "openuc2-canvas-setup",
+  "version": "1.0.0",
+  "metadata": {
+    "name": "",
+    "description": "",
+    "author": "",
+    "created": null,
+    "modified": null
+  },
+  "catalog": {
+    "repository": "example/optiland-canvas-dev-fixture",
+    "commit": "0000000000000000000000000000000000000000",
+    "catalog_sha256": "",
+    "grid_profile": "openuc2-core-50"
+  },
+  "view": {
+    "active_layer": 0,
+    "trace_plane": "XY",
+    "show_footprints": true,
+    "show_ports": false,
+    "show_optical_geometry": true
+  },
+  "instances": [
+    {
+      "instance_id": "m-0001",
+      "module_uuid": "11111111-1111-4111-8111-000000000001",
+      "module_version": "1.0.0",
+      "fallback": {
+        "module_id": "source-collimated-3line-1x1",
+        "name": "Three-line collimated source module",
+        "color": null,
+        "footprint_cells": [
+          [
+            0,
+            0,
+            0
+          ]
+        ]
+      },
+      "placement": {
+        "anchor_grid": [
+          0,
+          0,
+          0
+        ],
+        "rotation_quadrants": 0
+      },
+      "parameter_overrides": {},
+      "enabled": true
+    },
+    {
+      "instance_id": "m-0002",
+      "module_uuid": "11111111-1111-4111-8111-000000000002",
+      "module_version": "1.0.0",
+      "fallback": {
+        "module_id": "lens-pcx-nbk7-1x1",
+        "name": "N-BK7 singlet lens module",
+        "color": "#7CC142",
+        "footprint_cells": [
+          [
+            0,
+            0,
+            0
+          ]
+        ]
+      },
+      "placement": {
+        "anchor_grid": [
+          1,
+          0,
+          0
+        ],
+        "rotation_quadrants": 0
+      },
+      "parameter_overrides": {},
+      "enabled": true
+    },
+    {
+      "instance_id": "m-0003",
+      "module_uuid": "11111111-1111-4111-8111-000000000003",
+      "module_version": "1.0.0",
+      "fallback": {
+        "module_id": "mirror-flat-45-1x1",
+        "name": "45 degree fold mirror module",
+        "color": null,
+        "footprint_cells": [
+          [
+            0,
+            0,
+            0
+          ]
+        ]
+      },
+      "placement": {
+        "anchor_grid": [
+          2,
+          0,
+          0
+        ],
+        "rotation_quadrants": 0
+      },
+      "parameter_overrides": {},
+      "enabled": true
+    },
+    {
+      "instance_id": "m-0004",
+      "module_uuid": "11111111-1111-4111-8111-000000000004",
+      "module_version": "1.0.0",
+      "fallback": {
+        "module_id": "detector-line-1x1",
+        "name": "Camera cross-section module",
+        "color": null,
+        "footprint_cells": [
+          [
+            0,
+            0,
+            0
+          ]
+        ]
+      },
+      "placement": {
+        "anchor_grid": [
+          2,
+          -1,
+          0
+        ],
+        "rotation_quadrants": 3
+      },
+      "parameter_overrides": {},
+      "enabled": true
+    }
+  ],
+  "custom_canvas": {
+    "ocanvas": null
+  }
+}

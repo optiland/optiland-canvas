@@ -49,6 +49,33 @@ circle. `Edge::is_full_turn_arc` identifies the representation for validators
 that need to reject it; the portable spelling is two semicircular arcs, which
 every build reads the same way.
 
+## Floats round-trip exactly
+
+A number that goes out comes back as the *same* `f64`, not a near one. This is
+part of the contract: `.ocanvas` is what other tools build on, and a scene that
+changed slightly every time it was saved and loaded would not be a format.
+
+It needs saying because it is not free. `serde_json`'s parser is best-effort
+unless the **`float_roundtrip`** feature is on, and without it a value can come
+back one ULP away from the one written. The workspace enables it, and
+`every_glass_survives_a_round_trip_bit_for_bit` holds the line.
+
+That was not hypothetical. The builtin catalogue's fused-silica Sellmeier `c`
+terms are *computed* (`0.1162414²`) rather than written as literals, and the
+best-effort parse changed them. Dispersion is compared by equality when a module
+fragment merges into a scene, so the effect was that a fused-silica module could
+not be placed at all: it was refused as a glass conflict with the very catalogue
+it came from. The write side was always exact; the read side now agrees.
+
+Anything writing `.ocanvas` from another language should hold itself to the same
+rule — emit shortest-round-trip floats, and parse them back exactly.
+
+Note the one number JSON cannot hold at all: **infinity**. It is not a legal JSON
+number, so nothing in a scene may serialize one (`json!(f64::INFINITY)` silently
+becomes `null`). Where an openUC2 module descriptor needs an infinite radius for
+a plane surface, it carries the string `"inf"`; see
+[openuc2/module-fragments.md](openuc2/module-fragments.md).
+
 ## Top-level shape
 
 | Field | Type | Meaning |

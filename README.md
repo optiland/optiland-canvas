@@ -1,6 +1,6 @@
 # Optiland Canvas
 
-**A browser-based, real-time optical sketchpad. Draw an optical system and watch the light move. There is no "run" button.**
+A browser-based, real-time optical sketchpad. Draw an optical system and watch the light move.
 
 Rust → WebAssembly → WebGPU. Part of the [Optiland](https://github.com/optiland/optiland) family: use the canvas to *ideate*, then hand the design off to Optiland for rigorous analysis.
 
@@ -14,30 +14,30 @@ Rust → WebAssembly → WebGPU. Part of the [Optiland](https://github.com/optil
 
 Optiland Canvas is a tool for the *ideation* phase of optical design, the part before you commit to a prescription. It is a 2D (meridional-plane), non-sequential geometric ray tracer wrapped in a canvas-style UI: sketch lenses, mirrors, and prisms freehand, drag them around, and see refraction, reflection, TIR, dispersion, and stray-light ghosts update live. When a design is worth pursuing, export it to [Optiland](https://github.com/optiland/optiland), the Python engine for optimization, tolerancing, and full analysis.
 
-**Why 2D.** For a rotationally symmetric system the meridional cross-section *is* the design. For prisms and folded paths, the top-down plane is how designers already sketch. 2D is also where real-time interactivity is tractable, and interactivity is the point.
+**Why 2D.** For a rotationally symmetric system the meridional cross-section *is* the design. For prisms and folded paths, the top-down plane is how designers already sketch. 2D is also where a full retrace fits inside a 16 ms frame.
 
 ## Features
 
 **Optics**
 - Non-sequential ray tracing: refraction, reflection, total internal reflection, Fresnel splitting, ghost reflections, Beer–Lambert absorption.
 - Per-ray dispersion: closed-form Cauchy from an `(n_d, V_d)` point, or full Sellmeier for catalog glasses. Chromatic spread is a first-class output, not a post-process.
-- Spectral rendering: rays colored by wavelength, so dispersion looks like dispersion. Toggle the ghost layer and TIR highlight live.
-- The **Abbe glass map is the material picker**: hover to reassign glass and watch the focus re-converge. The obtainable region is bounded, so you can't paint with glass that doesn't exist.
+- Spectral rendering: rays colored by wavelength. Toggle the ghost layer and TIR highlight live.
+- The Abbe glass map is the material picker: hover to reassign glass and watch the focus re-converge. The obtainable region is bounded, so you can't paint with glass that doesn't exist.
 - Live detectors: irradiance histogram, flux-weighted centroid, optical path length.
 
 **Interaction**
-- **Draw a surface freehand** and it's fit to a parametric curve (`line → arc → conic → asphere → spline`) with a **complexity slider** that trades manufacturability against fit residual in real time.
-- Every parameter has an on-canvas handle **and** a numeric twin. Drag the handle or scrub the number, and the light follows. No Apply button, no modal dialogs.
+- Draw a surface freehand and it's fit to a parametric curve (`line → arc → conic → asphere → spline`) with a complexity slider that trades manufacturability against fit residual in real time.
+- Every parameter has an on-canvas handle and a numeric twin. Drag the handle or scrub the number, and the light follows. No Apply button, no modal dialogs.
 - Pop-up inspector cards (several at once, one per element), an adjustable grid with snapping, copy/paste/delete, per-parameter and whole-element pinning, plus zoom & pan.
 
 **Workflow**
-- **Layers** with show/hide and per-layer opacity; **onion-skin** hidden layers to compare candidate architectures superimposed, and flip between them.
-- A **non-linear undo tree**: every settled edit snapshots the scene, branches are visible in a sidebar, and you can jump to any of them (not just a flat undo stack).
-- A **variation gallery**: save designs as live, independently-traced thumbnails and compare them on the same detector, then click to load one.
-- **Wavefront scrub**: a timeline that draws rays only up to a propagation time *t* (clipped by cumulative optical path length), so you can watch the front sweep through the system.
+- Layers with show/hide and per-layer opacity; onion-skin hidden layers to compare candidate architectures superimposed, and flip between them.
+- A non-linear undo tree: every settled edit snapshots the scene, branches are visible in a sidebar, and you can jump to any of them (not just a flat undo stack).
+- A variation gallery: save designs as live, independently-traced thumbnails and compare them on the same detector, then click to load one.
+- Wavefront scrub: a timeline that draws rays only up to a propagation time *t* (clipped by cumulative optical path length), so you can watch the front sweep through the system.
 
 **Under the hood**
-- **Two-tier tracer:** a fast f32 path (GPU compute via `wgpu`, with a CPU fallback) draws the picture; an exact f64 reference computes every displayed *number*. Numbers never come from the fast path.
+- Two-tier tracer: a fast f32 path (GPU compute via `wgpu`, with a CPU fallback) draws the picture; an exact f64 reference computes every displayed *number*. Numbers never come from the fast path.
 - Scene state lives in Rust; the browser holds only UI state.
 - `.ocanvas`: a plain-JSON, human-readable, diffable scene format.
 
@@ -54,7 +54,7 @@ npm install
 npm run dev          # builds the wasm, starts Vite; open the printed URL
 ```
 
-Then pick the **draw** tool and sketch a lens surface, slide the complexity slider, double-click an element to inspect it, drag it around, and scroll to zoom. A WebGPU-capable browser uses the GPU tracer; others fall back to CPU.
+Then pick the draw tool and sketch a lens surface, slide the complexity slider, double-click an element to inspect it, drag it around, and scroll to zoom. A WebGPU-capable browser uses the GPU tracer; others fall back to CPU.
 
 Prefer the engine without the UI?
 
@@ -81,11 +81,11 @@ The fast (f32) and exact (f64) tracers are cross-validated on every `cargo test`
 
 The reference tracer also agrees with analytic solutions (Snell's law, the TIR critical angle, thin-lens focus, the parabolic mirror, and Fresnel R/T at normal and Brewster incidence) to between 10⁻⁶ and 10⁻¹².
 
-A **performance-regression gate** (`cargo test -p oc-gpu --release --test perf_regression`) keeps every path (f64 CPU, f32 CPU, and f32 GPU on each `wgpu` adapter) from regressing against a committed baseline. CPU costs are machine-normalized so the baseline is portable; real GPUs must additionally hold the ≤ 8 ms @ 2k×8 budget.
+A performance-regression gate (`cargo test -p oc-gpu --release --test perf_regression`) keeps every path (f64 CPU, f32 CPU, and f32 GPU on each `wgpu` adapter) from regressing against a committed baseline. CPU costs are machine-normalized so the baseline is portable; real GPUs must additionally hold the ≤ 8 ms @ 2k×8 budget.
 
 ## Validated against Optiland
 
-Beyond the internal f32/f64 cross-check, the f64 reference tracer's **forward trace is validated against the main [Optiland](https://github.com/optiland/optiland) engine**, the 3D sequential tracer this canvas hands designs off to. Matched rotationally-symmetric systems are traced in both and their final ray **position** and **direction** compared meridional-ray by meridional-ray (canvas `+x` ↔ Optiland `+z`):
+Beyond the internal f32/f64 cross-check, the f64 reference tracer's forward trace is validated against the main [Optiland](https://github.com/optiland/optiland) engine, the 3D sequential tracer this canvas hands designs off to. Matched rotationally-symmetric systems are traced in both and their final ray position and direction compared meridional-ray by meridional-ray (canvas `+x` ↔ Optiland `+z`):
 
 | Case (constant index unless noted) | Worst Δ direction | Worst Δ position |
 |---|---|---|
@@ -98,12 +98,12 @@ Beyond the internal f32/f64 cross-check, the f64 reference tracer's **forward tr
 
 The two engines are numerically identical on the forward trace: vector Snell's-law refraction and reflection agree to machine precision, and the N-BK7 Sellmeier index is bit-identical. Even aspheres agree to ~10⁻⁹ because both sides run an independent Newton solver seeded by the analytic conic: the reference finds the intersection *point* to machine precision but takes its surface normal by finite difference. (Positions are compared after removing the reference tracer's deliberate 10⁻⁷ mm ray-spawn offset.) See [`validation/`](validation/) to reproduce.
 
-The **wavefront** is validated the same way. A wavefront is a surface of constant optical path, so the M4 wavefront scrub draws the equal-OPL locus, and the wavefront aberration is the **optical path difference**, each ray's OPL to the image plane relative to the axial ray. The reference tracer's `Σ nᵢ·dᵢ` matches Optiland's `RealRays.opd` in OPD to **≤ 4 × 10⁻¹⁴ mm** on spheres and **≤ 8 × 10⁻¹⁰ mm** with N-BK7 dispersion (the even-asphere case reaches ~2 × 10⁻⁸ mm, bounded by the same finite-difference normal). Taking OPD relative to the axial ray cancels the ray-spawn-offset piston. `cargo test -p oc-trace --test wavefront` locks two of these Optiland OPD sets in as golden values.
+The wavefront is validated the same way. A wavefront is a surface of constant optical path, so the M4 wavefront scrub draws the equal-OPL locus, and the wavefront aberration is the optical path difference, each ray's OPL to the image plane relative to the axial ray. The reference tracer's `Σ nᵢ·dᵢ` matches Optiland's `RealRays.opd` in OPD to ≤ 4 × 10⁻¹⁴ mm on spheres and ≤ 8 × 10⁻¹⁰ mm with N-BK7 dispersion (the even-asphere case reaches ~2 × 10⁻⁸ mm, bounded by the same finite-difference normal). Taking OPD relative to the axial ray cancels the ray-spawn-offset piston. `cargo test -p oc-trace --test wavefront` locks two of these Optiland OPD sets in as golden values.
 
 ## The handoff to Optiland
 
 The canvas decides *what* to build; [Optiland](https://github.com/optiland/optiland)
-makes it right. That seam is M5: the `.ocanvas` format is **frozen and versioned**
+makes it right. That seam is M5: the `.ocanvas` format is frozen and versioned
 (documented in [`docs/ocanvas-format.md`](docs/ocanvas-format.md)), and the
 [`oc-py`](crates/oc-py) PyO3 crate round-trips a scene to an Optiland `Optic` and
 back.
@@ -126,11 +126,11 @@ optic.draw(); plt.show()                       # Optiland's own layout plot
 open("out.ocanvas", "w").write(oc.from_optic(optic))   # import: Optic → scene
 ```
 
-Export is **exact** for the rotationally-symmetric refractive subset: a
+Export is exact for the rotationally-symmetric refractive subset: a
 prescription survives `scene → Optic → scene` with parameter-level equality,
 asserted on a corpus of singlets, doublets, aspheres, and cemented pairs in both
 Rust (`cargo test -p oc-core`) and Python (`pytest crates/oc-py/tests`, against a
-live Optiland). Fidelity is **reported, never faked**: anything the
+live Optiland). Fidelity is reported, never faked: anything the
 sequential model can't hold (splines, GRIN, tilted or off-axis surfaces) comes
 back as a `FidelityWarning` (or a hard error under `strict=True`), not a silent
 approximation. "A tool that lies about fidelity is worthless to a professional."
@@ -151,7 +151,7 @@ crates/
 web/         Vite + TypeScript UI shell
 ```
 
-Everything is f64 in the core; wavelengths are in micrometres. The kernel is a library first: if the UI disappeared, the crates would still be worth using on their own.
+Everything is f64 in the core; wavelengths are in micrometres. The kernel is a library first: `oc-core` and `oc-trace` depend on neither the UI nor wasm, and between them pull only `glam`, `serde`, and an optional `rayon`.
 
 ## openUC2 mode
 
@@ -174,11 +174,11 @@ Start with [`docs/openuc2/architecture.md`](docs/openuc2/architecture.md), or op
 | [catalogue.md](docs/openuc2/catalogue.md) | how the catalogue is built and pinned |
 | [setup-format.md](docs/openuc2/setup-format.md) | `.uc2canvas` and the flat `.ocanvas` export |
 | [module-fragments.md](docs/openuc2/module-fragments.md) | a module's optics, and the id hazards |
-| [fidelity.md](docs/openuc2/fidelity.md) | **what this engine will not claim** |
+| [fidelity.md](docs/openuc2/fidelity.md) | what this engine will not claim |
 
 ## Contributing
 
-Contributions are welcome! A few principles guide the project, worth knowing before a large change:
+A few principles guide the project, worth knowing before a large change:
 
 - **Feedback beats completeness.** When a trade-off pits physical exactness against sub-16 ms response, response wins; the exact answer is computed on idle by the reference tracer. **Never display a number that came from the fast f32 path.**
 - **The two tracers must agree.** The f32/f64 cross-validation (`cargo test -p oc-gpu`) is the guard rail: a fast tracer that quietly disagrees with the exact one is worse than none. Keep it green.

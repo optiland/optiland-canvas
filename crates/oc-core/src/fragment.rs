@@ -73,6 +73,16 @@ pub enum FragmentError {
     /// Two glasses share a name but disagree on dispersion, so neither the
     /// fragment's nor the destination's optics can be preserved by merging.
     GlassConflict { name: String },
+    /// A glass the fragment carries is malformed and must not reach a catalog.
+    InvalidGlass {
+        /// Index into the fragment's own `glasses`.
+        index: usize,
+        /// The glass's name, for diagnostics. Empty when that is the defect.
+        name: String,
+        /// What is wrong: `"name is empty"`, `"Sellmeier coefficients are not
+        /// finite"`, `"cached nd/vd are not finite"`.
+        what: &'static str,
+    },
     /// A material that cannot be carried through a rigid transform.
     UnsupportedMaterial { element: usize, what: &'static str },
     /// A batch operation named an object the scene does not contain.
@@ -100,6 +110,9 @@ impl fmt::Display for FragmentError {
                 "glass {name:?} exists in both the fragment and the scene with different \
                  dispersion data; rename one, as merging would change the optics of the other"
             ),
+            FragmentError::InvalidGlass { index, name, what } => {
+                write!(f, "fragment glass {index} ({name:?}): {what}")
+            }
             FragmentError::UnsupportedMaterial { element, what } => write!(
                 f,
                 "element {element} has material {what}, which cannot be rigidly transformed"
@@ -305,6 +318,8 @@ impl SceneFragment {
 
     /// Reject anything that cannot be placed, before any of it is placed.
     fn validate(&self) -> Result<(), FragmentError> {
+        self.validate_glasses()?;
+
         for (i, e) in self.elements.iter().enumerate() {
             if !e.transform.is_finite() {
                 return Err(FragmentError::NonFinite {
@@ -359,6 +374,53 @@ impl SceneFragment {
                 return Err(FragmentError::NonFinite {
                     what: "detector endpoint",
                     index: i,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Reject malformed glasses before any of them can reach a catalog.
+    ///
+    /// Checks **every** carried glass, not only the referenced ones that
+    /// [`Scene::insert_fragment`] will actually merge. A fragment carrying a
+    /// glass with no name or non-finite dispersion is malformed whatever its
+    /// elements happen to point at, and the table is the one part of a fragment
+    /// that outlives insertion: a bad entry merged today is a wrong index
+    /// tomorrow. Catching it here means a corrupt module file fails at load
+    /// rather than at trace.
+    ///
+    /// Each defect is worth its own check:
+    ///
+    /// - **Name.** The name is the merge key ([`GlassCatalog::intern`] matches on
+    ///   it case-insensitively), so an empty or blank one cannot identify a
+    ///   glass, and two such entries would silently alias each other.
+    /// - **Sellmeier coefficients.** These are the authoritative dispersion data
+    ///   and decide merge identity. A NaN never compares equal, so a NaN-bearing
+    ///   glass would defeat the conflict check and append a fresh entry on every
+    ///   insertion; an infinite coefficient poisons `n(λ)` into NaN, and a NaN
+    ///   index propagates silently through refraction rather than raising.
+    /// - **Cached `nd`/`vd`.** These are derived, and do *not* decide identity
+    ///   (§10.3), but they are read directly by the glass-map UI and by Abbe
+    ///   fitting. They can be non-finite even when `sell` is clean: `abbe_number`
+    ///   divides by `n_F − n_C`, which is zero for a dispersionless glass, so
+    ///   `vd` alone can be infinite. Checking them is not redundant.
+    fn validate_glasses(&self) -> Result<(), FragmentError> {
+        for (index, glass) in self.glasses.iter().enumerate() {
+            let defect = if glass.name.trim().is_empty() {
+                Some("name is empty")
+            } else if !glass.sell.b.iter().chain(&glass.sell.c).all(|v| v.is_finite()) {
+                Some("Sellmeier coefficients are not finite")
+            } else if !glass.nd.is_finite() || !glass.vd.is_finite() {
+                Some("cached nd/vd are not finite")
+            } else {
+                None
+            };
+            if let Some(what) = defect {
+                return Err(FragmentError::InvalidGlass {
+                    index,
+                    name: glass.name.clone(),
+                    what,
                 });
             }
         }
@@ -624,7 +686,7 @@ impl Scene {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::material::{abbe_number, Sellmeier};
+    use crate::material::{abbe_number, Sellmeier, LAMBDA_D};
     use crate::scene::{SourceKind, Spectrum};
     use crate::vec::Vec2;
     use std::f64::consts::FRAC_PI_2;
@@ -783,6 +845,183 @@ mod tests {
         );
         assert!(scene.elements.is_empty(), "insert must be atomic");
         assert_eq!(scene.catalog.len(), catalog_before);
+    }
+
+    // --- Malformed carried glasses -----------------------------------------
+
+    /// `made_up_glass`, then broken by `f`.
+    fn broken_glass(name: &str, f: impl FnOnce(&mut Glass)) -> Glass {
+        let mut g = made_up_glass(name);
+        f(&mut g);
+        g
+    }
+
+    /// A fragment referencing `glass` as its only element's material.
+    fn fragment_using(glass: Glass) -> SceneFragment {
+        fragment_of(
+            Material::Catalog(GlassId(0)),
+            vec![glass],
+            vec![Layer::default()],
+        )
+    }
+
+    #[test]
+    fn insert_rejects_a_glass_with_an_empty_name() {
+        let mut scene = Scene::new();
+        let fragment = fragment_using(broken_glass("X", |g| g.name = String::new()));
+        assert_eq!(
+            scene.insert_fragment(&fragment, Transform2::IDENTITY),
+            Err(FragmentError::InvalidGlass {
+                index: 0,
+                name: String::new(),
+                what: "name is empty",
+            })
+        );
+        assert!(scene.elements.is_empty());
+    }
+
+    #[test]
+    fn insert_rejects_a_glass_named_only_whitespace() {
+        // The name is the merge key, so a blank one identifies nothing.
+        let mut scene = Scene::new();
+        let fragment = fragment_using(broken_glass("X", |g| g.name = "  \t ".to_string()));
+        assert!(matches!(
+            scene.insert_fragment(&fragment, Transform2::IDENTITY),
+            Err(FragmentError::InvalidGlass {
+                what: "name is empty",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn insert_rejects_non_finite_sellmeier_coefficients() {
+        let catalog_before = Scene::new().catalog.len();
+        // Every coefficient is authoritative dispersion data; none may be junk.
+        let cases: Vec<(&str, Glass)> = vec![
+            ("b[0] NaN", broken_glass("A", |g| g.sell.b[0] = f64::NAN)),
+            ("b[2] inf", broken_glass("B", |g| g.sell.b[2] = f64::INFINITY)),
+            ("c[0] inf", broken_glass("C", |g| g.sell.c[0] = f64::INFINITY)),
+            (
+                "c[1] -inf",
+                broken_glass("D", |g| g.sell.c[1] = f64::NEG_INFINITY),
+            ),
+            ("c[2] NaN", broken_glass("E", |g| g.sell.c[2] = f64::NAN)),
+        ];
+        for (label, glass) in cases {
+            let mut scene = Scene::new();
+            let err = scene
+                .insert_fragment(&fragment_using(glass), Transform2::IDENTITY)
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    FragmentError::InvalidGlass {
+                        what: "Sellmeier coefficients are not finite",
+                        ..
+                    }
+                ),
+                "{label}: expected a Sellmeier defect, got {err:?}"
+            );
+            assert!(scene.elements.is_empty(), "{label}: must not mutate");
+            assert_eq!(scene.catalog.len(), catalog_before, "{label}: must not merge");
+        }
+    }
+
+    #[test]
+    fn insert_rejects_non_finite_cached_nd_or_vd() {
+        // `nd`/`vd` are caches and do not decide merge identity, but they are read
+        // directly by the glass map, and `vd` can be infinite on its own: it
+        // divides by (n_F - n_C), which vanishes for a dispersionless glass.
+        for (label, glass) in [
+            ("nd NaN", broken_glass("A", |g| g.nd = f64::NAN)),
+            ("vd inf", broken_glass("B", |g| g.vd = f64::INFINITY)),
+        ] {
+            let mut scene = Scene::new();
+            let err = scene
+                .insert_fragment(&fragment_using(glass), Transform2::IDENTITY)
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    FragmentError::InvalidGlass {
+                        what: "cached nd/vd are not finite",
+                        ..
+                    }
+                ),
+                "{label}: expected an nd/vd defect, got {err:?}"
+            );
+            assert!(scene.elements.is_empty(), "{label}: must not mutate");
+        }
+    }
+
+    #[test]
+    fn a_dispersionless_glass_has_infinite_vd_and_is_rejected() {
+        // Not a synthetic case: a glass whose index does not vary with wavelength
+        // gives n_F - n_C = 0, so `abbe_number` returns infinity. Such a glass
+        // reaches the Abbe map as a non-finite point.
+        let flat = Sellmeier {
+            b: [0.5, 0.0, 0.0],
+            c: [0.0, 0.0, 0.0],
+        };
+        let vd = abbe_number(&flat);
+        assert!(!vd.is_finite(), "expected an infinite Abbe number, got {vd}");
+
+        let glass = Glass {
+            name: "FLAT".to_string(),
+            nd: flat.index(LAMBDA_D),
+            vd,
+            sell: flat,
+        };
+        let mut scene = Scene::new();
+        assert!(matches!(
+            scene.insert_fragment(&fragment_using(glass), Transform2::IDENTITY),
+            Err(FragmentError::InvalidGlass {
+                what: "cached nd/vd are not finite",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn an_unreferenced_carried_glass_is_still_validated() {
+        // Only referenced glasses merge, but validation covers the whole table: a
+        // fragment carrying a malformed glass is malformed regardless of what its
+        // elements point at, and the bad entry would outlive this insertion.
+        let mut scene = Scene::new();
+        let fragment = fragment_of(
+            Material::Absorber, // references no glass at all
+            vec![broken_glass("UNUSED", |g| g.sell.b[0] = f64::NAN)],
+            vec![Layer::default()],
+        );
+        assert!(matches!(
+            scene.insert_fragment(&fragment, Transform2::IDENTITY),
+            Err(FragmentError::InvalidGlass { index: 0, .. })
+        ));
+        assert!(scene.elements.is_empty());
+    }
+
+    #[test]
+    fn from_scene_rejects_a_scene_carrying_a_malformed_glass() {
+        // The check runs at fragment construction too, so a corrupt module file
+        // fails at load rather than surfacing later at insertion.
+        let mut scene = Scene::new();
+        scene.catalog.intern(&broken_glass("BAD", |g| g.nd = f64::NAN));
+        assert!(matches!(
+            SceneFragment::from_scene(&scene),
+            Err(FragmentError::InvalidGlass { .. })
+        ));
+    }
+
+    #[test]
+    fn well_formed_glasses_still_insert() {
+        // Guard the guard: the new validation must not reject good glasses.
+        let mut scene = Scene::new();
+        let fragment = fragment_using(builtin_glass("N-BK7"));
+        assert!(scene.insert_fragment(&fragment, Transform2::IDENTITY).is_ok());
+        assert_eq!(scene.elements.len(), 1);
+        // The whole builtin catalog is well-formed.
+        assert!(SceneFragment::from_scene(&Scene::new()).is_ok());
     }
 
     #[test]

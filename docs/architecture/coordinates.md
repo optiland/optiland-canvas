@@ -12,8 +12,13 @@ and **no code anywhere else reorders an axis inline**. That rule is
 the same rule `oc-openuc2` has followed since it was written.
 
 Implemented in
-[`crates/oc-core/src/coordinates.rs`](../../crates/oc-core/src/coordinates.rs)
-(behind `scene3`; bodies land in PR 3D-01).
+[`crates/oc-core/src/coordinates.rs`](../../crates/oc-core/src/coordinates.rs).
+`oc-openuc2` calls it rather than keeping its own copy of the Three.js mapping.
+
+The module is **not** behind `scene3`. Gating it would have left `oc-openuc2`
+with two choices, a duplicate mapping or forcing the feature on for the whole
+default build, and the first is exactly the drift this page exists to prevent.
+Frame conversion is neither incomplete nor physics, so it ships.
 
 ## The canonical frame
 
@@ -93,8 +98,7 @@ the value the openUC2 suite already pins.
 
 ## What is tested
 
-In [`coordinates.rs`](../../crates/oc-core/src/coordinates.rs), and red until
-PR 3D-01:
+In [`coordinates.rs`](../../crates/oc-core/src/coordinates.rs):
 
 - each mapping sends the basis vectors exactly where the tables above say;
 - `canvas +x ↔ optiland +z` and `y ↔ y`, so the meridional relationship holds;
@@ -108,3 +112,8 @@ PR 3D-01:
   and an incidence angle survives the trip. This one is a tolerance, because
   permuting components reorders the sums inside `dot` and f64 addition is not
   associative. The claim under test is orthogonality, not a bit pattern.
+
+And in [`oc-openuc2`](../../crates/oc-openuc2/src/coordinates.rs), the drift
+guard: `uc2_to_three` is asserted to agree with `canvas_to_three` on the pinned
+point and on arbitrary ones, so the delegation cannot rot back into a second
+convention.

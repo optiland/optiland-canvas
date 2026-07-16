@@ -12,6 +12,10 @@ default = ["parallel"]
 # rayon-parallel tracing. Off for wasm32 (no threads) — the reference then runs
 # serially, which is fine for the on-idle "numbers come from the reference" path.
 parallel = ["dep:rayon"]
+# The f64 full-3D reference tracer (PR 3D-04). Implies the 3D scene model, since
+# there is nothing to trace without one. Off by default: while it is incomplete
+# it must not be reachable from anything that displays a number.
+trace3 = ["oc-core/scene3"]
 
 [dependencies]
 oc-core.workspace = true

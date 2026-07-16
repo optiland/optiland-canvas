@@ -6,12 +6,21 @@ members = [
     "crates/oc-gpu",
     "crates/oc-fit",
     "crates/oc-wasm",
+    "crates/oc-py",
 ]
 
-# Future-milestone crates (see README "Milestones"). They are intentionally
-# NOT workspace members yet so that `cargo test` stays green with a minimal
-# dependency footprint:
-#   crates/oc-py    (M5)  PyO3 bindings; Optiland import/export
+# `oc-py` (M5) is a PyO3 cdylib built into the `optiland_canvas` Python wheel via
+# maturin. It is a workspace *member* but excluded from `default-members`, so a
+# bare `cargo test` / `cargo build` stays Python-free and fast; build it
+# explicitly with `maturin develop` (see crates/oc-py/README.md) or
+# `cargo build -p oc-py`.
+default-members = [
+    "crates/oc-core",
+    "crates/oc-trace",
+    "crates/oc-gpu",
+    "crates/oc-fit",
+    "crates/oc-wasm",
+]
 
 [workspace.package]
 version = "0.0.1"

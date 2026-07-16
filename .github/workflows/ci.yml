@@ -20,10 +20,33 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      # oc-py is a PyO3 crate exercised in the `python-bridge` job below; keep it
+      # out of the pure-Rust job so this stays Python-free and fast.
       - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --exclude oc-py --all-targets -- -D warnings
       - name: test
-        run: cargo test --workspace
+        run: cargo test --workspace --exclude oc-py
+
+  python-bridge:
+    name: python bridge (optiland round-trip)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: clippy (oc-py)
+        run: cargo clippy -p oc-py --all-targets -- -D warnings
+      - name: build + install (maturin backend) with test deps
+        working-directory: crates/oc-py
+        run: pip install '.[test]'
+      - name: pytest (.ocanvas ⇄ Optiland Optic round-trip)
+        working-directory: crates/oc-py
+        run: pytest tests -q
 
   web:
     name: web build (wasm + typecheck)

@@ -6,7 +6,7 @@ Rust → WebAssembly → WebGPU. Part of the [Optiland](https://github.com/optil
 
 > **The one rule: there is never a "run" button.** Move a lens and the light moves. Scrub a glass value and the chromatic spread breathes. Drag a mirror to a grazing angle and total internal reflection lights up while your finger is still down. Every trade-off resolves toward sub-16 ms feedback; exact numbers settle a moment after you let go, computed by an f64 reference tracer.
 
-**Status:** M0–M4 complete and green, under active development (see the [roadmap](#roadmap)).
+**Status:** M0–M5 complete and green, under active development (see the [roadmap](#roadmap)).
 
 ---
 
@@ -100,6 +100,43 @@ The two engines are numerically identical on the forward trace: vector Snell's-l
 
 The **wavefront** is validated the same way. A wavefront is a surface of constant optical path, so the M4 wavefront scrub draws the equal-OPL locus, and the wavefront aberration is the **optical path difference** — each ray's OPL to the image plane relative to the axial ray. The reference tracer's `Σ nᵢ·dᵢ` matches Optiland's `RealRays.opd` in OPD to **≤ 4 × 10⁻¹⁴ mm** on spheres and **≤ 8 × 10⁻¹⁰ mm** with N-BK7 dispersion (the even-asphere case reaches ~2 × 10⁻⁸ mm, bounded by the same finite-difference normal). Taking OPD relative to the axial ray cancels the ray-spawn-offset piston. `cargo test -p oc-trace --test wavefront` locks two of these Optiland OPD sets in as golden values.
 
+## The handoff to Optiland
+
+The canvas decides *what* to build; [Optiland](https://github.com/optiland/optiland)
+makes it right. That seam is M5: the `.ocanvas` format is **frozen and versioned**
+(documented in [`docs/ocanvas-format.md`](docs/ocanvas-format.md)), and the
+[`oc-py`](crates/oc-py) PyO3 crate round-trips a scene to an Optiland `Optic` and
+back.
+
+Sketch a system in the browser and hit **⤓ save .ocanvas** (the Scene panel, top
+left); **⤒ open** loads one back. Then hand the file to Optiland in Python:
+
+```sh
+cd crates/oc-py && maturin develop --release   # build the `optiland_canvas` wheel
+pip install optiland
+```
+
+```python
+import optiland_canvas as oc
+import matplotlib.pyplot as plt
+
+optic = oc.to_optic("design.ocanvas")          # export: scene → Optiland Optic
+optic.draw(); plt.show()                       # Optiland's own layout plot
+
+open("out.ocanvas", "w").write(oc.from_optic(optic))   # import: Optic → scene
+```
+
+That is the whole loop: sketch it here, analyse it there, bring it back.
+
+Export is **exact** for the rotationally-symmetric refractive subset — a
+prescription survives `scene → Optic → scene` with parameter-level equality,
+asserted on a corpus of singlets, doublets, aspheres, and cemented pairs in both
+Rust (`cargo test -p oc-core`) and Python (`pytest crates/oc-py/tests`, against a
+live Optiland). Crucially, fidelity is **reported, never faked**: anything the
+sequential model can't hold — splines, GRIN, tilted or off-axis surfaces — comes
+back as a `FidelityWarning` (or a hard error under `strict=True`), not a silent
+approximation. "A tool that lies about fidelity is worthless to a professional."
+
 ## Architecture
 
 A Cargo workspace of small crates plus a TypeScript shell:
@@ -111,6 +148,7 @@ crates/
   oc-gpu     interactive tracer — wgpu compute (f32) + CPU-f32 fallback
   oc-fit     freehand stroke → parametric surface fitting
   oc-wasm    wasm-bindgen bindings; the browser's handle to the scene
+  oc-py      PyO3 bindings; .ocanvas ⇄ Optiland Optic round-trip
 web/         Vite + TypeScript UI shell
 ```
 
@@ -144,7 +182,7 @@ Each milestone ships something you can open and play with.
 - ✅ **M2 — It's optics.** Glass catalog, Abbe picker, dispersion, spectral rendering, ghosts, TIR, live detectors.
 - ✅ **M3 — It's precise.** Freehand→fit with a complexity slider, numeric inspector, grid, snapping, clipboard, pinning, zoom/pan.
 - ✅ **M4 — It's a workflow.** Layers with onion-skinning, a non-linear undo tree, a live variation gallery, and wavefront scrub.
-- ⬜ **M5 — It's an Optiland tool.** Frozen `.ocanvas` format, round-trip import/export, published PyO3 bindings.
+- ✅ **M5 — It's an Optiland tool.** Frozen, versioned `.ocanvas` format; round-trip import/export against the Optiland engine; PyO3 bindings (`optiland_canvas`). See [the handoff](#the-handoff-to-optiland).
 - ⬜ **M6 — It's fast.** Performance hardening; WebGL2 / CPU fallback path.
 - ⬜ **M7 — It's a canvas.** GRIN painting — brush strokes that *are* the optics.
 

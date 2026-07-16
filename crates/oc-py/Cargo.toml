@@ -1,0 +1,23 @@
+[package]
+name = "oc-py"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
+description = "PyO3 bindings for Optiland Canvas: .ocanvas ⇄ Optiland Optic (M5)."
+
+[lib]
+# Compiled into the `optiland_canvas` Python package as the `_native` submodule.
+name = "_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+oc-core = { workspace = true }
+serde_json = { workspace = true }
+
+[dependencies.pyo3]
+version = "0.23"
+# `extension-module` keeps us from linking libpython (so the wheel is portable);
+# `abi3-py39` builds against the stable ABI, one wheel for every CPython ≥ 3.9.
+features = ["extension-module", "abi3-py39"]

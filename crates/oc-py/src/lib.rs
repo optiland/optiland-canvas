@@ -62,6 +62,20 @@ fn to_py_err<E: std::fmt::Display>(e: E) -> PyErr {
     PyValueError::new_err(e.to_string())
 }
 
+/// Since pyo3 0.28 a `#[pymodule]` declares free-threaded support by default
+/// (`Py_MOD_GIL_NOT_USED`), where older versions declared nothing. The 0.23 → 0.29
+/// security upgrade therefore turned that claim on without touching this file,
+/// so it is audited here rather than left to a default nobody read.
+///
+/// The claim holds. Every function below is a pure `&str` → `String` call into
+/// `oc-core`: no `#[pyclass]`, no statics, no interior mutability, no `unsafe`,
+/// and no state that outlives a call. There is nothing for two threads to race
+/// on.
+///
+/// It is also moot for the wheel we ship: `abi3-py39` targets the stable ABI, and
+/// free-threaded CPython has its own (`cp313t`), so this build is loaded by
+/// GIL-enabled interpreters only. If that changes, the audit above is the thing
+/// to recheck, and `#[pymodule(gil_used = true)]` is the opt-out.
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(scene_to_seq, m)?)?;

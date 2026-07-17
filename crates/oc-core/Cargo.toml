@@ -19,3 +19,9 @@ scene3 = []
 glam.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+# The v2 schema fixture emitter. Gated, or a default `cargo test` would try to
+# build it without the module it prints.
+[[example]]
+name = "emit_v2_fixture"
+required-features = ["scene3"]

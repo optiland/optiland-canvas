@@ -7,7 +7,7 @@ assumption. Why, and what it costs, is [ADR
 0001](adr/0001-scene3-is-canonical-2d-is-a-view.md). This page is the contract
 the migration is held to.
 
-**Status: PR 3D-01 of 12.** Nothing here traces yet. The 3D scene model and
+**Status: PR 3D-02 of 12.** Nothing here traces yet. The 3D scene model and
 tracer are behind off-by-default feature flags, and the shipped engine is exactly
 the 2D one the README describes. See [migration state](#migration-state).
 
@@ -168,8 +168,8 @@ it is the CPU f32 oracle the shader is validated against.
 |---|---|---|
 | 3D-00 | this contract, the ADR, coordinate docs, test scaffolding, flags | **done** |
 | 3D-01 | f64 3D math, stable ids, coordinate conversion | **done** |
-| 3D-02 | `Scene3` schema, `.ocanvas` v2, v1 migration | next |
-| 3D-03 | 3D analytic geometry and containment | |
+| 3D-02 | `Scene3` schema, `.ocanvas` v2, v1 migration | **done** |
+| 3D-03 | 3D analytic geometry and containment | next |
 | 3D-04 | the f64 full-3D reference tracer | |
 | 3D-05 | the exact planar reducer and legacy compatibility | |
 | 3D-06 | 3D sources, detectors, apertures, authoring constructors | |

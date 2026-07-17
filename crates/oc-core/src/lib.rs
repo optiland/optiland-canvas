@@ -28,7 +28,13 @@ pub mod fragment;
 pub mod geom;
 pub mod id;
 pub mod material;
+#[cfg(feature = "scene3")]
+pub mod migrate_v1;
+#[cfg(feature = "scene3")]
+pub mod profile2;
 pub mod scene;
+#[cfg(feature = "scene3")]
+pub mod scene3;
 pub mod seq;
 pub mod vec;
 pub mod vec3;

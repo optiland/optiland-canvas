@@ -15,9 +15,13 @@
 
 pub mod color;
 pub mod cpu;
+#[cfg(feature = "gpu3")]
+pub mod cpu3;
 #[cfg(feature = "gpu")]
 pub mod gpu;
 pub mod scene;
+#[cfg(feature = "gpu3")]
+pub mod scene3;
 
 pub use scene::{BuildOpts, GpuScene, GpuSeg, SEG_GHOST, SEG_TIR, SEG_VALID};
 

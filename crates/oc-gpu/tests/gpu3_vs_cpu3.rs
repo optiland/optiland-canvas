@@ -21,12 +21,16 @@
 
 use oc_core::id::{LayerId, ObjectId};
 use oc_core::material::Material;
+use oc_core::profile2::{
+    ClosedProfile2, Curve2, ProfileConstruction3, ProfileEdge2, ProfileSolid3,
+};
 use oc_core::scene3::{
     Aperture3, ApertureInteraction, ApertureShape3, Body3, Detector3, DetectorGeometry3,
     DetectorResponse, DetectorTermination, ObjectCommon, PlanarShape2, Scene3, SolidGeometry3,
     SpectralScalar, SurfaceGeometry3, SurfaceObject3, SurfaceProps3, SurfaceResponse,
 };
 use oc_core::source3::EmittedRay3;
+use oc_core::vec::Vec2;
 use oc_core::vec3::{Isometry3, Plane3, Ray3, Vec3};
 use oc_gpu::cpu3::{self, SegOut3};
 use oc_gpu::gpu3::Gpu3Tracer;
@@ -303,6 +307,62 @@ fn sphere_box_cylinder_match_cpu() {
             (
                 Vec3::new(-20.0, 2.0, 4.0),
                 Vec3::new(1.0, 0.0, 0.1).normalize(),
+            ),
+        ],
+    );
+}
+
+#[test]
+fn an_extruded_prism_matches_cpu() {
+    let Some(tracer) = tracer_or_skip() else {
+        return;
+    };
+    let mut scene = Scene3::new();
+    // A right-angle prism extruded along Z.
+    let verts = [
+        Vec2::new(-3.0, -3.0),
+        Vec2::new(-3.0, 3.0),
+        Vec2::new(3.0, -3.0),
+    ];
+    let id = scene.alloc_object_id();
+    let edges: Vec<ProfileEdge2> = (0..3)
+        .map(|i| ProfileEdge2 {
+            patch: scene.alloc_patch_id(),
+            curve: Curve2::Line {
+                a: verts[i],
+                b: verts[(i + 1) % 3],
+            },
+        })
+        .collect();
+    let mut common = ObjectCommon::new(id, LayerId(0));
+    common.transform = Isometry3::IDENTITY;
+    scene.bodies.push(Body3 {
+        common,
+        geometry: SolidGeometry3::Profile(ProfileSolid3 {
+            profile: ClosedProfile2 { edges },
+            construction: ProfileConstruction3::ExtrudeLocalZ {
+                z_min_mm: -8.0,
+                z_max_mm: 8.0,
+            },
+        }),
+        material: glass(1.6),
+        absorption: Default::default(),
+        surface: SurfaceProps3::default(),
+        priority: 0,
+    });
+    scene.validate().unwrap();
+    assert_gpu_matches_cpu(
+        &tracer,
+        &scene,
+        &[
+            (Vec3::new(-20.0, 0.5, 0.0), Vec3::X),
+            (
+                Vec3::new(-20.0, 1.0, 2.0),
+                Vec3::new(1.0, 0.0, 0.05).normalize(),
+            ),
+            (
+                Vec3::new(-20.0, -1.0, 0.0),
+                Vec3::new(1.0, 0.05, 0.0).normalize(),
             ),
         ],
     );

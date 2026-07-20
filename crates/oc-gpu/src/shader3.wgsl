@@ -196,6 +196,12 @@ fn shape_contains(kind: u32, a: f32, b: f32, poly_start: u32, poly_count: u32, p
     return poly_contains(poly_start, poly_count, p);
 }
 
+fn cross2(p: vec2<f32>, q: vec2<f32>) -> f32 { return p.x * q.y - p.y * q.x; }
+
+fn extrude_contains(start: u32, count: u32, z_min: f32, z_max: f32, p: vec3<f32>) -> bool {
+    return p.z >= z_min && p.z <= z_max && poly_contains(start, count, vec2<f32>(p.x, p.y));
+}
+
 // ---------------------------------------------------------------------------
 // Media (containment + priority)
 // ---------------------------------------------------------------------------
@@ -209,8 +215,10 @@ fn body_contains(bi: u32, p: vec3<f32>) -> bool {
         return abs(pl.x) <= b.params.x && abs(pl.y) <= b.params.y && abs(pl.z) <= b.params.z;
     } else if (b.kind == OBJ_CYLINDER) {
         return pl.x * pl.x + pl.y * pl.y <= b.params.x * b.params.x && abs(pl.z) <= b.params.y;
+    } else if (b.kind == OBJ_EXTRUDE) {
+        return extrude_contains(b.poly_start, b.poly_count, b.z_min, b.z_max, pl);
     }
-    // Extruded/revolved containment lands in later parts.
+    // Revolved containment lands in Part 3.
     return false;
 }
 
@@ -341,6 +349,59 @@ fn cylinder_hit(o: vec3<f32>, d: vec3<f32>, r: f32, hl: f32) -> Hit {
     return best;
 }
 
+// 2D ray `o + t·d` (d need not be unit) against segment `a–b`; `w` is 1 on a hit
+// with `t > EPS` on the segment, else 0. Returns `(t, unit edge normal, w)`.
+fn segment_hit(a: vec2<f32>, b: vec2<f32>, o: vec2<f32>, d: vec2<f32>) -> vec4<f32> {
+    let edge = b - a;
+    let denom = cross2(d, edge);
+    if (abs(denom) < 1e-20) { return vec4<f32>(0.0); }
+    let ao = a - o;
+    let t = cross2(ao, edge) / denom;
+    let u = cross2(ao, d) / denom;
+    if (t <= EPS || u < 0.0 || u > 1.0) { return vec4<f32>(0.0); }
+    let n = normalize(vec2<f32>(edge.y, -edge.x));
+    return vec4<f32>(t, n.x, n.y, 1.0);
+}
+
+// Nearest extruded-profile hit: ruled side faces plus the two end caps, with the
+// outward local normal. Mirrors cpu3::extrude_hit.
+fn extrude_hit(start: u32, count: u32, z_min: f32, z_max: f32, o: vec3<f32>, d: vec3<f32>) -> Hit {
+    var best = no_hit();
+    let o2 = vec2<f32>(o.x, o.y);
+    let d2 = vec2<f32>(d.x, d.y);
+    if (length(d2) > 1e-12) {
+        for (var i = 0u; i < count; i = i + 1u) {
+            let a = verts[start + i];
+            let b = verts[start + (i + 1u) % count];
+            let s = segment_hit(a, b, o2, d2);
+            if (s.w > 0.5) {
+                let t = s.x;
+                let z = o.z + t * d.z;
+                if (z >= z_min && z <= z_max && (!best.hit || t < best.t)) {
+                    let p = o + d * t;
+                    var n = vec3<f32>(s.y, s.z, 0.0);
+                    if (extrude_contains(start, count, z_min, z_max, p + n * EPS)) { n = -n; }
+                    best = Hit(true, t, n);
+                }
+            }
+        }
+    }
+    if (abs(d.z) > 1e-12) {
+        var zc = array<f32, 2>(z_min, z_max);
+        var nz = array<f32, 2>(-1.0, 1.0);
+        for (var i = 0; i < 2; i = i + 1) {
+            let t = (zc[i] - o.z) / d.z;
+            if (t > EPS && (!best.hit || t < best.t)) {
+                let p = o + d * t;
+                if (poly_contains(start, count, vec2<f32>(p.x, p.y))) {
+                    best = Hit(true, t, vec3<f32>(0.0, 0.0, nz[i]));
+                }
+            }
+        }
+    }
+    return best;
+}
+
 // Nearest body hit, with the world-space outward normal.
 fn body_hit(bi: u32, o: vec3<f32>, d: vec3<f32>) -> Hit {
     let b = bodies[bi];
@@ -354,6 +415,8 @@ fn body_hit(bi: u32, o: vec3<f32>, d: vec3<f32>) -> Hit {
         h = box_hit(ol, dl, b.params.xyz);
     } else if (b.kind == OBJ_CYLINDER) {
         h = cylinder_hit(ol, dl, b.params.x, b.params.y);
+    } else if (b.kind == OBJ_EXTRUDE) {
+        h = extrude_hit(b.poly_start, b.poly_count, b.z_min, b.z_max, ol, dl);
     }
     if (h.hit) {
         h.n = normalize(rot * h.n);

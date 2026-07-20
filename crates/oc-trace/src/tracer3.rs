@@ -68,10 +68,43 @@ impl Default for TraceConfig3 {
     }
 }
 
+/// The launch rays a single source emits, as the tracer's [`LaunchRay3`].
+///
+/// The sampler lives in `oc-core` ([`Source3::emit`](oc_core::source3)); this is
+/// the thin wrapper that tags each ray with its source and hands it to transport.
+pub fn launch_from_source(source: &oc_core::scene3::Source3) -> Vec<LaunchRay3> {
+    source
+        .emit()
+        .into_iter()
+        .map(|e| LaunchRay3 {
+            ray: e.ray,
+            lambda_um: e.lambda_um,
+            flux: e.flux,
+            source: Some(e.source),
+        })
+        .collect()
+}
+
+/// Every launch ray a scene's sources emit, deterministically (§6.10).
+pub fn launch_from_scene(scene: &Scene3) -> Vec<LaunchRay3> {
+    scene.sources.iter().flat_map(launch_from_source).collect()
+}
+
+/// Trace a scene end to end, emitting launch rays from its sources.
+///
+/// The production entry point: the caller supplies a scene, and the sampler and
+/// transport run together. [`trace3`] stays available for tests that drive the
+/// engine with hand-built rays.
+pub fn trace_scene3(scene: &Scene3, cfg: &TraceConfig3) -> TraceResult3 {
+    let launch = launch_from_scene(scene);
+    trace3(scene, &launch, cfg)
+}
+
 /// Trace a set of explicit launch rays through the scene.
 ///
-/// Sources are turned into launch rays by PR 3D-06; here the caller supplies them
-/// so the transport engine is exercised on hand-built geometry.
+/// Sources are turned into launch rays by [`launch_from_scene`]; this entry point
+/// takes them explicitly so the transport engine can be exercised on hand-built
+/// geometry.
 pub fn trace3(scene: &Scene3, launch: &[LaunchRay3], cfg: &TraceConfig3) -> TraceResult3 {
     let objs = EventObjects::build(scene);
     let bvh = Bvh3::build(&objs.boxes);

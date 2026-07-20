@@ -40,6 +40,8 @@ pub mod scene;
 #[cfg(feature = "scene3")]
 pub mod scene3;
 pub mod seq;
+#[cfg(feature = "scene3")]
+pub mod source3;
 pub mod vec;
 pub mod vec3;
 

@@ -18,13 +18,91 @@ use oc_core::material::{Material, LAMBDA_D};
 use oc_core::profile2::{
     ClosedProfile2, Curve2, ProfileConstruction3, ProfileEdge2, ProfileSolid3,
 };
-use oc_core::scene3::{Body3, ObjectCommon, Scene3, SolidGeometry3, SurfaceProps3};
+use oc_core::scene3::{
+    Aperture3, ApertureInteraction, ApertureShape3, Body3, Detector3, DetectorGeometry3,
+    DetectorResponse, DetectorTermination, ObjectCommon, PlanarShape2, Scene3, SolidGeometry3,
+    SpectralScalar, SurfaceGeometry3, SurfaceObject3, SurfaceProps3, SurfaceResponse,
+};
 use oc_core::source3::EmittedRay3;
 use oc_core::vec::Vec2;
-use oc_core::vec3::{Isometry3, Ray3, Vec3};
+use oc_core::vec3::{Isometry3, Plane3, Ray3, Vec3};
 use oc_gpu::cpu3::{self, SegOut3};
 use oc_gpu::scene3::{BuildOpts, GpuScene3};
 use oc_trace::{trace3, LaunchRay3, Segment3, TraceConfig3};
+
+/// A rotation carrying local +Z onto `normal`, placing a surface/detector face.
+fn facing(pos: Vec3, normal: Vec3) -> Isometry3 {
+    let q = glam::DQuat::from_rotation_arc(Vec3::Z, normal.normalize());
+    Isometry3::new(pos, [q.x, q.y, q.z, q.w]).unwrap()
+}
+
+fn add_mirror(scene: &mut Scene3, pos: Vec3, normal: Vec3, half: f64) -> ObjectId {
+    let id = scene.alloc_object_id();
+    let mut common = ObjectCommon::new(id, LayerId(0));
+    common.transform = facing(pos, normal);
+    let resp = SurfaceResponse::Mirror {
+        reflectivity: SpectralScalar::Constant(1.0),
+    };
+    scene.surfaces.push(SurfaceObject3 {
+        common,
+        geometry: SurfaceGeometry3::Plane {
+            shape: PlanarShape2::Rectangle {
+                half_width_mm: half,
+                half_height_mm: half,
+            },
+        },
+        response_front: resp.clone(),
+        response_back: resp,
+    });
+    id
+}
+
+fn add_circular_aperture(
+    scene: &mut Scene3,
+    pos: Vec3,
+    normal: Vec3,
+    opening: f64,
+    mask: f64,
+) -> ObjectId {
+    let id = scene.alloc_object_id();
+    let mut common = ObjectCommon::new(id, LayerId(0));
+    common.transform = facing(pos, normal);
+    scene.apertures.push(Aperture3 {
+        common,
+        shape: ApertureShape3 {
+            plane_local: Plane3::XY,
+            clear_opening: PlanarShape2::Disc { radius_mm: opening },
+            outer_extent: Some(PlanarShape2::Disc { radius_mm: mask }),
+        },
+        interaction: ApertureInteraction::Absorb,
+        primary_stop_for: Vec::new(),
+    });
+    id
+}
+
+fn add_rect_detector(
+    scene: &mut Scene3,
+    pos: Vec3,
+    normal: Vec3,
+    hw: f64,
+    hh: f64,
+    bins: [usize; 2],
+) -> ObjectId {
+    let id = scene.alloc_object_id();
+    let mut common = ObjectCommon::new(id, LayerId(0));
+    common.transform = facing(pos, normal);
+    scene.detectors.push(Detector3 {
+        common,
+        geometry: DetectorGeometry3::Rectangle {
+            half_width_mm: hw,
+            half_height_mm: hh,
+        },
+        bins,
+        response: DetectorResponse::Unity,
+        termination: DetectorTermination::Terminate,
+    });
+    id
+}
 
 // ---------------------------------------------------------------------------
 // Scene building
@@ -148,7 +226,7 @@ fn assert_landing_matches(f64_scene: &Scene3, origins_dirs: &[(Vec3, Vec3)]) {
             "unexpected rejects: {:?}",
             gpu.rejected
         );
-        let f32_segs = &cpu3::trace(&gpu, 32)[0];
+        let f32_segs = &cpu3::trace_segments(&gpu, 32)[0];
         let (f32_hits, f32_dir) = f32_landing(f32_segs);
 
         assert_eq!(
@@ -282,4 +360,107 @@ fn a_profile_body_is_rejected_not_approximated() {
     assert_eq!(gpu.rejected.len(), 1, "the profile body should be rejected");
     assert_eq!(gpu.rejected[0].object, id.0);
     assert!(gpu.bodies.is_empty(), "no body should be traced");
+}
+
+// ---------------------------------------------------------------------------
+// Event objects: surfaces, apertures, detectors
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_tilted_mirror_folds_like_f64() {
+    let mut scene = Scene3::new();
+    // A 45° mirror at the origin: its normal folds a +X beam toward +Y.
+    add_mirror(
+        &mut scene,
+        Vec3::ZERO,
+        Vec3::new(-1.0, 1.0, 0.0).normalize(),
+        10.0,
+    );
+    scene.validate().unwrap();
+
+    let rays = [
+        (Vec3::new(-15.0, 0.0, 0.0), Vec3::X),
+        (Vec3::new(-15.0, 2.0, 0.0), Vec3::X),
+        (Vec3::new(-15.0, 0.0, 2.0), Vec3::X),
+    ];
+    assert_landing_matches(&scene, &rays);
+}
+
+/// Compare the first detector's readout between the f64 reference and the f32
+/// preview for a shared launch set.
+fn assert_detector_matches(scene: &Scene3, det: ObjectId, origins_dirs: &[(Vec3, Vec3)]) {
+    let (emitted, launch) = rays(origins_dirs);
+    let f64_res = trace3(scene, &launch, &cfg());
+    let f64_det = f64_res
+        .detectors
+        .iter()
+        .find(|d| d.detector.0 == det.0)
+        .expect("f64 detector");
+
+    let gpu = GpuScene3::build_with_rays(
+        scene,
+        &emitted,
+        BuildOpts {
+            ghosts: false,
+            flux_eps: 1e-9,
+            max_ghost: 0,
+        },
+    );
+    assert!(
+        gpu.rejected.is_empty(),
+        "unexpected rejects: {:?}",
+        gpu.rejected
+    );
+    let f32 = cpu3::trace(&gpu, 32);
+    let f32_det = f32.detector(det.0).expect("f32 detector");
+
+    assert_eq!(f64_det.hits, f32_det.hits, "hit count differs");
+    assert!(
+        (f64_det.total_incident as f32 - f32_det.total).abs() < 1e-4,
+        "total flux: f64 {} vs f32 {}",
+        f64_det.total_incident,
+        f32_det.total
+    );
+    assert_eq!(
+        f64_det.incident_flux.len(),
+        f32_det.incident.len(),
+        "cell count differs"
+    );
+    for (i, (a, b)) in f64_det
+        .incident_flux
+        .iter()
+        .zip(&f32_det.incident)
+        .enumerate()
+    {
+        assert!(
+            (*a as f32 - *b).abs() < 1e-4,
+            "cell {i}: f64 {a} vs f32 {b}"
+        );
+    }
+}
+
+#[test]
+fn an_aperture_and_detector_match_f64() {
+    // A circular aperture clips a grid of rays; a detector behind it records what
+    // gets through. Both the clipping and the binning must match f64.
+    let mut scene = Scene3::new();
+    add_circular_aperture(&mut scene, Vec3::new(0.0, 0.0, 0.0), Vec3::X, 3.0, 20.0);
+    let det = add_rect_detector(
+        &mut scene,
+        Vec3::new(10.0, 0.0, 0.0),
+        -Vec3::X,
+        6.0,
+        6.0,
+        [6, 6],
+    );
+    scene.validate().unwrap();
+
+    // A grid of parallel rays spanning inside and outside the opening.
+    let mut rays = Vec::new();
+    for iy in -3..=3 {
+        for iz in -3..=3 {
+            rays.push((Vec3::new(-10.0, iy as f64 * 1.2, iz as f64 * 1.2), Vec3::X));
+        }
+    }
+    assert_detector_matches(&scene, det, &rays);
 }

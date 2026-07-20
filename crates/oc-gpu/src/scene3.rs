@@ -13,18 +13,22 @@
 //!
 //! **Reject, never fake.** A geometry the preview cannot trace exactly is recorded
 //! as a [`Reject3`], not swapped for a lookalike. No arc becomes a chord, no
-//! asphere its base conic (§12.3). This first increment supports the analytic
-//! bodies — sphere and box — with dielectric or absorbing surfaces; profile
-//! bodies, cylinders, surfaces-of-revolution, zero-thickness surfaces, apertures,
-//! and detectors are rejected here and arrive in later increments, each with a
-//! named issue so the caller knows exactly what was left out.
+//! asphere its base conic (§12.3). Supported: the analytic bodies (sphere, box)
+//! with dielectric or absorbing surfaces, zero-thickness surfaces (mirror,
+//! absorber, scalar dielectric, explicit R/T), finite aperture masks, and area
+//! detectors. Rejected, each with a named issue: profile bodies, cylinders,
+//! surfaces of revolution, and tabulated responses — they arrive in later
+//! increments.
 
-use glam::{DQuat, DVec3, Mat3, Vec3};
+use glam::{DQuat, DVec3, Mat3, Vec2, Vec3};
 use oc_core::material::{Cauchy, Material};
 use oc_core::scene3::{
-    AbsorptionModel, Body3, Scene3, SolidGeometry3, SurfaceResponse, TwoSidedSurfaceResponse,
+    AbsorptionModel, Aperture3, Body3, Detector3, DetectorGeometry3, DetectorTermination,
+    PlanarShape2, Scene3, SolidGeometry3, SpectralScalar, SurfaceGeometry3, SurfaceObject3,
+    SurfaceResponse, TwoSidedSurfaceResponse,
 };
 use oc_core::source3::EmittedRay3;
+use oc_core::vec3::Isometry3;
 
 /// Body geometry kinds the preview understands.
 pub const OBJ_SPHERE: u32 = 0;
@@ -143,6 +147,9 @@ impl Default for BuildOpts {
 /// The compiled, uploadable 3D scene.
 pub struct GpuScene3 {
     pub bodies: Vec<GpuBody3>,
+    pub surfaces: Vec<GpuSurface3>,
+    pub apertures: Vec<GpuAperture3>,
+    pub detectors: Vec<GpuDetector3>,
     pub rays: Vec<GpuRay3>,
     pub ambient: f32,
     pub norm: Norm,
@@ -168,38 +175,38 @@ impl GpuScene3 {
     pub fn build_with_rays(scene: &Scene3, launch: &[EmittedRay3], opts: BuildOpts) -> Self {
         let norm = scene_norm(scene);
         let mut bodies = Vec::new();
+        let mut surfaces = Vec::new();
+        let mut apertures = Vec::new();
+        let mut detectors = Vec::new();
         let mut rejected = Vec::new();
+        // A geometry the preview cannot trace exactly is named, not dropped: the
+        // caller (the preview badge) must be able to say the scene is not fully
+        // shown (§3.5, §12.3).
+        let mut reject = |object: u64, kind: String| rejected.push(Reject3 { object, kind });
 
         for b in &scene.bodies {
             match compile_body(b, &norm, &scene.catalog) {
                 Ok(gb) => bodies.push(gb),
-                Err(kind) => rejected.push(Reject3 {
-                    object: b.common.id.0,
-                    kind,
-                }),
+                Err(kind) => reject(b.common.id.0, kind),
             }
         }
-
-        // v2-native object kinds the CPU oracle does not yet trace. Named so the
-        // preview badge can say the scene is not fully shown, rather than quietly
-        // dropping them (§3.5).
         for s in &scene.surfaces {
-            rejected.push(Reject3 {
-                object: s.common.id.0,
-                kind: "zero-thickness surface (not yet in the f32 preview)".into(),
-            });
+            match compile_surface(s, &norm) {
+                Ok(gs) => surfaces.push(gs),
+                Err(kind) => reject(s.common.id.0, kind),
+            }
         }
         for a in &scene.apertures {
-            rejected.push(Reject3 {
-                object: a.common.id.0,
-                kind: "aperture (not yet in the f32 preview)".into(),
-            });
+            match compile_aperture(a, &norm) {
+                Ok(ga) => apertures.push(ga),
+                Err(kind) => reject(a.common.id.0, kind),
+            }
         }
         for d in &scene.detectors {
-            rejected.push(Reject3 {
-                object: d.common.id.0,
-                kind: "detector (not yet in the f32 preview)".into(),
-            });
+            match compile_detector(d, &norm) {
+                Ok(gd) => detectors.push(gd),
+                Err(kind) => reject(d.common.id.0, kind),
+            }
         }
 
         let rays = launch
@@ -214,6 +221,9 @@ impl GpuScene3 {
 
         Self {
             bodies,
+            surfaces,
+            apertures,
+            detectors,
             rays,
             ambient: scene.env.ambient_index as f32,
             norm,
@@ -240,6 +250,17 @@ fn scene_norm(scene: &Scene3) -> Norm {
             grow(c - DVec3::splat(r));
             grow(c + DVec3::splat(r));
         }
+    }
+    // The event objects have extent too; a mirror or detector far from the bodies
+    // must not fall outside the frame and lose its f32 detail.
+    for s in &scene.surfaces {
+        grow(s.common.transform.pos);
+    }
+    for a in &scene.apertures {
+        grow(a.common.transform.pos);
+    }
+    for d in &scene.detectors {
+        grow(d.common.transform.pos);
     }
     if !min.is_finite() || !max.is_finite() {
         return Norm {
@@ -362,6 +383,275 @@ fn set_dispersion(
         Material::Mirror { .. } | Material::Absorber => gb.index_const = 1.0,
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Shapes, responses, and the event objects
+// ---------------------------------------------------------------------------
+
+/// A finite region of a plane, normalized. The f32 counterpart of
+/// [`PlanarShape2`], with the containment test the tracer needs.
+#[derive(Debug, Clone)]
+pub enum GpuShape2 {
+    Rectangle { hw: f32, hh: f32 },
+    Disc { r: f32 },
+    Annulus { inner: f32, outer: f32 },
+    Polygon { verts: Vec<Vec2> },
+}
+
+impl GpuShape2 {
+    fn from_planar(shape: &PlanarShape2, scale: f64) -> Self {
+        let s = |v: f64| (v / scale) as f32;
+        match shape {
+            PlanarShape2::Rectangle {
+                half_width_mm,
+                half_height_mm,
+            } => GpuShape2::Rectangle {
+                hw: s(*half_width_mm),
+                hh: s(*half_height_mm),
+            },
+            PlanarShape2::Disc { radius_mm } => GpuShape2::Disc { r: s(*radius_mm) },
+            PlanarShape2::Annulus { inner_mm, outer_mm } => GpuShape2::Annulus {
+                inner: s(*inner_mm),
+                outer: s(*outer_mm),
+            },
+            PlanarShape2::Polygon { vertices } => GpuShape2::Polygon {
+                verts: vertices.iter().map(|p| Vec2::new(s(p.x), s(p.y))).collect(),
+            },
+        }
+    }
+
+    /// Is the in-plane point `p` inside the shape?
+    pub fn contains(&self, p: Vec2) -> bool {
+        match self {
+            GpuShape2::Rectangle { hw, hh } => p.x.abs() <= *hw && p.y.abs() <= *hh,
+            GpuShape2::Disc { r } => p.length_squared() <= r * r,
+            GpuShape2::Annulus { inner, outer } => {
+                let r2 = p.length_squared();
+                r2 >= inner * inner && r2 <= outer * outer
+            }
+            GpuShape2::Polygon { verts } => point_in_polygon(verts, p),
+        }
+    }
+}
+
+/// Even-odd crossing test, matching `oc_core::geom3::primitives`.
+fn point_in_polygon(verts: &[Vec2], p: Vec2) -> bool {
+    let mut inside = false;
+    let n = verts.len();
+    let mut j = n - 1;
+    for i in 0..n {
+        let (a, b) = (verts[i], verts[j]);
+        if (a.y > p.y) != (b.y > p.y) {
+            let t = (p.y - a.y) / (b.y - a.y);
+            if p.x < a.x + t * (b.x - a.x) {
+                inside = !inside;
+            }
+        }
+        j = i;
+    }
+    inside
+}
+
+/// A constant surface response the preview supports. A tabulated one is rejected.
+#[derive(Debug, Clone, Copy)]
+pub enum GpuResponse {
+    Absorber,
+    Mirror { r: f32 },
+    Dielectric { ar: f32 },
+    ExplicitRt { r: f32, t: f32 },
+}
+
+fn constant(s: &SpectralScalar) -> Result<f32, String> {
+    match s {
+        SpectralScalar::Constant(v) => Ok(*v as f32),
+        SpectralScalar::Tabulated { .. } => {
+            Err("tabulated surface response (not yet in the f32 preview)".into())
+        }
+    }
+}
+
+fn compile_response(r: &SurfaceResponse) -> Result<GpuResponse, String> {
+    Ok(match r {
+        SurfaceResponse::Absorber => GpuResponse::Absorber,
+        SurfaceResponse::Mirror { reflectivity } => GpuResponse::Mirror {
+            r: constant(reflectivity)?,
+        },
+        SurfaceResponse::DielectricFresnel { ar_residual } => GpuResponse::Dielectric {
+            ar: constant(ar_residual)?,
+        },
+        SurfaceResponse::ExplicitRt {
+            reflectance,
+            transmittance,
+        } => GpuResponse::ExplicitRt {
+            r: constant(reflectance)?,
+            t: constant(transmittance)?,
+        },
+    })
+}
+
+/// The rigid placement of an object in the normalized frame.
+fn rigid(t: &Isometry3, norm: &Norm) -> (Mat3, Vec3) {
+    let q = DQuat::from_xyzw(t.rot_xyzw[0], t.rot_xyzw[1], t.rot_xyzw[2], t.rot_xyzw[3]);
+    (Mat3::from_quat(q.as_quat()), norm.point(t.pos))
+}
+
+/// A compiled zero-thickness surface: a finite region of its local `XY` plane,
+/// with a response on each side.
+#[derive(Debug, Clone)]
+pub struct GpuSurface3 {
+    pub rot: Mat3,
+    pub pos: Vec3,
+    pub shape: GpuShape2,
+    pub front: GpuResponse,
+    pub back: GpuResponse,
+    pub object: u64,
+}
+
+fn compile_surface(s: &SurfaceObject3, norm: &Norm) -> Result<GpuSurface3, String> {
+    let shape = match &s.geometry {
+        SurfaceGeometry3::Plane { shape } => GpuShape2::from_planar(shape, norm.scale),
+        SurfaceGeometry3::SurfaceOfRevolution { .. } => {
+            return Err("surface of revolution (not yet in the f32 preview)".into())
+        }
+    };
+    let (rot, pos) = rigid(&s.common.transform, norm);
+    Ok(GpuSurface3 {
+        rot,
+        pos,
+        shape,
+        front: compile_response(&s.response_front)?,
+        back: compile_response(&s.response_back)?,
+        object: s.common.id.0,
+    })
+}
+
+/// A compiled finite aperture: an opening in an opaque mask, in a plane placed in
+/// the normalized frame.
+#[derive(Debug, Clone)]
+pub struct GpuAperture3 {
+    pub origin: Vec3,
+    pub normal: Vec3,
+    pub u: Vec3,
+    pub v: Vec3,
+    pub clear: GpuShape2,
+    pub outer: Option<GpuShape2>,
+    pub object: u64,
+}
+
+fn compile_aperture(a: &Aperture3, norm: &Norm) -> Result<GpuAperture3, String> {
+    let t = &a.common.transform;
+    let pl = &a.shape.plane_local;
+    let (rot, _) = rigid(t, norm);
+    let origin = norm.point(t.transform_point(pl.origin));
+    Ok(GpuAperture3 {
+        origin,
+        normal: (rot * pl.normal.as_vec3()).normalize(),
+        u: (rot * pl.u.as_vec3()).normalize(),
+        v: (rot * pl.v.as_vec3()).normalize(),
+        clear: GpuShape2::from_planar(&a.shape.clear_opening, norm.scale),
+        outer: a
+            .shape
+            .outer_extent
+            .as_ref()
+            .map(|s| GpuShape2::from_planar(s, norm.scale)),
+        object: a.common.id.0,
+    })
+}
+
+/// A compiled area detector's face shape.
+#[derive(Debug, Clone, Copy)]
+pub enum DetShape {
+    Rectangle { hw: f32, hh: f32 },
+    Disc { r: f32 },
+    Annulus { inner: f32, outer: f32 },
+}
+
+/// A compiled area detector: a finite region of its local `XY` plane, binned.
+#[derive(Debug, Clone)]
+pub struct GpuDetector3 {
+    pub rot: Mat3,
+    pub pos: Vec3,
+    pub shape: DetShape,
+    pub bins: [usize; 2],
+    pub terminate: bool,
+    /// Cell area in `mm²` (physical, not normalized), for flux density.
+    pub cell_area_mm2: f32,
+    pub object: u64,
+}
+
+fn compile_detector(d: &Detector3, norm: &Norm) -> Result<GpuDetector3, String> {
+    let s = |v: f64| (v / norm.scale) as f32;
+    let (shape, total_mm2) = match &d.geometry {
+        DetectorGeometry3::Rectangle {
+            half_width_mm,
+            half_height_mm,
+        } => (
+            DetShape::Rectangle {
+                hw: s(*half_width_mm),
+                hh: s(*half_height_mm),
+            },
+            4.0 * half_width_mm * half_height_mm,
+        ),
+        DetectorGeometry3::Disc { radius_mm } => (
+            DetShape::Disc { r: s(*radius_mm) },
+            std::f64::consts::PI * radius_mm * radius_mm,
+        ),
+        DetectorGeometry3::Annulus { inner_mm, outer_mm } => (
+            DetShape::Annulus {
+                inner: s(*inner_mm),
+                outer: s(*outer_mm),
+            },
+            std::f64::consts::PI * (outer_mm * outer_mm - inner_mm * inner_mm),
+        ),
+        DetectorGeometry3::LineProbeLegacy { .. } => {
+            return Err("line probe has no area in 3D (not previewed)".into())
+        }
+    };
+    let (rot, pos) = rigid(&d.common.transform, norm);
+    let cells = (d.bins[0].max(1) * d.bins[1].max(1)) as f64;
+    Ok(GpuDetector3 {
+        rot,
+        pos,
+        shape,
+        bins: d.bins,
+        terminate: matches!(d.termination, DetectorTermination::Terminate),
+        cell_area_mm2: (total_mm2 / cells) as f32,
+        object: d.common.id.0,
+    })
+}
+
+impl DetShape {
+    /// Is the local `(u, v)` point on the face?
+    pub fn contains(&self, p: Vec2) -> bool {
+        match self {
+            DetShape::Rectangle { hw, hh } => p.x.abs() <= *hw && p.y.abs() <= *hh,
+            DetShape::Disc { r } => p.length_squared() <= r * r,
+            DetShape::Annulus { inner, outer } => {
+                let r2 = p.length_squared();
+                r2 >= inner * inner && r2 <= outer * outer
+            }
+        }
+    }
+
+    /// The cell index for a local hit, row-major over `bins`, or `None` off the
+    /// bounding grid. Mirrors `oc_trace`'s `detector_cell`.
+    pub fn cell(&self, p: Vec2, bins: [usize; 2]) -> Option<usize> {
+        let (nu, nv) = (bins[0].max(1), bins[1].max(1));
+        let (fx, fy) = match self {
+            DetShape::Rectangle { hw, hh } => ((p.x + hw) / (2.0 * hw), (p.y + hh) / (2.0 * hh)),
+            DetShape::Disc { r } => ((p.x + r) / (2.0 * r), (p.y + r) / (2.0 * r)),
+            DetShape::Annulus { outer, .. } => {
+                ((p.x + outer) / (2.0 * outer), (p.y + outer) / (2.0 * outer))
+            }
+        };
+        if !(0.0..=1.0).contains(&fx) || !(0.0..=1.0).contains(&fy) {
+            return None;
+        }
+        let iu = ((fx * nu as f32) as usize).min(nu - 1);
+        let iv = ((fy * nv as f32) as usize).min(nv - 1);
+        Some(iv * nu + iu)
+    }
 }
 
 #[cfg(test)]

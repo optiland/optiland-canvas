@@ -113,6 +113,31 @@ test.describe("3D preview — the 2D Canvas as a slice of Scene3", () => {
     const sliced = await litPixels(page);
     expect(sliced).toBeLessThan(all);
   });
+
+  test("dragging a 3D body moves it in the view plane and re-traces", async ({ page }) => {
+    await page.goto("/");
+    await expect(page.locator("#stat")).toContainText("segs");
+    await page.locator("#open3dFile").setInputFiles(FIXTURE);
+    await expect(page.locator("#preview3dBadge")).toHaveClass(/full_3d/);
+
+    // The one body (a sphere) starts on axis at the origin.
+    const pos = page.locator("#objects3d .opos").first();
+    await expect(pos).toHaveText("(0.0, 0.0, 0.0)");
+    expect(await litPixels(page)).toBeGreaterThan(100);
+
+    // Grab it at the view centre (its projected position) and drag it up.
+    const box = (await page.locator("#view").boundingBox())!;
+    const cx = box.x + box.width / 2;
+    const cy = box.y + box.height / 2;
+    await page.mouse.move(cx, cy);
+    await page.mouse.down();
+    await page.mouse.move(cx, cy - 150, { steps: 12 });
+    await page.mouse.up();
+
+    // It moved off-axis (its Y changed), and the projection re-traced.
+    await expect(pos).not.toHaveText("(0.0, 0.0, 0.0)");
+    expect(await litPixels(page)).toBeGreaterThan(100);
+  });
 });
 
 /// Count perceptibly-lit pixels on the main view canvas (background is near-black).

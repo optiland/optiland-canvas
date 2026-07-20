@@ -194,11 +194,12 @@ async function main() {
 
     // M3 overlay: element outlines, selection handles, snap guides, and the
     // freehand fit preview. It owns on-canvas manipulation, so the old fixed
-    // lens-handle ellipse is retired in its favour.
-    m3?.overlay(ctx);
+    // lens-handle ellipse is retired in its favour. Hidden while a 3D scene is
+    // previewed — those v1 outlines are not this scene.
+    if (!show3d) m3?.overlay(ctx);
     // M4 overlay: the sweeping wavefront front (§5.5), drawn on top.
     m4?.overlay(ctx);
-    // 3D preview: the projected f64 ray paths over the Z=0 slice (§10.1/§10.4).
+    // 3D preview: the projected ray paths over the Z=0 slice (§10.1/§10.4).
     slice3d?.overlay(ctx, toScreen);
 
     const mode = wavefront ? " · wavefront scrub" : "";
@@ -414,7 +415,8 @@ async function main() {
 
   // PR 3D-09: open an .ocanvas into the canonical 3D scene and preview its f64
   // paths projected onto this view. Additive — the v1 demo above is untouched.
-  slice3d = initSlice3d({ scene, render: renderView });
+  // It gets the view transforms so it can hit-test and drag 3D bodies.
+  slice3d = initSlice3d({ scene, view, toScreen, toWorld, render: renderView });
 
   // --- M5: save / open .ocanvas — the Optiland handoff (§6) ---------------
   // Save downloads the frozen .ocanvas document; Open loads one back (Rust

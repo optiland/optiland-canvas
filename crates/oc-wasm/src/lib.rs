@@ -1618,6 +1618,66 @@ impl Canvas {
         out
     }
 
+    /// The **interactive** f32 projection (§4.1): the same 9-float layout as
+    /// [`Canvas::trace_projected_3d`], traced on the fast CPU f32 path (`cpu3`) so
+    /// it can update every pointer-move during a drag. The picture, not the
+    /// numbers — settle with the f64 method for anything displayed.
+    #[wasm_bindgen(js_name = traceProjected3DFast)]
+    pub fn trace_projected_3d_fast(&self) -> Vec<f32> {
+        let Some(scene) = &self.scene3 else {
+            return Vec::new();
+        };
+        let gpu = oc_gpu::scene3::GpuScene3::build(
+            scene,
+            oc_gpu::scene3::BuildOpts {
+                ghosts: self.ghosts,
+                flux_eps: 1e-4,
+                max_ghost: self.max_ghost,
+            },
+        );
+        let per_ray = oc_gpu::cpu3::trace_segments(&gpu, 32);
+        let plane = &self.view_plane;
+        let mut out = Vec::new();
+        for segs in &per_ray {
+            for s in segs {
+                let a = plane.to_local(s.a);
+                let b = plane.to_local(s.b);
+                out.extend_from_slice(&[
+                    a.x as f32,
+                    a.y as f32,
+                    b.x as f32,
+                    b.y as f32,
+                    s.flux,
+                    s.lambda_um,
+                    s.flags as f32,
+                    plane.signed_distance(s.a) as f32,
+                    plane.signed_distance(s.b) as f32,
+                ]);
+            }
+        }
+        out
+    }
+
+    /// Move a body so its world position becomes `(x, y, z)` — the drag authoring
+    /// action (§10.5: an in-plane move translates the body). Bumps the revision.
+    /// Returns `false` if there is no such body.
+    #[wasm_bindgen(js_name = setBodyPosition)]
+    pub fn set_body_position(&mut self, body_id: f64, x: f64, y: f64, z: f64) -> bool {
+        let Some(scene) = self.scene3.as_mut() else {
+            return false;
+        };
+        let Some(body) = scene
+            .bodies
+            .iter_mut()
+            .find(|b| b.common.id.0 == body_id as u64)
+        else {
+            return false;
+        };
+        body.common.transform.pos = Vec3::new(x, y, z);
+        self.revision += 1;
+        true
+    }
+
     /// The f64 reference readout for a detector by id (§4.1: the honest numbers).
     /// JSON `{hits, totalIncident, totalSignal, cellArea, centroid, meanOpl,
     /// bins, incident}`, or `null` if there is no such detector.
@@ -1680,14 +1740,15 @@ impl Canvas {
                 let (kind, construction) = body_kind_construction(b);
                 let p = b.common.transform.pos;
                 format!(
-                    "{{\"id\":{},\"kind\":{},\"construction\":{},\"is3d\":{},\"pos\":[{},{},{}]}}",
+                    "{{\"id\":{},\"kind\":{},\"construction\":{},\"is3d\":{},\"pos\":[{},{},{}],\"radius\":{}}}",
                     b.common.id.0,
                     json_str(kind),
                     json_str(construction),
                     b.is_3d(),
                     p.x,
                     p.y,
-                    p.z
+                    p.z,
+                    body_radius(b)
                 )
             })
             .collect();
@@ -1909,6 +1970,40 @@ fn colored_segments(scene: &Scene, ghosts: bool, max_ghost: u32) -> Vec<f32> {
 
 /// Escape a string as a JSON string literal (quotes included) — for names and
 /// history labels that the shell round-trips through `JSON.parse`.
+/// A coarse world bounding radius for a body, for pointer hit-testing in the 3D
+/// view. Generous rather than tight: it only decides whether a click grabs it.
+fn body_radius(b: &oc_core::scene3::Body3) -> f64 {
+    use oc_core::profile2::Curve2;
+    use oc_core::scene3::SolidGeometry3;
+    match &b.geometry {
+        SolidGeometry3::Sphere { radius_mm } => *radius_mm,
+        SolidGeometry3::Box { half_extents_mm } => half_extents_mm.length(),
+        SolidGeometry3::Cylinder {
+            radius_mm,
+            half_length_mm,
+            ..
+        } => radius_mm.hypot(*half_length_mm),
+        SolidGeometry3::Profile(p) => {
+            let r = p
+                .profile
+                .edges
+                .iter()
+                .flat_map(|e| match &e.curve {
+                    Curve2::Line { a, b } => vec![a.length(), b.length()],
+                    Curve2::Polyline { points } => points.iter().map(|q| q.length()).collect(),
+                    Curve2::Conic(c) | Curve2::EvenAsphere { base: c, .. } => {
+                        vec![c.vertex.length() + c.half_ap]
+                    }
+                    Curve2::Arc {
+                        center, radius_mm, ..
+                    } => vec![center.length() + radius_mm],
+                })
+                .fold(0.0_f64, f64::max);
+            r.max(1.0)
+        }
+    }
+}
+
 /// A body's geometry kind and 3D construction, for the inspector.
 fn body_kind_construction(b: &oc_core::scene3::Body3) -> (&'static str, &'static str) {
     use oc_core::scene3::SolidGeometry3;
@@ -2577,6 +2672,44 @@ mod scene3_tests {
         );
         std::fs::write(path, scene.to_json()).expect("write fold fixture");
         eprintln!("wrote {path}");
+    }
+
+    #[test]
+    fn dragging_moves_a_body_and_bumps_the_revision() {
+        use oc_core::id::LayerId;
+        use oc_core::material::Material;
+        use oc_core::scene3::{
+            AbsorptionModel, Body3, ObjectCommon, SolidGeometry3, SurfaceProps3,
+        };
+        use oc_core::vec3::Isometry3;
+
+        let mut scene = Scene3::new();
+        let id = scene.alloc_object_id();
+        let mut common = ObjectCommon::new(id, LayerId(0));
+        common.transform = Isometry3::IDENTITY;
+        scene.bodies.push(Body3 {
+            common,
+            geometry: SolidGeometry3::Sphere { radius_mm: 8.0 },
+            material: Material::AbbePoint { nd: 1.5, vd: 64.0 },
+            absorption: AbsorptionModel::None,
+            surface: SurfaceProps3::default(),
+            priority: 0,
+        });
+
+        let mut c = Canvas::new();
+        c.scene3 = Some(scene);
+
+        // The inspector carries a hit-test radius.
+        assert!(c.scene_objects_json().contains("\"radius\":8"));
+
+        // An in-plane move updates the position and bumps the revision.
+        let rev = c.scene_revision();
+        assert!(c.set_body_position(id.0 as f64, 0.0, 5.0, 0.0));
+        assert!(c.scene_revision() > rev, "a move must bump the revision");
+        assert!(c.scene_objects_json().contains("\"pos\":[0,5,0]"));
+
+        // An unknown body id changes nothing.
+        assert!(!c.set_body_position(9999.0, 1.0, 1.0, 1.0));
     }
 
     /// Pull the first integer out of a `"key":[a,b,...]` array in a report JSON.

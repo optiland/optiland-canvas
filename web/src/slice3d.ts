@@ -40,9 +40,12 @@ function wavelengthColor(um: number): [number, number, number] {
 
 export function initSlice3d(opts: {
   scene: Canvas;
+  view: HTMLCanvasElement;
+  toScreen: (p: V2) => V2;
+  toWorld: (px: number, py: number) => V2;
   render: () => void;
 }): Slice3d {
-  const { scene, render } = opts;
+  const { scene, view, toScreen, toWorld, render } = opts;
 
   const badge = document.getElementById("preview3dBadge")!;
   const openBtn = document.getElementById("open3d") as HTMLButtonElement;
@@ -73,6 +76,16 @@ export function initSlice3d(opts: {
   // Slice half-thickness in mm; 0 = show everything projected.
   let slice = 0;
 
+  // The bodies, cached with their world position and a coarse radius, for
+  // pointer hit-testing. Refreshed whenever the scene changes.
+  type Obj = { id: number; kind: string; construction: string; is3d: boolean; pos: number[]; radius: number };
+  let objList: Obj[] = [];
+  // The body being dragged, and the grab offset (view-plane u,v) so it does not
+  // jump to the cursor. `origZ` keeps the out-of-plane coordinate fixed — an
+  // in-plane move (§10.5).
+  let dragBody: number | null = null;
+  let grabU = 0, grabV = 0, origZ = 0;
+
   const flash = (text: string, ok = true) => {
     msg.textContent = text;
     msg.style.color = ok ? "#7fffa0" : "#ff8a6b";
@@ -91,8 +104,10 @@ export function initSlice3d(opts: {
     badge.textContent = badgeText[mode] ?? mode;
   }
 
-  function retrace() {
-    segs = scene.traceProjected3D();
+  // `fast` uses the interactive f32 path (during a drag); the default settles on
+  // the authoritative f64 reference.
+  function retrace(fast = false) {
+    segs = fast ? scene.traceProjected3DFast() : scene.traceProjected3D();
     tracedRevision = scene.sceneRevision();
   }
 
@@ -103,12 +118,11 @@ export function initSlice3d(opts: {
 
   // The object inspector: each body's construction and world transform, so its
   // 3D shape and any missing depth are visible (§13). Re-read from Rust — never
-  // a JS-side mirror of the scene graph.
-  type Obj = { id: number; kind: string; construction: string; is3d: boolean; pos: number[] };
+  // a JS-side mirror of the scene graph. Also refreshes the hit-test cache.
   function refreshInspector() {
-    const objs: Obj[] = JSON.parse(scene.sceneObjectsJSON());
+    objList = JSON.parse(scene.sceneObjectsJSON());
     objects.replaceChildren();
-    for (const o of objs) {
+    for (const o of objList) {
       const row = document.createElement("div");
       row.className = "row";
       const [x, y, z] = o.pos.map((v) => v.toFixed(1));
@@ -190,6 +204,72 @@ export function initSlice3d(opts: {
 
   promoteRevolve.addEventListener("click", () => promoteAll(true));
   promoteExtrude.addEventListener("click", () => promoteAll(false));
+
+  // --- interactive editing: drag a body in the view plane (§10.5) ----------
+  //
+  // The body's projected centre and a coarse radius decide a grab. The handlers
+  // sit on `document` in the capture phase so they run *before* M3's canvas
+  // listeners, and only swallow the event when a body is actually grabbed — an
+  // empty-space drag still falls through to M3's pan/select, and middle-drag pan
+  // is untouched.
+
+  // The body under a client point (its projected disc), or null. In-plane
+  // coordinates are the world x,y for the default Z=0 view.
+  function pickBody(cx: number, cy: number): Obj | null {
+    let best: Obj | null = null;
+    let bestD = Infinity;
+    for (const o of objList) {
+      const c = toScreen({ x: o.pos[0], y: o.pos[1] });
+      const rim = toScreen({ x: o.pos[0] + o.radius, y: o.pos[1] });
+      const rScreen = Math.hypot(rim.x - c.x, rim.y - c.y);
+      const d = Math.hypot(cx - c.x, cy - c.y);
+      if (d <= rScreen + 8 && d < bestD) {
+        bestD = d;
+        best = o;
+      }
+    }
+    return best;
+  }
+
+  function onDown(e: PointerEvent) {
+    if (!loaded || e.button !== 0 || e.target !== view) return;
+    const o = pickBody(e.clientX, e.clientY);
+    if (!o) return; // empty space → M3 handles pan/select
+    dragBody = o.id;
+    const w = toWorld(e.clientX, e.clientY);
+    grabU = o.pos[0] - w.x;
+    grabV = o.pos[1] - w.y;
+    origZ = o.pos[2];
+    view.setPointerCapture(e.pointerId);
+    view.style.cursor = "grabbing";
+    e.stopPropagation();
+    e.preventDefault();
+  }
+
+  function onMove(e: PointerEvent) {
+    if (dragBody === null) return;
+    e.stopPropagation();
+    const w = toWorld(e.clientX, e.clientY);
+    // Translate in the view plane; the out-of-plane coordinate is unchanged.
+    scene.setBodyPosition(dragBody, w.x + grabU, w.y + grabV, origZ);
+    retrace(true); // f32 interactive picture during the drag
+    refreshInspector();
+    render();
+  }
+
+  function onUp(e: PointerEvent) {
+    if (dragBody === null) return;
+    e.stopPropagation();
+    dragBody = null;
+    view.style.cursor = "";
+    retrace(false); // settle on the f64 reference
+    render();
+  }
+
+  document.addEventListener("pointerdown", onDown, true);
+  document.addEventListener("pointermove", onMove, true);
+  document.addEventListener("pointerup", onUp, true);
+  document.addEventListener("pointercancel", onUp, true);
 
   // The sub-range [t0, t1] ⊆ [0, 1] of a segment whose signed distance from the
   // plane stays within the slab |dist| <= slice, interpolating linearly between

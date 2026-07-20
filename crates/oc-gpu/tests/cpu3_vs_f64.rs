@@ -7,10 +7,10 @@
 //! the branch structure must match, and a primitive the preview cannot trace must
 //! be **rejected with a capability issue**, never swapped for a lookalike (§12.3).
 //!
-//! This first increment covers the analytic bodies the compiler admits — sphere
-//! and box, dielectric or absorbing. The curved profile surfaces and the
-//! aperture/detector objects arrive in later increments; here they must show up
-//! in `rejected`, which the last test pins.
+//! Covers the objects the compiler admits: sphere, box, cylinder, and extruded
+//! line profiles; mirror surfaces; and aperture-plus-detector clipping. The
+//! revolved profile bodies are the one geometry still to land, and must show up
+//! in `rejected` rather than as a chord — the profile-rejection test pins that.
 #![cfg(feature = "gpu3")]
 
 use oc_core::id::{LayerId, ObjectId, SourceId};
@@ -267,6 +267,87 @@ fn a_glass_sphere_matches_f64_for_skew_rays() {
         (Vec3::new(-20.0, 0.0, 3.0), Vec3::X),
         (Vec3::new(-20.0, 2.5, -2.5), Vec3::X),
         (Vec3::new(-20.0, -4.0, 1.0), Vec3::X),
+    ];
+    assert_landing_matches(&scene, &rays);
+}
+
+#[test]
+fn a_glass_cylinder_matches_f64_for_skew_rays() {
+    let mut scene = Scene3::new();
+    push_body(
+        &mut scene,
+        SolidGeometry3::Cylinder {
+            radius_mm: 6.0,
+            half_length_mm: 15.0,
+            axis_local: Vec3::Z,
+        },
+        glass(1.5),
+    );
+    scene.validate().unwrap();
+
+    // The cylinder stands along Z; +X rays strike its curved wall.
+    let rays = [
+        (Vec3::new(-20.0, 0.0, 0.0), Vec3::X),
+        (Vec3::new(-20.0, 3.0, 0.0), Vec3::X),
+        (
+            Vec3::new(-20.0, 2.0, 4.0),
+            Vec3::new(1.0, 0.0, 0.1).normalize(),
+        ),
+        (
+            Vec3::new(-20.0, -3.5, 2.0),
+            Vec3::new(1.0, 0.05, 0.0).normalize(),
+        ),
+    ];
+    assert_landing_matches(&scene, &rays);
+}
+
+#[test]
+fn an_extruded_prism_matches_f64() {
+    let mut scene = Scene3::new();
+    // A right-angle prism, extruded along Z through the plane.
+    let verts = [
+        Vec2::new(-3.0, -3.0),
+        Vec2::new(-3.0, 3.0),
+        Vec2::new(3.0, -3.0),
+    ];
+    let id = scene.alloc_object_id();
+    let edges: Vec<ProfileEdge2> = (0..3)
+        .map(|i| ProfileEdge2 {
+            patch: scene.alloc_patch_id(),
+            curve: Curve2::Line {
+                a: verts[i],
+                b: verts[(i + 1) % 3],
+            },
+        })
+        .collect();
+    let mut common = ObjectCommon::new(id, LayerId(0));
+    common.transform = Isometry3::IDENTITY;
+    scene.bodies.push(Body3 {
+        common,
+        geometry: SolidGeometry3::Profile(ProfileSolid3 {
+            profile: ClosedProfile2 { edges },
+            construction: ProfileConstruction3::ExtrudeLocalZ {
+                z_min_mm: -8.0,
+                z_max_mm: 8.0,
+            },
+        }),
+        material: glass(1.6),
+        absorption: Default::default(),
+        surface: SurfaceProps3::default(),
+        priority: 0,
+    });
+    scene.validate().unwrap();
+
+    let rays = [
+        (Vec3::new(-20.0, 0.5, 0.0), Vec3::X),
+        (
+            Vec3::new(-20.0, 1.0, 2.0),
+            Vec3::new(1.0, 0.0, 0.05).normalize(),
+        ),
+        (
+            Vec3::new(-20.0, -1.0, 0.0),
+            Vec3::new(1.0, 0.05, 0.0).normalize(),
+        ),
     ];
     assert_landing_matches(&scene, &rays);
 }

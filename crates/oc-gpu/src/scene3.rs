@@ -13,15 +13,16 @@
 //!
 //! **Reject, never fake.** A geometry the preview cannot trace exactly is recorded
 //! as a [`Reject3`], not swapped for a lookalike. No arc becomes a chord, no
-//! asphere its base conic (§12.3). Supported: the analytic bodies (sphere, box)
-//! with dielectric or absorbing surfaces, zero-thickness surfaces (mirror,
+//! asphere its base conic (§12.3). Supported: the analytic bodies (sphere, box,
+//! cylinder), extruded line profiles (prisms), zero-thickness surfaces (mirror,
 //! absorber, scalar dielectric, explicit R/T), finite aperture masks, and area
-//! detectors. Rejected, each with a named issue: profile bodies, cylinders,
-//! surfaces of revolution, and tabulated responses — they arrive in later
-//! increments.
+//! detectors. Rejected, each with a named issue: revolved profiles and extrusions
+//! with curved edges (the surface-of-revolution solver is the remaining piece),
+//! and tabulated responses.
 
 use glam::{DQuat, DVec3, Mat3, Vec2, Vec3};
 use oc_core::material::{Cauchy, Material};
+use oc_core::profile2::ProfileConstruction3;
 use oc_core::scene3::{
     AbsorptionModel, Aperture3, Body3, Detector3, DetectorGeometry3, DetectorTermination,
     PlanarShape2, Scene3, SolidGeometry3, SpectralScalar, SurfaceGeometry3, SurfaceObject3,
@@ -33,6 +34,12 @@ use oc_core::vec3::Isometry3;
 /// Body geometry kinds the preview understands.
 pub const OBJ_SPHERE: u32 = 0;
 pub const OBJ_BOX: u32 = 1;
+/// A finite cylinder along the object's canonical `+Z` (the axis is folded into
+/// [`GpuBody3::rot`]). `params = (radius, half_length, 0)`.
+pub const OBJ_CYLINDER: u32 = 2;
+/// A closed line-profile extruded through local Z. Its polygon and Z limits are
+/// in [`GpuBody3::extrude`].
+pub const OBJ_EXTRUDE: u32 = 3;
 
 /// Surface behaviour kinds.
 pub const SURF_DIELECTRIC: u32 = 0;
@@ -69,21 +76,34 @@ impl Norm {
     }
 }
 
+/// A closed line-profile extruded through local Z, normalized.
+#[derive(Debug, Clone)]
+pub struct GpuExtrude {
+    /// The closed polygon in the local `XY` plane, in loop order.
+    pub verts: Vec<Vec2>,
+    pub z_min: f32,
+    pub z_max: f32,
+}
+
 /// A body compiled for the preview: geometry, surface, and a rigid placement in
 /// the *normalized* frame. Plain `f32` — the GPU `repr(C)` buffer layout lands
 /// with the shader (PR 3D-08); this is the CPU oracle's working form.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct GpuBody3 {
     pub kind: u32,
     pub surface: u32,
     pub disp: u32,
     pub priority: i32,
-    /// Local-to-world rotation (scale-free, so identical normalized).
+    /// Local(canonical)-to-world rotation. For a cylinder this folds in the axis
+    /// alignment, so the primitive is always along canonical `+Z`.
     pub rot: Mat3,
     /// Normalized translation `(t_world − origin) / scale`.
     pub pos: Vec3,
-    /// Sphere: `(radius, 0, 0)`; box: half-extents. Normalized.
+    /// Sphere: `(radius, 0, 0)`; box: half-extents; cylinder: `(radius,
+    /// half_length, 0)`. Normalized.
     pub params: Vec3,
+    /// The extruded polygon, when `kind == OBJ_EXTRUDE`.
+    pub extrude: Option<GpuExtrude>,
     pub index_const: f32,
     pub dp: [f32; 6],
     /// Constant bulk attenuation, `mm⁻¹` (0 = none). Applied per world length.
@@ -280,7 +300,44 @@ fn body_world_bound(b: &Body3) -> Option<(DVec3, f64)> {
     match &b.geometry {
         SolidGeometry3::Sphere { radius_mm } => Some((t.pos, *radius_mm)),
         SolidGeometry3::Box { half_extents_mm } => Some((t.pos, half_extents_mm.length())),
-        _ => None,
+        SolidGeometry3::Cylinder {
+            radius_mm,
+            half_length_mm,
+            ..
+        } => Some((t.pos, radius_mm.hypot(*half_length_mm))),
+        SolidGeometry3::Profile(p) => {
+            // The profile's XY reach plus its Z span, roughly.
+            let r = p
+                .profile
+                .edges
+                .iter()
+                .flat_map(profile_edge_points)
+                .fold(0.0_f64, |m, v| m.max(v.length()));
+            let z = match p.construction {
+                ProfileConstruction3::ExtrudeLocalZ { z_min_mm, z_max_mm } => {
+                    z_min_mm.abs().max(z_max_mm.abs())
+                }
+                _ => 0.0,
+            };
+            Some((t.pos, r.hypot(z).max(1.0)))
+        }
+    }
+}
+
+/// A profile edge's representative points, for a crude bound.
+fn profile_edge_points(e: &oc_core::profile2::ProfileEdge2) -> Vec<oc_core::vec::Vec2> {
+    use oc_core::profile2::Curve2;
+    match &e.curve {
+        Curve2::Line { a, b } => vec![*a, *b],
+        Curve2::Polyline { points } => points.clone(),
+        Curve2::Conic(c) | Curve2::EvenAsphere { base: c, .. } => {
+            vec![c.vertex, c.vertex + oc_core::vec::Vec2::new(0.0, c.half_ap)]
+        }
+        Curve2::Arc {
+            center, radius_mm, ..
+        } => {
+            vec![*center + oc_core::vec::Vec2::splat(*radius_mm)]
+        }
     }
 }
 
@@ -290,19 +347,70 @@ fn compile_body(
     norm: &Norm,
     catalog: &oc_core::material::GlassCatalog,
 ) -> Result<GpuBody3, String> {
-    let (kind, params_mm) = match &b.geometry {
-        SolidGeometry3::Sphere { radius_mm } => (OBJ_SPHERE, DVec3::new(*radius_mm, 0.0, 0.0)),
-        SolidGeometry3::Box { half_extents_mm } => (OBJ_BOX, *half_extents_mm),
-        SolidGeometry3::Cylinder { .. } => {
-            return Err("cylinder (not yet in the f32 preview)".into())
+    let s = |v: f64| (v / norm.scale) as f32;
+    // Body rotation from the transform. A cylinder composes an axis alignment on
+    // top so the primitive is always along canonical +Z.
+    let q = DQuat::from_xyzw(
+        b.common.transform.rot_xyzw[0],
+        b.common.transform.rot_xyzw[1],
+        b.common.transform.rot_xyzw[2],
+        b.common.transform.rot_xyzw[3],
+    );
+    let body_rot = Mat3::from_quat(q.as_quat());
+    let pos = norm.point(b.common.transform.pos);
+
+    let (kind, params, rot, extrude) = match &b.geometry {
+        SolidGeometry3::Sphere { radius_mm } => (
+            OBJ_SPHERE,
+            Vec3::new(s(*radius_mm), 0.0, 0.0),
+            body_rot,
+            None,
+        ),
+        SolidGeometry3::Box { half_extents_mm } => (
+            OBJ_BOX,
+            (*half_extents_mm / norm.scale).as_vec3(),
+            body_rot,
+            None,
+        ),
+        SolidGeometry3::Cylinder {
+            radius_mm,
+            half_length_mm,
+            axis_local,
+        } => {
+            let axis = axis_local.normalize().as_vec3();
+            let align = Mat3::from_quat(glam::Quat::from_rotation_arc(Vec3::Z, axis));
+            (
+                OBJ_CYLINDER,
+                Vec3::new(s(*radius_mm), s(*half_length_mm), 0.0),
+                body_rot * align,
+                None,
+            )
         }
-        SolidGeometry3::Profile(_) => {
-            return Err("profile body (not yet in the f32 preview)".into())
+        SolidGeometry3::Profile(p) => {
+            let (z_min, z_max) = match p.construction {
+                ProfileConstruction3::ExtrudeLocalZ { z_min_mm, z_max_mm } => (z_min_mm, z_max_mm),
+                ProfileConstruction3::RevolveLocalX => {
+                    return Err("revolved profile (not yet in the f32 preview)".into())
+                }
+                ProfileConstruction3::PlanarOnly { .. } => {
+                    return Err("planar-only body has no 3D form to preview".into())
+                }
+            };
+            let verts = line_polygon(&p.profile, norm.scale)?;
+            (
+                OBJ_EXTRUDE,
+                Vec3::ZERO,
+                body_rot,
+                Some(GpuExtrude {
+                    verts,
+                    z_min: s(z_min),
+                    z_max: s(z_max),
+                }),
+            )
         }
     };
 
     let surface = classify_surface(&b.surface.default)?;
-
     let alpha_per_mm = match &b.absorption {
         AbsorptionModel::None => 0.0,
         AbsorptionModel::Constant { alpha_per_mm } => *alpha_per_mm as f32,
@@ -310,16 +418,6 @@ fn compile_body(
             return Err("tabulated volume absorption (not yet in the f32 preview)".into())
         }
     };
-
-    let q = DQuat::from_xyzw(
-        b.common.transform.rot_xyzw[0],
-        b.common.transform.rot_xyzw[1],
-        b.common.transform.rot_xyzw[2],
-        b.common.transform.rot_xyzw[3],
-    );
-    let rot = Mat3::from_quat(q.as_quat());
-    let pos = norm.point(b.common.transform.pos);
-    let params = (params_mm / norm.scale).as_vec3();
 
     let mut gb = GpuBody3 {
         kind,
@@ -329,6 +427,7 @@ fn compile_body(
         rot,
         pos,
         params,
+        extrude,
         index_const: 1.0,
         dp: [0.0; 6],
         alpha_per_mm,
@@ -336,6 +435,37 @@ fn compile_body(
     };
     set_dispersion(&mut gb, &b.material, catalog)?;
     Ok(gb)
+}
+
+/// The closed polygon of a line-only profile, normalized and in loop order, or
+/// the reason it is not extrudable in the f32 preview (a curved edge).
+fn line_polygon(
+    profile: &oc_core::profile2::ClosedProfile2,
+    scale: f64,
+) -> Result<Vec<Vec2>, String> {
+    use oc_core::profile2::Curve2;
+    let mut verts = Vec::new();
+    for e in &profile.edges {
+        match &e.curve {
+            Curve2::Line { a, .. } => {
+                verts.push(Vec2::new((a.x / scale) as f32, (a.y / scale) as f32))
+            }
+            Curve2::Polyline { points } => {
+                for p in points.iter().take(points.len().saturating_sub(1)) {
+                    verts.push(Vec2::new((p.x / scale) as f32, (p.y / scale) as f32));
+                }
+            }
+            Curve2::Conic(_) | Curve2::EvenAsphere { .. } | Curve2::Arc { .. } => {
+                return Err(
+                    "extruded profile has a curved edge (not yet in the f32 preview)".into(),
+                )
+            }
+        }
+    }
+    if verts.len() < 3 {
+        return Err("extruded profile has fewer than three vertices".into());
+    }
+    Ok(verts)
 }
 
 /// A two-sided response the oracle supports, or the reason it does not. This
@@ -706,18 +836,48 @@ mod tests {
     }
 
     #[test]
-    fn a_cylinder_is_rejected_by_name() {
+    fn a_revolved_profile_is_rejected_by_name() {
+        // The curved profile bodies are the one geometry family still to land; the
+        // preview must reject them, not draw a chord.
+        use oc_core::profile2::{
+            ClosedProfile2, ConicParams2, Curve2, ProfileConstruction3, ProfileEdge2, ProfileSolid3,
+        };
         let mut scene = Scene3::new();
         let id = scene.alloc_object_id();
         let mut common = ObjectCommon::new(id, oc_core::id::LayerId(0));
         common.transform = oc_core::vec3::Isometry3::IDENTITY;
+        let edges = vec![
+            ProfileEdge2 {
+                patch: scene.alloc_patch_id(),
+                curve: Curve2::Conic(ConicParams2 {
+                    vertex: oc_core::vec::Vec2::new(-1.0, 0.0),
+                    axis: oc_core::vec::Vec2::X,
+                    c: 0.05,
+                    k: 0.0,
+                    half_ap: 4.0,
+                }),
+            },
+            ProfileEdge2 {
+                patch: scene.alloc_patch_id(),
+                curve: Curve2::Line {
+                    a: oc_core::vec::Vec2::new(-1.0, 4.0),
+                    b: oc_core::vec::Vec2::new(1.0, 4.0),
+                },
+            },
+            ProfileEdge2 {
+                patch: scene.alloc_patch_id(),
+                curve: Curve2::Line {
+                    a: oc_core::vec::Vec2::new(1.0, 4.0),
+                    b: oc_core::vec::Vec2::new(1.0, 0.0),
+                },
+            },
+        ];
         scene.bodies.push(Body3 {
             common,
-            geometry: SolidGeometry3::Cylinder {
-                radius_mm: 2.0,
-                half_length_mm: 5.0,
-                axis_local: Vec3::X.as_dvec3(),
-            },
+            geometry: SolidGeometry3::Profile(ProfileSolid3 {
+                profile: ClosedProfile2 { edges },
+                construction: ProfileConstruction3::RevolveLocalX,
+            }),
             material: Material::AbbePoint { nd: 1.5, vd: 64.0 },
             absorption: AbsorptionModel::None,
             surface: SurfaceProps3::default(),
@@ -727,7 +887,7 @@ mod tests {
         assert!(gpu.bodies.is_empty());
         assert_eq!(gpu.rejected.len(), 1);
         assert_eq!(gpu.rejected[0].object, id.0);
-        assert!(gpu.rejected[0].kind.contains("cylinder"));
+        assert!(gpu.rejected[0].kind.contains("revolved"));
     }
 
     #[test]

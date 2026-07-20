@@ -8,17 +8,17 @@
 //! shader will do and can stand in for it wherever no GPU is present.
 //!
 //! It traces the objects the compiler admits: the analytic bodies (sphere, box,
-//! dielectric or absorbing), zero-thickness surfaces (mirror, absorber, scalar
-//! dielectric, explicit R/T), finite aperture masks, and area detectors. The
-//! curved profile bodies (conic and asphere of revolution, extrusions) are the
-//! one remaining piece; until they land the compiler rejects them by name rather
-//! than the tracer guessing.
+//! cylinder), extruded line profiles (prisms), zero-thickness surfaces (mirror,
+//! absorber, scalar dielectric, explicit R/T), finite aperture masks, and area
+//! detectors. The one remaining geometry is the revolved profile (conic and
+//! even-asphere surfaces of revolution) and extrusions with curved edges; until
+//! they land the compiler rejects them by name rather than the tracer guessing.
 
 use glam::{DVec3, Vec2, Vec3};
 
 use crate::scene3::{
-    GpuAperture3, GpuBody3, GpuDetector3, GpuResponse, GpuScene3, GpuSurface3, OBJ_BOX, OBJ_SPHERE,
-    SURF_ABSORBER,
+    GpuAperture3, GpuBody3, GpuDetector3, GpuExtrude, GpuResponse, GpuScene3, GpuSurface3, OBJ_BOX,
+    OBJ_CYLINDER, OBJ_EXTRUDE, OBJ_SPHERE, SURF_ABSORBER,
 };
 
 /// Segment flag bits (shared meaning with the 2D path).
@@ -457,6 +457,8 @@ fn body_hit(b: &GpuBody3, o: Vec3, d: Vec3) -> Option<(f32, Vec3)> {
     match b.kind {
         OBJ_SPHERE => sphere_hit(ol, dl, b.params.x, EPS),
         OBJ_BOX => box_hit(ol, dl, b.params, EPS),
+        OBJ_CYLINDER => cylinder_hit(ol, dl, b.params.x, b.params.y, EPS),
+        OBJ_EXTRUDE => extrude_hit(b.extrude.as_ref()?, ol, dl, EPS),
         _ => None,
     }
 }
@@ -604,8 +606,147 @@ fn contains(b: &GpuBody3, p: Vec3) -> bool {
     match b.kind {
         OBJ_SPHERE => pl.length_squared() <= b.params.x * b.params.x,
         OBJ_BOX => pl.x.abs() <= b.params.x && pl.y.abs() <= b.params.y && pl.z.abs() <= b.params.z,
+        OBJ_CYLINDER => {
+            pl.x * pl.x + pl.y * pl.y <= b.params.x * b.params.x && pl.z.abs() <= b.params.y
+        }
+        OBJ_EXTRUDE => b
+            .extrude
+            .as_ref()
+            .map(|e| extrude_contains(e, pl))
+            .unwrap_or(false),
         _ => false,
     }
+}
+
+/// Is a local point inside the extruded body?
+fn extrude_contains(e: &GpuExtrude, p: Vec3) -> bool {
+    p.z >= e.z_min && p.z <= e.z_max && point_in_polygon(&e.verts, Vec2::new(p.x, p.y))
+}
+
+fn point_in_polygon(verts: &[Vec2], p: Vec2) -> bool {
+    let mut inside = false;
+    let n = verts.len();
+    let mut j = n - 1;
+    for i in 0..n {
+        let (a, b) = (verts[i], verts[j]);
+        if (a.y > p.y) != (b.y > p.y) {
+            let t = (p.y - a.y) / (b.y - a.y);
+            if p.x < a.x + t * (b.x - a.x) {
+                inside = !inside;
+            }
+        }
+        j = i;
+    }
+    inside
+}
+
+/// Nearest finite-cylinder intersection at `t > tmin` (canonical `+Z` axis), with
+/// the outward local normal. Side wall plus the two end caps.
+fn cylinder_hit(o: Vec3, d: Vec3, r: f32, hl: f32, tmin: f32) -> Option<(f32, Vec3)> {
+    let mut best: Option<(f32, Vec3)> = None;
+    let keep = |best: &mut Option<(f32, Vec3)>, t: f32, n: Vec3| {
+        if t > tmin && best.map(|(bt, _)| t < bt).unwrap_or(true) {
+            *best = Some((t, n));
+        }
+    };
+
+    let a = d.x * d.x + d.y * d.y;
+    if a > 1e-20 {
+        let b = 2.0 * (o.x * d.x + o.y * d.y);
+        let c = o.x * o.x + o.y * o.y - r * r;
+        let disc = b * b - 4.0 * a * c;
+        if disc >= 0.0 {
+            let sq = disc.sqrt();
+            for t in [(-b - sq) / (2.0 * a), (-b + sq) / (2.0 * a)] {
+                let z = o.z + t * d.z;
+                if z.abs() <= hl {
+                    let p = o + d * t;
+                    keep(&mut best, t, Vec3::new(p.x, p.y, 0.0) / r);
+                }
+            }
+        }
+    }
+    if d.z.abs() > 1e-20 {
+        for (zc, nz) in [(hl, 1.0_f32), (-hl, -1.0_f32)] {
+            let t = (zc - o.z) / d.z;
+            let p = o + d * t;
+            if p.x * p.x + p.y * p.y <= r * r {
+                keep(&mut best, t, Vec3::new(0.0, 0.0, nz));
+            }
+        }
+    }
+    best
+}
+
+/// Nearest extruded-profile intersection at `t > tmin`, with the outward local
+/// normal: ruled side faces plus the two end caps.
+fn extrude_hit(e: &GpuExtrude, o: Vec3, d: Vec3, tmin: f32) -> Option<(f32, Vec3)> {
+    let mut best: Option<(f32, Vec3)> = None;
+    let keep = |best: &mut Option<(f32, Vec3)>, t: f32, n: Vec3| {
+        if t > tmin && best.map(|(bt, _)| t < bt).unwrap_or(true) {
+            *best = Some((t, n));
+        }
+    };
+
+    let n = e.verts.len();
+    let o2 = Vec2::new(o.x, o.y);
+    let d2 = Vec2::new(d.x, d.y);
+    if d2.length() > 1e-12 {
+        for i in 0..n {
+            let (a, b) = (e.verts[i], e.verts[(i + 1) % n]);
+            if let Some((t, n2)) = segment_hit(a, b, o2, d2, tmin) {
+                let z = o.z + t * d.z;
+                if z >= e.z_min && z <= e.z_max {
+                    let p = o + d * t;
+                    let nrm = orient_out(e, Vec3::new(n2.x, n2.y, 0.0), p);
+                    keep(&mut best, t, nrm);
+                }
+            }
+        }
+    }
+    if d.z.abs() > 1e-12 {
+        for (z, nz) in [(e.z_min, -1.0_f32), (e.z_max, 1.0_f32)] {
+            let t = (z - o.z) / d.z;
+            if t > tmin {
+                let p = o + d * t;
+                if point_in_polygon(&e.verts, Vec2::new(p.x, p.y)) {
+                    keep(&mut best, t, Vec3::new(0.0, 0.0, nz));
+                }
+            }
+        }
+    }
+    best
+}
+
+/// Orient a side-face normal outward: away from the body's interior.
+fn orient_out(e: &GpuExtrude, n: Vec3, p: Vec3) -> Vec3 {
+    if extrude_contains(e, p + n * EPS) {
+        -n
+    } else {
+        n
+    }
+}
+
+/// Intersect the 2D ray `o + t·d` (`d` need not be unit) with segment `a–b`.
+/// Returns `(t, unit edge normal)` when `t > tmin` and the hit is on the segment.
+fn segment_hit(a: Vec2, b: Vec2, o: Vec2, d: Vec2, tmin: f32) -> Option<(f32, Vec2)> {
+    let edge = b - a;
+    let denom = cross2(d, edge);
+    if denom.abs() < 1e-20 {
+        return None;
+    }
+    let ao = a - o;
+    let t = cross2(ao, edge) / denom;
+    let u = cross2(ao, d) / denom;
+    if t <= tmin || !(0.0..=1.0).contains(&u) {
+        return None;
+    }
+    Some((t, Vec2::new(edge.y, -edge.x).normalize()))
+}
+
+#[inline]
+fn cross2(p: Vec2, q: Vec2) -> f32 {
+    p.x * q.y - p.y * q.x
 }
 
 // ---------------------------------------------------------------------------

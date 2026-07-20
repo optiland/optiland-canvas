@@ -55,6 +55,7 @@ export function initSlice3d(opts: {
   const promoteRevolve = document.getElementById("promoteRevolve") as HTMLButtonElement;
   const promoteExtrude = document.getElementById("promoteExtrude") as HTMLButtonElement;
   const promoteDepth = document.getElementById("promoteDepth") as HTMLInputElement;
+  const objects = document.getElementById("objects3d")!;
 
   let loaded = false;
   // Ids of bodies whose third dimension is still unresolved (PlanarOnly), from
@@ -63,6 +64,12 @@ export function initSlice3d(opts: {
   // The projected segments for the current scene + view plane, cached so pan/zoom
   // and slice edits redraw without re-running the f64 tracer. Refreshed on load.
   let segs: Float32Array<ArrayBufferLike> = new Float32Array(0);
+  // The scene revision the cached projection was traced at (§3.3). The overlay
+  // refuses to draw a projection older than the scene: a mutation bumps the
+  // revision, so a cached result that predates it is re-traced before it paints.
+  // (Synchronous today; the same guard rejects a stale *async* result once the
+  // GPU path lands.)
+  let tracedRevision = -1;
   // Slice half-thickness in mm; 0 = show everything projected.
   let slice = 0;
 
@@ -86,11 +93,33 @@ export function initSlice3d(opts: {
 
   function retrace() {
     segs = scene.traceProjected3D();
+    tracedRevision = scene.sceneRevision();
   }
 
   // Promotion is offered only while unresolved bodies remain.
   function updatePromoteRow() {
     promoteRow.style.display = planarBodies.length > 0 ? "" : "none";
+  }
+
+  // The object inspector: each body's construction and world transform, so its
+  // 3D shape and any missing depth are visible (§13). Re-read from Rust — never
+  // a JS-side mirror of the scene graph.
+  type Obj = { id: number; kind: string; construction: string; is3d: boolean; pos: number[] };
+  function refreshInspector() {
+    const objs: Obj[] = JSON.parse(scene.sceneObjectsJSON());
+    objects.replaceChildren();
+    for (const o of objs) {
+      const row = document.createElement("div");
+      row.className = "row";
+      const [x, y, z] = o.pos.map((v) => v.toFixed(1));
+      const shape = o.kind === "profile" ? `profile · ${o.construction}` : o.kind;
+      const planar = o.is3d ? "" : ` <span class="planar" title="no third dimension yet — promote to trace in full 3D">⚠ planar-only</span>`;
+      row.innerHTML =
+        `<span class="oid">#${o.id}</span>` +
+        `<span class="okind">${shape}${planar}</span>` +
+        `<span class="opos">(${x}, ${y}, ${z})</span>`;
+      objects.appendChild(row);
+    }
   }
 
   async function open(file: File) {
@@ -101,6 +130,7 @@ export function initSlice3d(opts: {
       sliceRow.style.display = "";
       updatePromoteRow();
       refreshBadge();
+      refreshInspector();
       retrace();
       const note = report.migratedFromV1
         ? `migrated from v1 · ${planarBodies.length} body(ies) still planar-only — promote to trace in full 3D`
@@ -133,6 +163,7 @@ export function initSlice3d(opts: {
     planarBodies = remaining;
     updatePromoteRow();
     refreshBadge();
+    refreshInspector();
     retrace();
     if (ok > 0) {
       const refused = remaining.length ? ` · ${remaining.length} refused` : "";
@@ -180,7 +211,11 @@ export function initSlice3d(opts: {
   return {
     active: () => loaded,
     overlay(ctx, toScreen) {
-      if (!loaded || segs.length === 0) return;
+      if (!loaded) return;
+      // Never paint a projection older than the scene (§3.3): a mutation that
+      // bumped the revision without a re-trace is caught here.
+      if (scene.sceneRevision() !== tracedRevision) retrace();
+      if (segs.length === 0) return;
       ctx.save();
       ctx.lineWidth = 1.2;
       ctx.globalCompositeOperation = "lighter";

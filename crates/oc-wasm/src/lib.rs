@@ -1662,6 +1662,37 @@ impl Canvas {
             incident.join(",")
         )
     }
+
+    /// The 3D objects for the inspector: each body's id, geometry kind, 3D
+    /// construction, whether its third dimension is resolved, and its world
+    /// position. JSON array `[{id,kind,construction,is3d,pos:[x,y,z]}]`; empty if
+    /// no scene is loaded. This is where "construction and missing depth are
+    /// visible" (§13).
+    #[wasm_bindgen(js_name = sceneObjectsJSON)]
+    pub fn scene_objects_json(&self) -> String {
+        let Some(scene) = &self.scene3 else {
+            return "[]".into();
+        };
+        let items: Vec<String> = scene
+            .bodies
+            .iter()
+            .map(|b| {
+                let (kind, construction) = body_kind_construction(b);
+                let p = b.common.transform.pos;
+                format!(
+                    "{{\"id\":{},\"kind\":{},\"construction\":{},\"is3d\":{},\"pos\":[{},{},{}]}}",
+                    b.common.id.0,
+                    json_str(kind),
+                    json_str(construction),
+                    b.is_3d(),
+                    p.x,
+                    p.y,
+                    p.z
+                )
+            })
+            .collect();
+        format!("[{}]", items.join(","))
+    }
 }
 
 impl Canvas {
@@ -1878,6 +1909,24 @@ fn colored_segments(scene: &Scene, ghosts: bool, max_ghost: u32) -> Vec<f32> {
 
 /// Escape a string as a JSON string literal (quotes included) — for names and
 /// history labels that the shell round-trips through `JSON.parse`.
+/// A body's geometry kind and 3D construction, for the inspector.
+fn body_kind_construction(b: &oc_core::scene3::Body3) -> (&'static str, &'static str) {
+    use oc_core::scene3::SolidGeometry3;
+    match &b.geometry {
+        SolidGeometry3::Sphere { .. } => ("sphere", "analytic"),
+        SolidGeometry3::Box { .. } => ("box", "analytic"),
+        SolidGeometry3::Cylinder { .. } => ("cylinder", "analytic"),
+        SolidGeometry3::Profile(p) => (
+            "profile",
+            match p.construction {
+                ProfileConstruction3::PlanarOnly { .. } => "planar-only",
+                ProfileConstruction3::RevolveLocalX => "revolved",
+                ProfileConstruction3::ExtrudeLocalZ { .. } => "extruded",
+            },
+        ),
+    }
+}
+
 /// A [`PromotionCheck`] as `{ok, reason}` JSON.
 fn check_json(check: &PromotionCheck) -> String {
     match check {
@@ -2291,13 +2340,25 @@ mod scene3_tests {
         let body_id = first_id(&report, "planarOnlyBodies").expect("a planar-only body");
         let rev = c.scene_revision();
 
+        // The inspector shows it as an unresolved profile.
+        let before = c.scene_objects_json();
+        assert!(
+            before.contains("\"construction\":\"planar-only\""),
+            "{before}"
+        );
+        assert!(before.contains("\"is3d\":false"), "{before}");
+
         // A meridionally-symmetric singlet profile promotes to a revolved solid.
         let promo = c.promote_body_to_revolved(body_id as f64).unwrap();
         assert!(promo.contains("\"body\":"), "{promo}");
         assert!(c.scene_revision() > rev, "promotion must bump the revision");
 
-        // Now a real 3D body exists, so the badge is no longer legacy-planar.
+        // Now a real 3D body exists, so the badge is no longer legacy-planar and
+        // the inspector reports a resolved, revolved body.
         assert_ne!(c.preview_mode(), "legacy_planar");
+        let after = c.scene_objects_json();
+        assert!(after.contains("\"construction\":\"revolved\""), "{after}");
+        assert!(after.contains("\"is3d\":true"), "{after}");
     }
 
     /// Build a v2 demo scene — a glass sphere lit by a collimated beam onto a

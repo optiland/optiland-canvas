@@ -77,13 +77,20 @@ test.describe("3D preview — the 2D Canvas as a slice of Scene3", () => {
     await expect(badge).toHaveClass(/legacy_planar/);
     // The promotion controls appear because a planar-only body exists.
     await expect(page.locator("#promote3dRow")).toBeVisible();
+    // The inspector shows the unresolved body and its missing depth.
+    const inspector = page.locator("#objects3d");
+    await expect(inspector).toContainText("profile · planar-only");
+    await expect(inspector).toContainText("planar-only");
 
     // Revolve it: the migrated singlet becomes a real 3D solid.
     await page.locator("#promoteRevolve").click();
     await expect(badge).not.toHaveClass(/legacy_planar/);
     await expect(page.locator("#preview3dMsg")).toContainText("promoted 1");
-    // Nothing left to promote ⇒ the controls retire.
+    // Nothing left to promote ⇒ the controls retire, and the inspector now shows
+    // a revolved body with no planar-only warning.
     await expect(page.locator("#promote3dRow")).toBeHidden();
+    await expect(inspector).toContainText("profile · revolved");
+    await expect(inspector).not.toContainText("planar-only");
     // The now-3D lens refracts the beam onto the view.
     expect(await litPixels(page)).toBeGreaterThan(200);
   });

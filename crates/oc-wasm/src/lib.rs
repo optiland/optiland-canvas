@@ -21,6 +21,17 @@ use oc_gpu::{color::wavelength_um_to_linear, scene::GpuScene, trace_cpu, BuildOp
 use oc_trace::{trace as ref_trace, TraceConfig};
 use wasm_bindgen::prelude::*;
 
+// --- 3D (Scene3) migration surface (PR 3D-09) ------------------------------
+use oc_core::id::BodyId;
+use oc_core::migrate_v1::{load_any, LoadReport};
+use oc_core::planar_reduce::{preview_mode, PreviewMode};
+use oc_core::profile2::ProfileConstruction3;
+use oc_core::scene3::{
+    can_promote_to_extruded, can_promote_to_revolved, promote_body, PromotionCheck, Scene3,
+};
+use oc_core::vec3::{Plane3, Vec3};
+use oc_trace::{trace_scene3, TraceConfig3};
+
 /// The openUC2 mode (§15.2). The freeform Canvas above does not know it exists.
 pub mod openuc2;
 
@@ -116,6 +127,18 @@ pub struct Canvas {
     /// Non-linear undo history (§5.2). Lazily reset by JS after the demo scene
     /// is built, so undo does not walk back into an empty document.
     history: History,
+    /// The canonical 3D scene, once a v2 (or migrated v1) document is loaded
+    /// (§3.1, PR 3D-09). `None` until the browser opens one; the v1 `scene`
+    /// above still drives the freeform demo. The 2D Canvas becomes a *view* of
+    /// this: a slice on [`Canvas::view_plane`].
+    scene3: Option<Scene3>,
+    /// The plane the 2D Canvas slices/projects (default `Z = 0`, §10.1).
+    view_plane: Plane3,
+    /// Slice half-thickness in mm for distance-from-plane filtering (§10.4).
+    slice_thickness: f64,
+    /// Bumped on every mutation of `scene3`, so an async f64 result carrying an
+    /// older revision is discarded rather than shown (§3.3, §13).
+    revision: u64,
 }
 
 #[wasm_bindgen]
@@ -135,6 +158,10 @@ impl Canvas {
             param_pins: HashSet::new(),
             active_layer: 0,
             history,
+            scene3: None,
+            view_plane: Plane3::XY,
+            slice_thickness: 0.0,
+            revision: 0,
         }
     }
 
@@ -456,7 +483,12 @@ impl Canvas {
         self.active_layer = self
             .active_layer
             .min(self.scene.layers.len().saturating_sub(1) as u32);
-        self.history = History::single(self.scene.to_json(), self.pins_sorted(), self.active_layer, "open");
+        self.history = History::single(
+            self.scene.to_json(),
+            self.pins_sorted(),
+            self.active_layer,
+            "open",
+        );
         Ok(())
     }
 
@@ -485,11 +517,7 @@ impl Canvas {
                     .iter()
                     .flat_map(|p| [format!("{:.4}", p.x), format!("{:.4}", p.y)])
                     .collect();
-                format!(
-                    "{},\"curve\":[{}]}}",
-                    rung_json_open(f),
-                    flat.join(",")
-                )
+                format!("{},\"curve\":[{}]}}", rung_json_open(f), flat.join(","))
             })
             .collect();
         format!(
@@ -617,7 +645,10 @@ impl Canvas {
         if self.locked(id) {
             return false;
         }
-        let (px, py) = (self.param_pins.contains(&(id, 0)), self.param_pins.contains(&(id, 1)));
+        let (px, py) = (
+            self.param_pins.contains(&(id, 0)),
+            self.param_pins.contains(&(id, 1)),
+        );
         if let Some(e) = self.scene.elements.get_mut(id as usize) {
             if !px {
                 e.transform.pos.x = x;
@@ -749,8 +780,16 @@ impl Canvas {
         }
 
         let names: Vec<String> = snaps.iter().map(|s| format!("\"{s}\"")).collect();
-        let jx = if guide_x.is_finite() { format!("{guide_x}") } else { "null".into() };
-        let jy = if guide_y.is_finite() { format!("{guide_y}") } else { "null".into() };
+        let jx = if guide_x.is_finite() {
+            format!("{guide_x}")
+        } else {
+            "null".into()
+        };
+        let jy = if guide_y.is_finite() {
+            format!("{guide_y}")
+        } else {
+            "null".into()
+        };
         format!(
             "{{\"x\":{},\"y\":{},\"snaps\":[{}],\"guideX\":{},\"guideY\":{}}}",
             sx,
@@ -806,8 +845,17 @@ impl Canvas {
     #[wasm_bindgen(js_name = pinnedParamsJson)]
     pub fn pinned_params_json(&self, id: u32) -> String {
         const NAMES: [&str; 11] = [
-            "x", "y", "rot", "thickness", "fit", "radius1", "radius2", "half_ap1", "half_ap2",
-            "conic_k1", "conic_k2",
+            "x",
+            "y",
+            "rot",
+            "thickness",
+            "fit",
+            "radius1",
+            "radius2",
+            "half_ap1",
+            "half_ap2",
+            "conic_k1",
+            "conic_k2",
         ];
         let names: Vec<String> = NAMES
             .iter()
@@ -838,7 +886,15 @@ impl Canvas {
             e.id = ElementId(i as u32);
         }
         // Shift the side-tables keyed by id (drop `id`, decrement anything above).
-        let remap = |k: u32| if k > id { Some(k - 1) } else if k < id { Some(k) } else { None };
+        let remap = |k: u32| {
+            if k > id {
+                Some(k - 1)
+            } else if k < id {
+                Some(k)
+            } else {
+                None
+            }
+        };
         let fitted = std::mem::take(&mut self.fitted);
         self.fitted = fitted
             .into_iter()
@@ -1270,7 +1326,11 @@ impl Canvas {
                 rays: 1,
             }];
             let mut segs = ref_trace(&scene, &cfg).segments;
-            segs.sort_by(|a, b| a.opl0.partial_cmp(&b.opl0).unwrap_or(std::cmp::Ordering::Equal));
+            segs.sort_by(|a, b| {
+                a.opl0
+                    .partial_cmp(&b.opl0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
             // Polyline: the first segment's start, then every segment's end.
             let n = if segs.is_empty() { 0 } else { segs.len() + 1 };
             out.push(n as f32);
@@ -1341,6 +1401,338 @@ impl Canvas {
             scene.elements.len(),
             scene.sources.len(),
             scene.detectors.len()
+        )
+    }
+}
+
+// --- 3D scene (Scene3): the canonical model the 2D Canvas is a view of -------
+//
+// PR 3D-09. These methods are additive: the v1 API above still drives the
+// freeform demo. The browser opens a v2 (or migrated v1) `.ocanvas` into
+// `scene3`, then reads its dimension, preview mode, and capability report, sets
+// the slice plane, promotes bodies to real 3D constructions, and traces the
+// authoritative f64 path projected onto the plane. Every scene mutation bumps
+// `revision`, so a settled async result carrying a stale one is discarded (§3.3).
+#[wasm_bindgen]
+impl Canvas {
+    /// Open an `.ocanvas` document of either version into the canonical 3D scene.
+    /// v1 is migrated with **no third dimension invented** (bodies become
+    /// `PlanarOnly`); v2 parses directly (§11.2). Returns a load-report JSON:
+    /// `{dimension, migratedFromV1, unresolvedThirdDimension, planarOnlyBodies,
+    /// lineProbeDetectors, legacySources, notes, previewMode}`. Throws with a
+    /// readable message if the document is not loadable.
+    #[wasm_bindgen(js_name = loadScene3JSON)]
+    pub fn load_scene3_json(&mut self, json: &str) -> Result<String, JsError> {
+        let (scene, report) = load_any(json).map_err(|e| JsError::new(&format!("{e:?}")))?;
+        self.scene3 = Some(scene);
+        self.revision += 1;
+        Ok(self.load_report_json(&report))
+    }
+
+    /// The canonical 3D scene as v2 JSON, or `""` if none is loaded.
+    #[wasm_bindgen(js_name = scene3JSON)]
+    pub fn scene3_json(&self) -> String {
+        self.scene3
+            .as_ref()
+            .map(|s| s.to_json())
+            .unwrap_or_default()
+    }
+
+    /// The loaded scene's dimension (`3`), or `0` if no 3D scene is loaded.
+    #[wasm_bindgen(js_name = sceneDimension)]
+    pub fn scene_dimension(&self) -> u8 {
+        self.scene3.as_ref().map_or(0, |s| s.dimension)
+    }
+
+    /// How the browser should preview the scene (§10.3): `"exact_planar"`,
+    /// `"full_3d"`, `"legacy_planar"`, or `"none"` when nothing is loaded. This
+    /// is the badge; it never labels a legacy result full 3D.
+    #[wasm_bindgen(js_name = previewMode)]
+    pub fn preview_mode(&self) -> String {
+        match &self.scene3 {
+            None => "none".into(),
+            Some(s) => match preview_mode(s) {
+                PreviewMode::ExactPlanarReduction => "exact_planar",
+                PreviewMode::Full3dProjected => "full_3d",
+                PreviewMode::LegacyPlanarCompatibility => "legacy_planar",
+            }
+            .into(),
+        }
+    }
+
+    /// The current scene revision. A settled f64 result carries the revision it
+    /// was traced at; the UI discards a result whose revision is not the latest.
+    #[wasm_bindgen(js_name = sceneRevision)]
+    pub fn scene_revision(&self) -> f64 {
+        self.revision as f64
+    }
+
+    /// The capability report for the loaded scene (§3.5): which physics the f64
+    /// reference supports, approximates, or rejects, each with the object. JSON
+    /// `{supported,exact,approximated,rejected}`, or `null` if none is loaded.
+    #[wasm_bindgen(js_name = capabilityReportJSON)]
+    pub fn capability_report_json(&self) -> String {
+        let Some(scene) = &self.scene3 else {
+            return "null".into();
+        };
+        let res = trace_scene3(scene, &self.cfg3());
+        let cap = &res.capability_report;
+        let arr = |v: &[String]| format!("[{}]", v.join(","));
+        let supported: Vec<String> = cap
+            .supported
+            .iter()
+            .map(|f| json_str(&format!("{f:?}")))
+            .collect();
+        let exact: Vec<String> = cap
+            .exact
+            .iter()
+            .map(|f| json_str(&format!("{f:?}")))
+            .collect();
+        let approx: Vec<String> = cap
+            .approximated
+            .iter()
+            .map(|a| json_str(&format!("{a:?}")))
+            .collect();
+        let rejected: Vec<String> = cap
+            .rejected
+            .iter()
+            .map(|r| json_str(&format!("{r:?}")))
+            .collect();
+        format!(
+            "{{\"supported\":{},\"exact\":{},\"approximated\":{},\"rejected\":{}}}",
+            arr(&supported),
+            arr(&exact),
+            arr(&approx),
+            arr(&rejected)
+        )
+    }
+
+    /// Set the plane the 2D Canvas slices/projects (§10.1). `u` and `v` are the
+    /// in-plane axes; they must be perpendicular. Throws on a degenerate or
+    /// sheared basis. The view is derived, so this does not bump the revision.
+    #[wasm_bindgen(js_name = setViewPlane)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_view_plane(
+        &mut self,
+        ox: f64,
+        oy: f64,
+        oz: f64,
+        ux: f64,
+        uy: f64,
+        uz: f64,
+        vx: f64,
+        vy: f64,
+        vz: f64,
+    ) -> Result<(), JsError> {
+        let plane = Plane3::new(
+            Vec3::new(ox, oy, oz),
+            Vec3::new(ux, uy, uz),
+            Vec3::new(vx, vy, vz),
+        )
+        .map_err(|e| JsError::new(&format!("{e:?}")))?;
+        self.view_plane = plane;
+        Ok(())
+    }
+
+    /// Slice half-thickness in mm for filtering projected paths by distance from
+    /// the plane (§10.4). `0` shows everything projected.
+    #[wasm_bindgen(js_name = setSliceThickness)]
+    pub fn set_slice_thickness(&mut self, mm: f64) {
+        self.slice_thickness = mm.max(0.0);
+    }
+
+    /// Promote a profile-authored body to a revolved solid (about local +X). The
+    /// profile is validated (mirror-symmetric, closed, non-self-intersecting);
+    /// the promotion is refused with a reason rather than guessed (§11.3).
+    /// Returns a report JSON `{body, from, to}`; throws on refusal.
+    #[wasm_bindgen(js_name = promoteBodyToRevolved)]
+    pub fn promote_body_to_revolved(&mut self, body_id: f64) -> Result<String, JsError> {
+        self.promote(body_id, ProfileConstruction3::RevolveLocalX)
+    }
+
+    /// Promote a profile-authored body to an extruded solid through local Z.
+    /// Returns a report JSON `{body, from, to}`; throws on refusal.
+    #[wasm_bindgen(js_name = promoteBodyToExtruded)]
+    pub fn promote_body_to_extruded(
+        &mut self,
+        body_id: f64,
+        z_min_mm: f64,
+        z_max_mm: f64,
+    ) -> Result<String, JsError> {
+        self.promote(
+            body_id,
+            ProfileConstruction3::ExtrudeLocalZ { z_min_mm, z_max_mm },
+        )
+    }
+
+    /// Whether a body can be promoted, without mutating it — for enabling the
+    /// promotion controls. JSON `{revolve:{ok,reason},extrude:{ok,reason}}`, or
+    /// `null` if the body or scene is absent.
+    #[wasm_bindgen(js_name = promotionOptionsJSON)]
+    pub fn promotion_options_json(&self, body_id: f64, z_min_mm: f64, z_max_mm: f64) -> String {
+        let Some(scene) = &self.scene3 else {
+            return "null".into();
+        };
+        let Some(body) = scene
+            .bodies
+            .iter()
+            .find(|b| b.common.id.0 == body_id as u64)
+        else {
+            return "null".into();
+        };
+        let rev = check_json(&can_promote_to_revolved(body));
+        let ext = check_json(&can_promote_to_extruded(body, z_min_mm, z_max_mm));
+        format!("{{\"revolve\":{rev},\"extrude\":{ext}}}")
+    }
+
+    /// Trace the authoritative f64 path and project every segment onto the view
+    /// plane. Nine floats per segment:
+    /// `[au, av, bu, bv, flux, lambda_um, flags, dist_a, dist_b]`, where
+    /// `(au,av)`/`(bu,bv)` are in-plane coordinates, `flags` is bit1=TIR bit2=ghost,
+    /// and `dist_*` is the signed distance of each endpoint from the plane so the
+    /// UI can filter by [`Canvas::set_slice_thickness`]. Empty if no scene.
+    #[wasm_bindgen(js_name = traceProjected3D)]
+    pub fn trace_projected_3d(&self) -> Vec<f32> {
+        let Some(scene) = &self.scene3 else {
+            return Vec::new();
+        };
+        let res = trace_scene3(scene, &self.cfg3());
+        let plane = &self.view_plane;
+        let mut out = Vec::with_capacity(res.segments.len() * 9);
+        for s in &res.segments {
+            let a = plane.to_local(s.a);
+            let b = plane.to_local(s.b);
+            let flags = (s.flags.tir as u32) * 2 + (s.flags.ghost as u32) * 4;
+            out.extend_from_slice(&[
+                a.x as f32,
+                a.y as f32,
+                b.x as f32,
+                b.y as f32,
+                s.flux_end as f32,
+                s.lambda_um as f32,
+                flags as f32,
+                plane.signed_distance(s.a) as f32,
+                plane.signed_distance(s.b) as f32,
+            ]);
+        }
+        out
+    }
+
+    /// The f64 reference readout for a detector by id (§4.1: the honest numbers).
+    /// JSON `{hits, totalIncident, totalSignal, cellArea, centroid, meanOpl,
+    /// bins, incident}`, or `null` if there is no such detector.
+    #[wasm_bindgen(js_name = detectorResultJSON)]
+    pub fn detector_result_json(&self, detector_id: f64) -> String {
+        let Some(scene) = &self.scene3 else {
+            return "null".into();
+        };
+        let res = trace_scene3(scene, &self.cfg3());
+        let Some(d) = res
+            .detectors
+            .iter()
+            .find(|d| d.detector.0 == detector_id as u64)
+        else {
+            return "null".into();
+        };
+        let centroid = if d.total_incident > 0.0 {
+            let c = d.flux_uv / d.total_incident;
+            format!("[{},{}]", c.x, c.y)
+        } else {
+            "null".to_string()
+        };
+        let mean_opl = if d.total_incident > 0.0 {
+            format!("{}", d.flux_opl / d.total_incident)
+        } else {
+            "null".to_string()
+        };
+        let cell_area = d
+            .cell_area_mm2
+            .map_or("null".to_string(), |a| format!("{a}"));
+        let incident: Vec<String> = d.incident_flux.iter().map(|v| format!("{v}")).collect();
+        format!(
+            "{{\"hits\":{},\"totalIncident\":{},\"totalSignal\":{},\"cellArea\":{},\"centroid\":{},\"meanOpl\":{},\"bins\":[{},{}],\"incident\":[{}]}}",
+            d.hits,
+            d.total_incident,
+            d.total_signal,
+            cell_area,
+            centroid,
+            mean_opl,
+            d.bins[0],
+            d.bins[1],
+            incident.join(",")
+        )
+    }
+}
+
+impl Canvas {
+    /// Promote a body and bump the revision, mapping errors to a JS-readable form.
+    fn promote(
+        &mut self,
+        body_id: f64,
+        construction: ProfileConstruction3,
+    ) -> Result<String, JsError> {
+        let scene = self
+            .scene3
+            .as_mut()
+            .ok_or_else(|| JsError::new("no 3D scene loaded"))?;
+        let report = promote_body(scene, BodyId(body_id as u64), construction)
+            .map_err(|e| JsError::new(&format!("{e:?}")))?;
+        self.revision += 1;
+        Ok(format!(
+            "{{\"body\":{},\"from\":{},\"to\":{},\"undecided\":{}}}",
+            report.body.0,
+            json_str(&format!("{:?}", report.from)),
+            json_str(&format!("{:?}", report.to)),
+            report.undecided.len()
+        ))
+    }
+
+    /// The f64 trace configuration, stamped with the current revision (§3.3).
+    fn cfg3(&self) -> TraceConfig3 {
+        TraceConfig3 {
+            ghosts: self.ghosts,
+            max_ghost_bounces: self.max_ghost,
+            revision: self.revision,
+            ..TraceConfig3::default()
+        }
+    }
+
+    /// Build the load-report JSON from a [`LoadReport`].
+    fn load_report_json(&self, report: &LoadReport) -> String {
+        let ids = |v: &[u64]| {
+            v.iter()
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let (migrated, planar, lines, sources, notes, unresolved) = match report {
+            LoadReport::V2 => (false, Vec::new(), Vec::new(), Vec::new(), Vec::new(), false),
+            LoadReport::MigratedFromV1(r) => (
+                true,
+                r.planar_only_bodies
+                    .iter()
+                    .map(|o| o.0)
+                    .collect::<Vec<u64>>(),
+                r.line_probe_detectors
+                    .iter()
+                    .map(|o| o.0)
+                    .collect::<Vec<u64>>(),
+                r.legacy_sources.iter().map(|s| s.0).collect::<Vec<u64>>(),
+                r.notes.clone(),
+                r.has_unresolved_dimension(),
+            ),
+        };
+        let notes_json: Vec<String> = notes.iter().map(|n| json_str(n)).collect();
+        format!(
+            "{{\"dimension\":{},\"migratedFromV1\":{},\"unresolvedThirdDimension\":{},\"planarOnlyBodies\":[{}],\"lineProbeDetectors\":[{}],\"legacySources\":[{}],\"notes\":[{}],\"previewMode\":{}}}",
+            self.scene_dimension(),
+            migrated,
+            unresolved,
+            ids(&planar),
+            ids(&lines),
+            ids(&sources),
+            notes_json.join(","),
+            json_str(&self.preview_mode())
         )
     }
 }
@@ -1478,17 +1870,7 @@ fn colored_segments(scene: &Scene, ghosts: bool, max_ghost: u32) -> Vec<f32> {
     for segs in &per_ray {
         for s in segs {
             let [r, g, b] = wavelength_um_to_linear(s.lambda_um);
-            out.extend_from_slice(&[
-                s.a.x,
-                s.a.y,
-                s.b.x,
-                s.b.y,
-                r,
-                g,
-                b,
-                s.flux,
-                s.flags as f32,
-            ]);
+            out.extend_from_slice(&[s.a.x, s.a.y, s.b.x, s.b.y, r, g, b, s.flux, s.flags as f32]);
         }
     }
     out
@@ -1496,6 +1878,17 @@ fn colored_segments(scene: &Scene, ghosts: bool, max_ghost: u32) -> Vec<f32> {
 
 /// Escape a string as a JSON string literal (quotes included) — for names and
 /// history labels that the shell round-trips through `JSON.parse`.
+/// A [`PromotionCheck`] as `{ok, reason}` JSON.
+fn check_json(check: &PromotionCheck) -> String {
+    match check {
+        PromotionCheck::Ok => "{\"ok\":true,\"reason\":null}".to_string(),
+        PromotionCheck::No(reason) => format!("{{\"ok\":false,\"reason\":{}}}", json_str(reason)),
+        PromotionCheck::Undecided(reason) => {
+            format!("{{\"ok\":false,\"reason\":{}}}", json_str(reason))
+        }
+    }
+}
+
 fn json_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -1624,7 +2017,13 @@ fn read_singlet(e: &Element) -> Option<Singlet> {
         Edge::Conic(cp) => cp,
         _ => return None,
     };
-    let radius = |c: f64| if c.abs() < 1e-12 { f64::INFINITY } else { 1.0 / c };
+    let radius = |c: f64| {
+        if c.abs() < 1e-12 {
+            f64::INFINITY
+        } else {
+            1.0 / c
+        }
+    };
     Some(Singlet {
         r1: radius(front.c),
         r2: radius(rear.c),
@@ -1752,7 +2151,10 @@ mod m4_tests {
                 advanced = true;
             }
         }
-        assert!(advanced, "at least one segment must carry the front forward");
+        assert!(
+            advanced,
+            "at least one segment must carry the front forward"
+        );
     }
 
     // --- variation gallery (§5.6) ------------------------------------------
@@ -1797,5 +2199,112 @@ mod m4_tests {
             }
         }
         assert_eq!(i, a.len(), "the flat encoding is consumed exactly");
+    }
+}
+
+/// The 3D scene (Scene3) view API (PR 3D-09).
+#[cfg(test)]
+mod scene3_tests {
+    use super::*;
+
+    /// A v1 Canvas with a collimated beam and a singlet, as the demo builds.
+    fn v1_beam_and_lens() -> Canvas {
+        let mut c = Canvas::new();
+        c.add_collimated_source(-70.0, 0.0, 0.0, 10.0, 5, 0.5876);
+        c.add_singlet(0.0, 0.0, 50.0, 4.0, 12.0, 1.5168, 64.17);
+        c
+    }
+
+    #[test]
+    fn loading_a_v1_document_migrates_without_inventing_a_third_dimension() {
+        let mut c = v1_beam_and_lens();
+        let v1_json = c.to_json();
+
+        let rev0 = c.scene_revision();
+        let report = c.load_scene3_json(&v1_json).unwrap();
+        assert!(report.contains("\"migratedFromV1\":true"), "{report}");
+        assert!(report.contains("\"dimension\":3"), "{report}");
+        // The lens body is unresolved (PlanarOnly): no revolve/extrude invented.
+        assert!(
+            report.contains("\"unresolvedThirdDimension\":true"),
+            "{report}"
+        );
+        assert!(report.contains("\"planarOnlyBodies\":["), "{report}");
+
+        assert_eq!(c.scene_dimension(), 3);
+        // Nothing has been promoted, so the badge is legacy-planar, not full 3D.
+        assert_eq!(c.preview_mode(), "legacy_planar");
+        assert!(c.scene_revision() > rev0, "load must bump the revision");
+    }
+
+    #[test]
+    fn a_migrated_scene_round_trips_as_v2() {
+        let mut c = v1_beam_and_lens();
+        let v1_json = c.to_json();
+        c.load_scene3_json(&v1_json).unwrap();
+
+        let v2 = c.scene3_json();
+        assert!(
+            v2.contains("\"version\": 2"),
+            "v2 header: {}",
+            &v2[..80.min(v2.len())]
+        );
+        assert!(v2.contains("\"dimension\": 3"));
+
+        // Reloading the v2 output is a parse, not a migration.
+        let report = c.load_scene3_json(&v2).unwrap();
+        assert!(report.contains("\"migratedFromV1\":false"), "{report}");
+    }
+
+    #[test]
+    fn no_scene_loaded_reports_dimension_zero_and_no_preview() {
+        let c = Canvas::new();
+        assert_eq!(c.scene_dimension(), 0);
+        assert_eq!(c.preview_mode(), "none");
+        assert_eq!(c.scene3_json(), "");
+        assert!(c.trace_projected_3d().is_empty());
+        assert_eq!(c.capability_report_json(), "null");
+        assert_eq!(c.detector_result_json(0.0), "null");
+    }
+
+    #[test]
+    fn the_view_plane_accepts_an_orthonormal_basis() {
+        // (Off-wasm, the error branch cannot be exercised: `JsError` construction
+        // calls a wasm-bindgen import that panics on the host. `Plane3::new` owns
+        // the rejection and is unit-tested in oc-core. Here the accept path sets
+        // the slice plane the projector uses.)
+        let mut c = Canvas::new();
+        assert!(c
+            .set_view_plane(0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0)
+            .is_ok());
+        c.set_slice_thickness(2.5);
+    }
+
+    #[test]
+    fn promoting_a_migrated_lens_to_revolved_makes_it_full_3d() {
+        let mut c = v1_beam_and_lens();
+        let v1_json = c.to_json();
+        let report = c.load_scene3_json(&v1_json).unwrap();
+
+        // The migrated singlet is the one PlanarOnly body; pull its id out of the
+        // report's list.
+        let body_id = first_id(&report, "planarOnlyBodies").expect("a planar-only body");
+        let rev = c.scene_revision();
+
+        // A meridionally-symmetric singlet profile promotes to a revolved solid.
+        let promo = c.promote_body_to_revolved(body_id as f64).unwrap();
+        assert!(promo.contains("\"body\":"), "{promo}");
+        assert!(c.scene_revision() > rev, "promotion must bump the revision");
+
+        // Now a real 3D body exists, so the badge is no longer legacy-planar.
+        assert_ne!(c.preview_mode(), "legacy_planar");
+    }
+
+    /// Pull the first integer out of a `"key":[a,b,...]` array in a report JSON.
+    fn first_id(json: &str, key: &str) -> Option<u64> {
+        let start = json.find(&format!("\"{key}\":["))? + key.len() + 4;
+        let rest = &json[start..];
+        let end = rest.find(']')?;
+        rest[..end].split(',').next()?.trim().parse().ok()
     }
 }

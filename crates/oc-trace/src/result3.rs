@@ -134,6 +134,7 @@ impl DetectorResult3 {
         Some(self.incident_flux.iter().map(|f| f / area).collect())
     }
 
+    #[cfg(feature = "parallel")]
     pub(crate) fn merge(&mut self, other: &DetectorResult3) {
         for (a, b) in self.incident_flux.iter_mut().zip(&other.incident_flux) {
             *a += *b;
@@ -194,6 +195,7 @@ impl EnergyLedger {
         }
     }
 
+    #[cfg(feature = "parallel")]
     pub(crate) fn merge(&mut self, o: &EnergyLedger) {
         self.launched += o.launched;
         self.detected_incident += o.detected_incident;
@@ -257,6 +259,7 @@ impl TerminationSummary {
         }
     }
 
+    #[cfg(feature = "parallel")]
     pub(crate) fn merge(&mut self, o: &TerminationSummary) {
         self.detector += o.detector;
         self.absorbed_volume += o.absorbed_volume;
@@ -378,6 +381,7 @@ impl CapabilityReport {
         }
     }
 
+    #[cfg(feature = "parallel")]
     pub(crate) fn merge(&mut self, o: &CapabilityReport) {
         for f in &o.exact {
             self.note_exact(*f);

@@ -194,6 +194,7 @@ impl LocalResult {
         }
     }
 
+    #[cfg(feature = "parallel")]
     fn merge(&mut self, o: LocalResult) {
         self.segments.extend(o.segments);
         for (a, b) in self.detectors.iter_mut().zip(&o.detectors) {

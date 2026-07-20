@@ -9,6 +9,7 @@ import init, { Canvas } from "../pkg/oc_wasm.js";
 import { initM3 } from "./m3";
 import { initM4, type M4 } from "./m4";
 import { RayLayer } from "./rays";
+import { initSlice3d, type Slice3d } from "./slice3d";
 import { initOpenUc2 } from "./features/openuc2/OpenUc2Page";
 
 const SCALE = 6.5; // px per mm
@@ -68,6 +69,8 @@ async function main() {
   let m3: { overlay: (ctx: CanvasRenderingContext2D) => void; sync: () => void; getSelected: () => number } | null = null;
   // M4 module (layers / undo tree / wavefront scrub / variation gallery).
   let m4: M4 | null = null;
+  // PR 3D-09: the 2D Canvas as a slice/projection of the canonical 3D scene.
+  let slice3d: Slice3d | null = null;
 
   // Layer cache the m3 overlay reads each frame (avoids re-parsing layer JSON per
   // element); refreshed whenever a layer changes. Also feeds onion-skinning.
@@ -132,7 +135,11 @@ async function main() {
     // (§5.5) the segments come from the reference tracer, clipped at the scrub
     // time; otherwise the interactive f32 path draws the live picture.
     const wavefront = m4?.wavefrontActive() ?? false;
-    const segs = wavefront ? m4!.wavefrontSegments() : scene.traceColored();
+    // When a 3D scene is being previewed, the projected f64 paths (drawn in the
+    // overlay below) are the picture; the v1 demo rays step aside.
+    const show3d = slice3d?.active() ?? false;
+    const segs = show3d ? new Float32Array(0)
+      : wavefront ? m4!.wavefrontSegments() : scene.traceColored();
     const traceMs = performance.now() - t0;
     const gOpacity = Number(ghostOpacity.value) / 100;
     const showTir = tirBox.checked;
@@ -191,6 +198,8 @@ async function main() {
     m3?.overlay(ctx);
     // M4 overlay: the sweeping wavefront front (§5.5), drawn on top.
     m4?.overlay(ctx);
+    // 3D preview: the projected f64 ray paths over the Z=0 slice (§10.1/§10.4).
+    slice3d?.overlay(ctx, toScreen);
 
     const mode = wavefront ? " · wavefront scrub" : "";
     const ms = performance.now() - t0;
@@ -402,6 +411,10 @@ async function main() {
   // the empty start document (§5.2).
   scene.historyReset("scene");
   m4.refreshPanels();
+
+  // PR 3D-09: open an .ocanvas into the canonical 3D scene and preview its f64
+  // paths projected onto this view. Additive — the v1 demo above is untouched.
+  slice3d = initSlice3d({ scene, render: renderView });
 
   // --- M5: save / open .ocanvas — the Optiland handoff (§6) ---------------
   // Save downloads the frozen .ocanvas document; Open loads one back (Rust

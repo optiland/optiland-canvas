@@ -137,6 +137,12 @@
         padding: 3px 8px; cursor: pointer; font: inherit; }
       .m4btn:hover { background: #1a2c48; }
       .m4btn:disabled { opacity: 0.4; cursor: default; }
+      /* 3D preview badge (§10.3): never labels a legacy result full 3D */
+      .badge3d { margin-left: auto; font-size: 10px; padding: 2px 7px; border-radius: 10px;
+        border: 1px solid #2a3a52; background: #0e1626; color: #8fa2bd; white-space: nowrap; }
+      .badge3d.full_3d { border-color: #2f6f4f; background: #10261b; color: #7fffa0; }
+      .badge3d.exact_planar { border-color: #2c5170; background: #0e1f2c; color: #7fd6ff; }
+      .badge3d.legacy_planar { border-color: #6b5a2a; background: #241f10; color: #ffd678; }
       /* layers */
       #layerList { display: flex; flex-direction: column; gap: 2px; }
       .layer-row { display: flex; align-items: center; gap: 4px; padding: 2px 4px; border-radius: 4px; cursor: pointer; }
@@ -216,6 +222,20 @@
           <input type="file" id="openSceneFile" accept=".ocanvas,application/json" hidden />
         </div>
         <div id="sceneMsg" class="m4hint">Save exports the frozen, versioned .ocanvas; hand it to Optiland in Python.</div>
+      </div>
+      <!-- PR 3D-09: the 2D Canvas as a slice/projection of the canonical 3D scene -->
+      <div class="m4-sec">
+        <h4>3D preview <span class="h4-sub">— Scene3 slice</span></h4>
+        <div class="m4row">
+          <button class="m4btn" id="open3d" title="Open an .ocanvas (v1 or v2) into the canonical 3D scene and project its f64 ray paths onto this view">⤒ open 3D scene</button>
+          <input type="file" id="open3dFile" accept=".ocanvas,application/json" hidden />
+          <span id="preview3dBadge" class="badge3d" title="How this scene is being previewed (§10.3)">no 3D scene</span>
+        </div>
+        <label class="m4row" id="slice3dRow" style="display:none">
+          slice ±<span id="slice3dLabel">∞</span> mm
+          <input type="range" id="slice3d" min="0" max="50" step="0.5" value="0" />
+        </label>
+        <div id="preview3dMsg" class="m4hint">Loads a scene as its canonical 3D form and draws the authoritative f64 rays projected onto the Z=0 slice. A migrated v1 scene stays legacy-planar until its bodies are promoted.</div>
       </div>
       <div class="m4-sec">
         <h4>Layers</h4>

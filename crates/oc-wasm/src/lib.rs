@@ -2300,6 +2300,93 @@ mod scene3_tests {
         assert_ne!(c.preview_mode(), "legacy_planar");
     }
 
+    /// Build a v2 demo scene — a glass sphere lit by a collimated beam onto a
+    /// detector — and write it to `web/public/demo-3d.ocanvas` for the browser
+    /// slice preview and its Playwright spec. Ignored: run explicitly with
+    /// `cargo test -p oc-wasm --lib write_demo_3d_fixture -- --ignored`.
+    #[test]
+    #[ignore]
+    fn write_demo_3d_fixture() {
+        use oc_core::id::LayerId;
+        use oc_core::material::{Material, LAMBDA_D};
+        use oc_core::scene::Spectrum;
+        use oc_core::scene3::{
+            AngularDistribution3, Body3, Detector3, DetectorGeometry3, DetectorResponse,
+            DetectorTermination, ObjectCommon, SamplingSequence, SolidGeometry3, Source3,
+            SourceSampling, SpatialDistribution3, SurfaceProps3,
+        };
+        use oc_core::vec3::Isometry3;
+
+        let mut scene = Scene3::new();
+
+        // A glass sphere at the origin.
+        let sphere = scene.alloc_object_id();
+        let mut common = ObjectCommon::new(sphere, LayerId(0));
+        common.transform = Isometry3::IDENTITY;
+        scene.bodies.push(Body3 {
+            common,
+            geometry: SolidGeometry3::Sphere { radius_mm: 8.0 },
+            material: Material::AbbePoint { nd: 1.6, vd: 64.0 },
+            absorption: Default::default(),
+            surface: SurfaceProps3::default(),
+            priority: 0,
+        });
+
+        // A collimated meridional beam from the left (spread in Y, thin in Z), so
+        // it focuses in the Z=0 slice.
+        let src = scene.alloc_source_id();
+        scene.sources.push(Source3 {
+            id: src,
+            transform: Isometry3::from_pos(Vec3::new(-30.0, 0.0, 0.0)),
+            spatial: SpatialDistribution3::Rectangle {
+                half_width_mm: 6.0,
+                half_height_mm: 0.25,
+            },
+            angular: AngularDistribution3::Direction { local_dir: Vec3::X },
+            spectrum: Spectrum::Monochromatic(LAMBDA_D),
+            flux: 1.0,
+            samples: SourceSampling {
+                spatial_samples: 21,
+                angular_samples: 1,
+                seed: 1,
+                sequence: SamplingSequence::Grid,
+            },
+        });
+
+        // A detector past the focus, facing back down the axis. Its local +Z
+        // maps to world -X under a -90° rotation about Y: q = (0, sin(-45°), 0,
+        // cos(-45°)).
+        let det = scene.alloc_object_id();
+        let s = std::f64::consts::FRAC_1_SQRT_2;
+        let mut dcommon = ObjectCommon::new(det, LayerId(0));
+        dcommon.transform = Isometry3::new(Vec3::new(24.0, 0.0, 0.0), [0.0, -s, 0.0, s]).unwrap();
+        scene.detectors.push(Detector3 {
+            common: dcommon,
+            geometry: DetectorGeometry3::Rectangle {
+                half_width_mm: 8.0,
+                half_height_mm: 8.0,
+            },
+            bins: [48, 48],
+            response: DetectorResponse::Unity,
+            termination: DetectorTermination::Terminate,
+        });
+
+        scene.validate().expect("demo scene validates");
+
+        // Sanity: it traces to non-empty projected segments and full-3D preview.
+        let mut c = Canvas::new();
+        c.scene3 = Some(scene.clone());
+        assert_eq!(c.preview_mode(), "full_3d");
+        assert!(!c.trace_projected_3d().is_empty(), "demo must trace rays");
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../web/public/demo-3d.ocanvas"
+        );
+        std::fs::write(path, scene.to_json()).expect("write demo fixture");
+        eprintln!("wrote {path}");
+    }
+
     /// Pull the first integer out of a `"key":[a,b,...]` array in a report JSON.
     fn first_id(json: &str, key: &str) -> Option<u64> {
         let start = json.find(&format!("\"{key}\":["))? + key.len() + 4;

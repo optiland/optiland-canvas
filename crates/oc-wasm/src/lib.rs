@@ -2387,6 +2387,137 @@ mod scene3_tests {
         eprintln!("wrote {path}");
     }
 
+    /// Build a **v1** singlet scene and write it to `web/public/demo-v1-lens.ocanvas`.
+    /// Loaded through the 3D preview it migrates to a legacy-planar scene whose
+    /// lens body is `PlanarOnly`, so the promotion controls have something real to
+    /// promote. Ignored (fixture generator).
+    #[test]
+    #[ignore]
+    fn write_demo_v1_lens_fixture() {
+        let mut c = Canvas::new();
+        c.add_collimated_source(-30.0, 0.0, 0.0, 10.0, 9, 0.5876);
+        c.add_singlet(0.0, 0.0, 50.0, 4.0, 12.0, 1.5168, 64.17);
+        c.add_detector(30.0, -8.0, 30.0, 8.0, 48);
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../web/public/demo-v1-lens.ocanvas"
+        );
+        std::fs::write(path, c.to_json()).expect("write v1 lens fixture");
+        eprintln!("wrote {path}");
+    }
+
+    /// Build a v2 scene that **folds the beam out of the Z=0 plane** — a mirror
+    /// tilted so a collimated beam reflects toward +Y+Z — and write it to
+    /// `web/public/demo-fold.ocanvas`. This is the out-of-plane-fold exit
+    /// criterion (§20): the reflected path climbs off the slice, so the slice
+    /// filter reveals it. Ignored (fixture generator).
+    #[test]
+    #[ignore]
+    fn write_demo_fold_fixture() {
+        use oc_core::id::LayerId;
+        use oc_core::material::LAMBDA_D;
+        use oc_core::scene::Spectrum;
+        use oc_core::scene3::{
+            AngularDistribution3, Detector3, DetectorGeometry3, DetectorResponse,
+            DetectorTermination, ObjectCommon, PlanarShape2, SamplingSequence, Source3,
+            SourceSampling, SpatialDistribution3, SpectralScalar, SurfaceGeometry3, SurfaceObject3,
+            SurfaceResponse,
+        };
+        use oc_core::vec3::Isometry3;
+
+        // A rotation carrying local +Z onto `normal`, without pulling in glam:
+        // build it from the axis-angle of the shortest arc from +Z.
+        fn facing(pos: Vec3, normal: Vec3) -> Isometry3 {
+            let n = normal.normalize();
+            let z = Vec3::Z;
+            let dot = z.dot(n).clamp(-1.0, 1.0);
+            if dot > 1.0 - 1e-12 {
+                return Isometry3::from_pos(pos);
+            }
+            if dot < -1.0 + 1e-12 {
+                // 180°: rotate about any axis ⟂ Z.
+                return Isometry3::new(pos, [1.0, 0.0, 0.0, 0.0]).unwrap();
+            }
+            let axis = z.cross(n).normalize();
+            let angle = dot.acos();
+            let (s, cw) = ((angle * 0.5).sin(), (angle * 0.5).cos());
+            Isometry3::new(pos, [axis.x * s, axis.y * s, axis.z * s, cw]).unwrap()
+        }
+
+        let mut scene = Scene3::new();
+
+        // A collimated beam along +X in the Z=0 plane.
+        let src = scene.alloc_source_id();
+        scene.sources.push(Source3 {
+            id: src,
+            transform: Isometry3::from_pos(Vec3::new(-20.0, 0.0, 0.0)),
+            spatial: SpatialDistribution3::Rectangle {
+                half_width_mm: 3.0,
+                half_height_mm: 0.25,
+            },
+            angular: AngularDistribution3::Direction { local_dir: Vec3::X },
+            spectrum: Spectrum::Monochromatic(LAMBDA_D),
+            flux: 1.0,
+            samples: SourceSampling {
+                spatial_samples: 9,
+                angular_samples: 1,
+                seed: 1,
+                sequence: SamplingSequence::Grid,
+            },
+        });
+
+        // A mirror at the origin whose normal folds +X to (0, 0.6, 0.8): out of
+        // the plane. (Reflection is invariant to the normal's sign.)
+        let mirror = scene.alloc_object_id();
+        let mut mcommon = ObjectCommon::new(mirror, LayerId(0));
+        mcommon.transform = facing(Vec3::ZERO, Vec3::new(-1.0, 0.6, 0.8));
+        let resp = SurfaceResponse::Mirror {
+            reflectivity: SpectralScalar::Constant(0.95),
+        };
+        scene.surfaces.push(SurfaceObject3 {
+            common: mcommon,
+            geometry: SurfaceGeometry3::Plane {
+                shape: PlanarShape2::Rectangle {
+                    half_width_mm: 8.0,
+                    half_height_mm: 8.0,
+                },
+            },
+            response_front: resp.clone(),
+            response_back: resp,
+        });
+
+        // A detector up off the plane, catching the folded beam.
+        let det = scene.alloc_object_id();
+        let mut dcommon = ObjectCommon::new(det, LayerId(0));
+        dcommon.transform = facing(Vec3::new(0.0, 9.0, 12.0), Vec3::new(0.0, -0.6, -0.8));
+        scene.detectors.push(Detector3 {
+            common: dcommon,
+            geometry: DetectorGeometry3::Rectangle {
+                half_width_mm: 8.0,
+                half_height_mm: 8.0,
+            },
+            bins: [48, 48],
+            response: DetectorResponse::Unity,
+            termination: DetectorTermination::Terminate,
+        });
+
+        scene.validate().expect("fold scene validates");
+        let mut c = Canvas::new();
+        c.scene3 = Some(scene.clone());
+        assert_eq!(c.preview_mode(), "full_3d");
+        let segs = c.trace_projected_3d();
+        // Some segment endpoint must be well off the Z=0 plane (the fold).
+        let off_plane = segs.chunks(9).any(|s| s[7].abs() > 2.0 || s[8].abs() > 2.0);
+        assert!(off_plane, "the fold must leave the plane");
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../web/public/demo-fold.ocanvas"
+        );
+        std::fs::write(path, scene.to_json()).expect("write fold fixture");
+        eprintln!("wrote {path}");
+    }
+
     /// Pull the first integer out of a `"key":[a,b,...]` array in a report JSON.
     fn first_id(json: &str, key: &str) -> Option<u64> {
         let start = json.find(&format!("\"{key}\":["))? + key.len() + 4;

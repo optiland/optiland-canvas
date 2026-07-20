@@ -143,6 +143,8 @@
       .badge3d.full_3d { border-color: #2f6f4f; background: #10261b; color: #7fffa0; }
       .badge3d.exact_planar { border-color: #2c5170; background: #0e1f2c; color: #7fd6ff; }
       .badge3d.legacy_planar { border-color: #6b5a2a; background: #241f10; color: #ffd678; }
+      #promoteDepth { width: 46px; background: #0e1626; color: #cdd6e4; border: 1px solid #24344d;
+        border-radius: 5px; padding: 2px 4px; font: inherit; }
       /* layers */
       #layerList { display: flex; flex-direction: column; gap: 2px; }
       .layer-row { display: flex; align-items: center; gap: 4px; padding: 2px 4px; border-radius: 4px; cursor: pointer; }
@@ -235,6 +237,11 @@
           slice ±<span id="slice3dLabel">∞</span> mm
           <input type="range" id="slice3d" min="0" max="50" step="0.5" value="0" />
         </label>
+        <div class="m4row" id="promote3dRow" style="display:none">
+          <button class="m4btn" id="promoteRevolve" title="Revolve the unresolved (planar-only) bodies about their +X optical axis — a migrated lens becomes a real 3D solid that refracts in full 3D">promote → revolve</button>
+          <button class="m4btn" id="promoteExtrude" title="Extrude the unresolved bodies through ± the depth (mm) below">extrude ±</button>
+          <input type="number" id="promoteDepth" value="5" min="0.5" max="50" step="0.5" title="extrusion half-depth in mm" />
+        </div>
         <div id="preview3dMsg" class="m4hint">Loads a scene as its canonical 3D form and draws the authoritative f64 rays projected onto the Z=0 slice. A migrated v1 scene stays legacy-planar until its bodies are promoted.</div>
       </div>
       <div class="m4-sec">

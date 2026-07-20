@@ -8,17 +8,20 @@
 //! shader will do and can stand in for it wherever no GPU is present.
 //!
 //! It traces the objects the compiler admits: the analytic bodies (sphere, box,
-//! cylinder), extruded line profiles (prisms), zero-thickness surfaces (mirror,
-//! absorber, scalar dielectric, explicit R/T), finite aperture masks, and area
-//! detectors. The one remaining geometry is the revolved profile (conic and
-//! even-asphere surfaces of revolution) and extrusions with curved edges; until
-//! they land the compiler rejects them by name rather than the tracer guessing.
+//! cylinder), extruded line profiles (prisms), revolved profiles (conic and
+//! even-asphere surfaces of revolution, plus their frustum rims), zero-thickness
+//! surfaces (mirror, absorber, scalar dielectric, explicit R/T), finite aperture
+//! masks, and area detectors. The conic of revolution is an exact quadratic and
+//! the asphere a safeguarded Newton with an analytic derivative (§7.3–7.4). What
+//! the compiler still cannot trace exactly it rejects by name — an off-axis arc,
+//! a curved-edge extrusion, a tabulated response — rather than guessing.
 
 use glam::{DVec3, Vec2, Vec3};
 
 use crate::scene3::{
-    GpuAperture3, GpuBody3, GpuDetector3, GpuExtrude, GpuResponse, GpuScene3, GpuSurface3, OBJ_BOX,
-    OBJ_CYLINDER, OBJ_EXTRUDE, OBJ_SPHERE, SURF_ABSORBER,
+    even_asphere_dsag, even_asphere_sag, GpuAperture3, GpuBody3, GpuDetector3, GpuExtrude,
+    GpuResponse, GpuRevolve, GpuScene3, GpuSurface3, RevFace, OBJ_BOX, OBJ_CYLINDER, OBJ_EXTRUDE,
+    OBJ_REVOLVE, OBJ_SPHERE, SURF_ABSORBER,
 };
 
 /// Segment flag bits (shared meaning with the 2D path).
@@ -459,6 +462,7 @@ fn body_hit(b: &GpuBody3, o: Vec3, d: Vec3) -> Option<(f32, Vec3)> {
         OBJ_BOX => box_hit(ol, dl, b.params, EPS),
         OBJ_CYLINDER => cylinder_hit(ol, dl, b.params.x, b.params.y, EPS),
         OBJ_EXTRUDE => extrude_hit(b.extrude.as_ref()?, ol, dl, EPS),
+        OBJ_REVOLVE => revolve_hit(b.revolve.as_ref()?, ol, dl, EPS),
         _ => None,
     }
 }
@@ -614,8 +618,356 @@ fn contains(b: &GpuBody3, p: Vec3) -> bool {
             .as_ref()
             .map(|e| extrude_contains(e, pl))
             .unwrap_or(false),
+        OBJ_REVOLVE => b
+            .revolve
+            .as_ref()
+            .map(|r| revolve_contains(r, pl))
+            .unwrap_or(false),
         _ => false,
     }
+}
+
+/// Is a local point inside the revolved body? Map to `(x, r)` and test the
+/// sampled meridian contour.
+fn revolve_contains(rev: &GpuRevolve, p: Vec3) -> bool {
+    let r = (p.y * p.y + p.z * p.z).sqrt();
+    point_in_polygon(&rev.contour, Vec2::new(p.x, r))
+}
+
+/// Nearest revolved-profile intersection at `t > tmin`, with the outward local
+/// normal. Each face is exact; the normal is oriented by a containment probe,
+/// because a single surface cannot say which side is glass.
+fn revolve_hit(rev: &GpuRevolve, o: Vec3, d: Vec3, tmin: f32) -> Option<(f32, Vec3)> {
+    let mut best: Option<(f32, Vec3)> = None;
+    let keep = |best: &mut Option<(f32, Vec3)>, t: f32, n: Vec3| {
+        if t > tmin && best.map(|(bt, _)| t < bt).unwrap_or(true) {
+            *best = Some((t, orient_rev(rev, n, o + d * t)));
+        }
+    };
+    for face in &rev.faces {
+        match face {
+            RevFace::Sag {
+                vertex_x,
+                axis_sign,
+                c,
+                k,
+                coeffs,
+                outer_r,
+                is_conic,
+            } => sag_hit(
+                *vertex_x,
+                *axis_sign,
+                *c,
+                *k,
+                coeffs,
+                *outer_r,
+                *is_conic,
+                o,
+                d,
+                tmin,
+                &mut |t, n| keep(&mut best, t, n),
+            ),
+            RevFace::Frustum { x0, y0, x1, y1 } => {
+                frustum_hit(*x0, *y0, *x1, *y1, o, d, tmin, &mut |t, n| {
+                    keep(&mut best, t, n)
+                })
+            }
+            RevFace::Arc {
+                center_x,
+                r,
+                a0,
+                a1,
+            } => arc_hit(*center_x, *r, *a0, *a1, o, d, tmin, &mut |t, n| {
+                keep(&mut best, t, n)
+            }),
+        }
+    }
+    best
+}
+
+fn orient_rev(rev: &GpuRevolve, n: Vec3, p: Vec3) -> Vec3 {
+    if revolve_contains(rev, p + n * EPS) {
+        -n
+    } else {
+        n
+    }
+}
+
+/// The outward normal of a conic/asphere of revolution at `p` (analytic, §7.4).
+/// `vertex` is on the axis; radial is the component perpendicular to `+X`.
+fn sag_normal(vertex_x: f32, axis_sign: f32, c: f32, k: f32, coeffs: &[f32; 8], p: Vec3) -> Vec3 {
+    let rad = Vec3::new(0.0, p.y, p.z);
+    let r = rad.length();
+    let axis = Vec3::new(axis_sign, 0.0, 0.0);
+    let n = if r > 0.0 {
+        axis - rad / r * even_asphere_dsag(c, k, coeffs, r)
+    } else {
+        axis
+    };
+    let _ = vertex_x;
+    n.normalize()
+}
+
+/// Intersect a conic (exact quadratic) or even-asphere (safeguarded Newton)
+/// surface of revolution about `+X`, reporting each aperture-clipped hit.
+#[allow(clippy::too_many_arguments)]
+fn sag_hit(
+    vertex_x: f32,
+    axis_sign: f32,
+    c: f32,
+    k: f32,
+    coeffs: &[f32; 8],
+    outer_r: f32,
+    is_conic: bool,
+    o: Vec3,
+    d: Vec3,
+    tmin: f32,
+    out: &mut dyn FnMut(f32, Vec3),
+) {
+    let ov = o - Vec3::new(vertex_x, 0.0, 0.0);
+    let z0 = ov.x * axis_sign;
+    let dz = d.x * axis_sign;
+    let o_rad = Vec3::new(0.0, ov.y, ov.z);
+    let d_rad = Vec3::new(0.0, d.y, d.z);
+
+    // The sag envelope: keep the near nappe out to the aperture; reject the far
+    // side of the whole revolution.
+    let sag_edge = even_asphere_sag(c, k, coeffs, outer_r);
+    let z_lo = sag_edge.min(0.0);
+    let z_hi = sag_edge.max(0.0);
+    let z_tol = 1e-4 * (1.0 + outer_r.abs());
+    let r_tol = 1e-5 * (1.0 + outer_r);
+
+    let accept = |t: f32, out: &mut dyn FnMut(f32, Vec3)| {
+        if t <= tmin {
+            return;
+        }
+        let p = o + d * t;
+        let r = (p.y * p.y + p.z * p.z).sqrt();
+        let z = (p - Vec3::new(vertex_x, 0.0, 0.0)).x * axis_sign;
+        if r <= outer_r + r_tol && z >= z_lo - z_tol && z <= z_hi + z_tol {
+            out(t, sag_normal(vertex_x, axis_sign, c, k, coeffs, p));
+        }
+    };
+
+    if is_conic {
+        let k1 = 1.0 + k;
+        let aa = c * (d_rad.length_squared() + k1 * dz * dz);
+        let bb = c * (2.0 * o_rad.dot(d_rad) + 2.0 * k1 * z0 * dz) - 2.0 * dz;
+        let cc = c * (o_rad.length_squared() + k1 * z0 * z0) - 2.0 * z0;
+        for t in quadratic_roots(aa, bb, cc) {
+            accept(t, out);
+        }
+        return;
+    }
+
+    // Even asphere: seed from the base conic, then Newton-refine the residual
+    // axial(t) − sag(r(t)) with the analytic derivative (§7.4).
+    let r_of = |t: f32| (o_rad + d_rad * t).length();
+    let residual = |t: f32| (z0 + t * dz) - even_asphere_sag(c, k, coeffs, r_of(t));
+    let dresidual = |t: f32| {
+        let rad = o_rad + d_rad * t;
+        let r = rad.length();
+        let dr = if r > 0.0 { rad.dot(d_rad) / r } else { 0.0 };
+        dz - even_asphere_dsag(c, k, coeffs, r) * dr
+    };
+
+    let k1 = 1.0 + k;
+    let aa = c * (d_rad.length_squared() + k1 * dz * dz);
+    let bb = c * (2.0 * o_rad.dot(d_rad) + 2.0 * k1 * z0 * dz) - 2.0 * dz;
+    let cc = c * (o_rad.length_squared() + k1 * z0 * z0) - 2.0 * z0;
+    let mut seeds: Vec<f32> = quadratic_roots(aa, bb, cc).into_iter().collect();
+    if seeds.is_empty() {
+        // A coarse march over the aperture span, so a strongly aspheric surface
+        // with no nearby conic root is still bracketed.
+        let start = tmin.max(0.0);
+        let step = outer_r.max(0.05) * 0.1;
+        let mut pt = start;
+        let mut pv = residual(pt);
+        for i in 1..=200 {
+            let t = start + step * i as f32;
+            let v = residual(t);
+            if pv * v < 0.0 {
+                seeds.push(0.5 * (pt + t));
+            }
+            pt = t;
+            pv = v;
+        }
+    }
+    for seed in seeds {
+        if let Some(t) = refine_root(seed, tmin, &residual, &dresidual) {
+            accept(t, out);
+        }
+    }
+}
+
+/// Real roots of `aa·t² + bb·t + cc`, numerically stable. Handles the degenerate
+/// linear case (a plane, or a ray along the axis).
+fn quadratic_roots(aa: f32, bb: f32, cc: f32) -> Vec<f32> {
+    if aa.abs() < 1e-20 {
+        return if bb.abs() > 1e-20 {
+            vec![-cc / bb]
+        } else {
+            Vec::new()
+        };
+    }
+    let disc = bb * bb - 4.0 * aa * cc;
+    if disc < 0.0 {
+        return Vec::new();
+    }
+    let sq = disc.sqrt();
+    let q = -0.5 * (bb + bb.signum() * sq);
+    let mut roots = vec![q / aa];
+    if q.abs() > 1e-20 {
+        roots.push(cc / q);
+    }
+    roots
+}
+
+/// Safeguarded Newton for `f(t) = 0` near `seed`, bisecting when a step leaves a
+/// sign-change bracket (§7.4). f32 tolerances.
+fn refine_root(
+    seed: f32,
+    tmin: f32,
+    f: &dyn Fn(f32) -> f32,
+    df: &dyn Fn(f32) -> f32,
+) -> Option<f32> {
+    let mut t = seed;
+    let span = 1e-2_f32;
+    let (mut lo, mut hi) = (seed - span, seed + span);
+    let (flo, fhi) = (f(lo), f(hi));
+    let bracketed = flo * fhi <= 0.0;
+    let mut flo = flo;
+
+    for _ in 0..48 {
+        let ft = f(t);
+        if ft.abs() < 1e-7 {
+            break;
+        }
+        let dft = df(t);
+        let mut nt = if dft.abs() > 1e-30 {
+            t - ft / dft
+        } else {
+            f32::INFINITY
+        };
+        if !nt.is_finite() || (bracketed && (nt < lo || nt > hi)) {
+            nt = 0.5 * (lo + hi);
+        }
+        if bracketed {
+            let fnt = f(nt);
+            if flo * fnt <= 0.0 {
+                hi = nt;
+            } else {
+                lo = nt;
+                flo = fnt;
+            }
+        }
+        let step = (nt - t).abs();
+        t = nt;
+        if step < 1e-8 * (1.0 + t.abs()) {
+            break;
+        }
+    }
+    let _ = fhi;
+    (f(t).abs() < 1e-5 && t > tmin).then_some(t)
+}
+
+/// A line segment `(x0,y0)–(x1,y1)` revolved about `+X`: a cone, cylinder, or flat
+/// annular face. Ported from `oc_core::geom3::primitives::frustum_intersect`.
+#[allow(clippy::too_many_arguments)]
+fn frustum_hit(
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    o: Vec3,
+    d: Vec3,
+    tmin: f32,
+    out: &mut dyn FnMut(f32, Vec3),
+) {
+    let (x_lo, x_hi) = (x0.min(x1), x0.max(x1));
+    let flat = (x1 - x0).abs() <= 1e-9 * (1.0 + x0.abs() + x1.abs());
+
+    if flat {
+        if d.x.abs() < 1e-12 {
+            return;
+        }
+        let t = (x0 - o.x) / d.x;
+        if t <= tmin {
+            return;
+        }
+        let p = o + d * t;
+        let r = (p.y * p.y + p.z * p.z).sqrt();
+        let (r_lo, r_hi) = (y0.min(y1), y0.max(y1));
+        let pad = 1e-9 * (1.0 + r_hi);
+        if r >= r_lo - pad && r <= r_hi + pad {
+            out(t, Vec3::X);
+        }
+        return;
+    }
+
+    let m = (y1 - y0) / (x1 - x0);
+    let b = y0 - m * x0;
+    let g0 = m * o.x + b;
+    let aa = d.y * d.y + d.z * d.z - m * m * d.x * d.x;
+    let bb = 2.0 * (o.y * d.y + o.z * d.z) - 2.0 * m * d.x * g0;
+    let cc = o.y * o.y + o.z * o.z - g0 * g0;
+    let pad = 1e-6 * (1.0 + x_hi.abs() + x_lo.abs());
+    for t in quadratic_roots(aa, bb, cc) {
+        if t <= tmin {
+            continue;
+        }
+        let p = o + d * t;
+        let r_line = m * p.x + b;
+        if r_line >= -pad && p.x >= x_lo - pad && p.x <= x_hi + pad {
+            out(t, Vec3::new(-m * r_line, p.y, p.z).normalize());
+        }
+    }
+}
+
+/// An axis-centred arc revolved about `+X`: a spherical zone.
+#[allow(clippy::too_many_arguments)]
+fn arc_hit(
+    center_x: f32,
+    r: f32,
+    a0: f32,
+    a1: f32,
+    o: Vec3,
+    d: Vec3,
+    tmin: f32,
+    out: &mut dyn FnMut(f32, Vec3),
+) {
+    let c3 = Vec3::new(center_x, 0.0, 0.0);
+    let oc = o - c3;
+    let b = oc.dot(d);
+    let disc = b * b - (oc.length_squared() - r * r);
+    if disc < 0.0 {
+        return;
+    }
+    let sq = disc.sqrt();
+    for t in [-b - sq, -b + sq] {
+        if t <= tmin {
+            continue;
+        }
+        let p = o + d * t;
+        let rad = (p.y * p.y + p.z * p.z).sqrt();
+        let ang = rad.atan2(p.x - center_x);
+        if angle_in_sweep(ang, a0, a1) {
+            out(t, (p - c3) / r);
+        }
+    }
+}
+
+/// Is `ang` within the CCW sweep from `a0` to `a1`? Mirrors the profile arc's
+/// unwrapped-difference convention.
+fn angle_in_sweep(ang: f32, a0: f32, a1: f32) -> bool {
+    use std::f32::consts::TAU;
+    let sweep = (a1 - a0).rem_euclid(TAU);
+    if sweep >= TAU - 1e-6 {
+        return true;
+    }
+    let rel = (ang - a0).rem_euclid(TAU);
+    rel <= sweep + 1e-6
 }
 
 /// Is a local point inside the extruded body?

@@ -7,16 +7,17 @@
 //! the branch structure must match, and a primitive the preview cannot trace must
 //! be **rejected with a capability issue**, never swapped for a lookalike (§12.3).
 //!
-//! Covers the objects the compiler admits: sphere, box, cylinder, and extruded
-//! line profiles; mirror surfaces; and aperture-plus-detector clipping. The
-//! revolved profile bodies are the one geometry still to land, and must show up
-//! in `rejected` rather than as a chord — the profile-rejection test pins that.
+//! Covers the objects the compiler admits: sphere, box, cylinder, extruded line
+//! profiles, and revolved profiles (a spherical singlet and an even-asphere);
+//! mirror surfaces; and aperture-plus-detector clipping. What is still out of
+//! reach — a curved-edge extrusion — must show up in `rejected` rather than as a
+//! chord, which the rejection test pins.
 #![cfg(feature = "gpu3")]
 
 use oc_core::id::{LayerId, ObjectId, SourceId};
 use oc_core::material::{Material, LAMBDA_D};
 use oc_core::profile2::{
-    ClosedProfile2, Curve2, ProfileConstruction3, ProfileEdge2, ProfileSolid3,
+    ClosedProfile2, ConicParams2, Curve2, ProfileConstruction3, ProfileEdge2, ProfileSolid3,
 };
 use oc_core::scene3::{
     Aperture3, ApertureInteraction, ApertureShape3, Body3, Detector3, DetectorGeometry3,
@@ -386,42 +387,145 @@ fn a_glass_box_matches_f64_for_skew_rays() {
 // Capability: unsupported geometry is rejected, not approximated (§12.3)
 // ---------------------------------------------------------------------------
 
-#[test]
-fn a_profile_body_is_rejected_not_approximated() {
-    let mut scene = Scene3::new();
-    // A profile (revolved) body: the f32 preview does not trace curved profile
-    // surfaces yet, so it must reject rather than draw a chord.
+/// A biconvex revolved singlet, authored as the generators do: two conic faces
+/// and two rim lines (mirrors `geom3.rs::singlet_profile`).
+fn revolved_singlet(
+    scene: &mut Scene3,
+    r1: f64,
+    r2: f64,
+    thickness: f64,
+    half_ap: f64,
+    nd: f64,
+) -> ObjectId {
+    let (zf, zr) = (-thickness / 2.0, thickness / 2.0);
+    let sag = |c: f64, ha: f64| c * ha * ha / (1.0 + (1.0 - c * c * ha * ha).max(0.0).sqrt());
+    let (c1, c2) = (1.0 / r1, 1.0 / r2);
+    let ftip = zf + sag(c1, half_ap);
+    let rtip = zr + sag(c2, half_ap);
+    let mk_conic = |scene: &mut Scene3, vx: f64, c: f64| ProfileEdge2 {
+        patch: scene.alloc_patch_id(),
+        curve: Curve2::Conic(ConicParams2 {
+            vertex: Vec2::new(vx, 0.0),
+            axis: Vec2::X,
+            c,
+            k: 0.0,
+            half_ap,
+        }),
+    };
+    let e0 = mk_conic(scene, zf, c1);
+    let e1 = ProfileEdge2 {
+        patch: scene.alloc_patch_id(),
+        curve: Curve2::Line {
+            a: Vec2::new(ftip, half_ap),
+            b: Vec2::new(rtip, half_ap),
+        },
+    };
+    let e2 = mk_conic(scene, zr, c2);
+    let e3 = ProfileEdge2 {
+        patch: scene.alloc_patch_id(),
+        curve: Curve2::Line {
+            a: Vec2::new(rtip, -half_ap),
+            b: Vec2::new(ftip, -half_ap),
+        },
+    };
     let id = scene.alloc_object_id();
+    let mut common = ObjectCommon::new(id, LayerId(0));
+    common.transform = Isometry3::IDENTITY;
+    scene.bodies.push(Body3 {
+        common,
+        geometry: SolidGeometry3::Profile(ProfileSolid3 {
+            profile: ClosedProfile2 {
+                edges: vec![e0, e1, e2, e3],
+            },
+            construction: ProfileConstruction3::RevolveLocalX,
+        }),
+        material: glass(nd),
+        absorption: Default::default(),
+        surface: SurfaceProps3::default(),
+        priority: 0,
+    });
+    id
+}
+
+#[test]
+fn a_revolved_singlet_matches_f64_for_skew_rays() {
+    // The canonical optical primitive: a spherical biconvex singlet, its conic
+    // surfaces of revolution refracting skew rays to within the §15.5 envelope.
+    let mut scene = Scene3::new();
+    revolved_singlet(&mut scene, 20.0, -20.0, 4.0, 8.0, 1.5);
+    scene.validate().unwrap();
+
+    let rays = [
+        (Vec3::new(-25.0, 0.0, 0.0), Vec3::X),
+        (Vec3::new(-25.0, 3.0, 0.0), Vec3::X),
+        (Vec3::new(-25.0, 0.0, 3.0), Vec3::X),
+        (Vec3::new(-25.0, 2.5, -2.5), Vec3::X),
+        (
+            Vec3::new(-25.0, 4.0, 1.0),
+            Vec3::new(1.0, -0.02, 0.0).normalize(),
+        ),
+    ];
+    assert_landing_matches(&scene, &rays);
+}
+
+#[test]
+fn a_revolved_asphere_matches_f64_for_skew_rays() {
+    // The even-asphere path: a conic front with A4/A6 terms, solved by the
+    // safeguarded Newton iteration, must still land within the envelope.
+    let mut scene = Scene3::new();
+    let half_ap = 8.0;
+    let c1 = 1.0 / 25.0;
+    let sag = |c: f64, ha: f64, a4: f64, a6: f64| {
+        let base = c * ha * ha / (1.0 + (1.0 - c * c * ha * ha).max(0.0).sqrt());
+        base + a4 * ha.powi(4) + a6 * ha.powi(6)
+    };
+    let (a4, a6) = (1e-5, 1e-8);
+    let ftip = -2.0 + sag(c1, half_ap, a4, a6);
+    let rtip =
+        2.0 + (-1.0 / 25.0) * half_ap * half_ap / (1.0 + (1.0 - half_ap * half_ap / 625.0).sqrt());
+    let mut coeffs = [0.0; 8];
+    coeffs[0] = a4;
+    coeffs[1] = a6;
     let edges = vec![
         ProfileEdge2 {
             patch: scene.alloc_patch_id(),
-            curve: Curve2::Line {
-                a: Vec2::new(-1.0, 0.0),
-                b: Vec2::new(1.0, 0.0),
+            curve: Curve2::EvenAsphere {
+                base: ConicParams2 {
+                    vertex: Vec2::new(-2.0, 0.0),
+                    axis: Vec2::X,
+                    c: c1,
+                    k: 0.0,
+                    half_ap,
+                },
+                coeffs,
             },
         },
         ProfileEdge2 {
             patch: scene.alloc_patch_id(),
             curve: Curve2::Line {
-                a: Vec2::new(1.0, 0.0),
-                b: Vec2::new(1.0, 2.0),
+                a: Vec2::new(ftip, half_ap),
+                b: Vec2::new(rtip, half_ap),
             },
         },
         ProfileEdge2 {
             patch: scene.alloc_patch_id(),
-            curve: Curve2::Line {
-                a: Vec2::new(1.0, 2.0),
-                b: Vec2::new(-1.0, 2.0),
-            },
+            curve: Curve2::Conic(ConicParams2 {
+                vertex: Vec2::new(2.0, 0.0),
+                axis: Vec2::X,
+                c: -1.0 / 25.0,
+                k: 0.0,
+                half_ap,
+            }),
         },
         ProfileEdge2 {
             patch: scene.alloc_patch_id(),
             curve: Curve2::Line {
-                a: Vec2::new(-1.0, 2.0),
-                b: Vec2::new(-1.0, 0.0),
+                a: Vec2::new(rtip, -half_ap),
+                b: Vec2::new(ftip, -half_ap),
             },
         },
     ];
+    let id = scene.alloc_object_id();
     let mut common = ObjectCommon::new(id, LayerId(0));
     common.transform = Isometry3::IDENTITY;
     scene.bodies.push(Body3 {
@@ -437,8 +541,70 @@ fn a_profile_body_is_rejected_not_approximated() {
     });
     scene.validate().unwrap();
 
+    let rays = [
+        (Vec3::new(-25.0, 0.0, 0.0), Vec3::X),
+        (Vec3::new(-25.0, 3.0, 0.0), Vec3::X),
+        (Vec3::new(-25.0, 2.0, 3.0), Vec3::X),
+    ];
+    assert_landing_matches(&scene, &rays);
+}
+
+#[test]
+fn a_curved_edge_extrusion_is_rejected_not_approximated() {
+    let mut scene = Scene3::new();
+    // An extrusion with a conic edge: the ruled curved side surface is the one
+    // profile case still to land, so it must reject rather than draw a chord.
+    let id = scene.alloc_object_id();
+    let edges = vec![
+        ProfileEdge2 {
+            patch: scene.alloc_patch_id(),
+            curve: Curve2::Conic(ConicParams2 {
+                vertex: Vec2::new(-1.0, 0.0),
+                axis: Vec2::X,
+                c: 0.05,
+                k: 0.0,
+                half_ap: 3.0,
+            }),
+        },
+        ProfileEdge2 {
+            patch: scene.alloc_patch_id(),
+            curve: Curve2::Line {
+                a: Vec2::new(-1.0, 3.0),
+                b: Vec2::new(1.0, 3.0),
+            },
+        },
+        ProfileEdge2 {
+            patch: scene.alloc_patch_id(),
+            curve: Curve2::Line {
+                a: Vec2::new(1.0, 3.0),
+                b: Vec2::new(1.0, 0.0),
+            },
+        },
+    ];
+    let mut common = ObjectCommon::new(id, LayerId(0));
+    common.transform = Isometry3::IDENTITY;
+    scene.bodies.push(Body3 {
+        common,
+        geometry: SolidGeometry3::Profile(ProfileSolid3 {
+            profile: ClosedProfile2 { edges },
+            construction: ProfileConstruction3::ExtrudeLocalZ {
+                z_min_mm: -4.0,
+                z_max_mm: 4.0,
+            },
+        }),
+        material: glass(1.5),
+        absorption: Default::default(),
+        surface: SurfaceProps3::default(),
+        priority: 0,
+    });
+    scene.validate().unwrap();
+
     let gpu = GpuScene3::build(&scene, BuildOpts::default());
-    assert_eq!(gpu.rejected.len(), 1, "the profile body should be rejected");
+    assert_eq!(
+        gpu.rejected.len(),
+        1,
+        "the curved extrusion should be rejected"
+    );
     assert_eq!(gpu.rejected[0].object, id.0);
     assert!(gpu.bodies.is_empty(), "no body should be traced");
 }

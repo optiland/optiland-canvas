@@ -14,15 +14,15 @@
 //! **Reject, never fake.** A geometry the preview cannot trace exactly is recorded
 //! as a [`Reject3`], not swapped for a lookalike. No arc becomes a chord, no
 //! asphere its base conic (§12.3). Supported: the analytic bodies (sphere, box,
-//! cylinder), extruded line profiles (prisms), zero-thickness surfaces (mirror,
-//! absorber, scalar dielectric, explicit R/T), finite aperture masks, and area
-//! detectors. Rejected, each with a named issue: revolved profiles and extrusions
-//! with curved edges (the surface-of-revolution solver is the remaining piece),
-//! and tabulated responses.
+//! cylinder), extruded line profiles (prisms), revolved profiles (conic and
+//! even-asphere surfaces of revolution with their frustum rims), zero-thickness
+//! surfaces (mirror, absorber, scalar dielectric, explicit R/T), finite aperture
+//! masks, and area detectors. Rejected, each with a named issue: an off-axis arc
+//! revolve, a curved-edge extrusion, and tabulated responses.
 
 use glam::{DQuat, DVec3, Mat3, Vec2, Vec3};
 use oc_core::material::{Cauchy, Material};
-use oc_core::profile2::ProfileConstruction3;
+use oc_core::profile2::{ClosedProfile2, ProfileConstruction3};
 use oc_core::scene3::{
     AbsorptionModel, Aperture3, Body3, Detector3, DetectorGeometry3, DetectorTermination,
     PlanarShape2, Scene3, SolidGeometry3, SpectralScalar, SurfaceGeometry3, SurfaceObject3,
@@ -40,6 +40,9 @@ pub const OBJ_CYLINDER: u32 = 2;
 /// A closed line-profile extruded through local Z. Its polygon and Z limits are
 /// in [`GpuBody3::extrude`].
 pub const OBJ_EXTRUDE: u32 = 3;
+/// A profile revolved about local `+X`. Its surfaces and containment contour are
+/// in [`GpuBody3::revolve`].
+pub const OBJ_REVOLVE: u32 = 4;
 
 /// Surface behaviour kinds.
 pub const SURF_DIELECTRIC: u32 = 0;
@@ -104,6 +107,8 @@ pub struct GpuBody3 {
     pub params: Vec3,
     /// The extruded polygon, when `kind == OBJ_EXTRUDE`.
     pub extrude: Option<GpuExtrude>,
+    /// The revolved profile, when `kind == OBJ_REVOLVE`.
+    pub revolve: Option<GpuRevolve>,
     pub index_const: f32,
     pub dp: [f32; 6],
     /// Constant bulk attenuation, `mm⁻¹` (0 = none). Applied per world length.
@@ -359,19 +364,15 @@ fn compile_body(
     let body_rot = Mat3::from_quat(q.as_quat());
     let pos = norm.point(b.common.transform.pos);
 
-    let (kind, params, rot, extrude) = match &b.geometry {
-        SolidGeometry3::Sphere { radius_mm } => (
-            OBJ_SPHERE,
-            Vec3::new(s(*radius_mm), 0.0, 0.0),
-            body_rot,
-            None,
-        ),
-        SolidGeometry3::Box { half_extents_mm } => (
-            OBJ_BOX,
-            (*half_extents_mm / norm.scale).as_vec3(),
-            body_rot,
-            None,
-        ),
+    let mut extrude = None;
+    let mut revolve = None;
+    let (kind, params, rot) = match &b.geometry {
+        SolidGeometry3::Sphere { radius_mm } => {
+            (OBJ_SPHERE, Vec3::new(s(*radius_mm), 0.0, 0.0), body_rot)
+        }
+        SolidGeometry3::Box { half_extents_mm } => {
+            (OBJ_BOX, (*half_extents_mm / norm.scale).as_vec3(), body_rot)
+        }
         SolidGeometry3::Cylinder {
             radius_mm,
             half_length_mm,
@@ -383,31 +384,25 @@ fn compile_body(
                 OBJ_CYLINDER,
                 Vec3::new(s(*radius_mm), s(*half_length_mm), 0.0),
                 body_rot * align,
-                None,
             )
         }
-        SolidGeometry3::Profile(p) => {
-            let (z_min, z_max) = match p.construction {
-                ProfileConstruction3::ExtrudeLocalZ { z_min_mm, z_max_mm } => (z_min_mm, z_max_mm),
-                ProfileConstruction3::RevolveLocalX => {
-                    return Err("revolved profile (not yet in the f32 preview)".into())
-                }
-                ProfileConstruction3::PlanarOnly { .. } => {
-                    return Err("planar-only body has no 3D form to preview".into())
-                }
-            };
-            let verts = line_polygon(&p.profile, norm.scale)?;
-            (
-                OBJ_EXTRUDE,
-                Vec3::ZERO,
-                body_rot,
-                Some(GpuExtrude {
-                    verts,
-                    z_min: s(z_min),
-                    z_max: s(z_max),
-                }),
-            )
-        }
+        SolidGeometry3::Profile(p) => match p.construction {
+            ProfileConstruction3::ExtrudeLocalZ { z_min_mm, z_max_mm } => {
+                extrude = Some(GpuExtrude {
+                    verts: line_polygon(&p.profile, norm.scale)?,
+                    z_min: s(z_min_mm),
+                    z_max: s(z_max_mm),
+                });
+                (OBJ_EXTRUDE, Vec3::ZERO, body_rot)
+            }
+            ProfileConstruction3::RevolveLocalX => {
+                revolve = Some(compile_revolve(&p.profile, norm.scale)?);
+                (OBJ_REVOLVE, Vec3::ZERO, body_rot)
+            }
+            ProfileConstruction3::PlanarOnly { .. } => {
+                return Err("planar-only body has no 3D form to preview".into())
+            }
+        },
     };
 
     let surface = classify_surface(&b.surface.default)?;
@@ -428,6 +423,7 @@ fn compile_body(
         pos,
         params,
         extrude,
+        revolve,
         index_const: 1.0,
         dp: [0.0; 6],
         alpha_per_mm,
@@ -466,6 +462,281 @@ fn line_polygon(
         return Err("extruded profile has fewer than three vertices".into());
     }
     Ok(verts)
+}
+
+// ---------------------------------------------------------------------------
+// Revolved profiles (§7.3–7.5)
+// ---------------------------------------------------------------------------
+
+/// One surface of a revolved profile, in the normalized frame. Its axis is local
+/// `+X`, matching the profile authoring convention.
+#[derive(Debug, Clone)]
+pub enum RevFace {
+    /// A conic or even-asphere surface of revolution. `axis_sign` is the sign of
+    /// the profile conic's axis (`±X`). `is_conic` selects the exact quadratic
+    /// over the safeguarded Newton solver.
+    Sag {
+        vertex_x: f32,
+        axis_sign: f32,
+        c: f32,
+        k: f32,
+        coeffs: [f32; 8],
+        outer_r: f32,
+        is_conic: bool,
+    },
+    /// A line segment revolved about `+X`: a cone, cylinder, or flat annulus. The
+    /// endpoints are clipped to `r >= 0`.
+    Frustum { x0: f32, y0: f32, x1: f32, y1: f32 },
+    /// An axis-centred arc revolved about `+X`: a spherical zone.
+    Arc {
+        center_x: f32,
+        r: f32,
+        a0: f32,
+        a1: f32,
+    },
+}
+
+/// A profile revolved about local `+X`: its surfaces plus a sampled `(x, r)`
+/// contour for the containment (media) test.
+#[derive(Debug, Clone)]
+pub struct GpuRevolve {
+    pub faces: Vec<RevFace>,
+    /// The meridian, sampled and closed, in `(x, r)` normalized coordinates. Used
+    /// by point-in-polygon to classify a point's medium.
+    pub contour: Vec<Vec2>,
+}
+
+/// Even-asphere sag at radial coordinate `r`, in f32 (§7.4). Shared by the
+/// contour sampler here and the intersector in `cpu3`.
+pub fn even_asphere_sag(c: f32, k: f32, coeffs: &[f32; 8], r: f32) -> f32 {
+    let r2 = r * r;
+    let denom = 1.0 + (1.0 - (1.0 + k) * c * c * r2).max(0.0).sqrt();
+    let mut sag = c * r2 / denom;
+    let mut rp = r2 * r2;
+    for &a in coeffs {
+        sag += a * rp;
+        rp *= r2;
+    }
+    sag
+}
+
+/// `d(sag)/dr`, analytic — the point of §7.4, so the asphere normal is exact.
+pub fn even_asphere_dsag(c: f32, k: f32, coeffs: &[f32; 8], r: f32) -> f32 {
+    let r2 = r * r;
+    let s = (1.0 - (1.0 + k) * c * c * r2).max(0.0).sqrt();
+    let mut d = if s > 0.0 { c * r / s } else { 0.0 };
+    let mut rp = r2 * r;
+    for (i, &a) in coeffs.iter().enumerate() {
+        d += a * (2 * i + 4) as f32 * rp;
+        rp *= r2;
+    }
+    d
+}
+
+fn compile_revolve(profile: &ClosedProfile2, scale: f64) -> Result<GpuRevolve, String> {
+    use oc_core::profile2::Curve2;
+    let mut faces = Vec::new();
+    for e in &profile.edges {
+        match &e.curve {
+            Curve2::Line { a, b } => {
+                if let Some(f) = revolve_line_face(*a, *b, scale) {
+                    faces.push(f);
+                }
+            }
+            Curve2::Polyline { points } => {
+                for w in points.windows(2) {
+                    if let Some(f) = revolve_line_face(w[0], w[1], scale) {
+                        faces.push(f);
+                    }
+                }
+            }
+            Curve2::Conic(cp) => faces.push(sag_face(cp, &[0.0; 8], scale, true)?),
+            Curve2::EvenAsphere { base, coeffs } => {
+                faces.push(sag_face(base, coeffs, scale, false)?)
+            }
+            Curve2::Arc {
+                center,
+                radius_mm,
+                a0,
+                a1,
+            } => {
+                if center.y.abs() > 1e-9 * (1.0 + center.x.abs()) {
+                    return Err("an off-axis arc revolves to a torus (not supported)".into());
+                }
+                faces.push(RevFace::Arc {
+                    center_x: (center.x / scale) as f32,
+                    r: (radius_mm / scale) as f32,
+                    a0: *a0 as f32,
+                    a1: *a1 as f32,
+                });
+            }
+        }
+    }
+    Ok(GpuRevolve {
+        faces,
+        contour: revolve_contour(profile, scale),
+    })
+}
+
+fn sag_face(
+    cp: &oc_core::profile2::ConicParams2,
+    coeffs: &[f64; 8],
+    scale: f64,
+    is_conic: bool,
+) -> Result<RevFace, String> {
+    let axis = cp.axis.normalize();
+    if axis.y.abs() > 1e-6 {
+        return Err("an off-axis conic cannot revolve about +X".into());
+    }
+    let axis_sign = if axis.x >= 0.0 { 1.0 } else { -1.0 };
+    let mut cn = [0.0f32; 8];
+    for (i, cc) in coeffs.iter().enumerate() {
+        cn[i] = (cc * scale.powi(2 * i as i32 + 3)) as f32;
+    }
+    Ok(RevFace::Sag {
+        vertex_x: (cp.vertex.x / scale) as f32,
+        axis_sign,
+        // A curvature `1/R` scales like inverse length.
+        c: (cp.c * scale) as f32,
+        k: cp.k as f32,
+        coeffs: cn,
+        outer_r: (cp.half_ap / scale) as f32,
+        is_conic,
+    })
+}
+
+/// A line revolved about `+X`, clipped to `r >= 0`. A segment entirely below the
+/// axis is skipped: its mirror above covers the same surface.
+fn revolve_line_face(
+    mut a: oc_core::vec::Vec2,
+    mut b: oc_core::vec::Vec2,
+    scale: f64,
+) -> Option<RevFace> {
+    if a.y < 0.0 && b.y < 0.0 {
+        return None;
+    }
+    if a.y < 0.0 {
+        let u = a.y / (a.y - b.y);
+        a = oc_core::vec::Vec2::new(a.x + u * (b.x - a.x), 0.0);
+    } else if b.y < 0.0 {
+        let u = b.y / (b.y - a.y);
+        b = oc_core::vec::Vec2::new(b.x + u * (a.x - b.x), 0.0);
+    }
+    Some(RevFace::Frustum {
+        x0: (a.x / scale) as f32,
+        y0: (a.y / scale) as f32,
+        x1: (b.x / scale) as f32,
+        y1: (b.y / scale) as f32,
+    })
+}
+
+/// Sample the profile into a closed `(x, r)` contour, chained into loop order so
+/// point-in-polygon can classify a revolved point's medium. Dense enough that the
+/// chord error is far below the medium-probe epsilon.
+fn revolve_contour(profile: &ClosedProfile2, scale: f64) -> Vec<Vec2> {
+    use oc_core::profile2::Curve2;
+    const N: usize = 48;
+    let s = |v: f64| (v / scale) as f32;
+    // Each edge as an ordered polyline in normalized (x, y).
+    let mut segs: Vec<Vec<Vec2>> = Vec::new();
+    for e in &profile.edges {
+        let mut pts = Vec::new();
+        match &e.curve {
+            Curve2::Line { a, b } => {
+                pts.push(Vec2::new(s(a.x), s(a.y)));
+                pts.push(Vec2::new(s(b.x), s(b.y)));
+            }
+            Curve2::Polyline { points } => {
+                for p in points {
+                    pts.push(Vec2::new(s(p.x), s(p.y)));
+                }
+            }
+            Curve2::Conic(cp) => sample_sag(cp, &[0.0; 8], scale, N, &mut pts),
+            Curve2::EvenAsphere { base, coeffs } => sample_sag(base, coeffs, scale, N, &mut pts),
+            Curve2::Arc {
+                center,
+                radius_mm,
+                a0,
+                a1,
+            } => {
+                for i in 0..=N {
+                    let ang = a0 + (a1 - a0) * i as f64 / N as f64;
+                    pts.push(Vec2::new(
+                        s(center.x + radius_mm * ang.cos()),
+                        s(center.y + radius_mm * ang.sin()),
+                    ));
+                }
+            }
+        }
+        if pts.len() >= 2 {
+            segs.push(pts);
+        }
+    }
+    chain_loop(segs)
+}
+
+/// Sample a conic/asphere profile edge across its aperture, `x = vertex_x +
+/// axis_sign·sag(|y|)`, appending normalized `(x, y)` points.
+fn sample_sag(
+    cp: &oc_core::profile2::ConicParams2,
+    coeffs: &[f64; 8],
+    scale: f64,
+    n: usize,
+    out: &mut Vec<Vec2>,
+) {
+    let axis_sign = if cp.axis.normalize().x >= 0.0 {
+        1.0
+    } else {
+        -1.0
+    };
+    let cn = (cp.c * scale) as f32;
+    let mut cf = [0.0f32; 8];
+    for (i, c) in coeffs.iter().enumerate() {
+        cf[i] = (c * scale.powi(2 * i as i32 + 3)) as f32;
+    }
+    let vx = (cp.vertex.x / scale) as f32;
+    let ha = (cp.half_ap / scale) as f32;
+    for i in 0..=n {
+        let y = -ha + 2.0 * ha * i as f32 / n as f32;
+        let x = vx + axis_sign as f32 * even_asphere_sag(cn, cp.k as f32, &cf, y.abs());
+        out.push(Vec2::new(x, y));
+    }
+}
+
+/// Chain edge polylines into one closed loop by matching nearest endpoints.
+fn chain_loop(mut segs: Vec<Vec<Vec2>>) -> Vec<Vec2> {
+    if segs.is_empty() {
+        return Vec::new();
+    }
+    let mut loop_pts = segs.swap_remove(0);
+    while !segs.is_empty() {
+        let tail = *loop_pts.last().unwrap();
+        // The unused segment whose nearer endpoint is closest to the tail.
+        let mut best = 0usize;
+        let mut best_d = f32::INFINITY;
+        let mut best_rev = false;
+        for (i, seg) in segs.iter().enumerate() {
+            let df = (seg[0] - tail).length();
+            let db = (*seg.last().unwrap() - tail).length();
+            if df < best_d {
+                best_d = df;
+                best = i;
+                best_rev = false;
+            }
+            if db < best_d {
+                best_d = db;
+                best = i;
+                best_rev = true;
+            }
+        }
+        let mut seg = segs.swap_remove(best);
+        if best_rev {
+            seg.reverse();
+        }
+        // Skip the duplicate join point.
+        loop_pts.extend(seg.into_iter().skip(1));
+    }
+    loop_pts
 }
 
 /// A two-sided response the oracle supports, or the reason it does not. This
@@ -836,9 +1107,9 @@ mod tests {
     }
 
     #[test]
-    fn a_revolved_profile_is_rejected_by_name() {
-        // The curved profile bodies are the one geometry family still to land; the
-        // preview must reject them, not draw a chord.
+    fn an_extrusion_with_a_curved_edge_is_rejected_by_name() {
+        // Extrusions revolve only line profiles; a curved edge needs the ruled
+        // side-surface solver that has not landed, so it is rejected, not a chord.
         use oc_core::profile2::{
             ClosedProfile2, ConicParams2, Curve2, ProfileConstruction3, ProfileEdge2, ProfileSolid3,
         };
@@ -876,7 +1147,10 @@ mod tests {
             common,
             geometry: SolidGeometry3::Profile(ProfileSolid3 {
                 profile: ClosedProfile2 { edges },
-                construction: ProfileConstruction3::RevolveLocalX,
+                construction: ProfileConstruction3::ExtrudeLocalZ {
+                    z_min_mm: -2.0,
+                    z_max_mm: 2.0,
+                },
             }),
             material: Material::AbbePoint { nd: 1.5, vd: 64.0 },
             absorption: AbsorptionModel::None,
@@ -887,7 +1161,7 @@ mod tests {
         assert!(gpu.bodies.is_empty());
         assert_eq!(gpu.rejected.len(), 1);
         assert_eq!(gpu.rejected[0].object, id.0);
-        assert!(gpu.rejected[0].kind.contains("revolved"));
+        assert!(gpu.rejected[0].kind.contains("curved edge"));
     }
 
     #[test]

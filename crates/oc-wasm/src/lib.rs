@@ -32,6 +32,10 @@ use oc_trace::{trace_scene3, TraceConfig3};
 /// The openUC2 mode (§15.2). The freeform Canvas above does not know it exists.
 pub mod openuc2;
 
+/// Cross-section of the 3D scene with the view plane (§10.4), for drawing the
+/// optical elements in the 2D layout.
+mod xsection;
+
 /// State kept for an element drawn freehand: its fitted ladder (§5.3) so the
 /// complexity slider can re-swap the front surface with no refit, plus the
 /// extrusion depth used to close the body.
@@ -1676,6 +1680,19 @@ impl Canvas {
         )
     }
 
+    /// The optical elements' cross-section with the view plane (§10.4), for
+    /// drawing the 2D layout — a lens as its meridional profile, a sphere as a
+    /// circle, a mirror or detector as a line. A JSON array of polylines
+    /// `[{kind, closed, pts:[u,v,...]}]` in view-plane coordinates; `[]` if no
+    /// scene is loaded.
+    #[wasm_bindgen(js_name = sceneCrossSectionJSON)]
+    pub fn scene_cross_section_json(&self) -> String {
+        match &self.scene3 {
+            Some(scene) => xsection::cross_section_json(scene, &self.view_plane),
+            None => "[]".into(),
+        }
+    }
+
     /// The 3D objects for the inspector: each body's id, geometry kind, 3D
     /// construction, whether its third dimension is resolved, and its world
     /// position. JSON array `[{id,kind,construction,is3d,pos:[x,y,z]}]`; empty if
@@ -2579,5 +2596,56 @@ mod scene3_tests {
 
         // An unknown body id changes nothing.
         assert!(!c.set_body_position(9999.0, 1.0, 1.0, 1.0));
+    }
+
+    #[test]
+    fn the_cross_section_draws_the_elements() {
+        use oc_core::id::LayerId;
+        use oc_core::material::Material;
+        use oc_core::scene3::{
+            AbsorptionModel, Body3, Detector3, DetectorGeometry3, DetectorResponse,
+            DetectorTermination, ObjectCommon, SolidGeometry3, SurfaceProps3,
+        };
+        use oc_core::vec3::Isometry3;
+
+        let mut scene = Scene3::new();
+        // A glass sphere at the origin: its Z=0 section is a circle.
+        let sid = scene.alloc_object_id();
+        let mut common = ObjectCommon::new(sid, LayerId(0));
+        common.transform = Isometry3::IDENTITY;
+        scene.bodies.push(Body3 {
+            common,
+            geometry: SolidGeometry3::Sphere { radius_mm: 8.0 },
+            material: Material::AbbePoint { nd: 1.5, vd: 64.0 },
+            absorption: AbsorptionModel::None,
+            surface: SurfaceProps3::default(),
+            priority: 0,
+        });
+        // A detector across the axis: its plane cuts Z=0 in a line.
+        let did = scene.alloc_object_id();
+        let s = std::f64::consts::FRAC_1_SQRT_2;
+        let mut dcommon = ObjectCommon::new(did, LayerId(0));
+        dcommon.transform = Isometry3::new(Vec3::new(20.0, 0.0, 0.0), [0.0, -s, 0.0, s]).unwrap();
+        scene.detectors.push(Detector3 {
+            common: dcommon,
+            geometry: DetectorGeometry3::Rectangle {
+                half_width_mm: 8.0,
+                half_height_mm: 8.0,
+            },
+            bins: [16, 16],
+            response: DetectorResponse::Unity,
+            termination: DetectorTermination::Terminate,
+        });
+
+        let mut c = Canvas::new();
+        c.scene3 = Some(scene);
+        let xs = c.scene_cross_section_json();
+        // The body (sphere circle) and the detector line are both present, with
+        // actual points.
+        assert!(xs.contains("\"kind\":\"body\""), "{xs}");
+        assert!(xs.contains("\"kind\":\"detector\""), "{xs}");
+        assert!(xs.contains("\"pts\":["), "{xs}");
+        // No scene ⇒ empty.
+        assert_eq!(Canvas::new().scene_cross_section_json(), "[]");
     }
 }

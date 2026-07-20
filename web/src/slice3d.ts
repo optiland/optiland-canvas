@@ -73,6 +73,10 @@ export function initSlice3d(opts: {
   // pointer hit-testing. Refreshed whenever the scene changes.
   type Obj = { id: number; kind: string; construction: string; is3d: boolean; pos: number[]; radius: number };
   let objList: Obj[] = [];
+  // The elements' cross-section with the view plane, as polylines to draw. Kept
+  // in step with the geometry (load, drag).
+  type XLine = { kind: string; closed: boolean; pts: number[] };
+  let xsec: XLine[] = [];
   // The body being dragged, and the grab offset (view-plane u,v) so it does not
   // jump to the cursor. `origZ` keeps the out-of-plane coordinate fixed — an
   // in-plane move (§10.5).
@@ -104,6 +108,12 @@ export function initSlice3d(opts: {
     tracedRevision = scene.sceneRevision();
   }
 
+  // The element outlines follow the geometry: refreshed on load and on every drag
+  // step so a moved lens's section moves with it.
+  function refreshGeometry() {
+    xsec = JSON.parse(scene.sceneCrossSectionJSON());
+  }
+
   // The object inspector: each body's construction and world transform, so its
   // 3D shape and any missing depth are visible (§13). Re-read from Rust — never
   // a JS-side mirror of the scene graph. Also refreshes the hit-test cache.
@@ -131,6 +141,7 @@ export function initSlice3d(opts: {
       sliceRow.style.display = "";
       refreshBadge();
       refreshInspector();
+      refreshGeometry();
       retrace();
       const note = report.migratedFromV1
         ? `migrated from v1 (2D-only bodies are not traced in full 3D)`
@@ -204,6 +215,7 @@ export function initSlice3d(opts: {
     // Translate in the view plane; the out-of-plane coordinate is unchanged.
     scene.setBodyPosition(dragBody, w.x + grabU, w.y + grabV, origZ);
     retrace(true); // f32 interactive picture during the drag
+    refreshGeometry();
     refreshInspector();
     render();
   }
@@ -239,6 +251,39 @@ export function initSlice3d(opts: {
     return lo < hi ? [lo, hi] : null;
   }
 
+  // Stroke (and lightly fill) the element cross-sections. Each kind reads
+  // differently: a glass body, a mirror, a plain surface, a detector, an
+  // aperture mask.
+  const STYLE: Record<string, { stroke: string; width: number; fill?: string }> = {
+    body: { stroke: "rgba(150,185,225,0.9)", width: 1.5, fill: "rgba(120,155,205,0.10)" },
+    mirror: { stroke: "rgba(190,205,235,0.95)", width: 2.5 },
+    surface: { stroke: "rgba(150,160,175,0.7)", width: 1.5 },
+    detector: { stroke: "rgba(127,214,255,0.85)", width: 2 },
+    aperture: { stroke: "rgba(210,165,120,0.85)", width: 2.5 },
+  };
+
+  function drawElements(ctx: CanvasRenderingContext2D, toScreen: (p: V2) => V2) {
+    for (const el of xsec) {
+      const pts = el.pts;
+      if (pts.length < 4) continue;
+      const st = STYLE[el.kind] ?? STYLE.surface;
+      ctx.beginPath();
+      for (let i = 0; i < pts.length; i += 2) {
+        const s = toScreen({ x: pts[i], y: pts[i + 1] });
+        if (i === 0) ctx.moveTo(s.x, s.y);
+        else ctx.lineTo(s.x, s.y);
+      }
+      if (el.closed) ctx.closePath();
+      if (el.closed && st.fill) {
+        ctx.fillStyle = st.fill;
+        ctx.fill();
+      }
+      ctx.strokeStyle = st.stroke;
+      ctx.lineWidth = st.width;
+      ctx.stroke();
+    }
+  }
+
   return {
     active: () => loaded,
     overlay(ctx, toScreen) {
@@ -246,6 +291,11 @@ export function initSlice3d(opts: {
       // Never paint a projection older than the scene (§3.3): a mutation that
       // bumped the revision without a re-trace is caught here.
       if (scene.sceneRevision() !== tracedRevision) retrace();
+
+      // The optical elements first (a lens as its profile, a mirror/detector as a
+      // line), so the rays draw over them.
+      drawElements(ctx, toScreen);
+
       if (segs.length === 0) return;
       ctx.save();
       ctx.lineWidth = 1.2;

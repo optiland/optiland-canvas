@@ -64,6 +64,31 @@ test.describe("3D preview — the 2D Canvas as a slice of Scene3", () => {
     expect(thin).toBeLessThanOrEqual(wide);
   });
 
+  test("the optical elements are drawn, not just the rays", async ({ page }) => {
+    await page.goto("/");
+    await expect(page.locator("#stat")).toContainText("segs");
+    await page.locator("#open3dFile").setInputFiles(FIXTURE);
+    await expect(page.locator("#preview3dBadge")).toHaveClass(/full_3d/);
+
+    // The sphere's cross-section is an 8 mm circle at the origin; its bottom edge
+    // sits below the ±6 mm beam, so a lit pixel there is the element outline, not
+    // a ray. (6.5 px/mm ⇒ radius ≈ 52 px.)
+    const lit = await page.evaluate(() => {
+      const c = document.getElementById("view") as HTMLCanvasElement;
+      const ctx = c.getContext("2d")!;
+      const dpr = window.devicePixelRatio || 1;
+      const x = Math.round((c.clientWidth / 2) * dpr);
+      const y = Math.round((c.clientHeight / 2 + 52) * dpr);
+      const d = ctx.getImageData(x - 7, y - 7, 14, 14).data;
+      let n = 0;
+      for (let i = 0; i < d.length; i += 4) {
+        if (d[i] + d[i + 1] + d[i + 2] > 30) n++;
+      }
+      return n;
+    });
+    expect(lit).toBeGreaterThan(0);
+  });
+
   test("an out-of-plane fold leaves the slice", async ({ page }) => {
     await page.goto("/");
     await expect(page.locator("#stat")).toContainText("segs");

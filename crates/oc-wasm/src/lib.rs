@@ -21,14 +21,11 @@ use oc_gpu::{color::wavelength_um_to_linear, scene::GpuScene, trace_cpu, BuildOp
 use oc_trace::{trace as ref_trace, TraceConfig};
 use wasm_bindgen::prelude::*;
 
-// --- 3D (Scene3) migration surface (PR 3D-09) ------------------------------
-use oc_core::id::BodyId;
+// --- 3D (Scene3) view surface (PR 3D-09) -----------------------------------
 use oc_core::migrate_v1::{load_any, LoadReport};
 use oc_core::planar_reduce::{preview_mode, PreviewMode};
 use oc_core::profile2::ProfileConstruction3;
-use oc_core::scene3::{
-    can_promote_to_extruded, can_promote_to_revolved, promote_body, PromotionCheck, Scene3,
-};
+use oc_core::scene3::Scene3;
 use oc_core::vec3::{Plane3, Vec3};
 use oc_trace::{trace_scene3, TraceConfig3};
 
@@ -1541,50 +1538,6 @@ impl Canvas {
         self.slice_thickness = mm.max(0.0);
     }
 
-    /// Promote a profile-authored body to a revolved solid (about local +X). The
-    /// profile is validated (mirror-symmetric, closed, non-self-intersecting);
-    /// the promotion is refused with a reason rather than guessed (§11.3).
-    /// Returns a report JSON `{body, from, to}`; throws on refusal.
-    #[wasm_bindgen(js_name = promoteBodyToRevolved)]
-    pub fn promote_body_to_revolved(&mut self, body_id: f64) -> Result<String, JsError> {
-        self.promote(body_id, ProfileConstruction3::RevolveLocalX)
-    }
-
-    /// Promote a profile-authored body to an extruded solid through local Z.
-    /// Returns a report JSON `{body, from, to}`; throws on refusal.
-    #[wasm_bindgen(js_name = promoteBodyToExtruded)]
-    pub fn promote_body_to_extruded(
-        &mut self,
-        body_id: f64,
-        z_min_mm: f64,
-        z_max_mm: f64,
-    ) -> Result<String, JsError> {
-        self.promote(
-            body_id,
-            ProfileConstruction3::ExtrudeLocalZ { z_min_mm, z_max_mm },
-        )
-    }
-
-    /// Whether a body can be promoted, without mutating it — for enabling the
-    /// promotion controls. JSON `{revolve:{ok,reason},extrude:{ok,reason}}`, or
-    /// `null` if the body or scene is absent.
-    #[wasm_bindgen(js_name = promotionOptionsJSON)]
-    pub fn promotion_options_json(&self, body_id: f64, z_min_mm: f64, z_max_mm: f64) -> String {
-        let Some(scene) = &self.scene3 else {
-            return "null".into();
-        };
-        let Some(body) = scene
-            .bodies
-            .iter()
-            .find(|b| b.common.id.0 == body_id as u64)
-        else {
-            return "null".into();
-        };
-        let rev = check_json(&can_promote_to_revolved(body));
-        let ext = check_json(&can_promote_to_extruded(body, z_min_mm, z_max_mm));
-        format!("{{\"revolve\":{rev},\"extrude\":{ext}}}")
-    }
-
     /// Trace the authoritative f64 path and project every segment onto the view
     /// plane. Nine floats per segment:
     /// `[au, av, bu, bv, flux, lambda_um, flags, dist_a, dist_b]`, where
@@ -1757,28 +1710,6 @@ impl Canvas {
 }
 
 impl Canvas {
-    /// Promote a body and bump the revision, mapping errors to a JS-readable form.
-    fn promote(
-        &mut self,
-        body_id: f64,
-        construction: ProfileConstruction3,
-    ) -> Result<String, JsError> {
-        let scene = self
-            .scene3
-            .as_mut()
-            .ok_or_else(|| JsError::new("no 3D scene loaded"))?;
-        let report = promote_body(scene, BodyId(body_id as u64), construction)
-            .map_err(|e| JsError::new(&format!("{e:?}")))?;
-        self.revision += 1;
-        Ok(format!(
-            "{{\"body\":{},\"from\":{},\"to\":{},\"undecided\":{}}}",
-            report.body.0,
-            json_str(&format!("{:?}", report.from)),
-            json_str(&format!("{:?}", report.to)),
-            report.undecided.len()
-        ))
-    }
-
     /// The f64 trace configuration, stamped with the current revision (§3.3).
     fn cfg3(&self) -> TraceConfig3 {
         TraceConfig3 {
@@ -2019,17 +1950,6 @@ fn body_kind_construction(b: &oc_core::scene3::Body3) -> (&'static str, &'static
                 ProfileConstruction3::ExtrudeLocalZ { .. } => "extruded",
             },
         ),
-    }
-}
-
-/// A [`PromotionCheck`] as `{ok, reason}` JSON.
-fn check_json(check: &PromotionCheck) -> String {
-    match check {
-        PromotionCheck::Ok => "{\"ok\":true,\"reason\":null}".to_string(),
-        PromotionCheck::No(reason) => format!("{{\"ok\":false,\"reason\":{}}}", json_str(reason)),
-        PromotionCheck::Undecided(reason) => {
-            format!("{{\"ok\":false,\"reason\":{}}}", json_str(reason))
-        }
     }
 }
 
@@ -2424,38 +2344,6 @@ mod scene3_tests {
         c.set_slice_thickness(2.5);
     }
 
-    #[test]
-    fn promoting_a_migrated_lens_to_revolved_makes_it_full_3d() {
-        let mut c = v1_beam_and_lens();
-        let v1_json = c.to_json();
-        let report = c.load_scene3_json(&v1_json).unwrap();
-
-        // The migrated singlet is the one PlanarOnly body; pull its id out of the
-        // report's list.
-        let body_id = first_id(&report, "planarOnlyBodies").expect("a planar-only body");
-        let rev = c.scene_revision();
-
-        // The inspector shows it as an unresolved profile.
-        let before = c.scene_objects_json();
-        assert!(
-            before.contains("\"construction\":\"planar-only\""),
-            "{before}"
-        );
-        assert!(before.contains("\"is3d\":false"), "{before}");
-
-        // A meridionally-symmetric singlet profile promotes to a revolved solid.
-        let promo = c.promote_body_to_revolved(body_id as f64).unwrap();
-        assert!(promo.contains("\"body\":"), "{promo}");
-        assert!(c.scene_revision() > rev, "promotion must bump the revision");
-
-        // Now a real 3D body exists, so the badge is no longer legacy-planar and
-        // the inspector reports a resolved, revolved body.
-        assert_ne!(c.preview_mode(), "legacy_planar");
-        let after = c.scene_objects_json();
-        assert!(after.contains("\"construction\":\"revolved\""), "{after}");
-        assert!(after.contains("\"is3d\":true"), "{after}");
-    }
-
     /// Build a v2 demo scene — a glass sphere lit by a collimated beam onto a
     /// detector — and write it to `web/public/demo-3d.ocanvas` for the browser
     /// slice preview and its Playwright spec. Ignored: run explicitly with
@@ -2540,25 +2428,6 @@ mod scene3_tests {
             "/../../web/public/demo-3d.ocanvas"
         );
         std::fs::write(path, scene.to_json()).expect("write demo fixture");
-        eprintln!("wrote {path}");
-    }
-
-    /// Build a **v1** singlet scene and write it to `web/public/demo-v1-lens.ocanvas`.
-    /// Loaded through the 3D preview it migrates to a legacy-planar scene whose
-    /// lens body is `PlanarOnly`, so the promotion controls have something real to
-    /// promote. Ignored (fixture generator).
-    #[test]
-    #[ignore]
-    fn write_demo_v1_lens_fixture() {
-        let mut c = Canvas::new();
-        c.add_collimated_source(-30.0, 0.0, 0.0, 10.0, 9, 0.5876);
-        c.add_singlet(0.0, 0.0, 50.0, 4.0, 12.0, 1.5168, 64.17);
-        c.add_detector(30.0, -8.0, 30.0, 8.0, 48);
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../web/public/demo-v1-lens.ocanvas"
-        );
-        std::fs::write(path, c.to_json()).expect("write v1 lens fixture");
         eprintln!("wrote {path}");
     }
 
@@ -2710,13 +2579,5 @@ mod scene3_tests {
 
         // An unknown body id changes nothing.
         assert!(!c.set_body_position(9999.0, 1.0, 1.0, 1.0));
-    }
-
-    /// Pull the first integer out of a `"key":[a,b,...]` array in a report JSON.
-    fn first_id(json: &str, key: &str) -> Option<u64> {
-        let start = json.find(&format!("\"{key}\":["))? + key.len() + 4;
-        let rest = &json[start..];
-        let end = rest.find(']')?;
-        rest[..end].split(',').next()?.trim().parse().ok()
     }
 }

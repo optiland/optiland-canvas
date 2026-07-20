@@ -54,16 +54,9 @@ export function initSlice3d(opts: {
   const sliceRow = document.getElementById("slice3dRow")!;
   const sliceInput = document.getElementById("slice3d") as HTMLInputElement;
   const sliceLabel = document.getElementById("slice3dLabel")!;
-  const promoteRow = document.getElementById("promote3dRow")!;
-  const promoteRevolve = document.getElementById("promoteRevolve") as HTMLButtonElement;
-  const promoteExtrude = document.getElementById("promoteExtrude") as HTMLButtonElement;
-  const promoteDepth = document.getElementById("promoteDepth") as HTMLInputElement;
   const objects = document.getElementById("objects3d")!;
 
   let loaded = false;
-  // Ids of bodies whose third dimension is still unresolved (PlanarOnly), from
-  // the migration report — the ones the promotion controls act on.
-  let planarBodies: number[] = [];
   // The projected segments for the current scene + view plane, cached so pan/zoom
   // and slice edits redraw without re-running the f64 tracer. Refreshed on load.
   let segs: Float32Array<ArrayBufferLike> = new Float32Array(0);
@@ -111,11 +104,6 @@ export function initSlice3d(opts: {
     tracedRevision = scene.sceneRevision();
   }
 
-  // Promotion is offered only while unresolved bodies remain.
-  function updatePromoteRow() {
-    promoteRow.style.display = planarBodies.length > 0 ? "" : "none";
-  }
-
   // The object inspector: each body's construction and world transform, so its
   // 3D shape and any missing depth are visible (§13). Re-read from Rust — never
   // a JS-side mirror of the scene graph. Also refreshes the hit-test cache.
@@ -127,7 +115,7 @@ export function initSlice3d(opts: {
       row.className = "row";
       const [x, y, z] = o.pos.map((v) => v.toFixed(1));
       const shape = o.kind === "profile" ? `profile · ${o.construction}` : o.kind;
-      const planar = o.is3d ? "" : ` <span class="planar" title="no third dimension yet — promote to trace in full 3D">⚠ planar-only</span>`;
+      const planar = o.is3d ? "" : ` <span class="planar" title="a 2D-only body: no third dimension, so it is not traced in full 3D">⚠ 2D-only</span>`;
       row.innerHTML =
         `<span class="oid">#${o.id}</span>` +
         `<span class="okind">${shape}${planar}</span>` +
@@ -140,52 +128,18 @@ export function initSlice3d(opts: {
     try {
       const report = JSON.parse(scene.loadScene3JSON(await file.text()));
       loaded = true;
-      planarBodies = report.planarOnlyBodies ?? [];
       sliceRow.style.display = "";
-      updatePromoteRow();
       refreshBadge();
       refreshInspector();
       retrace();
       const note = report.migratedFromV1
-        ? `migrated from v1 · ${planarBodies.length} body(ies) still planar-only — promote to trace in full 3D`
+        ? `migrated from v1 (2D-only bodies are not traced in full 3D)`
         : `v2 · dimension ${report.dimension}`;
       flash(`opened ${file.name} · ${note}`);
       render();
     } catch (err) {
       flash(`could not open ${file.name}: ${err}`, false);
     }
-  }
-
-  // Promote every unresolved body to a 3D construction (§11.3). A body the
-  // construction refuses (e.g. an asymmetric profile cannot revolve) stays
-  // planar-only with its reason surfaced, never silently changed.
-  function promoteAll(revolve: boolean) {
-    const depth = Number(promoteDepth.value) || 5;
-    const remaining: number[] = [];
-    let ok = 0;
-    let reason = "";
-    for (const id of planarBodies) {
-      try {
-        if (revolve) scene.promoteBodyToRevolved(id);
-        else scene.promoteBodyToExtruded(id, -depth, depth);
-        ok++;
-      } catch (err) {
-        remaining.push(id);
-        reason = String(err);
-      }
-    }
-    planarBodies = remaining;
-    updatePromoteRow();
-    refreshBadge();
-    refreshInspector();
-    retrace();
-    if (ok > 0) {
-      const refused = remaining.length ? ` · ${remaining.length} refused` : "";
-      flash(`promoted ${ok} body(ies) → ${revolve ? "revolved" : "extruded"}${refused}`);
-    } else {
-      flash(`promotion refused: ${reason}`, false);
-    }
-    render();
   }
 
   openBtn.addEventListener("click", () => openFile.click());
@@ -201,9 +155,6 @@ export function initSlice3d(opts: {
     // A slice change is a filter, not a retrace: reuse the cached projection.
     render();
   });
-
-  promoteRevolve.addEventListener("click", () => promoteAll(true));
-  promoteExtrude.addEventListener("click", () => promoteAll(false));
 
   // --- interactive editing: drag a body in the view plane (§10.5) ----------
   //

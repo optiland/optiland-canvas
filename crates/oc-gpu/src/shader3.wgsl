@@ -116,6 +116,17 @@ struct Seg {
     _pad: u32,
 };
 
+// A revolved-face record (`faces` arena). `a`/`b`/`coeffs` are read per `kind`.
+struct RFace {
+    kind: u32,
+    is_conic: u32,
+    _p0: u32,
+    _p1: u32,
+    a: vec4<f32>,
+    b: vec4<f32>,
+    coeffs: array<f32, 8>,
+};
+
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> bodies: array<Body>;
 @group(0) @binding(2) var<storage, read> surfaces: array<Surface>;
@@ -123,7 +134,7 @@ struct Seg {
 @group(0) @binding(4) var<storage, read> detectors: array<Detector>;
 @group(0) @binding(5) var<storage, read> rays: array<vec4<f32>>; // pairs: [origin_flux, dir_lambda]
 @group(0) @binding(6) var<storage, read> verts: array<vec2<f32>>;
-@group(0) @binding(7) var<storage, read> faces: array<vec4<f32>>; // Part 3
+@group(0) @binding(7) var<storage, read> faces: array<RFace>;
 @group(0) @binding(8) var<storage, read_write> segs: array<Seg>;
 
 const SEG_VALID: u32 = 1u;
@@ -152,6 +163,12 @@ const OBJ_REVOLVE: u32 = 4u;
 // Body surface behaviour kinds.
 const SURF_DIELECTRIC: u32 = 0u;
 const SURF_ABSORBER: u32 = 1u;
+
+// Revolved-face kinds.
+const FACE_SAG: u32 = 0u;
+const FACE_FRUSTUM: u32 = 1u;
+const FACE_ARC: u32 = 2u;
+const TAU: f32 = 6.2831853;
 
 // Self-hit offset and medium-probe distance, in the normalized frame. Matches
 // cpu3::EPS exactly.
@@ -202,6 +219,12 @@ fn extrude_contains(start: u32, count: u32, z_min: f32, z_max: f32, p: vec3<f32>
     return p.z >= z_min && p.z <= z_max && poly_contains(start, count, vec2<f32>(p.x, p.y));
 }
 
+// A revolved point is inside if `(x, r)` is inside the sampled meridian contour.
+fn revolve_contains(cstart: u32, ccount: u32, p: vec3<f32>) -> bool {
+    let r = sqrt(p.y * p.y + p.z * p.z);
+    return poly_contains(cstart, ccount, vec2<f32>(p.x, r));
+}
+
 // ---------------------------------------------------------------------------
 // Media (containment + priority)
 // ---------------------------------------------------------------------------
@@ -217,8 +240,9 @@ fn body_contains(bi: u32, p: vec3<f32>) -> bool {
         return pl.x * pl.x + pl.y * pl.y <= b.params.x * b.params.x && abs(pl.z) <= b.params.y;
     } else if (b.kind == OBJ_EXTRUDE) {
         return extrude_contains(b.poly_start, b.poly_count, b.z_min, b.z_max, pl);
+    } else if (b.kind == OBJ_REVOLVE) {
+        return revolve_contains(b.contour_start, b.contour_count, pl);
     }
-    // Revolved containment lands in Part 3.
     return false;
 }
 
@@ -402,6 +426,305 @@ fn extrude_hit(start: u32, count: u32, z_min: f32, z_max: f32, o: vec3<f32>, d: 
     return best;
 }
 
+// ---------------------------------------------------------------------------
+// Revolved profiles (Part 3): conic (exact quadratic, §7.3), even asphere
+// (safeguarded Newton, §7.4), frustum rims, and axis-centred arcs.
+// ---------------------------------------------------------------------------
+
+fn rf_sag(c: f32, k: f32, coeffs: array<f32, 8>, r: f32) -> f32 {
+    let r2 = r * r;
+    let denom = 1.0 + sqrt(max(1.0 - (1.0 + k) * c * c * r2, 0.0));
+    var sag = c * r2 / denom;
+    var rp = r2 * r2;
+    var cf = coeffs;
+    for (var i = 0; i < 8; i = i + 1) {
+        sag = sag + cf[i] * rp;
+        rp = rp * r2;
+    }
+    return sag;
+}
+
+fn rf_dsag(c: f32, k: f32, coeffs: array<f32, 8>, r: f32) -> f32 {
+    let r2 = r * r;
+    let s = sqrt(max(1.0 - (1.0 + k) * c * c * r2, 0.0));
+    var d = 0.0;
+    if (s > 0.0) { d = c * r / s; }
+    var rp = r2 * r;
+    var cf = coeffs;
+    for (var i = 0; i < 8; i = i + 1) {
+        d = d + cf[i] * f32(2 * i + 4) * rp;
+        rp = rp * r2;
+    }
+    return d;
+}
+
+// The outward normal of a conic/asphere of revolution at local point `p` (§7.4).
+fn sag_normal(axis_sign: f32, c: f32, k: f32, coeffs: array<f32, 8>, p: vec3<f32>) -> vec3<f32> {
+    let rad = vec3<f32>(0.0, p.y, p.z);
+    let r = length(rad);
+    let axis = vec3<f32>(axis_sign, 0.0, 0.0);
+    if (r > 0.0) {
+        return normalize(axis - rad / r * rf_dsag(c, k, coeffs, r));
+    }
+    return normalize(axis);
+}
+
+struct QRoots { n: u32, t0: f32, t1: f32 };
+
+fn quad_roots(aa: f32, bb: f32, cc: f32) -> QRoots {
+    if (abs(aa) < 1e-20) {
+        if (abs(bb) > 1e-20) { return QRoots(1u, -cc / bb, 0.0); }
+        return QRoots(0u, 0.0, 0.0);
+    }
+    let disc = bb * bb - 4.0 * aa * cc;
+    if (disc < 0.0) { return QRoots(0u, 0.0, 0.0); }
+    let sq = sqrt(disc);
+    let sgn = select(-1.0, 1.0, bb >= 0.0);
+    let q = -0.5 * (bb + sgn * sq);
+    let t0 = q / aa;
+    if (abs(q) > 1e-20) { return QRoots(2u, t0, cc / q); }
+    return QRoots(1u, t0, 0.0);
+}
+
+// The residual f(t) = axial(t) − sag(r(t)) and its derivative, for the asphere
+// Newton solve (§7.4).
+fn a_residual(t: f32, c: f32, k: f32, coeffs: array<f32, 8>, z0: f32, dz: f32,
+              o_rad: vec3<f32>, d_rad: vec3<f32>) -> f32 {
+    let r = length(o_rad + d_rad * t);
+    return (z0 + t * dz) - rf_sag(c, k, coeffs, r);
+}
+
+fn a_dresidual(t: f32, c: f32, k: f32, coeffs: array<f32, 8>, dz: f32,
+               o_rad: vec3<f32>, d_rad: vec3<f32>) -> f32 {
+    let rad = o_rad + d_rad * t;
+    let r = length(rad);
+    var dr = 0.0;
+    if (r > 0.0) { dr = dot(rad, d_rad) / r; }
+    return dz - rf_dsag(c, k, coeffs, r) * dr;
+}
+
+// Safeguarded Newton for the asphere residual near `seed`; `.y` is 1 on success.
+fn a_refine(seed: f32, tmin: f32, c: f32, k: f32, coeffs: array<f32, 8>, z0: f32, dz: f32,
+            o_rad: vec3<f32>, d_rad: vec3<f32>) -> vec2<f32> {
+    var t = seed;
+    let span = 1e-2;
+    var lo = seed - span;
+    var hi = seed + span;
+    var flo = a_residual(lo, c, k, coeffs, z0, dz, o_rad, d_rad);
+    let fhi = a_residual(hi, c, k, coeffs, z0, dz, o_rad, d_rad);
+    let bracketed = flo * fhi <= 0.0;
+
+    for (var it = 0; it < 48; it = it + 1) {
+        let ft = a_residual(t, c, k, coeffs, z0, dz, o_rad, d_rad);
+        if (abs(ft) < 1e-7) { break; }
+        let dft = a_dresidual(t, c, k, coeffs, dz, o_rad, d_rad);
+        var nt = 1e30;
+        if (abs(dft) > 1e-30) { nt = t - ft / dft; }
+        let finite = nt == nt && nt < 1e30 && nt > -1e30;
+        if (!finite || (bracketed && (nt < lo || nt > hi))) { nt = 0.5 * (lo + hi); }
+        if (bracketed) {
+            let fnt = a_residual(nt, c, k, coeffs, z0, dz, o_rad, d_rad);
+            if (flo * fnt <= 0.0) { hi = nt; } else { lo = nt; flo = fnt; }
+        }
+        let step = abs(nt - t);
+        t = nt;
+        if (step < 1e-8 * (1.0 + abs(t))) { break; }
+    }
+    let ok = abs(a_residual(t, c, k, coeffs, z0, dz, o_rad, d_rad)) < 1e-5 && t > tmin;
+    return vec2<f32>(t, select(0.0, 1.0, ok));
+}
+
+// Accept a sag-surface root: check the aperture/sag envelope, and keep it if it is
+// the nearest so far. Returns the updated best.
+fn sag_accept(best: Hit, t: f32, tmin: f32, o: vec3<f32>, d: vec3<f32>, vertex_x: f32,
+              axis_sign: f32, c: f32, k: f32, coeffs: array<f32, 8>, outer_r: f32,
+              z_lo: f32, z_hi: f32, z_tol: f32, r_tol: f32) -> Hit {
+    if (t <= tmin) { return best; }
+    if (best.hit && t >= best.t) { return best; }
+    let p = o + d * t;
+    let r = sqrt(p.y * p.y + p.z * p.z);
+    let z = (p.x - vertex_x) * axis_sign;
+    if (r <= outer_r + r_tol && z >= z_lo - z_tol && z <= z_hi + z_tol) {
+        return Hit(true, t, sag_normal(axis_sign, c, k, coeffs, p));
+    }
+    return best;
+}
+
+fn sag_face_hit(f: RFace, o: vec3<f32>, d: vec3<f32>, tmin: f32) -> Hit {
+    let vertex_x = f.a.x;
+    let axis_sign = f.a.y;
+    let c = f.a.z;
+    let k = f.a.w;
+    let outer_r = f.b.x;
+    let coeffs = f.coeffs;
+
+    let ov = o - vec3<f32>(vertex_x, 0.0, 0.0);
+    let z0 = ov.x * axis_sign;
+    let dz = d.x * axis_sign;
+    let o_rad = vec3<f32>(0.0, ov.y, ov.z);
+    let d_rad = vec3<f32>(0.0, d.y, d.z);
+
+    let sag_edge = rf_sag(c, k, coeffs, outer_r);
+    let z_lo = min(sag_edge, 0.0);
+    let z_hi = max(sag_edge, 0.0);
+    let z_tol = 1e-4 * (1.0 + abs(outer_r));
+    let r_tol = 1e-5 * (1.0 + outer_r);
+
+    let k1 = 1.0 + k;
+    let aa = c * (dot(d_rad, d_rad) + k1 * dz * dz);
+    let bb = c * (2.0 * dot(o_rad, d_rad) + 2.0 * k1 * z0 * dz) - 2.0 * dz;
+    let cc = c * (dot(o_rad, o_rad) + k1 * z0 * z0) - 2.0 * z0;
+    let qr = quad_roots(aa, bb, cc);
+
+    var best = no_hit();
+    if (f.is_conic == 1u) {
+        if (qr.n >= 1u) { best = sag_accept(best, qr.t0, tmin, o, d, vertex_x, axis_sign, c, k, coeffs, outer_r, z_lo, z_hi, z_tol, r_tol); }
+        if (qr.n >= 2u) { best = sag_accept(best, qr.t1, tmin, o, d, vertex_x, axis_sign, c, k, coeffs, outer_r, z_lo, z_hi, z_tol, r_tol); }
+        return best;
+    }
+
+    // Even asphere: seed from the conic roots; if there are none, march across the
+    // aperture span to bracket a sign change, then Newton-refine (§7.4).
+    if (qr.n >= 1u) {
+        let ref0 = a_refine(qr.t0, tmin, c, k, coeffs, z0, dz, o_rad, d_rad);
+        if (ref0.y > 0.5) { best = sag_accept(best, ref0.x, tmin, o, d, vertex_x, axis_sign, c, k, coeffs, outer_r, z_lo, z_hi, z_tol, r_tol); }
+    }
+    if (qr.n >= 2u) {
+        let ref1 = a_refine(qr.t1, tmin, c, k, coeffs, z0, dz, o_rad, d_rad);
+        if (ref1.y > 0.5) { best = sag_accept(best, ref1.x, tmin, o, d, vertex_x, axis_sign, c, k, coeffs, outer_r, z_lo, z_hi, z_tol, r_tol); }
+    }
+    if (qr.n == 0u) {
+        let start = max(tmin, 0.0);
+        let step = max(outer_r, 0.05) * 0.1;
+        var pt = start;
+        var pv = a_residual(pt, c, k, coeffs, z0, dz, o_rad, d_rad);
+        for (var i = 1; i <= 200; i = i + 1) {
+            let t = start + step * f32(i);
+            let v = a_residual(t, c, k, coeffs, z0, dz, o_rad, d_rad);
+            if (pv * v < 0.0) {
+                let rf = a_refine(0.5 * (pt + t), tmin, c, k, coeffs, z0, dz, o_rad, d_rad);
+                if (rf.y > 0.5) { best = sag_accept(best, rf.x, tmin, o, d, vertex_x, axis_sign, c, k, coeffs, outer_r, z_lo, z_hi, z_tol, r_tol); }
+            }
+            pt = t;
+            pv = v;
+        }
+    }
+    return best;
+}
+
+// A line segment revolved about +X: cone, cylinder, or flat annular face.
+fn frustum_face_hit(f: RFace, o: vec3<f32>, d: vec3<f32>, tmin: f32) -> Hit {
+    let x0 = f.a.x;
+    let y0 = f.a.y;
+    let x1 = f.a.z;
+    let y1 = f.a.w;
+    let x_lo = min(x0, x1);
+    let x_hi = max(x0, x1);
+    let flat = abs(x1 - x0) <= 1e-9 * (1.0 + abs(x0) + abs(x1));
+
+    if (flat) {
+        if (abs(d.x) < 1e-12) { return no_hit(); }
+        let t = (x0 - o.x) / d.x;
+        if (t <= tmin) { return no_hit(); }
+        let p = o + d * t;
+        let r = sqrt(p.y * p.y + p.z * p.z);
+        let r_lo = min(y0, y1);
+        let r_hi = max(y0, y1);
+        let pad = 1e-9 * (1.0 + r_hi);
+        if (r >= r_lo - pad && r <= r_hi + pad) {
+            return Hit(true, t, vec3<f32>(1.0, 0.0, 0.0));
+        }
+        return no_hit();
+    }
+
+    let m = (y1 - y0) / (x1 - x0);
+    let b = y0 - m * x0;
+    let g0 = m * o.x + b;
+    let aa = d.y * d.y + d.z * d.z - m * m * d.x * d.x;
+    let bb = 2.0 * (o.y * d.y + o.z * d.z) - 2.0 * m * d.x * g0;
+    let cc = o.y * o.y + o.z * o.z - g0 * g0;
+    let pad = 1e-6 * (1.0 + abs(x_hi) + abs(x_lo));
+    let qr = quad_roots(aa, bb, cc);
+    var best = no_hit();
+    var roots = array<f32, 2>(qr.t0, qr.t1);
+    for (var i = 0u; i < qr.n; i = i + 1u) {
+        let t = roots[i];
+        if (t <= tmin || (best.hit && t >= best.t)) { continue; }
+        let p = o + d * t;
+        let r_line = m * p.x + b;
+        if (r_line >= -pad && p.x >= x_lo - pad && p.x <= x_hi + pad) {
+            best = Hit(true, t, normalize(vec3<f32>(-m * r_line, p.y, p.z)));
+        }
+    }
+    return best;
+}
+
+fn rem_euclid(a: f32, b: f32) -> f32 {
+    return a - b * floor(a / b);
+}
+
+fn angle_in_sweep(ang: f32, a0: f32, a1: f32) -> bool {
+    let sweep = rem_euclid(a1 - a0, TAU);
+    if (sweep >= TAU - 1e-6) { return true; }
+    let rel = rem_euclid(ang - a0, TAU);
+    return rel <= sweep + 1e-6;
+}
+
+// An axis-centred arc revolved about +X: a spherical zone.
+fn arc_face_hit(f: RFace, o: vec3<f32>, d: vec3<f32>, tmin: f32) -> Hit {
+    let center_x = f.a.x;
+    let r = f.a.y;
+    let a0 = f.a.z;
+    let a1 = f.a.w;
+    let c3 = vec3<f32>(center_x, 0.0, 0.0);
+    let oc = o - c3;
+    let b = dot(oc, d);
+    let disc = b * b - (dot(oc, oc) - r * r);
+    if (disc < 0.0) { return no_hit(); }
+    let sq = sqrt(disc);
+    var ts = array<f32, 2>(-b - sq, -b + sq);
+    var best = no_hit();
+    for (var i = 0; i < 2; i = i + 1) {
+        let t = ts[i];
+        if (t <= tmin || (best.hit && t >= best.t)) { continue; }
+        let p = o + d * t;
+        let rad = sqrt(p.y * p.y + p.z * p.z);
+        let ang = atan2(rad, p.x - center_x);
+        if (angle_in_sweep(ang, a0, a1)) {
+            best = Hit(true, t, (p - c3) / r);
+        }
+    }
+    return best;
+}
+
+// Nearest revolved-profile hit, with the outward local normal oriented by a
+// containment probe (a single surface cannot say which side is glass).
+fn revolve_hit(face_start: u32, face_count: u32, cstart: u32, ccount: u32,
+               o: vec3<f32>, d: vec3<f32>, tmin: f32) -> Hit {
+    var best = no_hit();
+    for (var fi = 0u; fi < face_count; fi = fi + 1u) {
+        let f = faces[face_start + fi];
+        var h = no_hit();
+        if (f.kind == FACE_SAG) {
+            h = sag_face_hit(f, o, d, tmin);
+        } else if (f.kind == FACE_FRUSTUM) {
+            h = frustum_face_hit(f, o, d, tmin);
+        } else {
+            h = arc_face_hit(f, o, d, tmin);
+        }
+        if (h.hit && (!best.hit || h.t < best.t)) {
+            best = h;
+        }
+    }
+    if (best.hit) {
+        let p = o + d * best.t;
+        if (revolve_contains(cstart, ccount, p + best.n * EPS)) {
+            best.n = -best.n;
+        }
+    }
+    return best;
+}
+
 // Nearest body hit, with the world-space outward normal.
 fn body_hit(bi: u32, o: vec3<f32>, d: vec3<f32>) -> Hit {
     let b = bodies[bi];
@@ -417,6 +740,8 @@ fn body_hit(bi: u32, o: vec3<f32>, d: vec3<f32>) -> Hit {
         h = cylinder_hit(ol, dl, b.params.x, b.params.y);
     } else if (b.kind == OBJ_EXTRUDE) {
         h = extrude_hit(b.poly_start, b.poly_count, b.z_min, b.z_max, ol, dl);
+    } else if (b.kind == OBJ_REVOLVE) {
+        h = revolve_hit(b.face_start, b.face_count, b.contour_start, b.contour_count, ol, dl, EPS);
     }
     if (h.hit) {
         h.n = normalize(rot * h.n);

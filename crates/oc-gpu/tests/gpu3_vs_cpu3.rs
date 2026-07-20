@@ -22,7 +22,7 @@
 use oc_core::id::{LayerId, ObjectId};
 use oc_core::material::Material;
 use oc_core::profile2::{
-    ClosedProfile2, Curve2, ProfileConstruction3, ProfileEdge2, ProfileSolid3,
+    ClosedProfile2, ConicParams2, Curve2, ProfileConstruction3, ProfileEdge2, ProfileSolid3,
 };
 use oc_core::scene3::{
     Aperture3, ApertureInteraction, ApertureShape3, Body3, Detector3, DetectorGeometry3,
@@ -364,6 +364,162 @@ fn an_extruded_prism_matches_cpu() {
                 Vec3::new(-20.0, -1.0, 0.0),
                 Vec3::new(1.0, 0.05, 0.0).normalize(),
             ),
+        ],
+    );
+}
+
+/// A biconvex revolved singlet: two conic faces and two rim lines (mirrors
+/// `cpu3_vs_f64`'s `revolved_singlet`).
+fn revolved_singlet(scene: &mut Scene3, r1: f64, r2: f64, thickness: f64, half_ap: f64, nd: f64) {
+    let (zf, zr) = (-thickness / 2.0, thickness / 2.0);
+    let sag = |c: f64, ha: f64| c * ha * ha / (1.0 + (1.0 - c * c * ha * ha).max(0.0).sqrt());
+    let (c1, c2) = (1.0 / r1, 1.0 / r2);
+    let ftip = zf + sag(c1, half_ap);
+    let rtip = zr + sag(c2, half_ap);
+    let mk_conic = |scene: &mut Scene3, vx: f64, c: f64| ProfileEdge2 {
+        patch: scene.alloc_patch_id(),
+        curve: Curve2::Conic(ConicParams2 {
+            vertex: Vec2::new(vx, 0.0),
+            axis: Vec2::X,
+            c,
+            k: 0.0,
+            half_ap,
+        }),
+    };
+    let e0 = mk_conic(scene, zf, c1);
+    let e1 = ProfileEdge2 {
+        patch: scene.alloc_patch_id(),
+        curve: Curve2::Line {
+            a: Vec2::new(ftip, half_ap),
+            b: Vec2::new(rtip, half_ap),
+        },
+    };
+    let e2 = mk_conic(scene, zr, c2);
+    let e3 = ProfileEdge2 {
+        patch: scene.alloc_patch_id(),
+        curve: Curve2::Line {
+            a: Vec2::new(rtip, -half_ap),
+            b: Vec2::new(ftip, -half_ap),
+        },
+    };
+    let id = scene.alloc_object_id();
+    let mut common = ObjectCommon::new(id, LayerId(0));
+    common.transform = Isometry3::IDENTITY;
+    scene.bodies.push(Body3 {
+        common,
+        geometry: SolidGeometry3::Profile(ProfileSolid3 {
+            profile: ClosedProfile2 {
+                edges: vec![e0, e1, e2, e3],
+            },
+            construction: ProfileConstruction3::RevolveLocalX,
+        }),
+        material: glass(nd),
+        absorption: Default::default(),
+        surface: SurfaceProps3::default(),
+        priority: 0,
+    });
+}
+
+#[test]
+fn a_revolved_singlet_matches_cpu() {
+    let Some(tracer) = tracer_or_skip() else {
+        return;
+    };
+    let mut scene = Scene3::new();
+    revolved_singlet(&mut scene, 20.0, -20.0, 4.0, 8.0, 1.5);
+    scene.validate().unwrap();
+    assert_gpu_matches_cpu(
+        &tracer,
+        &scene,
+        &[
+            (Vec3::new(-25.0, 0.0, 0.0), Vec3::X),
+            (Vec3::new(-25.0, 3.0, 0.0), Vec3::X),
+            (Vec3::new(-25.0, 0.0, 3.0), Vec3::X),
+            (Vec3::new(-25.0, 2.5, -2.5), Vec3::X),
+        ],
+    );
+}
+
+#[test]
+fn a_revolved_asphere_matches_cpu() {
+    let Some(tracer) = tracer_or_skip() else {
+        return;
+    };
+    let mut scene = Scene3::new();
+    let half_ap = 8.0;
+    let c1 = 1.0 / 25.0;
+    let sag = |c: f64, ha: f64, a4: f64, a6: f64| {
+        let base = c * ha * ha / (1.0 + (1.0 - c * c * ha * ha).max(0.0).sqrt());
+        base + a4 * ha.powi(4) + a6 * ha.powi(6)
+    };
+    let (a4, a6) = (1e-5, 1e-8);
+    let ftip = -2.0 + sag(c1, half_ap, a4, a6);
+    let rtip =
+        2.0 + (-1.0 / 25.0) * half_ap * half_ap / (1.0 + (1.0 - half_ap * half_ap / 625.0).sqrt());
+    let mut coeffs = [0.0; 8];
+    coeffs[0] = a4;
+    coeffs[1] = a6;
+    let edges = vec![
+        ProfileEdge2 {
+            patch: scene.alloc_patch_id(),
+            curve: Curve2::EvenAsphere {
+                base: ConicParams2 {
+                    vertex: Vec2::new(-2.0, 0.0),
+                    axis: Vec2::X,
+                    c: c1,
+                    k: 0.0,
+                    half_ap,
+                },
+                coeffs,
+            },
+        },
+        ProfileEdge2 {
+            patch: scene.alloc_patch_id(),
+            curve: Curve2::Line {
+                a: Vec2::new(ftip, half_ap),
+                b: Vec2::new(rtip, half_ap),
+            },
+        },
+        ProfileEdge2 {
+            patch: scene.alloc_patch_id(),
+            curve: Curve2::Conic(ConicParams2 {
+                vertex: Vec2::new(2.0, 0.0),
+                axis: Vec2::X,
+                c: -1.0 / 25.0,
+                k: 0.0,
+                half_ap,
+            }),
+        },
+        ProfileEdge2 {
+            patch: scene.alloc_patch_id(),
+            curve: Curve2::Line {
+                a: Vec2::new(rtip, -half_ap),
+                b: Vec2::new(ftip, -half_ap),
+            },
+        },
+    ];
+    let id = scene.alloc_object_id();
+    let mut common = ObjectCommon::new(id, LayerId(0));
+    common.transform = Isometry3::IDENTITY;
+    scene.bodies.push(Body3 {
+        common,
+        geometry: SolidGeometry3::Profile(ProfileSolid3 {
+            profile: ClosedProfile2 { edges },
+            construction: ProfileConstruction3::RevolveLocalX,
+        }),
+        material: glass(1.5),
+        absorption: Default::default(),
+        surface: SurfaceProps3::default(),
+        priority: 0,
+    });
+    scene.validate().unwrap();
+    assert_gpu_matches_cpu(
+        &tracer,
+        &scene,
+        &[
+            (Vec3::new(-25.0, 0.0, 0.0), Vec3::X),
+            (Vec3::new(-25.0, 3.0, 0.0), Vec3::X),
+            (Vec3::new(-25.0, 2.0, 3.0), Vec3::X),
         ],
     );
 }

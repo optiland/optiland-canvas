@@ -26,6 +26,22 @@ jobs:
         run: cargo clippy --workspace --exclude oc-py --all-targets -- -D warnings
       - name: test
         run: cargo test --workspace --exclude oc-py
+      # The 3D scene model, geometry, and tracer live behind off-by-default
+      # feature flags so the shipped engine stays 2D (canonical-3d-kernel.md).
+      # The step above therefore runs the gated suites as zero tests; this one
+      # turns the flags on so the 3D code is actually linted and exercised. It is
+      # scoped to the crates each flag reaches, not the whole workspace, so a
+      # crate that never opts in is not asked for a feature it does not have.
+      - name: clippy (3D features)
+        run: cargo clippy -p oc-core --features scene3 --all-targets -- -D warnings
+      - name: test (3D features)
+        run: cargo test -p oc-core --features scene3
+      # `trace3` implies `oc-core/scene3`, so this also covers the geometry as the
+      # tracer consumes it.
+      - name: clippy (3D tracer)
+        run: cargo clippy -p oc-trace --features trace3 --all-targets -- -D warnings
+      - name: test (3D tracer)
+        run: cargo test -p oc-trace --features trace3
 
   python-bridge:
     name: python bridge (optiland round-trip)

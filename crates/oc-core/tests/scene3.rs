@@ -784,10 +784,12 @@ fn promotion_is_the_only_way_a_body_becomes_3d() {
     assert!(s3.body(id).unwrap().is_3d());
     assert!(s3.validate().is_ok());
 
-    // The skeleton is honest about what it has not checked yet.
+    // The geometry engine now runs the real checks, so nothing is left undecided:
+    // the mirror is a closed, y-symmetric rectangle and revolves to a cylinder.
     assert!(
-        !report.undecided.is_empty(),
-        "promotion claimed a validation it has not run"
+        report.undecided.is_empty(),
+        "the revolve validator ran, so no check should be undecided: {:?}",
+        report.undecided
     );
 }
 
@@ -816,20 +818,15 @@ fn promotion_refuses_what_it_can_already_disprove() {
 }
 
 #[test]
-fn the_promotion_checks_report_undecided_rather_than_ok() {
-    // The checks that need a geometry engine are not implemented yet, and saying
-    // "Ok" would be a claim of validation nobody has run. PR 3D-03 turns these
-    // into Ok or No.
+fn the_promotion_checks_now_decide() {
+    // The geometry engine has landed, so a check that once reported `Undecided`
+    // returns a real verdict. The mirror is a closed rectangle, symmetric about
+    // y = 0, so it both revolves (to a cylinder) and extrudes.
     let (s3, _) = load_any(V1_CORPUS[2].1).unwrap();
     let b = &s3.bodies[0];
-    assert!(matches!(
-        can_promote_to_revolved(b),
-        PromotionCheck::Undecided(_)
-    ));
-    assert!(matches!(
-        can_promote_to_extruded(b, 0.0, 10.0),
-        PromotionCheck::Undecided(_)
-    ));
+    assert_eq!(can_promote_to_revolved(b), PromotionCheck::Ok);
+    assert_eq!(can_promote_to_extruded(b, 0.0, 10.0), PromotionCheck::Ok);
+    // An inverted extrusion is still refused before the geometry runs.
     assert!(can_promote_to_extruded(b, 10.0, 0.0).is_refusal());
 }
 
@@ -921,4 +918,39 @@ fn ids_do_not_collide_across_kinds() {
     assert_eq!(ids.len(), n, "ids collided across kinds");
     assert!(s3.validate().is_ok());
     assert_eq!(s3.source(SourceId(s3.sources[0].id.0)).unwrap().flux, 1.0);
+}
+
+// ---------------------------------------------------------------------------
+// Spectral and absorption sampling (the tracer's consumers, §6.7)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn spectral_and_absorption_tables_interpolate_and_honour_the_range_policy() {
+    use oc_core::scene3::{AbsorptionModel, Interpolation, OutOfRangePolicy, SpectralScalar};
+
+    // A linear ramp 0.4 -> 0.8 over 0.5..0.7 um.
+    let ramp = |out_of_range| SpectralScalar::Tabulated {
+        lambda_um: vec![0.5, 0.7],
+        values: vec![0.4, 0.8],
+        interpolation: Interpolation::Linear,
+        out_of_range,
+    };
+
+    // Interpolates at the midpoint.
+    assert!((ramp(OutOfRangePolicy::Error).sample(0.6).unwrap() - 0.6).abs() < 1e-12);
+    // Error policy refuses out of range rather than inventing a value.
+    assert_eq!(ramp(OutOfRangePolicy::Error).sample(0.4), None);
+    assert_eq!(ramp(OutOfRangePolicy::Error).sample(0.8), None);
+    // Clamp holds the endpoint; Zero returns nothing.
+    assert_eq!(ramp(OutOfRangePolicy::Clamp).sample(0.4), Some(0.4));
+    assert_eq!(ramp(OutOfRangePolicy::Clamp).sample(0.9), Some(0.8));
+    assert_eq!(ramp(OutOfRangePolicy::Zero).sample(0.4), Some(0.0));
+
+    // Constants are wavelength-flat; absorption-free models return zero.
+    assert_eq!(SpectralScalar::Constant(0.5).sample(1.0), Some(0.5));
+    assert_eq!(AbsorptionModel::None.sample(0.5), Some(0.0));
+    assert_eq!(
+        AbsorptionModel::Constant { alpha_per_mm: 0.1 }.sample(0.5),
+        Some(0.1)
+    );
 }

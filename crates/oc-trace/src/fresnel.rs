@@ -2,12 +2,39 @@
 //! reflectance. Pure functions, f64, no scene dependencies — these are the exact
 //! building blocks the reference tracer is validated against (§7).
 
-use oc_core::Vec2;
+use oc_core::{Vec2, Vec3};
 
 /// Reflect a unit direction `d` about a unit normal `n`.
 #[inline]
 pub fn reflect(d: Vec2, n: Vec2) -> Vec2 {
     d - 2.0 * d.dot(n) * n
+}
+
+/// Reflect a unit direction `d` about a unit normal `n`, in 3D.
+///
+/// The same formula as [`reflect`]; the reflection law is dimension-free, and
+/// keeping one implementation per dimension is cheaper than a generic bound the
+/// tracer would have to name at every call.
+#[inline]
+pub fn reflect3(d: Vec3, n: Vec3) -> Vec3 {
+    d - 2.0 * d.dot(n) * n
+}
+
+/// Refract `d` (unit) in 3D crossing an interface from index `n1` into `n2`.
+///
+/// `n` must be the unit interface normal oriented to *oppose* the incident
+/// direction (`n·d < 0`). Returns the transmitted unit direction, or `None` under
+/// total internal reflection. The transmitted ray lies in the plane of incidence
+/// by construction: it is a combination of `d` and `n`, and those two span that
+/// plane.
+pub fn refract3(d: Vec3, n: Vec3, n1: f64, n2: f64) -> Option<Vec3> {
+    let eta = n1 / n2;
+    let cosi = -n.dot(d); // > 0 by the orientation contract
+    let k = 1.0 - eta * eta * (1.0 - cosi * cosi);
+    if k < 0.0 {
+        return None; // TIR
+    }
+    Some(eta * d + (eta * cosi - k.sqrt()) * n)
 }
 
 /// Refract `d` (unit) crossing an interface from index `n1` into `n2`.

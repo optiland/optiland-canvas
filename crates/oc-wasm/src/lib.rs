@@ -2145,11 +2145,13 @@ impl Canvas {
                 let (kind, construction) = body_kind_construction(b);
                 let p = b.common.transform.pos;
                 let q = b.common.transform.rot_xyzw;
-                // In-plane (about +Z) angle in degrees. A body's authoring only ever
-                // sets a pure-Z rotation, so `2·atan2(qz, qw)` recovers it exactly.
+                // In-plane (about +Z) angle in degrees. App-authored bodies only ever
+                // set a pure-Z rotation, so `2·atan2(qz, qw)` recovers it exactly;
+                // imported scenes (optikit materializer) carry arbitrary quats, so
+                // `rot` ships the full [x,y,z,w] for faithful 3D drawing.
                 let rot_z = (2.0 * q[2].atan2(q[3])).to_degrees();
                 format!(
-                    "{{\"id\":{},\"kind\":{},\"construction\":{},\"is3d\":{},\"body\":true,\"pos\":[{},{},{}],\"radius\":{},\"rotZ\":{}}}",
+                    "{{\"id\":{},\"kind\":{},\"construction\":{},\"is3d\":{},\"body\":true,\"pos\":[{},{},{}],\"radius\":{},\"rotZ\":{},\"rot\":[{},{},{},{}]}}",
                     b.common.id.0,
                     json_str(kind),
                     json_str(construction),
@@ -2158,7 +2160,11 @@ impl Canvas {
                     p.y,
                     p.z,
                     body_radius(b),
-                    rot_z
+                    rot_z,
+                    q[0],
+                    q[1],
+                    q[2],
+                    q[3]
                 )
             })
             .collect();
@@ -2168,8 +2174,9 @@ impl Canvas {
         for s in &scene.surfaces {
             let (kind, radius) = surface_kind_radius(s);
             let p = s.common.transform.pos;
+            let q = s.common.transform.rot_xyzw;
             items.push(format!(
-                "{{\"id\":{},\"kind\":{},\"construction\":{},\"is3d\":true,\"body\":false,\"pos\":[{},{},{}],\"radius\":{},\"rotZ\":{}}}",
+                "{{\"id\":{},\"kind\":{},\"construction\":{},\"is3d\":true,\"body\":false,\"pos\":[{},{},{}],\"radius\":{},\"rotZ\":{},\"rot\":[{},{},{},{}]}}",
                 s.common.id.0,
                 json_str(kind),
                 json_str("planar"),
@@ -2177,36 +2184,50 @@ impl Canvas {
                 p.y,
                 p.z,
                 radius,
-                surface_tilt_deg(s)
+                surface_tilt_deg(s),
+                q[0],
+                q[1],
+                q[2],
+                q[3]
             ));
         }
         // Apertures: selectable/movable/tiltable/deletable, drawn as an annulus.
         for a in &scene.apertures {
             let (outer, opening) = aperture_radius_opening(a);
             let p = a.common.transform.pos;
+            let q = a.common.transform.rot_xyzw;
             items.push(format!(
-                "{{\"id\":{},\"kind\":\"aperture\",\"construction\":\"planar\",\"is3d\":true,\"body\":false,\"pos\":[{},{},{}],\"radius\":{},\"opening\":{},\"rotZ\":{}}}",
+                "{{\"id\":{},\"kind\":\"aperture\",\"construction\":\"planar\",\"is3d\":true,\"body\":false,\"pos\":[{},{},{}],\"radius\":{},\"opening\":{},\"rotZ\":{},\"rot\":[{},{},{},{}]}}",
                 a.common.id.0,
                 p.x,
                 p.y,
                 p.z,
                 outer,
                 opening,
-                aperture_tilt_deg(a)
+                aperture_tilt_deg(a),
+                q[0],
+                q[1],
+                q[2],
+                q[3]
             ));
         }
         // Detectors: first-class movable/tiltable/deletable objects, like surfaces.
         for d in &scene.detectors {
             let (hw, hh) = detector_half_extents(d);
             let p = d.common.transform.pos;
+            let q = d.common.transform.rot_xyzw;
             items.push(format!(
-                "{{\"id\":{},\"kind\":\"detector\",\"construction\":\"planar\",\"is3d\":true,\"body\":false,\"pos\":[{},{},{}],\"radius\":{},\"rotZ\":{}}}",
+                "{{\"id\":{},\"kind\":\"detector\",\"construction\":\"planar\",\"is3d\":true,\"body\":false,\"pos\":[{},{},{}],\"radius\":{},\"rotZ\":{},\"rot\":[{},{},{},{}]}}",
                 d.common.id.0,
                 p.x,
                 p.y,
                 p.z,
                 hw.hypot(hh),
-                detector_tilt_deg(d)
+                detector_tilt_deg(d),
+                q[0],
+                q[1],
+                q[2],
+                q[3]
             ));
         }
         format!("[{}]", items.join(","))
@@ -3082,6 +3103,9 @@ mod scene3_tests {
         assert_eq!(objs.matches("\"id\":").count(), before + 1);
         assert!(objs.contains("\"kind\":\"mirror\""));
         assert!(objs.contains("\"body\":false"));
+        // Every item carries its full quaternion (imported scenes hold
+        // non-pure-Z rotations the scalar rotZ cannot represent).
+        assert_eq!(objs.matches("\"rot\":[").count(), objs.matches("\"id\":").count());
         assert!(c.delete_object_3d(id));
 
         // A configurable element: front/back responses + tilt round-trip.

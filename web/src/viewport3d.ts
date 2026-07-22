@@ -132,7 +132,7 @@ export function initViewport3d(opts: {
   }
 
   // --- scene data (re-read from Rust; never mirrored) --------------------
-  type Obj = { id: number; kind: string; construction: string; is3d: boolean; body: boolean; pos: number[]; radius: number; rotZ: number; opening?: number };
+  type Obj = { id: number; kind: string; construction: string; is3d: boolean; body: boolean; pos: number[]; radius: number; rotZ: number; rot?: number[]; opening?: number };
   type XLine = { kind: string; closed: boolean; pts: number[] };
   let segs: Float32Array = new Float32Array(0);
   let tracedRevision = -1;
@@ -290,13 +290,36 @@ export function initViewport3d(opts: {
     return pts;
   }
 
-  // A local point (x, radius r), revolved by θ about local +X, then placed into
-  // the world by the body's in-plane rotation `rotZ` about +Z and translation.
-  function placer(o: Obj) {
+  // The object's full local→world rotation. App-authored objects carry a pure-Z
+  // rotation (rotZ); imported scenes (the optikit materializer) carry arbitrary
+  // quaternions in `rot` [x,y,z,w] — vertical-axis lenses would otherwise draw
+  // lying down. Falls back to rotZ when `rot` is absent.
+  function rotOf(o: Obj): (v: V3) => V3 {
+    if (o.rot && o.rot.length === 4) {
+      const [qx, qy, qz, qw] = o.rot;
+      return (v: V3): V3 => {
+        // v + 2 u × (u × v + w v), u = quat vector part.
+        const cx = qy * v.z - qz * v.y + qw * v.x;
+        const cy = qz * v.x - qx * v.z + qw * v.y;
+        const cz = qx * v.y - qy * v.x + qw * v.z;
+        return {
+          x: v.x + 2 * (qy * cz - qz * cy),
+          y: v.y + 2 * (qz * cx - qx * cz),
+          z: v.z + 2 * (qx * cy - qy * cx),
+        };
+      };
+    }
     const a = (o.rotZ * Math.PI) / 180, ca = Math.cos(a), sa = Math.sin(a);
+    return (v: V3): V3 => ({ x: v.x * ca - v.y * sa, y: v.x * sa + v.y * ca, z: v.z });
+  }
+
+  // A local point (x, radius r), revolved by θ about the body's optical axis
+  // (local +X), then placed into the world by the body's rotation + translation.
+  function placer(o: Obj) {
+    const R = rotOf(o);
     return (x: number, r: number, theta: number): V3 => {
-      const ly = r * Math.cos(theta), lz = r * Math.sin(theta);
-      return { x: o.pos[0] + x * ca - ly * sa, y: o.pos[1] + x * sa + ly * ca, z: o.pos[2] + lz };
+      const w = R({ x, y: r * Math.cos(theta), z: r * Math.sin(theta) });
+      return { x: o.pos[0] + w.x, y: o.pos[1] + w.y, z: o.pos[2] + w.z };
     };
   }
 
@@ -319,12 +342,12 @@ export function initViewport3d(opts: {
   }
 
   // A planar surface (mirror/beam block/element) as a disc: a rim circle in its
-  // plane plus a diameter, sized by its radius and oriented by its normal tilt.
+  // plane plus a diameter, sized by its radius and oriented by its rotation
+  // (the disc lies in the object's local z = 0 plane, kernel convention).
   function drawSurfaceDisc(ctx: CanvasRenderingContext2D, o: Obj, B: ReturnType<typeof basis>) {
-    const phi = (o.rotZ * Math.PI) / 180;
-    // In-plane axes: u1 along the surface line in X–Y, u2 out of plane (+Z).
-    const u1: V3 = { x: -Math.sin(phi), y: Math.cos(phi), z: 0 };
-    const u2: V3 = { x: 0, y: 0, z: 1 };
+    const rot = rotOf(o);
+    const u1: V3 = rot({ x: 1, y: 0, z: 0 });
+    const u2: V3 = rot({ x: 0, y: 1, z: 0 });
     const C: V3 = { x: o.pos[0], y: o.pos[1], z: o.pos[2] };
     const R = o.radius;
     const ring: V3[] = [];
@@ -336,13 +359,14 @@ export function initViewport3d(opts: {
     polyline(ctx, [add(C, scl(u1, -R)), add(C, scl(u1, R))], B); // the meridional diameter
   }
 
-  // A local (x, y) point extruded to z-height `zl`, placed into the world by the
-  // body's rotZ (about +Z) + translation. Local Z = world Z (rotZ leaves Z fixed).
+  // A local (x, y) point extruded to z-height `zl`, placed into the world by
+  // the body's rotation + translation.
   function extrudePlacer(o: Obj) {
-    const a = (o.rotZ * Math.PI) / 180, ca = Math.cos(a), sa = Math.sin(a);
-    return (x: number, y: number, zl: number): V3 => ({
-      x: o.pos[0] + x * ca - y * sa, y: o.pos[1] + x * sa + y * ca, z: o.pos[2] + zl,
-    });
+    const R = rotOf(o);
+    return (x: number, y: number, zl: number): V3 => {
+      const w = R({ x, y, z: zl });
+      return { x: o.pos[0] + w.x, y: o.pos[1] + w.y, z: o.pos[2] + w.z };
+    };
   }
 
   // A prism (extruded profile): front + back polygons joined by rails.
@@ -359,9 +383,9 @@ export function initViewport3d(opts: {
   // An aperture: two concentric circles (the absorbing mask rim and the clear
   // opening) in the aperture plane.
   function drawAperture(ctx: CanvasRenderingContext2D, o: Obj, B: ReturnType<typeof basis>) {
-    const phi = (o.rotZ * Math.PI) / 180;
-    const u1: V3 = { x: -Math.sin(phi), y: Math.cos(phi), z: 0 };
-    const u2: V3 = { x: 0, y: 0, z: 1 };
+    const rot = rotOf(o);
+    const u1: V3 = rot({ x: 1, y: 0, z: 0 });
+    const u2: V3 = rot({ x: 0, y: 1, z: 0 });
     const C: V3 = { x: o.pos[0], y: o.pos[1], z: o.pos[2] };
     const circle = (R: number) => {
       const ring: V3[] = [];

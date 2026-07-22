@@ -304,6 +304,66 @@ fn a_circular_aperture_passes_the_centre_and_blocks_the_edge_from_both_sides() {
     );
 }
 
+#[test]
+fn an_annular_aperture_blocks_the_centre_and_passes_the_ring() {
+    let mut scene = Scene3::new();
+    // A ring opening 3..5 mm in an opaque disc of radius 20, plane x = 0.
+    add_annular_aperture(&mut scene, Vec3::ZERO, Vec3::X, 3.0, 5.0, 20.0);
+    let cfg = no_ghosts();
+
+    // On axis (r = 0 < inner): the central obstruction blocks it.
+    let centre = trace3(
+        &scene,
+        &[launch(
+            Ray3::new(Vec3::new(-5.0, 0.0, 0.0), Vec3::X).unwrap(),
+            LAMBDA_D,
+            1.0,
+        )],
+        &cfg,
+    );
+    assert!(
+        (centre.ledger.blocked_aperture - 1.0).abs() < 1e-12,
+        "the centre of an annulus should block, got {}",
+        centre.ledger.blocked_aperture
+    );
+
+    // In the ring (r = 4): passes.
+    let ring = trace3(
+        &scene,
+        &[launch(
+            Ray3::new(Vec3::new(-5.0, 4.0, 0.0), Vec3::X).unwrap(),
+            LAMBDA_D,
+            1.0,
+        )],
+        &cfg,
+    );
+    assert_eq!(ring.ledger.blocked_aperture, 0.0, "the ring should pass");
+}
+
+#[test]
+fn a_mirror_reflection_is_not_flagged_as_tir() {
+    // A ray strikes a plain mirror at 45°: the reflected ray is specular, not
+    // total internal reflection, so no segment must carry the TIR flag.
+    let mut scene = Scene3::new();
+    add_mirror(&mut scene, Vec3::ZERO, Vec3::new(-1.0, 0.0, 0.0), 20.0, 1.0);
+
+    let res = trace3(
+        &scene,
+        &[launch(
+            Ray3::new(Vec3::new(-5.0, 3.0, 0.0), Vec3::X).unwrap(),
+            LAMBDA_D,
+            1.0,
+        )],
+        &no_ghosts(),
+    );
+
+    assert!(res.segments.len() >= 2, "the ray should reflect off the mirror");
+    assert!(
+        res.segments.iter().all(|s| !s.flags.tir),
+        "a mirror reflection must not be flagged as TIR"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Detector area normalization
 // ---------------------------------------------------------------------------

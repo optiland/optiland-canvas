@@ -12,31 +12,38 @@
 // the slab. Thickness 0 means "show everything projected".
 
 import type { Canvas } from "../pkg/oc_wasm.js";
+import { createCardManager, type CardSource } from "./cards";
 
 type V2 = { x: number; y: number };
 
 export type Slice3d = {
   /** Is a 3D scene loaded and being previewed? (Suppresses the v1 demo rays.) */
   active: () => boolean;
-  /** Draw the projected f64 paths for the current pan/zoom. */
+  /** Draw the element cross-sections and inspector cards for the current view. */
   overlay: (ctx: CanvasRenderingContext2D, toScreen: (p: V2) => V2) => void;
+  /** The projected ray paths in RayLayer's `[ax,ay,bx,by,r,g,b,flux,flags]`
+   *  layout (slab-clipped), so 3D rays render through the same HDR renderer as v1. */
+  raySegments: () => Float32Array;
+  /** Re-trace (f64) and refresh geometry/inspector after an external scene edit
+   *  (a glass change, a density change). Does not repaint — the caller renders. */
+  refresh: () => void;
+  /** The id of the selected/last-inspected body, or -1. */
+  selectedBody: () => number;
+  /** Boot the canonical 3D scene into the default authoring scene (a singlet,
+   *  a collimated beam, an area detector) so the app opens straight into 3D. */
+  bootDefault: () => void;
+  /** Stand this view down when another view takes the canvas: close its cards
+   *  and cancel any in-progress drag, so nothing lingers behind the 3D model. */
+  standDown: () => void;
+  /** Adopt a selection from the other view (id, or -1 to clear). */
+  setSelected: (id: number) => void;
+  /** Select an object and open its inspector card (after adding an element). */
+  focusObject: (id: number) => void;
 };
 
-// The flat layout of `traceProjected3D`: 9 floats per segment.
-const STRIDE = 9;
-
-/** A coarse visible-wavelength (µm) → CSS rgb, good enough to tell colours apart. */
-function wavelengthColor(um: number): [number, number, number] {
-  const nm = um * 1000;
-  let r = 0, g = 0, b = 0;
-  if (nm < 440) { r = (440 - nm) / (440 - 380); b = 1; }
-  else if (nm < 490) { g = (nm - 440) / (490 - 440); b = 1; }
-  else if (nm < 510) { g = 1; b = (510 - nm) / (510 - 490); }
-  else if (nm < 580) { r = (nm - 510) / (580 - 510); g = 1; }
-  else if (nm < 645) { r = 1; g = (645 - nm) / (645 - 580); }
-  else { r = 1; }
-  return [Math.round(r * 255), Math.round(g * 255), Math.round(b * 255)];
-}
+// The flat layout of `traceProjected3D`: 11 floats per segment
+// (au,av,bu,bv, r,g,b, flux, flags, dist_a, dist_b).
+const STRIDE = 11;
 
 export function initSlice3d(opts: {
   scene: Canvas;
@@ -44,8 +51,14 @@ export function initSlice3d(opts: {
   toScreen: (p: V2) => V2;
   toWorld: (px: number, py: number) => V2;
   render: () => void;
+  /** True while this view owns the canvas (2D cross-section active). When false,
+   *  its pointer/keyboard handlers stand down so the 3D model view has the canvas. */
+  owns?: () => boolean;
+  /** A body was selected/inspected (for the Abbe picker to target). */
+  onSelect?: (id: number) => void;
 }): Slice3d {
   const { scene, view, toScreen, toWorld, render } = opts;
+  const owns = () => opts.owns?.() ?? true;
 
   const badge = document.getElementById("preview3dBadge")!;
   const openBtn = document.getElementById("open3d") as HTMLButtonElement;
@@ -71,7 +84,7 @@ export function initSlice3d(opts: {
 
   // The bodies, cached with their world position and a coarse radius, for
   // pointer hit-testing. Refreshed whenever the scene changes.
-  type Obj = { id: number; kind: string; construction: string; is3d: boolean; pos: number[]; radius: number };
+  type Obj = { id: number; kind: string; construction: string; is3d: boolean; body: boolean; pos: number[]; radius: number; rotZ: number };
   let objList: Obj[] = [];
   // The elements' cross-section with the view plane, as polylines to draw. Kept
   // in step with the geometry (load, drag).
@@ -82,6 +95,36 @@ export function initSlice3d(opts: {
   // in-plane move (§10.5).
   let dragBody: number | null = null;
   let grabU = 0, grabV = 0, origZ = 0;
+  // Dragging the selected body's rotation handle (an in-plane tilt about +Z).
+  let rotating = false;
+  // The selected / last-inspected body (what the Abbe material picker targets).
+  let selected = -1;
+  function select(id: number) { selected = id; opts.onSelect?.(id); }
+  // Clipboard for copy/paste (a body id), and the diagonal offset counter so
+  // repeated pastes stagger, exactly like the v1 canvas.
+  let clipboard = -1;
+  let pasteN = 0;
+
+  // Grid snapping mirrors the v1 canvas — it reads the same shared grid controls.
+  const gridBox = document.getElementById("gridBox") as HTMLInputElement | null;
+  const gridSpacing = document.getElementById("gridSpacing") as HTMLInputElement | null;
+  const gridOn = () => gridBox?.checked ?? false;
+  const gridStep = () => Math.max(0.1, Number(gridSpacing?.value) || 5);
+  const snapToGrid = (v: number) => Math.round(v / gridStep()) * gridStep();
+
+  // Draw-mirror tool (§5.3, retargeted to Scene3): arm it, then click-drag in the
+  // cross-section to lay a planar fold mirror along the segment.
+  let drawMode = false;
+  let drawStart: V2 | null = null;
+  let drawEnd: V2 | null = null;
+  const drawBtn = document.getElementById("drawMirror") as HTMLButtonElement | null;
+  function setDrawMode(on: boolean) {
+    drawMode = on;
+    drawStart = drawEnd = null;
+    drawBtn?.classList.toggle("active", on);
+    view.style.cursor = on ? "crosshair" : "";
+  }
+  drawBtn?.addEventListener("click", () => setDrawMode(!drawMode));
 
   const flash = (text: string, ok = true) => {
     msg.textContent = text;
@@ -193,11 +236,42 @@ export function initSlice3d(opts: {
     return best;
   }
 
+  // The selected body's rotation handle: a dot `radius + 6` mm out along the
+  // body's current in-plane angle. Grabbing it tilts the body about +Z.
+  function rotHandleWorld(o: Obj): V2 {
+    const hr = o.radius + 6;
+    const a = (o.rotZ * Math.PI) / 180;
+    return { x: o.pos[0] + hr * Math.cos(a), y: o.pos[1] + hr * Math.sin(a) };
+  }
+
   function onDown(e: PointerEvent) {
-    if (!loaded || e.button !== 0 || e.target !== view) return;
+    if (!owns() || !loaded || e.button !== 0 || e.target !== view) return;
+    // Draw-mirror tool: a click-drag lays a segment, released into a fold mirror.
+    if (drawMode) {
+      const w = toWorld(e.clientX, e.clientY);
+      const p = gridOn() ? { x: snapToGrid(w.x), y: snapToGrid(w.y) } : { x: w.x, y: w.y };
+      drawStart = p; drawEnd = { ...p };
+      view.setPointerCapture(e.pointerId);
+      e.stopPropagation(); e.preventDefault();
+      return;
+    }
+    // The rotation handle sits outside the object, so grab it before the body.
+    const so = objList.find((o) => o.id === selected);
+    if (so) {
+      const rh = toScreen(rotHandleWorld(so));
+      if (Math.hypot(e.clientX - rh.x, e.clientY - rh.y) <= 10) {
+        rotating = true;
+        view.setPointerCapture(e.pointerId);
+        view.style.cursor = "grabbing";
+        e.stopPropagation();
+        e.preventDefault();
+        return;
+      }
+    }
     const o = pickBody(e.clientX, e.clientY);
     if (!o) return; // empty space → M3 handles pan/select
     dragBody = o.id;
+    select(o.id);
     const w = toWorld(e.clientX, e.clientY);
     grabU = o.pos[0] - w.x;
     grabV = o.pos[1] - w.y;
@@ -209,18 +283,70 @@ export function initSlice3d(opts: {
   }
 
   function onMove(e: PointerEvent) {
+    if (drawStart) {
+      const w = toWorld(e.clientX, e.clientY);
+      drawEnd = gridOn() ? { x: snapToGrid(w.x), y: snapToGrid(w.y) } : { x: w.x, y: w.y };
+      e.stopPropagation();
+      render();
+      return;
+    }
+    if (rotating) {
+      e.stopPropagation();
+      const so = objList.find((o) => o.id === selected);
+      if (so) {
+        const w = toWorld(e.clientX, e.clientY);
+        const deg = (Math.atan2(w.y - so.pos[1], w.x - so.pos[0]) * 180) / Math.PI;
+        // Bodies rotate about +Z; a surface's tilt is its normal angle.
+        if (so.body) scene.setObjectRotationZDeg(selected, deg);
+        else scene.setSurfaceTiltZDeg(selected, deg);
+        retrace(true);
+        refreshGeometry();
+        refreshInspector();
+        cardMgr.renderAll();
+        render();
+      }
+      return;
+    }
     if (dragBody === null) return;
     e.stopPropagation();
     const w = toWorld(e.clientX, e.clientY);
     // Translate in the view plane; the out-of-plane coordinate is unchanged.
-    scene.setBodyPosition(dragBody, w.x + grabU, w.y + grabV, origZ);
+    // Snap to the grid while it is on, exactly like the v1 canvas.
+    let x = w.x + grabU, y = w.y + grabV;
+    if (gridOn()) { x = snapToGrid(x); y = snapToGrid(y); }
+    scene.setObjectPosition(dragBody, x, y, origZ);
     retrace(true); // f32 interactive picture during the drag
     refreshGeometry();
     refreshInspector();
+    cardMgr.renderAll(); // the dragged body's card fields track it
     render();
   }
 
   function onUp(e: PointerEvent) {
+    if (drawStart) {
+      e.stopPropagation();
+      const a = drawStart, b = drawEnd ?? drawStart;
+      drawStart = drawEnd = null;
+      const len = Math.hypot(b.x - a.x, b.y - a.y);
+      if (len > 1) {
+        const id = scene.addPlanarMirror(a.x, a.y, b.x, b.y, 0.95);
+        setDrawMode(false); // a placement tool: one mirror per arming
+        if (id >= 0) select(id);
+        retrace(false); refreshGeometry(); refreshInspector(); render();
+      } else {
+        view.style.cursor = drawMode ? "crosshair" : "";
+        render();
+      }
+      return;
+    }
+    if (rotating) {
+      e.stopPropagation();
+      rotating = false;
+      view.style.cursor = "";
+      retrace(false); // settle on the f64 reference
+      render();
+      return;
+    }
     if (dragBody === null) return;
     e.stopPropagation();
     dragBody = null;
@@ -262,6 +388,22 @@ export function initSlice3d(opts: {
     aperture: { stroke: "rgba(210,165,120,0.85)", width: 2.5 },
   };
 
+  // The selected body's centre dot and rotation handle (v1's on-canvas handles).
+  function drawSelection(ctx: CanvasRenderingContext2D, toScreen: (p: V2) => V2) {
+    if (selected < 0) return;
+    const o = objList.find((x) => x.id === selected);
+    if (!o) return;
+    const c = toScreen({ x: o.pos[0], y: o.pos[1] });
+    ctx.fillStyle = "#7fd6ff";
+    ctx.beginPath(); ctx.arc(c.x, c.y, 4, 0, Math.PI * 2); ctx.fill();
+    const rh = toScreen(rotHandleWorld(o));
+    ctx.strokeStyle = "rgba(127,214,255,0.6)";
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(c.x, c.y); ctx.lineTo(rh.x, rh.y); ctx.stroke();
+    ctx.fillStyle = "#ffd678";
+    ctx.beginPath(); ctx.arc(rh.x, rh.y, 4, 0, Math.PI * 2); ctx.fill();
+  }
+
   function drawElements(ctx: CanvasRenderingContext2D, toScreen: (p: V2) => V2) {
     for (const el of xsec) {
       const pts = el.pts;
@@ -284,39 +426,267 @@ export function initSlice3d(opts: {
     }
   }
 
+  // --- inspector card (the same floating-window engine the v1 canvas uses) ---
+  //
+  // A Scene3 adapter over `./cards`: the card anchors to a body's projected
+  // position, shows its position and (for a singlet) its editable geometry and
+  // glass, and every field writes straight back to the Rust scene and re-traces.
+  const card3dTemplate = document.getElementById("card3dTemplate") as HTMLTemplateElement;
+
+  // Re-trace (f64), refresh the geometry/inspector, and repaint. Called after any
+  // scene edit so the picture and numbers settle honestly.
+  function afterEdit() {
+    retrace(false);
+    refreshGeometry();
+    refreshInspector();
+    cardMgr.renderAll();
+    render();
+  }
+
+  // Write a card's fields back to the scene. A refused geometry edit leaves the
+  // scene unchanged; the following re-render reverts the field to the real value.
+  function commitCard(id: number, root: HTMLElement) {
+    const num = (n: string) => Number((root.querySelector(`input[data-name="${n}"]`) as HTMLInputElement).value);
+    const o = objList.find((o) => o.id === id);
+    scene.setObjectPosition(id, num("x"), num("y"), o ? o.pos[2] : 0);
+    if (o) { if (o.body) scene.setObjectRotationZDeg(id, num("rot")); else scene.setSurfaceTiltZDeg(id, num("rot")); }
+    if (JSON.parse(scene.singletGeomJSON(id))) {
+      scene.setSingletGeom(id, num("r1"), num("r2"), num("thickness"), num("semiAperture"), num("conic1"), num("conic2"));
+    }
+    if (JSON.parse(scene.bodyGlassJSON(id))) {
+      scene.setBodyGlassAbbe(id, num("nd"), num("vd"));
+    }
+    if (JSON.parse(scene.apertureOpeningJSON(id))) {
+      scene.setApertureOpening(id, num("apMin"), num("apMax")); // min/max radius; refused if invalid
+    }
+    if (o && !o.body) {
+      const sel = (n: string) => (root.querySelector(`select[data-name="${n}"]`) as HTMLSelectElement)?.value;
+      const f = sel("front"), b = sel("back");
+      if (f && b) scene.setSurfaceResponse(id, f, b);
+    }
+    afterEdit();
+  }
+
+  // Show/populate the per-face response block for a surface object (hidden for
+  // bodies), reading current responses from Rust.
+  function renderSurfaceCard(id: number, root: HTMLElement, o: Obj) {
+    const block = root.querySelector(".c3-surface") as HTMLElement | null;
+    if (!block) return;
+    const r = o.body ? null : JSON.parse(scene.surfaceResponseJSON(id));
+    if (!r) { block.style.display = "none"; return; } // bodies + apertures have no per-face response
+    block.style.display = "block";
+    const set = (n: string, v: string) => {
+      const s = root.querySelector(`select[data-name="${n}"]`) as HTMLSelectElement;
+      if (s && document.activeElement !== s) s.value = v;
+    };
+    set("front", r.front); set("back", r.back);
+  }
+
+  const cardSource: CardSource = {
+    template: card3dTemplate,
+    toScreen,
+    render2d: render,
+    anchorWorld: (id) => {
+      const o = objList.find((o) => o.id === id);
+      return o ? { x: o.pos[0], y: o.pos[1] } : null;
+    },
+    render(id, root) {
+      const o = objList.find((o) => o.id === id);
+      if (!o) return false; // body deleted → close the orphan card
+      const q = (sel: string) => root.querySelector(sel) as HTMLElement;
+      q(".c-title").textContent = `#${id} · ${o.kind === "profile" ? o.construction : o.kind}`;
+      const setV = (name: string, v: number | null) => {
+        const inp = root.querySelector(`input[data-name="${name}"]`) as HTMLInputElement;
+        if (!inp || document.activeElement === inp) return;
+        inp.value = v == null ? "" : String(Number(v.toFixed(4)));
+      };
+      setV("x", o.pos[0]);
+      setV("y", o.pos[1]);
+      setV("rot", o.rotZ); // tilt: body Z-rotation or surface normal angle
+      const g = JSON.parse(scene.singletGeomJSON(id));
+      const glass = JSON.parse(scene.bodyGlassJSON(id));
+      q(".c3-singlet").style.display = g ? "block" : "none";
+      if (g) {
+        setV("r1", g.r1); setV("r2", g.r2); setV("thickness", g.thickness);
+        setV("semiAperture", g.semiAperture); setV("conic1", g.conic1); setV("conic2", g.conic2);
+      }
+      q(".c3-glass").style.display = glass ? "block" : "none"; // any glass body (singlet, prism)
+      if (glass) { setV("nd", glass.nd); setV("vd", glass.vd); }
+      const ap = JSON.parse(scene.apertureOpeningJSON(id)); // {inner, outer} for a stop
+      q(".c3-aperture").style.display = ap ? "block" : "none";
+      if (ap) { setV("apMin", ap.inner); setV("apMax", ap.outer); }
+      renderSurfaceCard(id, root, o);
+      return true;
+    },
+    wire(id, root) {
+      root.querySelectorAll<HTMLInputElement>("input[data-name]").forEach((input) => {
+        let before = "";
+        input.addEventListener("focus", () => { before = input.value; });
+        input.addEventListener("keydown", (e) => {
+          if (e.key === "Escape") { input.value = before; input.blur(); commitCard(id, root); }
+          e.stopPropagation(); // keep field keys out of the global shortcuts
+        });
+        input.addEventListener("input", () => commitCard(id, root));
+        input.addEventListener("wheel", (e) => { // hover-scroll scrubs
+          e.preventDefault();
+          const step = Number(input.step) || 0.5;
+          const dir = e.deltaY < 0 ? 1 : -1;
+          input.value = String(Number((Number(input.value) + dir * step * (e.shiftKey ? 10 : 1)).toFixed(6)));
+          commitCard(id, root);
+        }, { passive: false });
+      });
+      root.querySelectorAll<HTMLSelectElement>("select[data-name]").forEach((sel) => {
+        sel.addEventListener("keydown", (e) => e.stopPropagation());
+        sel.addEventListener("change", () => commitCard(id, root));
+      });
+    },
+  };
+
+  const cardMgr = createCardManager(cardSource);
+
+  // Double-click a body to open its inspector card. Runs in the capture phase so
+  // it beats M3's canvas dblclick (which would otherwise open a v1 card on the
+  // hidden demo). Only acts when a body is actually under the cursor.
+  document.addEventListener("dblclick", (e) => {
+    if (!owns() || !loaded || e.target !== view) return;
+    const o = pickBody(e.clientX, e.clientY);
+    if (o) { select(o.id); cardMgr.open(o.id); e.stopPropagation(); }
+  }, true);
+
+  // The projected ray paths in RayLayer's `[ax,ay,bx,by,r,g,b,flux,flags]`
+  // layout, each segment clipped to the active slab. The main renderer feeds this
+  // to the same HDR RayLayer as v1, so 3D rays get the identical spectral colour,
+  // tonemap, ghost layer, and TIR handling.
+  function raySegments(): Float32Array {
+    if (scene.sceneRevision() !== tracedRevision) retrace();
+    const out: number[] = [];
+    for (let i = 0; i + STRIDE <= segs.length; i += STRIDE) {
+      const range = slabRange(segs[i + 9], segs[i + 10]);
+      if (!range) continue;
+      const [t0, t1] = range;
+      const au = segs[i], av = segs[i + 1], bu = segs[i + 2], bv = segs[i + 3];
+      out.push(
+        au + (bu - au) * t0, av + (bv - av) * t0,
+        au + (bu - au) * t1, av + (bv - av) * t1,
+        segs[i + 4], segs[i + 5], segs[i + 6], // linear r,g,b
+        segs[i + 7], // flux
+        segs[i + 8], // flags (bit1 TIR, bit2 ghost)
+      );
+    }
+    return new Float32Array(out);
+  }
+
+  // Re-trace (f64) and refresh derived state after an external edit (a glass or
+  // density change made outside the drag/card paths). The caller repaints.
+  function refresh() {
+    retrace(false);
+    refreshGeometry();
+    refreshInspector();
+    cardMgr.renderAll();
+  }
+  const afterEdit3d = () => { refresh(); render(); };
+
+  // --- copy / paste / delete / nudge on the selected body (§5.1) -----------
+  // The v1 canvas' keyboard verbs, retargeted to the Scene3 selection. M3's own
+  // keydown defers these to us while a 3D scene is active (`threeDActive`).
+  function pasteBody() {
+    if (clipboard < 0) return;
+    pasteN++;
+    const d = gridOn() ? gridStep() : 5;
+    const id = scene.cloneBody3D(clipboard, d * pasteN, -d * pasteN, 0);
+    if (id >= 0) { select(id); afterEdit3d(); cardMgr.open(id); }
+  }
+  function deleteSelected() {
+    if (selected < 0) return;
+    if (scene.deleteObject3D(selected)) {
+      cardMgr.close(selected);
+      selected = -1;
+      afterEdit3d();
+    }
+  }
+  function nudge(key: string) {
+    const o = objList.find((x) => x.id === selected);
+    if (!o) return;
+    const s = gridOn() ? gridStep() : 1;
+    const dx = key === "ArrowLeft" ? -s : key === "ArrowRight" ? s : 0;
+    const dy = key === "ArrowUp" ? s : key === "ArrowDown" ? -s : 0;
+    scene.setObjectPosition(selected, o.pos[0] + dx, o.pos[1] + dy, o.pos[2]);
+    afterEdit3d();
+  }
+
+  window.addEventListener("keydown", (e) => {
+    if (!owns() || !loaded || e.target instanceof HTMLInputElement) return;
+    const mod = e.ctrlKey || e.metaKey;
+    if (e.key === "Escape") { cardMgr.closeAll(); selected = -1; render(); return; }
+    if (mod && (e.key === "c" || e.key === "C")) { if (selected >= 0) clipboard = selected; e.preventDefault(); return; }
+    if (mod && (e.key === "v" || e.key === "V")) { pasteBody(); e.preventDefault(); return; }
+    if (mod && (e.key === "x" || e.key === "X")) { if (selected >= 0) { clipboard = selected; deleteSelected(); } e.preventDefault(); return; }
+    if (mod && (e.key === "d" || e.key === "D")) { if (selected >= 0) { clipboard = selected; pasteBody(); } e.preventDefault(); return; }
+    if (e.key === "Delete" || e.key === "Backspace") { deleteSelected(); e.preventDefault(); return; }
+    if (e.key.startsWith("Arrow")) { nudge(e.key); e.preventDefault(); return; }
+  });
+
+  function bootDefault() {
+    const singletId = scene.newDefaultScene3();
+    loaded = true;
+    sliceRow.style.display = "";
+    refreshBadge();
+    refreshInspector();
+    refreshGeometry();
+    retrace();
+    select(singletId); // the Abbe picker targets the lens by default
+    flash("default 3D scene · a singlet traced in the Y–Z plane");
+    render();
+  }
+
+  // Stand down when the 3D model view takes over: drop any in-progress drag and
+  // close the floating cards so they don't hover over the other view.
+  function standDown() {
+    dragBody = null;
+    rotating = false;
+    setDrawMode(false);
+    view.style.cursor = "";
+    cardMgr.closeAll();
+  }
+  // Adopt a selection handed over from the other view (keeps the material picker
+  // and the highlighted body consistent across a toggle).
+  function setSelected(id: number) {
+    select(id);
+  }
+  // Re-read, select an object, and open its card (used after adding an element).
+  function focusObject(id: number) {
+    retrace(false); refreshGeometry(); refreshInspector();
+    select(id); cardMgr.open(id); render();
+  }
+
   return {
     active: () => loaded,
+    bootDefault,
+    standDown,
+    setSelected,
+    focusObject,
+    raySegments,
+    refresh,
+    selectedBody: () => selected,
+    // The element cross-sections, the selection/rotation handle, and the
+    // inspector cards; the rays themselves go through the shared RayLayer (see
+    // `raySegments`), drawn by the main renderer.
     overlay(ctx, toScreen) {
       if (!loaded) return;
-      // Never paint a projection older than the scene (§3.3): a mutation that
-      // bumped the revision without a re-trace is caught here.
-      if (scene.sceneRevision() !== tracedRevision) retrace();
-
-      // The optical elements first (a lens as its profile, a mirror/detector as a
-      // line), so the rays draw over them.
+      // Cards follow their body under any pan/zoom/drag: reposition every frame.
+      cardMgr.positionAll();
       drawElements(ctx, toScreen);
-
-      if (segs.length === 0) return;
-      ctx.save();
-      ctx.lineWidth = 1.2;
-      ctx.globalCompositeOperation = "lighter";
-      for (let i = 0; i + STRIDE <= segs.length; i += STRIDE) {
-        const au = segs[i], av = segs[i + 1], bu = segs[i + 2], bv = segs[i + 3];
-        const flux = segs[i + 4], lambda = segs[i + 5];
-        const range = slabRange(segs[i + 7], segs[i + 8]);
-        if (!range) continue;
-        const [t0, t1] = range;
-        const [r, g, b] = wavelengthColor(lambda);
-        const a = Math.min(1, 0.25 + flux * 0.75);
-        ctx.strokeStyle = `rgba(${r},${g},${b},${a})`;
-        const p0 = toScreen({ x: au + (bu - au) * t0, y: av + (bv - av) * t0 });
-        const p1 = toScreen({ x: au + (bu - au) * t1, y: av + (bv - av) * t1 });
-        ctx.beginPath();
-        ctx.moveTo(p0.x, p0.y);
-        ctx.lineTo(p1.x, p1.y);
-        ctx.stroke();
+      drawSelection(ctx, toScreen);
+      // The in-progress draw-mirror segment.
+      if (drawStart && drawEnd) {
+        const a = toScreen(drawStart), b = toScreen(drawEnd);
+        ctx.strokeStyle = "rgba(190,205,235,0.9)";
+        ctx.lineWidth = 2;
+        ctx.setLineDash([6, 4]);
+        ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+        ctx.setLineDash([]);
       }
-      ctx.restore();
+      cardMgr.drawLeaders(ctx, selected);
     },
   };
 }

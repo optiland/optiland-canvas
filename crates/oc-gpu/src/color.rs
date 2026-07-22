@@ -65,15 +65,28 @@ fn white_balance() -> [f32; 3] {
 /// each wavelength keeps its physical relative luminance (green brightest).
 /// Tonemap the accumulated result before display.
 pub fn wavelength_um_to_linear(um: f32) -> [f32; 3] {
-    let nm = (um * 1000.0).clamp(380.0, 780.0);
+    let nm = um * 1000.0;
+    if !(VISIBLE_MIN_NM..=VISIBLE_MAX_NM).contains(&nm) {
+        return YELLOW_LINEAR; // outside the visible band: a legible fixed yellow
+    }
     let c = raw_linear(nm);
     let wb = white_balance();
     [c[0] * wb[0], c[1] * wb[1], c[2] * wb[2]]
 }
 
+/// The visible band; a wavelength outside it has no true colour and is shown as
+/// [`YELLOW_LINEAR`] / [`YELLOW_SRGB`] so invisible (UV / IR) rays stay legible.
+pub const VISIBLE_MIN_NM: f32 = 380.0;
+pub const VISIBLE_MAX_NM: f32 = 780.0;
+const YELLOW_LINEAR: [f32; 3] = [1.0, 0.8, 0.0];
+const YELLOW_SRGB: [f32; 3] = [1.0, 0.9, 0.0];
+
 /// Map a wavelength in **micrometres** to a display sRGB triple in `[0, 1]`.
 pub fn wavelength_um_to_srgb(um: f32) -> [f32; 3] {
-    let nm = (um * 1000.0).clamp(380.0, 780.0);
+    let nm = um * 1000.0;
+    if !(VISIBLE_MIN_NM..=VISIBLE_MAX_NM).contains(&nm) {
+        return YELLOW_SRGB; // outside the visible band: a legible fixed yellow
+    }
     let [x, y, z] = cie_xyz(nm);
 
     // XYZ → linear sRGB (D65).
@@ -137,6 +150,20 @@ mod tests {
                 "channel {k} off neutral by {dev:.3} (sum {s:?})"
             );
         }
+    }
+
+    #[test]
+    fn out_of_visible_is_yellow() {
+        // UV (300 nm) and IR (900 nm) have no spectral colour: both render yellow
+        // (red and green on, blue off), in linear and display space alike.
+        for um in [0.30_f32, 0.90] {
+            let lin = wavelength_um_to_linear(um);
+            assert!(lin[0] > 0.5 && lin[1] > 0.5 && lin[2] == 0.0, "linear {lin:?}");
+            let srgb = wavelength_um_to_srgb(um);
+            assert!(srgb[0] > 0.5 && srgb[1] > 0.5 && srgb[2] == 0.0, "srgb {srgb:?}");
+        }
+        // A visible wavelength is unaffected (green stays green-dominant).
+        assert_eq!(dominant(wavelength_um_to_srgb(0.530)), 1);
     }
 
     #[test]

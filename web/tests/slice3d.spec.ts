@@ -25,9 +25,11 @@ test.describe("3D preview — the 2D Canvas as a slice of Scene3", () => {
     // listeners are attached before we drive the file input.
     await expect(page.locator("#stat")).toContainText("segs");
 
+    // The app boots straight into the canonical 3D scene (a singlet), so the
+    // badge is already full-3D and the slice control is shown.
     const badge = page.locator("#preview3dBadge");
-    await expect(badge).toHaveText("no 3D scene");
-    await expect(page.locator("#slice3dRow")).toBeHidden();
+    await expect(badge).toHaveClass(/full_3d/);
+    await expect(page.locator("#slice3dRow")).toBeVisible();
 
     // Open the demo scene into the canonical 3D scene (a native v2 glass sphere).
     await page.locator("#open3dFile").setInputFiles(FIXTURE);

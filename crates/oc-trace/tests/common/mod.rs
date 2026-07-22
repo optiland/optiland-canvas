@@ -268,6 +268,33 @@ pub fn add_circular_aperture(
     id
 }
 
+pub fn add_annular_aperture(
+    scene: &mut Scene3,
+    pos: Vec3,
+    normal: Vec3,
+    inner: f64,
+    outer: f64,
+    mask: f64,
+) -> ObjectId {
+    let id = next_id(scene);
+    let mut common = ObjectCommon::new(id, LayerId(0));
+    common.transform = facing(pos, normal);
+    scene.apertures.push(Aperture3 {
+        common,
+        shape: ApertureShape3 {
+            plane_local: Plane3::XY,
+            clear_opening: PlanarShape2::Annulus {
+                inner_mm: inner,
+                outer_mm: outer,
+            },
+            outer_extent: Some(PlanarShape2::Disc { radius_mm: mask }),
+        },
+        interaction: ApertureInteraction::Absorb,
+        primary_stop_for: Vec::new(),
+    });
+    id
+}
+
 pub fn add_rect_aperture(
     scene: &mut Scene3,
     pos: Vec3,

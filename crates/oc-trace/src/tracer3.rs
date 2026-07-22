@@ -781,7 +781,7 @@ fn apply_response(
                 flux_at * refl,
                 opl_at,
                 false,
-                true,
+                false, // a mirror reflection is specular, not total internal reflection
                 min_flux,
             );
         }

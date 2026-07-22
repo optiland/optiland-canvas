@@ -23,6 +23,8 @@
 //! off-by-default **`scene3`** feature, so the shipped engine cannot reach a
 //! half-built scene model while the migration is in progress.
 
+#[cfg(feature = "scene3")]
+pub mod build3;
 pub mod coordinates;
 pub mod fragment;
 pub mod geom;

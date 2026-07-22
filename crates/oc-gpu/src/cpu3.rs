@@ -263,7 +263,7 @@ fn interact_body(
                     gdepth: w.gdepth,
                     medium_n: n2,
                     medium_alpha: a2,
-                    flags: w.flags,
+                    flags: w.flags & !SEG_TIR, // transmitted: clear the TIR mark
                 },
                 max_depth,
                 min_flux,
@@ -280,7 +280,7 @@ fn interact_body(
                         gdepth: w.gdepth + 1,
                         medium_n: w.medium_n,
                         medium_alpha: w.medium_alpha,
-                        flags: w.flags | SEG_GHOST,
+                        flags: (w.flags & !SEG_TIR) | SEG_GHOST, // Fresnel ghost, not TIR
                     },
                     max_depth,
                     min_flux,
@@ -321,7 +321,7 @@ fn interact_surface(
                 gdepth: w.gdepth,
                 medium_n: w.medium_n,
                 medium_alpha: w.medium_alpha,
-                flags: w.flags,
+                flags: w.flags & !SEG_TIR, // TIR is per-interaction, not inherited
             },
             max_depth,
             min_flux,
@@ -329,7 +329,7 @@ fn interact_surface(
     };
     let reflect_branch = |stack: &mut Vec<Work>, flux: f32, ghost: bool| {
         let dir = reflect(w.d, n_oppose);
-        let mut flags = w.flags;
+        let mut flags = w.flags & !SEG_TIR; // specular reflection is not TIR
         let mut gdepth = w.gdepth;
         if ghost {
             flags |= SEG_GHOST;

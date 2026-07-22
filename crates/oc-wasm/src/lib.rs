@@ -22,6 +22,7 @@ use oc_trace::{trace as ref_trace, TraceConfig};
 use wasm_bindgen::prelude::*;
 
 // --- 3D (Scene3) view surface (PR 3D-09) -----------------------------------
+use oc_core::build3::SingletGeom;
 use oc_core::migrate_v1::{load_any, LoadReport};
 use oc_core::planar_reduce::{preview_mode, PreviewMode};
 use oc_core::profile2::ProfileConstruction3;
@@ -1543,11 +1544,13 @@ impl Canvas {
     }
 
     /// Trace the authoritative f64 path and project every segment onto the view
-    /// plane. Nine floats per segment:
-    /// `[au, av, bu, bv, flux, lambda_um, flags, dist_a, dist_b]`, where
-    /// `(au,av)`/`(bu,bv)` are in-plane coordinates, `flags` is bit1=TIR bit2=ghost,
-    /// and `dist_*` is the signed distance of each endpoint from the plane so the
-    /// UI can filter by [`Canvas::set_slice_thickness`]. Empty if no scene.
+    /// plane. Eleven floats per segment:
+    /// `[au, av, bu, bv, r, g, b, flux, flags, dist_a, dist_b]`, where
+    /// `(au,av)`/`(bu,bv)` are in-plane coordinates, `(r,g,b)` is the segment's
+    /// linear-light wavelength colour (the same convention as [`Canvas::trace_colored`],
+    /// so the browser draws 3D rays through the identical HDR `RayLayer`),
+    /// `flags` is bit1=TIR bit2=ghost, and `dist_*` is the signed distance of each
+    /// endpoint from the plane so the UI can slab-filter (§10.4). Empty if no scene.
     #[wasm_bindgen(js_name = traceProjected3D)]
     pub fn trace_projected_3d(&self) -> Vec<f32> {
         let Some(scene) = &self.scene3 else {
@@ -1555,18 +1558,21 @@ impl Canvas {
         };
         let res = trace_scene3(scene, &self.cfg3());
         let plane = &self.view_plane;
-        let mut out = Vec::with_capacity(res.segments.len() * 9);
+        let mut out = Vec::with_capacity(res.segments.len() * 11);
         for s in &res.segments {
             let a = plane.to_local(s.a);
             let b = plane.to_local(s.b);
             let flags = (s.flags.tir as u32) * 2 + (s.flags.ghost as u32) * 4;
+            let [r, g, b_] = wavelength_um_to_linear(s.lambda_um as f32);
             out.extend_from_slice(&[
                 a.x as f32,
                 a.y as f32,
                 b.x as f32,
                 b.y as f32,
+                r,
+                g,
+                b_,
                 s.flux_end as f32,
-                s.lambda_um as f32,
                 flags as f32,
                 plane.signed_distance(s.a) as f32,
                 plane.signed_distance(s.b) as f32,
@@ -1575,7 +1581,7 @@ impl Canvas {
         out
     }
 
-    /// The **interactive** f32 projection (§4.1): the same 9-float layout as
+    /// The **interactive** f32 projection (§4.1): the same 11-float layout as
     /// [`Canvas::trace_projected_3d`], traced on the fast CPU f32 path (`cpu3`) so
     /// it can update every pointer-move during a drag. The picture, not the
     /// numbers — settle with the f64 method for anything displayed.
@@ -1599,13 +1605,16 @@ impl Canvas {
             for s in segs {
                 let a = plane.to_local(s.a);
                 let b = plane.to_local(s.b);
+                let [r, g, b_] = wavelength_um_to_linear(s.lambda_um);
                 out.extend_from_slice(&[
                     a.x as f32,
                     a.y as f32,
                     b.x as f32,
                     b.y as f32,
+                    r,
+                    g,
+                    b_,
                     s.flux,
-                    s.lambda_um,
                     s.flags as f32,
                     plane.signed_distance(s.a) as f32,
                     plane.signed_distance(s.b) as f32,
@@ -1613,6 +1622,357 @@ impl Canvas {
             }
         }
         out
+    }
+
+    /// Reconfigure the scene's first source (the light-source picker, §6.6).
+    /// `kind` ∈ `collimated_rect` (p0 = ⌀Y, p1 = ⌀X mm) / `collimated_disc`
+    /// (p0 = ⌀ mm) / `point` (p0 = cone half-angle °) / `lambertian` (p0 = ⌀ mm);
+    /// `samples` is the ray count. Bumps the revision. `false` if no scene/source
+    /// or an unknown kind.
+    #[wasm_bindgen(js_name = setSourceConfig)]
+    pub fn set_source_config(&mut self, kind: &str, p0: f64, p1: f64, samples: u32) -> bool {
+        use oc_core::scene3::{AngularDistribution3 as A, SpatialDistribution3 as S};
+        let Some(scene) = self.scene3.as_mut() else {
+            return false;
+        };
+        let n = samples.max(1);
+        let ok = match kind {
+            "collimated_rect" => scene.set_first_source(
+                S::Rectangle {
+                    half_width_mm: (p0 * 0.5).max(0.01),
+                    half_height_mm: (p1 * 0.5).max(0.01),
+                },
+                A::Direction { local_dir: Vec3::X },
+                n,
+                1,
+            ),
+            "collimated_disc" => scene.set_first_source(
+                S::Disc {
+                    radius_mm: (p0 * 0.5).max(0.01),
+                },
+                A::Direction { local_dir: Vec3::X },
+                n,
+                1,
+            ),
+            "point" => scene.set_first_source(
+                S::Point,
+                A::UniformConeSolidAngle {
+                    half_angle_rad: p0.to_radians().clamp(1e-4, 1.55),
+                },
+                1,
+                n,
+            ),
+            "lambertian" => {
+                // An extended diffuse disc: split the budget between area and angle.
+                let m = (n as f64).sqrt().ceil() as u32;
+                scene.set_first_source(
+                    S::Disc {
+                        radius_mm: (p0 * 0.5).max(0.01),
+                    },
+                    A::LambertianHemisphere,
+                    m,
+                    m,
+                )
+            }
+            _ => false,
+        };
+        if ok {
+            self.revision += 1;
+        }
+        ok
+    }
+
+    /// The first source's kind + params, for the picker UI to initialise:
+    /// `{kind, p0, p1, samples}`, or `null` if there is no source.
+    #[wasm_bindgen(js_name = firstSourceJSON)]
+    pub fn first_source_json(&self) -> String {
+        let Some(scene) = &self.scene3 else {
+            return "null".into();
+        };
+        match scene.first_source_spec() {
+            Some((kind, p0, p1, n)) => format!(
+                "{{\"kind\":{},\"p0\":{},\"p1\":{},\"samples\":{}}}",
+                json_str(kind),
+                p0,
+                p1,
+                n
+            ),
+            None => "null".into(),
+        }
+    }
+
+    /// Set the first source's wavelengths. `nm` are the wavelengths in nanometres
+    /// and `weights` their relative weights (equal weights if `weights` is empty
+    /// or a different length). At least one positive wavelength is required.
+    /// Bumps the revision. `false` if there is no source or no usable line.
+    #[wasm_bindgen(js_name = setSourceWavelengths)]
+    pub fn set_source_wavelengths(&mut self, nm: &[f64], weights: &[f64]) -> bool {
+        let Some(scene) = self.scene3.as_mut() else {
+            return false;
+        };
+        let use_weights = weights.len() == nm.len();
+        let lines: Vec<(f64, f64)> = nm
+            .iter()
+            .enumerate()
+            .map(|(i, w)| (w / 1000.0, if use_weights { weights[i] } else { 1.0 }))
+            .collect();
+        if scene.set_first_source_spectrum(&lines) {
+            self.revision += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The first source's wavelengths in nanometres (weights folded in as repeated
+    /// samples are not — this returns the distinct lines), as a JSON array
+    /// `[{nm, weight}]`, or `null` if there is no source.
+    #[wasm_bindgen(js_name = firstSourceWavelengthsJSON)]
+    pub fn first_source_wavelengths_json(&self) -> String {
+        let Some(scene) = &self.scene3 else {
+            return "null".into();
+        };
+        match scene.first_source_spectrum() {
+            Some(lines) => {
+                let items: Vec<String> = lines
+                    .iter()
+                    .map(|(um, wt)| format!("{{\"nm\":{},\"weight\":{}}}", um * 1000.0, wt))
+                    .collect();
+                format!("[{}]", items.join(","))
+            }
+            None => "null".into(),
+        }
+    }
+
+    /// The display colour of a wavelength (nm) as a CSS `rgb(r,g,b)` string — the
+    /// same wavelength→colour map the ray renderer uses, so a UI swatch matches
+    /// the rays. Outside the visible band this is yellow.
+    #[wasm_bindgen(js_name = wavelengthCssColor)]
+    pub fn wavelength_css_color(&self, nm: f64) -> String {
+        let [r, g, b] = oc_gpu::color::wavelength_um_to_srgb((nm / 1000.0) as f32);
+        format!(
+            "rgb({},{},{})",
+            (r * 255.0).round() as u32,
+            (g * 255.0).round() as u32,
+            (b * 255.0).round() as u32
+        )
+    }
+
+    /// Add a planar mirror spanning the meridional segment `(ax,ay)`→`(bx,by)`
+    /// (view-plane mm) — the "draw a fold mirror" tool. Returns the new object id,
+    /// or `-1` for a degenerate segment / no scene. Bumps the revision.
+    #[wasm_bindgen(js_name = addPlanarMirror)]
+    pub fn add_planar_mirror(&mut self, ax: f64, ay: f64, bx: f64, by: f64, reflectivity: f64) -> f64 {
+        let Some(scene) = self.scene3.as_mut() else {
+            return -1.0;
+        };
+        match scene.add_planar_mirror(
+            Vec3::new(ax, ay, 0.0),
+            Vec3::new(bx, by, 0.0),
+            reflectivity,
+        ) {
+            Some(id) => {
+                self.revision += 1;
+                id as f64
+            }
+            None => -1.0,
+        }
+    }
+
+    /// Add a round optical element (a flat plate) at `(x,y)`, radius `radius` mm,
+    /// tilted `tilt_deg` in the meridional plane. Defaults to a front-surface
+    /// mirror (front reflective, back clear); reconfigure with `setSurfaceResponse`.
+    /// Returns the new object id. Bumps the revision.
+    #[wasm_bindgen(js_name = addPlanarElement)]
+    pub fn add_planar_element(&mut self, x: f64, y: f64, radius: f64, tilt_deg: f64) -> f64 {
+        use oc_core::scene3::{SpectralScalar, SurfaceResponse};
+        let Some(scene) = self.scene3.as_mut() else {
+            return -1.0;
+        };
+        let front = SurfaceResponse::Mirror {
+            reflectivity: SpectralScalar::Constant(0.95),
+        };
+        let back = SurfaceResponse::ExplicitRt {
+            reflectance: SpectralScalar::Constant(0.0),
+            transmittance: SpectralScalar::Constant(1.0),
+        };
+        let id = scene.add_planar_element(Vec3::new(x, y, 0.0), radius.max(0.5), tilt_deg, front, back);
+        self.revision += 1;
+        id as f64
+    }
+
+    /// Set a surface object's front/back responses (`mirror`/`absorb`/`clear`/
+    /// `refract`). Bumps the revision. `false` for an unknown kind / non-surface.
+    #[wasm_bindgen(js_name = setSurfaceResponse)]
+    pub fn set_surface_response(&mut self, id: f64, front: &str, back: &str) -> bool {
+        let Some(scene) = self.scene3.as_mut() else {
+            return false;
+        };
+        if scene.set_surface_response(id as u64, front, back) {
+            self.revision += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// A surface object's `{front, back}` response kinds, or `null` if `id` is not
+    /// a surface.
+    #[wasm_bindgen(js_name = surfaceResponseJSON)]
+    pub fn surface_response_json(&self, id: f64) -> String {
+        let Some(scene) = &self.scene3 else {
+            return "null".into();
+        };
+        match scene.surface_response(id as u64) {
+            Some((f, b)) => format!("{{\"front\":{},\"back\":{}}}", json_str(f), json_str(b)),
+            None => "null".into(),
+        }
+    }
+
+    /// Add a circular aperture stop at `(x,y)`, opening radius `opening` mm,
+    /// tilted `tilt_deg`. Rays inside the opening pass; the rest are absorbed.
+    /// Returns the new object id. Bumps the revision.
+    #[wasm_bindgen(js_name = addAperture)]
+    pub fn add_aperture(&mut self, x: f64, y: f64, opening: f64, tilt_deg: f64) -> f64 {
+        let Some(scene) = self.scene3.as_mut() else {
+            return -1.0;
+        };
+        let id = scene.add_aperture(Vec3::new(x, y, 0.0), opening.max(0.2), tilt_deg);
+        self.revision += 1;
+        id as f64
+    }
+
+    /// Add a square area detector at `(x,y)`, half-size `half` mm, its face normal
+    /// tilted `tilt_deg` in the meridional plane (same convention as surfaces and
+    /// apertures). 64×64 bins. Returns the new object id. Bumps the revision.
+    #[wasm_bindgen(js_name = addAreaDetector)]
+    pub fn add_area_detector_3d(&mut self, x: f64, y: f64, half: f64, tilt_deg: f64) -> f64 {
+        let Some(scene) = self.scene3.as_mut() else {
+            return -1.0;
+        };
+        let phi = tilt_deg.to_radians();
+        let normal = Vec3::new(phi.cos(), phi.sin(), 0.0);
+        let h = half.max(0.5);
+        let id = scene.add_area_detector(Vec3::new(x, y, 0.0), normal, h, h, [64, 64]);
+        self.revision += 1;
+        id.0 as f64
+    }
+
+    /// An aperture's clear opening as `{"inner","outer"}` (min / max radius that
+    /// passes, mm), or `null` if `id` is not an aperture. A plain disc opening
+    /// reports `inner: 0`.
+    #[wasm_bindgen(js_name = apertureOpeningJSON)]
+    pub fn aperture_opening_json(&self, id: f64) -> String {
+        match self
+            .scene3
+            .as_ref()
+            .and_then(|s| s.aperture_opening(id as u64))
+        {
+            Some((inner, outer)) => format!("{{\"inner\":{inner},\"outer\":{outer}}}"),
+            None => "null".into(),
+        }
+    }
+
+    /// Set an aperture's clear opening to the ring `inner..outer` mm (min / max
+    /// radius that passes). `inner = 0` is a plain hole; a positive inner radius
+    /// adds a central obstruction. Bumps the revision. `false` (scene unchanged)
+    /// if the radii are invalid (`0 <= inner < outer` required) or `id` is not an
+    /// aperture.
+    #[wasm_bindgen(js_name = setApertureOpening)]
+    pub fn set_aperture_opening(&mut self, id: f64, inner: f64, outer: f64) -> bool {
+        let Some(scene) = self.scene3.as_mut() else {
+            return false;
+        };
+        if scene.set_aperture_opening(id as u64, inner, outer) {
+            self.revision += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Add a glass prism at `(x,y)`: an equilateral triangle of side `side` mm,
+    /// extruded out of plane, glass `(nd,vd)`, tilted `tilt_deg`. Returns the new
+    /// body id. Bumps the revision.
+    #[wasm_bindgen(js_name = addPrism)]
+    pub fn add_prism(&mut self, x: f64, y: f64, side: f64, tilt_deg: f64, nd: f64, vd: f64) -> f64 {
+        let Some(scene) = self.scene3.as_mut() else {
+            return -1.0;
+        };
+        let id = scene.add_prism(Vec3::new(x, y, 0.0), side, tilt_deg, nd, vd);
+        self.revision += 1;
+        id as f64
+    }
+
+    /// An extruded body's local profile + z-extents, for drawing a prism in 3D:
+    /// `{zMin, zMax, points:[[x,y],...]}` (polygon vertices, local frame), or
+    /// `null` if `id` is not an extruded profile body.
+    #[wasm_bindgen(js_name = bodyExtrudeJSON)]
+    pub fn body_extrude_json(&self, id: f64) -> String {
+        use oc_core::profile2::Curve2;
+        use oc_core::scene3::SolidGeometry3;
+        let Some(scene) = &self.scene3 else {
+            return "null".into();
+        };
+        let Some(b) = scene.bodies.iter().find(|b| b.common.id.0 == id as u64) else {
+            return "null".into();
+        };
+        let SolidGeometry3::Profile(p) = &b.geometry else {
+            return "null".into();
+        };
+        let ProfileConstruction3::ExtrudeLocalZ { z_min_mm, z_max_mm } = p.construction else {
+            return "null".into();
+        };
+        let mut pts: Vec<String> = Vec::new();
+        for e in &p.profile.edges {
+            match &e.curve {
+                Curve2::Line { a, .. } => pts.push(format!("[{},{}]", a.x, a.y)),
+                Curve2::Polyline { points } => {
+                    for q in points {
+                        pts.push(format!("[{},{}]", q.x, q.y));
+                    }
+                }
+                _ => {}
+            }
+        }
+        format!(
+            "{{\"zMin\":{},\"zMax\":{},\"points\":[{}]}}",
+            z_min_mm,
+            z_max_mm,
+            pts.join(",")
+        )
+    }
+
+    /// Set a surface object's meridional tilt (its normal's X–Y angle, degrees).
+    /// Bumps the revision. `false` for a non-surface id.
+    #[wasm_bindgen(js_name = setSurfaceTiltZDeg)]
+    pub fn set_surface_tilt_z_deg(&mut self, id: f64, deg: f64) -> bool {
+        let Some(scene) = self.scene3.as_mut() else {
+            return false;
+        };
+        if scene.set_surface_tilt_z_deg(id as u64, deg) {
+            self.revision += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Set the spatial ray count of the scene's first source (the ray-density
+    /// control). Bumps the revision. `false` if there is no 3D scene or source.
+    #[wasm_bindgen(js_name = setSourceSamples)]
+    pub fn set_source_samples(&mut self, samples: u32) -> bool {
+        let Some(scene) = self.scene3.as_mut() else {
+            return false;
+        };
+        match scene.sources.first_mut() {
+            Some(src) => {
+                src.samples.spatial_samples = samples.max(1);
+                self.revision += 1;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Move a body so its world position becomes `(x, y, z)` — the drag authoring
@@ -1680,6 +2040,81 @@ impl Canvas {
         )
     }
 
+    /// The f64 readout for the scene's first area detector (the common case: one
+    /// detector), same JSON as [`Canvas::detector_result_json`], or `null` if
+    /// there is no 3D scene or no detector. Saves the browser from tracking ids
+    /// for the default single-detector scene.
+    #[wasm_bindgen(js_name = firstDetectorResultJSON)]
+    pub fn first_detector_result_json(&self) -> String {
+        let Some(scene) = &self.scene3 else {
+            return "null".into();
+        };
+        match scene.detectors.first() {
+            Some(d) => self.detector_result_json(d.common.id.0 as f64),
+            None => "null".into(),
+        }
+    }
+
+    /// Per-hit records on the scene's first area detector, for a **spot diagram**
+    /// (§6.9): the actual ray-detector intersection points, not a binned grid.
+    /// One trace with hit-recording on (bounded); flat f32 layout
+    /// `[halfW, halfH, n, (u, v, r, g, b, flux) × n]` where `(u,v)` are the
+    /// detector-local mm coordinates and `(r,g,b)` the linear-light wavelength
+    /// colour (same convention as the ray renderer). Empty if no 3D scene /
+    /// detector. Records are capped at `max_records`, so a very dense beam shows a
+    /// representative sample rather than every ray.
+    #[wasm_bindgen(js_name = firstDetectorHitsF32)]
+    pub fn first_detector_hits_f32(&self) -> Vec<f32> {
+        let first = self
+            .scene3
+            .as_ref()
+            .and_then(|s| s.detectors.first())
+            .map(|d| d.common.id.0 as f64);
+        match first {
+            Some(id) => self.detector_hits_f32(id),
+            None => Vec::new(),
+        }
+    }
+
+    /// Per-hit spot-diagram records for the area detector with id `detector_id`,
+    /// same flat f32 layout as [`Canvas::first_detector_hits_f32`]. Empty if there
+    /// is no 3D scene or no such detector. Lets the browser show whichever
+    /// detector is selected when a scene has several.
+    #[wasm_bindgen(js_name = detectorHitsF32)]
+    pub fn detector_hits_f32(&self, detector_id: f64) -> Vec<f32> {
+        let Some(scene) = &self.scene3 else {
+            return Vec::new();
+        };
+        let did = detector_id as u64;
+        let Some(det) = scene.detectors.iter().find(|d| d.common.id.0 == did) else {
+            return Vec::new();
+        };
+        let (hw, hh) = detector_half_extents(det);
+        let cfg = TraceConfig3 {
+            record_detector_hits: true,
+            max_records: 8192,
+            ..self.cfg3()
+        };
+        let res = trace_scene3(scene, &cfg);
+        let Some(d) = res.detectors.iter().find(|d| d.detector.0 == did) else {
+            return Vec::new();
+        };
+        let mut out = Vec::with_capacity(3 + d.records.len() * 6);
+        out.extend_from_slice(&[hw as f32, hh as f32, d.records.len() as f32]);
+        for h in &d.records {
+            let [r, g, b] = wavelength_um_to_linear(h.lambda_um as f32);
+            out.extend_from_slice(&[
+                h.uv_mm.x as f32,
+                h.uv_mm.y as f32,
+                r,
+                g,
+                b,
+                h.incident_flux as f32,
+            ]);
+        }
+        out
+    }
+
     /// The optical elements' cross-section with the view plane (§10.4), for
     /// drawing the 2D layout — a lens as its meridional profile, a sphere as a
     /// circle, a mirror or detector as a line. A JSON array of polylines
@@ -1703,14 +2138,18 @@ impl Canvas {
         let Some(scene) = &self.scene3 else {
             return "[]".into();
         };
-        let items: Vec<String> = scene
+        let mut items: Vec<String> = scene
             .bodies
             .iter()
             .map(|b| {
                 let (kind, construction) = body_kind_construction(b);
                 let p = b.common.transform.pos;
+                let q = b.common.transform.rot_xyzw;
+                // In-plane (about +Z) angle in degrees. A body's authoring only ever
+                // sets a pure-Z rotation, so `2·atan2(qz, qw)` recovers it exactly.
+                let rot_z = (2.0 * q[2].atan2(q[3])).to_degrees();
                 format!(
-                    "{{\"id\":{},\"kind\":{},\"construction\":{},\"is3d\":{},\"pos\":[{},{},{}],\"radius\":{}}}",
+                    "{{\"id\":{},\"kind\":{},\"construction\":{},\"is3d\":{},\"body\":true,\"pos\":[{},{},{}],\"radius\":{},\"rotZ\":{}}}",
                     b.common.id.0,
                     json_str(kind),
                     json_str(construction),
@@ -1718,11 +2157,226 @@ impl Canvas {
                     p.x,
                     p.y,
                     p.z,
-                    body_radius(b)
+                    body_radius(b),
+                    rot_z
                 )
             })
             .collect();
+        // Surface objects (drawn mirrors, etc.) are selectable/movable/deletable
+        // too, but not bodies: `body:false` so the UI omits the tilt/rotation
+        // authoring (their base orientation is a facing, not a pure-Z rotation).
+        for s in &scene.surfaces {
+            let (kind, radius) = surface_kind_radius(s);
+            let p = s.common.transform.pos;
+            items.push(format!(
+                "{{\"id\":{},\"kind\":{},\"construction\":{},\"is3d\":true,\"body\":false,\"pos\":[{},{},{}],\"radius\":{},\"rotZ\":{}}}",
+                s.common.id.0,
+                json_str(kind),
+                json_str("planar"),
+                p.x,
+                p.y,
+                p.z,
+                radius,
+                surface_tilt_deg(s)
+            ));
+        }
+        // Apertures: selectable/movable/tiltable/deletable, drawn as an annulus.
+        for a in &scene.apertures {
+            let (outer, opening) = aperture_radius_opening(a);
+            let p = a.common.transform.pos;
+            items.push(format!(
+                "{{\"id\":{},\"kind\":\"aperture\",\"construction\":\"planar\",\"is3d\":true,\"body\":false,\"pos\":[{},{},{}],\"radius\":{},\"opening\":{},\"rotZ\":{}}}",
+                a.common.id.0,
+                p.x,
+                p.y,
+                p.z,
+                outer,
+                opening,
+                aperture_tilt_deg(a)
+            ));
+        }
+        // Detectors: first-class movable/tiltable/deletable objects, like surfaces.
+        for d in &scene.detectors {
+            let (hw, hh) = detector_half_extents(d);
+            let p = d.common.transform.pos;
+            items.push(format!(
+                "{{\"id\":{},\"kind\":\"detector\",\"construction\":\"planar\",\"is3d\":true,\"body\":false,\"pos\":[{},{},{}],\"radius\":{},\"rotZ\":{}}}",
+                d.common.id.0,
+                p.x,
+                p.y,
+                p.z,
+                hw.hypot(hh),
+                detector_tilt_deg(d)
+            ));
+        }
         format!("[{}]", items.join(","))
+    }
+
+    // --- Scene3 authoring + editing (the always-3D app) -------------------
+
+    /// Initialize the canonical 3D scene to the default authoring scene: a
+    /// biconvex singlet at the origin, a collimated beam from the left, and an
+    /// area detector near the focus. Bumps the revision. Returns the singlet's
+    /// body id, so the browser can select it.
+    #[wasm_bindgen(js_name = newDefaultScene3)]
+    pub fn new_default_scene3(&mut self) -> f64 {
+        let scene = Scene3::default_scene();
+        let body_id = scene.bodies.first().map_or(0, |b| b.common.id.0);
+        self.scene3 = Some(scene);
+        self.revision += 1;
+        body_id as f64
+    }
+
+    /// Move any object or source by id in world space (§10.5). Bumps the
+    /// revision. `false` if no object has that id or there is no 3D scene.
+    #[wasm_bindgen(js_name = setObjectPosition)]
+    pub fn set_object_position(&mut self, id: f64, x: f64, y: f64, z: f64) -> bool {
+        let Some(scene) = self.scene3.as_mut() else {
+            return false;
+        };
+        if scene.set_object_position(id as u64, Vec3::new(x, y, z)) {
+            self.revision += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Rotate an object in the meridional plane (right-handed about +Z), degrees.
+    /// Bumps the revision. `false` if no object has that id.
+    #[wasm_bindgen(js_name = setObjectRotationZDeg)]
+    pub fn set_object_rotation_z_deg(&mut self, id: f64, deg: f64) -> bool {
+        let Some(scene) = self.scene3.as_mut() else {
+            return false;
+        };
+        if scene.set_object_rotation_z_deg(id as u64, deg) {
+            self.revision += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// A singlet body's geometry as JSON
+    /// `{r1,r2,thickness,semiAperture,conic1,conic2}` (an infinite radius is
+    /// `null`, i.e. a plane), or `null` if `id` is not a singlet.
+    #[wasm_bindgen(js_name = singletGeomJSON)]
+    pub fn singlet_geom_json(&self, id: f64) -> String {
+        let Some(scene) = &self.scene3 else {
+            return "null".into();
+        };
+        let Some(g) = scene.singlet_geom(id as u64) else {
+            return "null".into();
+        };
+        let num = |v: f64| {
+            if v.is_finite() {
+                format!("{v}")
+            } else {
+                "null".into()
+            }
+        };
+        format!(
+            "{{\"r1\":{},\"r2\":{},\"thickness\":{},\"semiAperture\":{},\"conic1\":{},\"conic2\":{}}}",
+            num(g.r1_mm),
+            num(g.r2_mm),
+            num(g.thickness_mm),
+            num(g.semi_aperture_mm),
+            num(g.conic1),
+            num(g.conic2),
+        )
+    }
+
+    /// A body's bulk glass as JSON `{nd,vd}` (an Abbe point), or `null` if `id` is
+    /// not a body or its material is not an Abbe point (catalog glass, mirror, …).
+    #[wasm_bindgen(js_name = bodyGlassJSON)]
+    pub fn body_glass_json(&self, id: f64) -> String {
+        let Some(scene) = &self.scene3 else {
+            return "null".into();
+        };
+        match scene.body_glass_abbe(id as u64) {
+            Some((nd, vd)) => format!("{{\"nd\":{nd},\"vd\":{vd}}}"),
+            None => "null".into(),
+        }
+    }
+
+    /// Replace a singlet body's geometry. Refuses (returns `false`, scene
+    /// unchanged) if `id` is not a singlet or the geometry is not revolvable — a
+    /// bad card edit never corrupts the scene. Bumps the revision on success.
+    #[wasm_bindgen(js_name = setSingletGeom)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_singlet_geom(
+        &mut self,
+        id: f64,
+        r1: f64,
+        r2: f64,
+        thickness: f64,
+        semi_aperture: f64,
+        conic1: f64,
+        conic2: f64,
+    ) -> bool {
+        let Some(scene) = self.scene3.as_mut() else {
+            return false;
+        };
+        let g = SingletGeom {
+            r1_mm: r1,
+            r2_mm: r2,
+            thickness_mm: thickness,
+            semi_aperture_mm: semi_aperture,
+            conic1,
+            conic2,
+        };
+        if scene.set_singlet_geom(id as u64, g) {
+            self.revision += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Set a body's bulk glass to an Abbe point `(nd, vd)`. Bumps the revision.
+    /// `false` if `id` is not a body.
+    #[wasm_bindgen(js_name = setBodyGlassAbbe)]
+    pub fn set_body_glass_abbe(&mut self, id: f64, nd: f64, vd: f64) -> bool {
+        let Some(scene) = self.scene3.as_mut() else {
+            return false;
+        };
+        if scene.set_body_glass_abbe(id as u64, nd, vd) {
+            self.revision += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Delete any object or source by id. Bumps the revision. `false` if nothing
+    /// matched.
+    #[wasm_bindgen(js_name = deleteObject3D)]
+    pub fn delete_object_3d(&mut self, id: f64) -> bool {
+        let Some(scene) = self.scene3.as_mut() else {
+            return false;
+        };
+        if scene.delete_object(id as u64) {
+            self.revision += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Duplicate a body offset by `(dx,dy,dz)`, with fresh ids. Returns the new
+    /// body id, or `-1` if `id` is not a body. Bumps the revision.
+    #[wasm_bindgen(js_name = cloneBody3D)]
+    pub fn clone_body_3d(&mut self, id: f64, dx: f64, dy: f64, dz: f64) -> f64 {
+        let Some(scene) = self.scene3.as_mut() else {
+            return -1.0;
+        };
+        match scene.clone_body(id as u64, Vec3::new(dx, dy, dz)) {
+            Some(new_id) => {
+                self.revision += 1;
+                new_id.0 as f64
+            }
+            None => -1.0,
+        }
     }
 }
 
@@ -1949,6 +2603,95 @@ fn body_radius(b: &oc_core::scene3::Body3) -> f64 {
                 .fold(0.0_f64, f64::max);
             r.max(1.0)
         }
+    }
+}
+
+/// A surface object's meridional tilt (its plane-normal angle in X–Y, degrees),
+/// for the inspector's `rotZ`. The normal is `q · +Z`; only its X–Y angle matters
+/// for a meridional surface.
+fn surface_tilt_deg(s: &oc_core::scene3::SurfaceObject3) -> f64 {
+    let [x, y, z, w] = s.common.transform.rot_xyzw;
+    let nx = 2.0 * (z * x + w * y);
+    let ny = 2.0 * (z * y - w * x);
+    ny.atan2(nx).to_degrees()
+}
+
+/// An aperture's meridional tilt (its plane-normal X–Y angle, degrees).
+fn aperture_tilt_deg(a: &oc_core::scene3::Aperture3) -> f64 {
+    let [x, y, z, w] = a.common.transform.rot_xyzw;
+    let nx = 2.0 * (z * x + w * y);
+    let ny = 2.0 * (z * y - w * x);
+    ny.atan2(nx).to_degrees()
+}
+
+/// A detector's meridional tilt (its face-normal X–Y angle, degrees).
+fn detector_tilt_deg(d: &oc_core::scene3::Detector3) -> f64 {
+    let [x, y, z, w] = d.common.transform.rot_xyzw;
+    let nx = 2.0 * (z * x + w * y);
+    let ny = 2.0 * (z * y - w * x);
+    ny.atan2(nx).to_degrees()
+}
+
+/// An aperture's `(outer_mask_radius, clear_opening_radius)` for drawing + picking.
+fn aperture_radius_opening(a: &oc_core::scene3::Aperture3) -> (f64, f64) {
+    use oc_core::scene3::PlanarShape2;
+    let radius_of = |s: &PlanarShape2| match s {
+        PlanarShape2::Disc { radius_mm } => *radius_mm,
+        PlanarShape2::Annulus { outer_mm, .. } => *outer_mm,
+        PlanarShape2::Rectangle {
+            half_width_mm,
+            half_height_mm,
+        } => half_width_mm.hypot(*half_height_mm),
+        PlanarShape2::Polygon { vertices } => {
+            vertices.iter().fold(1.0_f64, |m, v| m.max(v.length()))
+        }
+    };
+    let opening = radius_of(&a.shape.clear_opening);
+    let outer = a
+        .shape
+        .outer_extent
+        .as_ref()
+        .map_or(opening * 2.5, radius_of);
+    (outer.max(opening + 1.0), opening)
+}
+
+/// A surface object's kind label + a coarse hit-test radius, for the inspector
+/// and pointer picking (mirrors the body helpers).
+fn surface_kind_radius(s: &oc_core::scene3::SurfaceObject3) -> (&'static str, f64) {
+    use oc_core::scene3::{PlanarShape2, SurfaceGeometry3, SurfaceResponse};
+    let kind = match s.response_front {
+        SurfaceResponse::Mirror { .. } => "mirror",
+        _ => "surface",
+    };
+    let radius = match &s.geometry {
+        SurfaceGeometry3::Plane { shape } => match shape {
+            PlanarShape2::Rectangle {
+                half_width_mm,
+                half_height_mm,
+            } => half_width_mm.hypot(*half_height_mm),
+            PlanarShape2::Disc { radius_mm } => *radius_mm,
+            PlanarShape2::Annulus { outer_mm, .. } => *outer_mm,
+            PlanarShape2::Polygon { vertices } => vertices
+                .iter()
+                .fold(1.0_f64, |m, v| m.max(v.length())),
+        },
+        SurfaceGeometry3::SurfaceOfRevolution { .. } => 5.0,
+    };
+    (kind, radius.max(1.0))
+}
+
+/// A detector's in-plane half-extents (mm), for scaling a spot diagram into its
+/// face. Disc/annulus report their bounding radius; a line probe has no area.
+fn detector_half_extents(d: &oc_core::scene3::Detector3) -> (f64, f64) {
+    use oc_core::scene3::DetectorGeometry3;
+    match &d.geometry {
+        DetectorGeometry3::Rectangle {
+            half_width_mm,
+            half_height_mm,
+        } => (*half_width_mm, *half_height_mm),
+        DetectorGeometry3::Disc { radius_mm } => (*radius_mm, *radius_mm),
+        DetectorGeometry3::Annulus { outer_mm, .. } => (*outer_mm, *outer_mm),
+        DetectorGeometry3::LineProbeLegacy { .. } => (1.0, 1.0),
     }
 }
 
@@ -2294,6 +3037,224 @@ mod scene3_tests {
         c.add_collimated_source(-70.0, 0.0, 0.0, 10.0, 5, 0.5876);
         c.add_singlet(0.0, 0.0, 50.0, 4.0, 12.0, 1.5168, 64.17);
         c
+    }
+
+    #[test]
+    fn the_default_scene3_boots_full_3d_and_focuses() {
+        let mut c = Canvas::new();
+        let body_id = c.new_default_scene3();
+
+        // A genuine 3D scene: authored, not migrated, so it previews full 3D.
+        assert_eq!(c.preview_mode(), "full_3d");
+        assert!(body_id >= 0.0);
+
+        // The authoritative f64 path traces rays through it.
+        assert!(
+            !c.trace_projected_3d().is_empty(),
+            "the default scene must trace rays"
+        );
+
+        // Rays reach the detector near the focus: it registers flux.
+        let det_id = c.scene3.as_ref().unwrap().detectors[0].common.id.0 as f64;
+        let readout = c.detector_result_json(det_id);
+        assert!(readout.contains("\"hits\":"), "{readout}");
+        assert!(!readout.contains("\"hits\":0,"), "beam must reach the detector: {readout}");
+    }
+
+    #[test]
+    fn source_reconfig_and_drawn_mirror_show_up() {
+        let mut c = Canvas::new();
+        c.new_default_scene3();
+        // The picker reads back the boot source (a collimated rectangle).
+        assert!(c.first_source_json().contains("\"kind\":\"collimated_rect\""));
+
+        // Switch to a point source; the trace still reaches the detector.
+        let rev0 = c.scene_revision();
+        assert!(c.set_source_config("point", 3.0, 0.0, 200));
+        assert!(c.scene_revision() > rev0);
+        assert!(c.first_source_json().contains("\"kind\":\"point\""));
+
+        // Draw a fold mirror: it appears in the object list as a non-body surface.
+        let before = c.scene_objects_json().matches("\"id\":").count();
+        let id = c.add_planar_mirror(20.0, -6.0, 20.0, 6.0, 0.95);
+        assert!(id >= 0.0);
+        let objs = c.scene_objects_json();
+        assert_eq!(objs.matches("\"id\":").count(), before + 1);
+        assert!(objs.contains("\"kind\":\"mirror\""));
+        assert!(objs.contains("\"body\":false"));
+        assert!(c.delete_object_3d(id));
+
+        // A configurable element: front/back responses + tilt round-trip.
+        let eid = c.add_planar_element(25.0, 0.0, 8.0, 45.0);
+        assert!(c.surface_response_json(eid).contains("\"front\":\"mirror\""));
+        assert!(c.set_surface_response(eid, "absorb", "clear"));
+        assert!(c.surface_response_json(eid).contains("\"front\":\"absorb\""));
+        assert!(c.set_surface_tilt_z_deg(eid, -30.0));
+        // The object list reports the surface's (now negative) tilt as its rotZ.
+        assert!(c.scene_objects_json().contains("\"rotZ\":-2") || c.scene_objects_json().contains("\"rotZ\":-3"));
+    }
+
+    #[test]
+    fn apertures_and_prisms_show_up_and_trace() {
+        let mut c = Canvas::new();
+        c.new_default_scene3();
+
+        // A prism: a body, glass-editable, with a drawable extruded outline.
+        let pid = c.add_prism(-40.0, 0.0, 16.0, 10.0, 1.62, 36.0);
+        assert!(pid >= 0.0);
+        let ext = c.body_extrude_json(pid);
+        assert!(ext.contains("\"zMin\":") && ext.contains("\"points\":[["), "{ext}");
+        assert!(c.scene_objects_json().contains("\"construction\":\"extruded\""));
+        assert!(c.body_glass_json(pid).contains("\"nd\":1.62"));
+
+        // An aperture: a non-body object, selectable with an opening + tilt.
+        let aid = c.add_aperture(-20.0, 0.0, 4.0, 15.0);
+        let objs = c.scene_objects_json();
+        assert!(objs.contains("\"kind\":\"aperture\""));
+        assert!(objs.contains("\"opening\":4"));
+        assert!(c.set_surface_tilt_z_deg(aid, 25.0)); // apertures tilt too
+        // A fresh aperture is a plain disc: inner 0, outer = the opening.
+        assert_eq!(c.aperture_opening_json(aid), "{\"inner\":0,\"outer\":4}");
+        // Widen it into an annular stop (min/max radius) — a central obstruction.
+        assert!(c.set_aperture_opening(aid, 2.0, 6.0));
+        assert_eq!(c.aperture_opening_json(aid), "{\"inner\":2,\"outer\":6}");
+        // Back to a plain hole when the inner radius is cleared.
+        assert!(c.set_aperture_opening(aid, 0.0, 5.0));
+        assert_eq!(c.aperture_opening_json(aid), "{\"inner\":0,\"outer\":5}");
+        // Invalid geometry (outer <= inner) is refused, scene unchanged.
+        assert!(!c.set_aperture_opening(aid, 5.0, 5.0));
+        assert_eq!(c.aperture_opening_json(aid), "{\"inner\":0,\"outer\":5}");
+        // Non-apertures have no opening.
+        assert_eq!(c.aperture_opening_json(pid), "null");
+        // Both trace without error.
+        assert!(!c.trace_projected_3d().is_empty());
+    }
+
+    /// End-to-end proof of the annular-stop card flow: `setApertureOpening` on a
+    /// live scene makes the projected trace actually block the on-axis ray, the
+    /// same call path the inspector card drives.
+    #[test]
+    fn an_annular_aperture_stops_the_on_axis_ray_in_the_projected_trace() {
+        // Does any projected segment sit on the axis in the gap after the stop
+        // (x ∈ (-40, -2), |y| < 2)? That region is only reached by a ray that got
+        // through the centre of the stop at x = -40.
+        let on_axis_after_stop = |c: &Canvas| {
+            let segs = c.trace_projected_3d();
+            segs.chunks(11).any(|s| {
+                let (ax, ay, bx, by) = (s[0], s[1], s[2], s[3]);
+                let mid_x = 0.5 * (ax + bx);
+                let mid_y = 0.5 * (ay + by);
+                mid_x > -40.0 && mid_x < -2.0 && mid_y.abs() < 2.0
+            })
+        };
+
+        let mut c = Canvas::new();
+        c.new_default_scene3(); // collimated beam +X, singlet at 0, detector at 48
+        let aid = c.add_aperture(-40.0, 0.0, 5.0, 0.0); // a plain hole, radius 5
+
+        // Plain hole: the on-axis ray sails through the centre and onto the lens.
+        assert!(
+            on_axis_after_stop(&c),
+            "a plain aperture must pass the on-axis ray"
+        );
+
+        // Turn it into a 3..5 mm ring — the central obstruction must stop it.
+        assert!(c.set_aperture_opening(aid, 3.0, 5.0));
+        assert!(
+            !on_axis_after_stop(&c),
+            "the annulus centre must block the on-axis ray"
+        );
+    }
+
+    #[test]
+    fn detectors_are_first_class_movable_tiltable_multi_add_objects() {
+        let mut c = Canvas::new();
+        c.new_default_scene3(); // ships with one detector at x = 48
+
+        // Add a second area detector: it shows up as a non-body "detector" object.
+        let did = c.add_area_detector_3d(30.0, 0.0, 8.0, 0.0);
+        assert!(did >= 0.0);
+        let objs = c.scene_objects_json();
+        let n_detectors = objs.matches("\"kind\":\"detector\"").count();
+        assert_eq!(n_detectors, 2, "both detectors must be listed as objects");
+        assert!(objs.contains("\"body\":false"));
+
+        // Movable via the generic object-position setter (the drag path).
+        assert!(c.set_object_position(did, 33.0, 4.0, 0.0));
+        assert!(c.scene_objects_json().contains("[33,4,0]"));
+
+        // Tiltable via the surface-tilt setter (the non-body rotation-handle path).
+        assert!(c.set_surface_tilt_z_deg(did, 20.0));
+        assert!(
+            (c.scene3.as_ref().unwrap().surface_tilt_z_deg(did as u64).unwrap() - 20.0).abs()
+                < 1e-6
+        );
+
+        // Its per-detector readout is reachable by id (dock follows selection).
+        assert_ne!(c.detector_result_json(did), "null");
+        // Deletable like any other object.
+        assert!(c.delete_object_3d(did));
+        assert_eq!(
+            c.scene_objects_json().matches("\"kind\":\"detector\"").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn source_wavelengths_can_be_set_and_read_back() {
+        let mut c = Canvas::new();
+        c.new_default_scene3();
+
+        // Set the Fraunhofer F/d/C lines (nm), equal weight (empty weights).
+        assert!(c.set_source_wavelengths(&[486.13, 587.56, 656.27], &[]));
+        let js = c.first_source_wavelengths_json();
+        assert!(js.contains("\"nm\":486.13"), "{js}");
+        assert!(js.contains("\"nm\":587.56"), "{js}");
+        assert!(js.contains("\"nm\":656.27"), "{js}");
+
+        // A single wavelength is fine; an empty list is refused.
+        assert!(c.set_source_wavelengths(&[532.0], &[]));
+        assert!(!c.set_source_wavelengths(&[], &[]));
+
+        // Colour map: a visible line is coloured, an IR line falls back to yellow.
+        assert_eq!(c.wavelength_css_color(900.0), "rgb(255,230,0)"); // IR → yellow
+        assert_ne!(c.wavelength_css_color(530.0), "rgb(255,230,0)"); // green ≠ yellow
+    }
+
+    #[test]
+    fn the_default_detector_reports_spot_hits() {
+        let mut c = Canvas::new();
+        c.new_default_scene3();
+        let a = c.first_detector_hits_f32();
+        assert!(a.len() >= 3, "header must be present");
+        let (hw, hh, n) = (a[0], a[1], a[2] as usize);
+        assert!(hw > 0.0 && hh > 0.0, "detector has a finite face");
+        assert!(n > 0, "the focused beam must land some hits");
+        assert_eq!(a.len(), 3 + n * 6, "flat layout is [hw,hh,n, 6×n]");
+        // Every recorded hit lies within the detector face.
+        for i in 0..n {
+            let (u, v) = (a[3 + i * 6], a[3 + i * 6 + 1]);
+            assert!(u.abs() <= hw + 1e-3 && v.abs() <= hh + 1e-3, "hit ({u},{v}) off-face");
+        }
+    }
+
+    #[test]
+    fn editing_the_default_singlet_re_traces_and_can_be_refused() {
+        let mut c = Canvas::new();
+        let id = c.new_default_scene3();
+        let rev0 = c.scene_revision();
+
+        // A valid radius edit lands and bumps the revision.
+        assert!(c.set_singlet_geom(id, 40.0, -50.0, 4.0, 12.0, 0.0, 0.0));
+        assert!(c.scene_revision() > rev0);
+        let g = c.singlet_geom_json(id);
+        assert!(g.contains("\"r1\":40"), "{g}");
+
+        // An impossible geometry is refused; the scene and revision are unchanged.
+        let rev1 = c.scene_revision();
+        assert!(!c.set_singlet_geom(id, 5.0, -5.0, 4.0, 40.0, 0.0, 0.0));
+        assert_eq!(c.scene_revision(), rev1);
+        assert!(c.scene3.as_ref().unwrap().validate().is_ok());
     }
 
     #[test]

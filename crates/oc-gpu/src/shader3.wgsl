@@ -970,10 +970,10 @@ fn interact_body(w: Work, ev: Event, point: vec3<f32>, flux_end: f32, lambda: f3
         let cos_i = clamp(-dot(n, w.d), 0.0, 1.0);
         let r = clamp(reflectance(cos_i, n1, n2), 0.0, 1.0);
         let td = res.xyz;
-        push(Work(point + td * EPS, td, flux_end * (1.0 - r), w.depth + 1u, w.gdepth, n2, m2.y, w.flags), min_flux);
+        push(Work(point + td * EPS, td, flux_end * (1.0 - r), w.depth + 1u, w.gdepth, n2, m2.y, w.flags & ~SEG_TIR), min_flux);
         if (params.ghosts == 1u && w.gdepth < params.max_ghost && r > 0.0) {
             let dir = reflect3(w.d, n);
-            push(Work(point + dir * EPS, dir, flux_end * r, w.depth + 1u, w.gdepth + 1u, w.medium_n, w.medium_alpha, w.flags | SEG_GHOST), min_flux);
+            push(Work(point + dir * EPS, dir, flux_end * r, w.depth + 1u, w.gdepth + 1u, w.medium_n, w.medium_alpha, (w.flags & ~SEG_TIR) | SEG_GHOST), min_flux);
         }
     }
 }
@@ -998,23 +998,23 @@ fn interact_surface(w: Work, ev: Event, point: vec3<f32>, flux_end: f32, min_flu
         return;
     } else if (kind == RESP_MIRROR) {
         let dir = reflect3(w.d, n_oppose);
-        push(Work(point + dir * EPS, dir, flux_end * clamp(rr, 0.0, 1.0), w.depth + 1u, w.gdepth, w.medium_n, w.medium_alpha, w.flags), min_flux);
+        push(Work(point + dir * EPS, dir, flux_end * clamp(rr, 0.0, 1.0), w.depth + 1u, w.gdepth, w.medium_n, w.medium_alpha, w.flags & ~SEG_TIR), min_flux);
     } else if (kind == RESP_DIELECTRIC) {
         let cos_i = clamp(-dot(n_oppose, w.d), 0.0, 1.0);
         let r = clamp(reflectance(cos_i, w.medium_n, w.medium_n) * ar, 0.0, 1.0);
-        push(Work(point + w.d * EPS, w.d, flux_end * (1.0 - r), w.depth + 1u, w.gdepth, w.medium_n, w.medium_alpha, w.flags), min_flux);
+        push(Work(point + w.d * EPS, w.d, flux_end * (1.0 - r), w.depth + 1u, w.gdepth, w.medium_n, w.medium_alpha, w.flags & ~SEG_TIR), min_flux);
         if (params.ghosts == 1u && w.gdepth < params.max_ghost && r > 0.0) {
             let dir = reflect3(w.d, n_oppose);
-            push(Work(point + dir * EPS, dir, flux_end * r, w.depth + 1u, w.gdepth + 1u, w.medium_n, w.medium_alpha, w.flags | SEG_GHOST), min_flux);
+            push(Work(point + dir * EPS, dir, flux_end * r, w.depth + 1u, w.gdepth + 1u, w.medium_n, w.medium_alpha, (w.flags & ~SEG_TIR) | SEG_GHOST), min_flux);
         }
     } else {
         // Explicit R/T.
         let r = clamp(rr, 0.0, 1.0);
         let t = clamp(tt, 0.0, 1.0);
-        push(Work(point + w.d * EPS, w.d, flux_end * t, w.depth + 1u, w.gdepth, w.medium_n, w.medium_alpha, w.flags), min_flux);
+        push(Work(point + w.d * EPS, w.d, flux_end * t, w.depth + 1u, w.gdepth, w.medium_n, w.medium_alpha, w.flags & ~SEG_TIR), min_flux);
         if (params.ghosts == 1u && w.gdepth < params.max_ghost && r > 0.0) {
             let dir = reflect3(w.d, n_oppose);
-            push(Work(point + dir * EPS, dir, flux_end * r, w.depth + 1u, w.gdepth + 1u, w.medium_n, w.medium_alpha, w.flags | SEG_GHOST), min_flux);
+            push(Work(point + dir * EPS, dir, flux_end * r, w.depth + 1u, w.gdepth + 1u, w.medium_n, w.medium_alpha, (w.flags & ~SEG_TIR) | SEG_GHOST), min_flux);
         }
     }
 }

@@ -1624,6 +1624,82 @@ impl Canvas {
         out
     }
 
+    /// Trace the authoritative f64 path and return every segment in **world
+    /// frame** (CV-B, the embed surface). Eleven floats per segment:
+    /// `[ax, ay, az, bx, by, bz, r, g, b, flux, flags]` — endpoints in world mm,
+    /// `(r,g,b)` the segment's linear-light wavelength colour, `flags` bit1=TIR
+    /// bit2=ghost (the [`Canvas::trace_projected_3d`] convention). The trace runs
+    /// in f64; this buffer is its downcast picture for Three.js/Konva line
+    /// geometry. It is forbidden as the source of any displayed number — flux
+    /// totals, centroids, and spot statistics come from the f64 readout APIs
+    /// ([`Canvas::first_detector_result_json`] and companions). Empty if no scene.
+    #[wasm_bindgen(js_name = traceWorld3D)]
+    pub fn trace_world_3d(&self) -> Vec<f32> {
+        let Some(scene) = &self.scene3 else {
+            return Vec::new();
+        };
+        let res = trace_scene3(scene, &self.cfg3());
+        let mut out = Vec::with_capacity(res.segments.len() * 11);
+        for s in &res.segments {
+            let flags = (s.flags.tir as u32) * 2 + (s.flags.ghost as u32) * 4;
+            let [r, g, b] = wavelength_um_to_linear(s.lambda_um as f32);
+            out.extend_from_slice(&[
+                s.a.x as f32,
+                s.a.y as f32,
+                s.a.z as f32,
+                s.b.x as f32,
+                s.b.y as f32,
+                s.b.z as f32,
+                r,
+                g,
+                b,
+                s.flux_end as f32,
+                flags as f32,
+            ]);
+        }
+        out
+    }
+
+    /// The **interactive** world-frame trace (CV-B): the same 11-float layout as
+    /// [`Canvas::trace_world_3d`], traced on the fast CPU f32 path (`cpu3`) so it
+    /// can drive drag-time preview frames. The picture, not the numbers — the
+    /// settled frame and every displayed number come from the f64 method (§4.1).
+    #[wasm_bindgen(js_name = traceWorld3DFast)]
+    pub fn trace_world_3d_fast(&self) -> Vec<f32> {
+        let Some(scene) = &self.scene3 else {
+            return Vec::new();
+        };
+        let gpu = oc_gpu::scene3::GpuScene3::build(
+            scene,
+            oc_gpu::scene3::BuildOpts {
+                ghosts: self.ghosts,
+                flux_eps: 1e-4,
+                max_ghost: self.max_ghost,
+            },
+        );
+        let per_ray = oc_gpu::cpu3::trace_segments(&gpu, 32);
+        let mut out = Vec::new();
+        for segs in &per_ray {
+            for s in segs {
+                let [r, g, b] = wavelength_um_to_linear(s.lambda_um);
+                out.extend_from_slice(&[
+                    s.a.x as f32,
+                    s.a.y as f32,
+                    s.a.z as f32,
+                    s.b.x as f32,
+                    s.b.y as f32,
+                    s.b.z as f32,
+                    r,
+                    g,
+                    b,
+                    s.flux,
+                    s.flags as f32,
+                ]);
+            }
+        }
+        out
+    }
+
     /// Reconfigure the scene's first source (the light-source picker, §6.6).
     /// `kind` ∈ `collimated_rect` (p0 = ⌀Y, p1 = ⌀X mm) / `collimated_disc`
     /// (p0 = ⌀ mm) / `point` (p0 = cone half-angle °) / `lambertian` (p0 = ⌀ mm);

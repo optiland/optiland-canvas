@@ -85,6 +85,26 @@ jobs:
       - name: build
         working-directory: web
         run: npm run build
+      # CV-B artifact (integration spec §18.7): pack the wasm-pack output into a
+      # commit-stamped npm tarball. A maintainer copies it into the configurator's
+      # vendor/ (rule 13); the `+<sha>` build metadata is the version pin. This
+      # mechanism retires under ADR-12/ADR-8 (registry publish once public).
+      - name: pack kernel tarball (CV-B)
+        working-directory: web/pkg
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          SHA=$(git rev-parse --short=9 HEAD)
+          npm pkg set version="${VERSION}+${SHA}"
+          FILE=$(npm pack --silent | tail -n1)
+          TARGET="oc-wasm-${VERSION}+${SHA}.tgz"
+          [ "$FILE" = "$TARGET" ] || mv "$FILE" "$TARGET"
+          echo "packed $TARGET"
+      - name: upload kernel tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: oc-wasm-tarball
+          path: web/pkg/oc-wasm-*.tgz
+          retention-days: 30
       - name: install browser
         working-directory: web
         run: npx playwright install --with-deps chromium

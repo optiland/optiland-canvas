@@ -533,6 +533,41 @@ fn r_plus_t_may_not_exceed_one() {
 }
 
 #[test]
+fn complementary_dichroic_curves_are_physical() {
+    use oc_core::scene3::{Interpolation, OutOfRangePolicy, SpectralScalar};
+    let step = |values: Vec<f64>| SpectralScalar::Tabulated {
+        lambda_um: vec![0.505, 0.507],
+        values,
+        interpolation: Interpolation::Linear,
+        out_of_range: OutOfRangePolicy::Clamp,
+    };
+    let (mut s3, _) = load_any(V1_CORPUS[2].1).unwrap();
+    // A dichroic: R and T are complementary step curves. Each peaks at 1 (at
+    // DIFFERENT wavelengths), so a per-curve-maxima bound would reject this
+    // physical surface; the pointwise union-grid check accepts it.
+    s3.bodies[0].surface.default.from_outside = SurfaceResponse::ExplicitRt {
+        reflectance: step(vec![1.0, 0.0]),
+        transmittance: step(vec![0.0, 1.0]),
+    };
+    assert!(s3.validate().is_ok());
+    // A pair that genuinely sums past 1 somewhere is still refused.
+    s3.bodies[0].surface.default.from_outside = SurfaceResponse::ExplicitRt {
+        reflectance: step(vec![1.0, 0.4]),
+        transmittance: step(vec![0.0, 0.7]),
+    };
+    assert!(matches!(
+        s3.validate().unwrap_err(),
+        SceneError::OutOfRange { .. }
+    ));
+    // Mixed constant + table: bounded pointwise on the table's grid.
+    s3.bodies[0].surface.default.from_outside = SurfaceResponse::ExplicitRt {
+        reflectance: SpectralScalar::Constant(0.5),
+        transmittance: step(vec![0.5, 0.2]),
+    };
+    assert!(s3.validate().is_ok());
+}
+
+#[test]
 fn negative_absorption_is_refused() {
     use oc_core::scene3::AbsorptionModel;
     let (mut s3, _) = load_any(V1_CORPUS[2].1).unwrap();

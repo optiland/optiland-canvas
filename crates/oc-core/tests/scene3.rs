@@ -989,3 +989,100 @@ fn spectral_and_absorption_tables_interpolate_and_honour_the_range_policy() {
         Some(0.1)
     );
 }
+
+// ---------------------------------------------------------------------------
+// transform_objects (CV-C): batch pose edits on the loaded scene
+// ---------------------------------------------------------------------------
+
+#[test]
+fn transform_objects_moves_a_batch_together() {
+    use oc_core::build3::SingletGeom;
+    use oc_core::vec3::{Isometry3, Vec3};
+
+    let mut scene = Scene3::new();
+    let body = scene.add_singlet(Vec3::new(50.0, 0.0, 0.0), SingletGeom::biconvex(), 1.5168, 64.17);
+    let src = scene.add_collimated_beam(
+        Vec3::ZERO,
+        1.0,
+        0.2,
+        4,
+        oc_core::scene::Spectrum::Monochromatic(0.55),
+    );
+    let before_body = scene.bodies[0].common.transform;
+    let before_src = scene.sources[0].transform;
+
+    let delta = Isometry3::from_pos(Vec3::new(0.0, 7.0, -3.0));
+    scene
+        .transform_objects(&[body.0, src.raw()], delta)
+        .expect("both ids resolve");
+
+    // Each object composed the same delta, so their relative pose is intact.
+    assert_eq!(scene.bodies[0].common.transform, delta.compose(before_body));
+    assert_eq!(scene.sources[0].transform, delta.compose(before_src));
+    let rel = |a: Isometry3, b: Isometry3| a.pos - b.pos;
+    assert_eq!(
+        rel(scene.bodies[0].common.transform, scene.sources[0].transform),
+        rel(before_body, before_src)
+    );
+}
+
+#[test]
+fn transform_objects_unknown_id_is_atomic() {
+    use oc_core::build3::SingletGeom;
+    use oc_core::vec3::{Isometry3, Vec3};
+
+    let mut scene = Scene3::new();
+    let body = scene.add_singlet(Vec3::ZERO, SingletGeom::biconvex(), 1.5168, 64.17);
+    let before = scene.bodies[0].common.transform;
+
+    let delta = Isometry3::from_pos(Vec3::new(5.0, 0.0, 0.0));
+    let err = scene
+        .transform_objects(&[body.0, 9999], delta)
+        .expect_err("unknown id must refuse");
+    assert!(matches!(err, SceneError::DanglingRef { id: 9999, .. }));
+    // Nothing moved, including the id that did resolve.
+    assert_eq!(scene.bodies[0].common.transform, before);
+}
+
+#[test]
+fn transform_objects_duplicate_id_applies_once() {
+    use oc_core::build3::SingletGeom;
+    use oc_core::vec3::{Isometry3, Vec3};
+
+    let mut scene = Scene3::new();
+    let body = scene.add_singlet(Vec3::ZERO, SingletGeom::biconvex(), 1.5168, 64.17);
+    let delta = Isometry3::from_pos(Vec3::new(5.0, 0.0, 0.0));
+    scene
+        .transform_objects(&[body.0, body.0, body.0], delta)
+        .expect("duplicates are a set, not a multiplier");
+    assert_eq!(scene.bodies[0].common.transform.pos, Vec3::new(5.0, 0.0, 0.0));
+}
+
+#[test]
+fn thin_lens_validates_focal_length() {
+    use oc_core::scene3::{PlanarShape2, SurfaceGeometry3, SurfaceObject3, SurfaceResponse};
+
+    let mut scene = Scene3::new();
+    let id = scene.alloc_object_id();
+    let resp = SurfaceResponse::ThinLens {
+        focal_length_mm: 0.0,
+    };
+    scene.surfaces.push(SurfaceObject3 {
+        common: ObjectCommon::new(id, oc_core::id::LayerId(0)),
+        geometry: SurfaceGeometry3::Plane {
+            shape: PlanarShape2::Disc { radius_mm: 10.0 },
+        },
+        response_front: resp.clone(),
+        response_back: resp,
+    });
+    let err = scene.validate().expect_err("f = 0 is not a lens");
+    assert!(matches!(err, SceneError::OutOfRange { .. }), "{err:?}");
+
+    // A finite nonzero focal length (negative = diverging) validates.
+    let lens = SurfaceResponse::ThinLens {
+        focal_length_mm: -75.0,
+    };
+    scene.surfaces[0].response_front = lens.clone();
+    scene.surfaces[0].response_back = lens;
+    scene.validate().expect("diverging thin lens is valid");
+}

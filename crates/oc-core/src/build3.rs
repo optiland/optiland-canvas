@@ -785,6 +785,7 @@ fn response_kind(r: &SurfaceResponse) -> &'static str {
         SurfaceResponse::Absorber => "absorb",
         SurfaceResponse::ExplicitRt { .. } => "clear",
         SurfaceResponse::DielectricFresnel { .. } => "refract",
+        SurfaceResponse::ThinLens { .. } => "thin-lens",
     }
 }
 

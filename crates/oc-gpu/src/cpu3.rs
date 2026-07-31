@@ -374,6 +374,40 @@ fn interact_surface(
                 reflect_branch(stack, flux_end * r, true);
             }
         }
+        GpuResponse::ThinLens { f } => {
+            // Ideal-lens slope law u' = u − h/f in the surface's local frame
+            // (direction-aware; mirrors tracer3's f64 branch). Full
+            // transmission, no reflection, no absorption.
+            let rt = s.rot.transpose();
+            let pl = rt * (point - s.pos);
+            let dl = rt * w.d;
+            let dir = if dl.z.abs() < 1e-6 || f == 0.0 {
+                w.d
+            } else {
+                s.rot
+                    * Vec3::new(
+                        dl.x - dl.z.abs() * pl.x / f,
+                        dl.y - dl.z.abs() * pl.y / f,
+                        dl.z,
+                    )
+                    .normalize()
+            };
+            push(
+                stack,
+                Work {
+                    o: point + dir * EPS,
+                    d: dir,
+                    flux: flux_end,
+                    depth: w.depth + 1,
+                    gdepth: w.gdepth,
+                    medium_n: w.medium_n,
+                    medium_alpha: w.medium_alpha,
+                    flags: w.flags & !SEG_TIR,
+                },
+                max_depth,
+                min_flux,
+            );
+        }
     }
 }
 

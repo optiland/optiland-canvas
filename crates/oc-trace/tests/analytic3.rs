@@ -479,3 +479,87 @@ fn an_explicit_beamsplitter_splits_reflected_and_transmitted() {
     assert!((refl.flux_start - 0.5).abs() < 1e-12, "reflected half");
     assert!((tran.flux_start - 0.5).abs() < 1e-12, "transmitted half");
 }
+
+// ---------------------------------------------------------------------------
+// Ideal thin lens (SurfaceResponse::ThinLens)
+// ---------------------------------------------------------------------------
+
+/// The lens under test: at the origin, axis +X, f = 50 mm, generous aperture.
+fn thin_lens_scene(f: f64) -> Scene3 {
+    let mut scene = Scene3::new();
+    add_thin_lens(&mut scene, Vec3::ZERO, Vec3::X, 20.0, f);
+    scene
+}
+
+/// The post-lens direction of a single ray traced through `scene`.
+fn exit_dir(scene: &Scene3, ray: Ray3) -> Vec3 {
+    let res = trace3(scene, &[launch(ray, LAMBDA_D, 1.0)], &no_ghosts());
+    *primary_dirs(&res).last().expect("ray reached the lens")
+}
+
+#[test]
+fn a_thin_lens_focuses_a_collimated_bundle_exactly_at_f() {
+    let scene = thin_lens_scene(50.0);
+    // Skew heights: nothing meridional about (y, z) = (7, -4).
+    for (y, z) in [(0.001, 0.0), (5.0, 0.0), (0.0, -8.0), (7.0, -4.0), (-12.0, 9.0)] {
+        let ray = Ray3::new(Vec3::new(-30.0, y, z), Vec3::X).unwrap();
+        let d = exit_dir(&scene, ray);
+        // Every ray passes exactly through the back focal point (50, 0, 0).
+        let expect = (Vec3::new(50.0, 0.0, 0.0) - Vec3::new(0.0, y, z)).normalize();
+        assert!(
+            (d - expect).length() < 1e-12,
+            "h = ({y}, {z}): {d:?} vs {expect:?}"
+        );
+    }
+}
+
+#[test]
+fn a_thin_lens_images_an_axial_point_exactly() {
+    // Object at 100 mm with f = 50: 1/s_o + 1/s_i = 1/f puts the image at
+    // exactly 100 mm behind the lens, for every aperture angle.
+    let scene = thin_lens_scene(50.0);
+    let src = Vec3::new(-100.0, 0.0, 0.0);
+    for (y, z) in [(3.0, 0.0), (0.0, 6.0), (-9.0, 5.0), (14.0, -8.0)] {
+        let hit = Vec3::new(0.0, y, z);
+        let ray = Ray3::new(src, (hit - src).normalize()).unwrap();
+        let d = exit_dir(&scene, ray);
+        let expect = (Vec3::new(100.0, 0.0, 0.0) - hit).normalize();
+        assert!(
+            (d - expect).length() < 1e-12,
+            "h = ({y}, {z}): {d:?} vs {expect:?}"
+        );
+    }
+}
+
+#[test]
+fn a_backward_ray_converges_toward_the_front_focus() {
+    // Direction-aware sign: a bundle travelling -X focuses at (-50, 0, 0).
+    let scene = thin_lens_scene(50.0);
+    let ray = Ray3::new(Vec3::new(30.0, 6.0, -2.0), Vec3::NEG_X).unwrap();
+    let d = exit_dir(&scene, ray);
+    let expect = (Vec3::new(-50.0, 0.0, 0.0) - Vec3::new(0.0, 6.0, -2.0)).normalize();
+    assert!((d - expect).length() < 1e-12, "{d:?} vs {expect:?}");
+}
+
+#[test]
+fn a_diverging_thin_lens_diverges_from_the_virtual_front_focus() {
+    // f = -50: a parallel ray leaves along the line from the virtual focus
+    // (-50, 0, 0) through its hit point.
+    let scene = thin_lens_scene(-50.0);
+    let ray = Ray3::new(Vec3::new(-30.0, 8.0, 3.0), Vec3::X).unwrap();
+    let d = exit_dir(&scene, ray);
+    let expect = (Vec3::new(0.0, 8.0, 3.0) - Vec3::new(-50.0, 0.0, 0.0)).normalize();
+    assert!((d - expect).length() < 1e-12, "{d:?} vs {expect:?}");
+}
+
+#[test]
+fn a_thin_lens_transmits_all_flux_with_no_branches() {
+    let scene = thin_lens_scene(50.0);
+    let ray = Ray3::new(Vec3::new(-30.0, 5.0, 0.0), Vec3::X).unwrap();
+    let res = trace3(&scene, &[launch(ray, LAMBDA_D, 1.0)], &no_ghosts());
+    // One launch leg, one transmitted leg, nothing reflected or absorbed.
+    assert_eq!(primary_dirs(&res).len(), 2);
+    assert!(res.segments.iter().all(|s| !s.flags.ghost));
+    let last = res.segments.last().unwrap();
+    assert!((last.flux_end - 1.0).abs() < 1e-12, "flux: {}", last.flux_end);
+}

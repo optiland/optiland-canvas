@@ -27,7 +27,7 @@ use oc_core::migrate_v1::{load_any, LoadReport};
 use oc_core::planar_reduce::{preview_mode, PreviewMode};
 use oc_core::profile2::ProfileConstruction3;
 use oc_core::scene3::Scene3;
-use oc_core::vec3::{Plane3, Vec3};
+use oc_core::vec3::{Isometry3, Plane3, Vec3};
 use oc_trace::{trace_scene3, TraceConfig3};
 
 /// The openUC2 mode (§15.2). The freeform Canvas above does not know it exists.
@@ -1698,6 +1698,39 @@ impl Canvas {
             }
         }
         out
+    }
+
+    /// CV-C: rigidly move a batch of loaded-scene objects by one delta —
+    /// the wasm face of [`Scene3::transform_objects`]. `ids` are raw object
+    /// ids (bodies, standalone surfaces, apertures, detectors, sources, in
+    /// any mix; a dragged module passes all of its manifest object ids in one
+    /// call so relative geometry is preserved exactly). `delta` is 7 floats
+    /// `[px, py, pz, qx, qy, qz, qw]` — world-frame millimetres plus a unit
+    /// quaternion. Bumps the revision; the next `traceWorld3DFast` call
+    /// retraces the moved scene (the fast path rebuilds from live scene
+    /// state). Returns `false` and mutates nothing on an unknown id, a
+    /// malformed delta, or no loaded scene — the caller's tier-1 reload is
+    /// the recovery.
+    #[wasm_bindgen(js_name = transformObjects3)]
+    pub fn transform_objects_3(&mut self, ids: &[f64], delta: &[f64]) -> bool {
+        let Some(scene) = self.scene3.as_mut() else {
+            return false;
+        };
+        if delta.len() != 7 {
+            return false;
+        }
+        let Ok(iso) = Isometry3::new(
+            Vec3::new(delta[0], delta[1], delta[2]),
+            [delta[3], delta[4], delta[5], delta[6]],
+        ) else {
+            return false;
+        };
+        let raw: Vec<u64> = ids.iter().map(|&v| v as u64).collect();
+        if scene.transform_objects(&raw, iso).is_err() {
+            return false;
+        }
+        self.revision += 1;
+        true
     }
 
     /// Reconfigure the scene's first source (the light-source picker, §6.6).
@@ -3708,5 +3741,44 @@ mod scene3_tests {
         assert!(xs.contains("\"pts\":["), "{xs}");
         // No scene ⇒ empty.
         assert_eq!(Canvas::new().scene_cross_section_json(), "[]");
+    }
+
+    #[test]
+    fn transform_objects_3_moves_the_scene_and_the_fast_trace_follows() {
+        use oc_core::build3::SingletGeom;
+        use oc_core::scene::Spectrum;
+
+        let mut scene = Scene3::new();
+        let body = scene.add_singlet(
+            Vec3::new(50.0, 0.0, 0.0),
+            SingletGeom::biconvex(),
+            1.5168,
+            64.17,
+        );
+        scene.add_collimated_beam(Vec3::ZERO, 1.0, 0.2, 8, Spectrum::Monochromatic(0.55));
+
+        let mut c = Canvas::new();
+        c.load_scene3_json(&serde_json::to_string(&scene).unwrap())
+            .unwrap();
+        let rev0 = c.scene_revision();
+        let baseline = c.trace_world_3d_fast();
+        assert!(!baseline.is_empty());
+
+        // Unknown id: refused, nothing changes.
+        assert!(!c.transform_objects_3(&[9999.0], &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]));
+        assert_eq!(c.scene_revision(), rev0);
+        // Malformed delta: refused.
+        assert!(!c.transform_objects_3(&[body.0 as f64], &[1.0, 0.0, 0.0]));
+
+        // Identity delta: accepted, picture identical.
+        assert!(c.transform_objects_3(&[body.0 as f64], &[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]));
+        assert_eq!(c.trace_world_3d_fast(), baseline);
+
+        // A real move: revision bumps and the fast retrace sees the new pose
+        // (the 1 mm beam misses a lens shifted 20 mm sideways, so the picture
+        // must change without any reload).
+        assert!(c.transform_objects_3(&[body.0 as f64], &[0.0, 20.0, 0.0, 0.0, 0.0, 0.0, 1.0]));
+        assert!(c.scene_revision() > rev0);
+        assert_ne!(c.trace_world_3d_fast(), baseline);
     }
 }

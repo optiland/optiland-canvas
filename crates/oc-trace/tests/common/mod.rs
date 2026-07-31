@@ -221,6 +221,22 @@ pub fn add_mirror(
     )
 }
 
+pub fn add_thin_lens(
+    scene: &mut Scene3,
+    pos: Vec3,
+    normal: Vec3,
+    half: f64,
+    focal_length_mm: f64,
+) -> ObjectId {
+    push_surface(
+        scene,
+        pos,
+        normal,
+        half,
+        SurfaceResponse::ThinLens { focal_length_mm },
+    )
+}
+
 pub fn add_beamsplitter(
     scene: &mut Scene3,
     pos: Vec3,

@@ -710,6 +710,45 @@ fn interact_surface(
         &s.response_back
     };
     let n_oppose = if from_front { normal } else { -normal };
+    // The ideal thin lens is the one response whose outgoing direction depends
+    // on WHERE the surface was hit, so it needs the surface's local frame and
+    // is handled here rather than in the frame-blind `apply_response`.
+    if let SurfaceResponse::ThinLens { focal_length_mm } = response {
+        let f = *focal_length_mm;
+        if !f.is_finite() || f == 0.0 {
+            r.report.reject(CapabilityIssue::UnsupportedSurfaceResponse {
+                surface: SurfaceRef::new(s.common.id, oc_core::id::PatchId(0)),
+            });
+            r.ledger.numerical_loss += flux_at;
+            r.terminations.record(TerminationReason::UnsupportedPhysics);
+            return;
+        }
+        r.report.note_exact(PhysicsFeature::ThinLens);
+        let t = &s.common.transform;
+        let p_local = t.inverse_transform_point(point);
+        let d_local = t.quat().inverse() * w.ray.dir;
+        // Slope law u' = u − h/f per transverse axis, direction-aware: with the
+        // axial component preserved, d'_t = d_t − |d_z|·h_t/f sends a forward
+        // parallel bundle exactly through (0, 0, +f) and a backward one through
+        // (0, 0, −f), and images every axial conjugate exactly (1/s_o + 1/s_i =
+        // 1/f). A ray grazing in the lens plane (|d_z| ≈ 0) passes undeviated.
+        let dir = if d_local.z.abs() < 1e-12 {
+            w.ray.dir
+        } else {
+            let bent = Vec3::new(
+                d_local.x - d_local.z.abs() * p_local.x / f,
+                d_local.y - d_local.z.abs() * p_local.y / f,
+                d_local.z,
+            )
+            .normalize();
+            t.quat() * bent
+        };
+        // Full transmission: no reflection branch, no absorption, no added OPL.
+        spawn(
+            stack, r, cfg, w, point, dir, flux_at, opl_at, false, false, min_flux,
+        );
+        return;
+    }
     // A zero-thickness surface has the same medium on both sides (§6.6): no
     // refraction, transmission continues undeviated.
     apply_response(
@@ -888,6 +927,15 @@ fn apply_response(
                     min_flux,
                 );
             }
+        }
+        // A thin lens on a body patch has no meaning: the bend depends on the
+        // hit position in a lens plane the patch does not define. Standalone
+        // surfaces intercept it in `interact_surface`; anything else refuses.
+        SurfaceResponse::ThinLens { .. } => {
+            r.report
+                .reject(CapabilityIssue::UnsupportedSurfaceResponse { surface });
+            r.ledger.numerical_loss += flux_at;
+            r.terminations.record(TerminationReason::UnsupportedPhysics);
         }
     }
 }

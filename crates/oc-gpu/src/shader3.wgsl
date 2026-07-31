@@ -152,6 +152,7 @@ const RESP_ABSORBER: u32 = 0u;
 const RESP_MIRROR: u32 = 1u;
 const RESP_DIELECTRIC: u32 = 2u;
 const RESP_EXPLICIT_RT: u32 = 3u;
+const RESP_THIN_LENS: u32 = 4u;
 
 // Body geometry kinds.
 const OBJ_SPHERE: u32 = 0u;
@@ -996,6 +997,17 @@ fn interact_surface(w: Work, ev: Event, point: vec3<f32>, flux_end: f32, min_flu
 
     if (kind == RESP_ABSORBER) {
         return;
+    } else if (kind == RESP_THIN_LENS) {
+        // Ideal-lens slope law u' = u - h/f in the surface's local frame
+        // (rr carries the normalized focal length). Full transmission.
+        let srot = surface_rot(s);
+        let pl = transpose(srot) * (point - s.pos.xyz);
+        let dl = transpose(srot) * w.d;
+        var dir = w.d;
+        if (abs(dl.z) > 1e-6 && rr != 0.0) {
+            dir = srot * normalize(vec3<f32>(dl.x - abs(dl.z) * pl.x / rr, dl.y - abs(dl.z) * pl.y / rr, dl.z));
+        }
+        push(Work(point + dir * EPS, dir, flux_end, w.depth + 1u, w.gdepth, w.medium_n, w.medium_alpha, w.flags & ~SEG_TIR), min_flux);
     } else if (kind == RESP_MIRROR) {
         let dir = reflect3(w.d, n_oppose);
         push(Work(point + dir * EPS, dir, flux_end * clamp(rr, 0.0, 1.0), w.depth + 1u, w.gdepth, w.medium_n, w.medium_alpha, w.flags & ~SEG_TIR), min_flux);

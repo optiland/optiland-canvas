@@ -393,6 +393,17 @@ pub enum SurfaceResponse {
         transmittance: SpectralScalar,
     },
     Absorber,
+    /// An ideal thin lens: the transmitted ray bends so the slope law
+    /// `u' = u − h/f` holds exactly at every height `h` in the lens plane
+    /// (direction-aware, so a backward ray converges toward the front focus).
+    /// Full transmission, no reflection, no dispersion, no added path length —
+    /// the stand-in for a designed multi-element assembly whose prescription
+    /// is not modelled (an infinity objective, a camera lens). Only meaningful
+    /// on a standalone planar surface; a body patch authoring it is rejected
+    /// by the tracer. Positive `focal_length_mm` converges, negative diverges.
+    ThinLens {
+        focal_length_mm: f64,
+    },
 }
 
 impl Default for SurfaceResponse {
@@ -465,6 +476,12 @@ impl SurfaceResponse {
                 };
                 if exceeds {
                     return Err(range("reflectance + transmittance", "exceeds 1"));
+                }
+                Ok(())
+            }
+            Self::ThinLens { focal_length_mm } => {
+                if !focal_length_mm.is_finite() || *focal_length_mm == 0.0 {
+                    return Err(range("focal_length_mm", "must be finite and nonzero"));
                 }
                 Ok(())
             }
@@ -1258,6 +1275,75 @@ impl Scene3 {
         if let Some(h) = high {
             self.next_id = self.next_id.max(h + 1);
         }
+    }
+
+    /// Rigidly move a batch of objects by `delta` (CV-C).
+    ///
+    /// `ids` may name bodies, standalone surfaces, apertures, detectors, and
+    /// sources in any mix — a dragged module transforms all of its objects in
+    /// one call, and each object composes `delta` onto the transform it already
+    /// carries, so the batch preserves its relative geometry exactly. This is
+    /// the 3D sibling of the 2D document's `transform_objects`.
+    ///
+    /// Atomic: every id is resolved before anything moves; an unknown id is a
+    /// [`SceneError::DanglingRef`] that mutates nothing. A duplicated id in
+    /// `ids` applies once, not twice — the caller's list is a set of targets,
+    /// not a multiplier.
+    pub fn transform_objects(&mut self, ids: &[u64], delta: Isometry3) -> Result<(), SceneError> {
+        #[derive(Clone, Copy)]
+        enum Slot {
+            Body(usize),
+            Surface(usize),
+            Aperture(usize),
+            Detector(usize),
+            Source(usize),
+        }
+        let mut slots: Vec<Slot> = Vec::with_capacity(ids.len());
+        let mut seen = std::collections::BTreeSet::new();
+        for &id in ids {
+            if !seen.insert(id) {
+                continue;
+            }
+            let slot = (self.bodies.iter())
+                .position(|b| b.common.id.raw() == id)
+                .map(Slot::Body)
+                .or_else(|| {
+                    (self.surfaces.iter())
+                        .position(|s| s.common.id.raw() == id)
+                        .map(Slot::Surface)
+                })
+                .or_else(|| {
+                    (self.apertures.iter())
+                        .position(|a| a.common.id.raw() == id)
+                        .map(Slot::Aperture)
+                })
+                .or_else(|| {
+                    (self.detectors.iter())
+                        .position(|d| d.common.id.raw() == id)
+                        .map(Slot::Detector)
+                })
+                .or_else(|| (self.sources.iter()).position(|s| s.id.raw() == id).map(Slot::Source));
+            match slot {
+                Some(s) => slots.push(s),
+                None => {
+                    return Err(SceneError::DanglingRef {
+                        what: "transform target",
+                        id,
+                    })
+                }
+            }
+        }
+        for slot in slots {
+            let t = match slot {
+                Slot::Body(i) => &mut self.bodies[i].common.transform,
+                Slot::Surface(i) => &mut self.surfaces[i].common.transform,
+                Slot::Aperture(i) => &mut self.apertures[i].common.transform,
+                Slot::Detector(i) => &mut self.detectors[i].common.transform,
+                Slot::Source(i) => &mut self.sources[i].transform,
+            };
+            *t = delta.compose(*t);
+        }
+        Ok(())
     }
 
     /// Full structural and physical validation.

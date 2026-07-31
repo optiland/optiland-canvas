@@ -37,6 +37,7 @@ pub const RESP_ABSORBER: u32 = 0;
 pub const RESP_MIRROR: u32 = 1;
 pub const RESP_DIELECTRIC: u32 = 2;
 pub const RESP_EXPLICIT_RT: u32 = 3;
+pub const RESP_THIN_LENS: u32 = 4;
 
 // Revolved-face kinds (Part 3).
 pub const FACE_SAG: u32 = 0;
@@ -274,13 +275,15 @@ fn encode_det_shape(shape: &DetShape) -> (u32, f32, f32) {
     }
 }
 
-/// Encode a surface response as `(kind, r, t, ar)`.
+/// Encode a surface response as `(kind, r, t, ar)`. A thin lens carries its
+/// normalized focal length in the `r` slot.
 fn encode_response(r: &GpuResponse) -> (u32, f32, f32, f32) {
     match r {
         GpuResponse::Absorber => (RESP_ABSORBER, 0.0, 0.0, 0.0),
         GpuResponse::Mirror { r } => (RESP_MIRROR, *r, 0.0, 0.0),
         GpuResponse::Dielectric { ar } => (RESP_DIELECTRIC, 0.0, 0.0, *ar),
         GpuResponse::ExplicitRt { r, t } => (RESP_EXPLICIT_RT, *r, *t, 0.0),
+        GpuResponse::ThinLens { f } => (RESP_THIN_LENS, *f, 0.0, 0.0),
     }
 }
 

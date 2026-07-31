@@ -287,6 +287,7 @@ pub enum PhysicsFeature {
     DielectricFresnel,
     Mirror,
     ExplicitRt,
+    ThinLens,
     VolumeAbsorption,
     SpectralResponse,
 }

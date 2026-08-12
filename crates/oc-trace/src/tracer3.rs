@@ -47,6 +47,11 @@ pub struct TraceConfig3 {
     /// Keep per-hit detector records (bounded by `max_records`).
     pub record_detector_hits: bool,
     pub max_records: usize,
+    /// Record the interaction-level event log ([`TraceEvent3`]): which scene
+    /// object each branch met, what it did there, and which children it
+    /// spawned. Off by default — the log is for sequence extraction and
+    /// diagnostics, not the render path.
+    pub record_events: bool,
     /// The scene revision, copied into the result so a stale trace is discarded
     /// rather than shown (§3.3).
     pub revision: u64,
@@ -63,6 +68,7 @@ impl Default for TraceConfig3 {
             max_branches: 100_000,
             record_detector_hits: false,
             max_records: 4096,
+            record_events: false,
             revision: 0,
         }
     }
@@ -157,6 +163,7 @@ pub fn trace3(scene: &Scene3, launch: &[LaunchRay3], cfg: &TraceConfig3) -> Trac
         ledger: r.ledger,
         terminations: r.terminations,
         capability_report: r.report,
+        events: r.events,
     }
 }
 
@@ -174,6 +181,7 @@ struct LocalResult {
     ledger: EnergyLedger,
     terminations: TerminationSummary,
     report: CapabilityReport,
+    events: Vec<TraceEvent3>,
     next_path: u64,
 }
 
@@ -190,6 +198,7 @@ impl LocalResult {
             ledger: EnergyLedger::default(),
             terminations: TerminationSummary::default(),
             report,
+            events: Vec::new(),
             next_path: 0,
         }
     }
@@ -203,6 +212,7 @@ impl LocalResult {
         self.ledger.merge(&o.ledger);
         self.terminations.merge(&o.terminations);
         self.report.merge(&o.report);
+        self.events.extend(o.events);
     }
 
     fn new_path(&mut self) -> PathId {
@@ -396,6 +406,14 @@ fn trace_one(
             let flux_end = w.flux * beer_lambert(alpha, cfg.bounds_mm);
             record_absorption(r, w.flux - flux_end);
             push_segment(r, &w, end, flux_end, w.opl + n_here * cfg.bounds_mm);
+            push_event(
+                r,
+                cfg,
+                &w,
+                end,
+                w.opl + n_here * cfg.bounds_mm,
+                TraceEventKind::Escaped,
+            );
             r.ledger.escaped += flux_end;
             r.terminations.record(TerminationReason::EscapedBounds);
             continue;
@@ -413,6 +431,18 @@ fn trace_one(
                     scene.detectors[det].termination,
                     DetectorTermination::Terminate
                 );
+                push_event(
+                    r,
+                    cfg,
+                    &w,
+                    ev.point,
+                    opl_at,
+                    TraceEventKind::DetectorHit {
+                        detector: scene.detectors[det].id(),
+                        uv,
+                        terminal: terminates,
+                    },
+                );
                 record_detector(
                     r, scene, det, &w, ev.point, uv, dir_local, flux_at, opl_at, cfg,
                 );
@@ -428,7 +458,16 @@ fn trace_one(
             EventKind::ApertureBlocked { ap } => {
                 r.ledger.blocked_aperture += flux_at;
                 r.report.note_exact(PhysicsFeature::Aperture);
-                let _ = ap;
+                push_event(
+                    r,
+                    cfg,
+                    &w,
+                    ev.point,
+                    opl_at,
+                    TraceEventKind::ApertureBlocked {
+                        aperture: scene.apertures[ap].id(),
+                    },
+                );
                 r.terminations.record(TerminationReason::ApertureBlocked);
             }
             EventKind::Surface { surf, normal } => {
@@ -460,6 +499,29 @@ fn deposit_truncated(r: &mut LocalResult, w: &RayWork, reason: TerminationReason
 fn record_absorption(r: &mut LocalResult, absorbed: f64) {
     if absorbed > 0.0 {
         r.ledger.absorbed_volume += absorbed;
+    }
+}
+
+/// Append an event-log entry, when the config asks for one.
+fn push_event(
+    r: &mut LocalResult,
+    cfg: &TraceConfig3,
+    w: &RayWork,
+    point: Vec3,
+    opl: f64,
+    kind: TraceEventKind,
+) {
+    if cfg.record_events {
+        r.events.push(TraceEvent3 {
+            path_id: w.path_id,
+            parent: w.parent,
+            depth: w.depth,
+            ghost: w.ghost,
+            point,
+            opl_mm: opl,
+            lambda_um: w.lambda,
+            kind,
+        });
     }
 }
 
@@ -710,6 +772,15 @@ fn interact_surface(
         &s.response_back
     };
     let n_oppose = if from_front { normal } else { -normal };
+    let surface_ref = SurfaceRef::new(s.common.id, oc_core::id::PatchId(0));
+    let lens_interact = |children: Vec<(ChildRole, PathId)>| TraceEventKind::Interact {
+        surface: surface_ref,
+        body: false,
+        normal: n_oppose,
+        n1: n_here,
+        n2: n_here,
+        children,
+    };
     // The ideal thin lens is the one response whose outgoing direction depends
     // on WHERE the surface was hit, so it needs the surface's local frame and
     // is handled here rather than in the frame-blind `apply_response`.
@@ -717,10 +788,11 @@ fn interact_surface(
         let f = *focal_length_mm;
         if !f.is_finite() || f == 0.0 {
             r.report.reject(CapabilityIssue::UnsupportedSurfaceResponse {
-                surface: SurfaceRef::new(s.common.id, oc_core::id::PatchId(0)),
+                surface: surface_ref,
             });
             r.ledger.numerical_loss += flux_at;
             r.terminations.record(TerminationReason::UnsupportedPhysics);
+            push_event(r, cfg, w, point, opl_at, lens_interact(Vec::new()));
             return;
         }
         r.report.note_exact(PhysicsFeature::ThinLens);
@@ -744,9 +816,11 @@ fn interact_surface(
             t.quat() * bent
         };
         // Full transmission: no reflection branch, no absorption, no added OPL.
-        spawn(
+        let child = spawn(
             stack, r, cfg, w, point, dir, flux_at, opl_at, false, false, min_flux,
         );
+        let children = child.map(|id| (ChildRole::ThinLens, id)).into_iter().collect();
+        push_event(r, cfg, w, point, opl_at, lens_interact(children));
         return;
     }
     // A zero-thickness surface has the same medium on both sides (§6.6): no
@@ -757,7 +831,7 @@ fn interact_surface(
         cfg,
         w,
         response,
-        SurfaceRef::new(s.common.id, oc_core::id::PatchId(0)),
+        surface_ref,
         point,
         n_oppose,
         n_here,
@@ -790,11 +864,22 @@ fn apply_response(
 ) {
     let cos_i = -n_oppose.dot(w.ray.dir).clamp(-1.0, 1.0);
     let sample = |s: &oc_core::scene3::SpectralScalar| s.sample(w.lambda);
+    // `medium_transition` doubles as the body marker: bodies are the interfaces
+    // that transition media, zero-thickness surfaces never do (§6.6).
+    let interact = |children: Vec<(ChildRole, PathId)>| TraceEventKind::Interact {
+        surface,
+        body: medium_transition,
+        normal: n_oppose,
+        n1,
+        n2,
+        children,
+    };
 
     match response {
         SurfaceResponse::Absorber => {
             r.ledger.absorbed_surface += flux_at;
             r.terminations.record(TerminationReason::AbsorbedSurface);
+            push_event(r, cfg, w, point, opl_at, interact(Vec::new()));
         }
         SurfaceResponse::Mirror { reflectivity } => {
             r.report.note_exact(PhysicsFeature::Mirror);
@@ -805,12 +890,13 @@ fn apply_response(
                         .reject(CapabilityIssue::UnsupportedSurfaceResponse { surface });
                     r.ledger.numerical_loss += flux_at;
                     r.terminations.record(TerminationReason::UnsupportedPhysics);
+                    push_event(r, cfg, w, point, opl_at, interact(Vec::new()));
                     return;
                 }
             };
             r.ledger.absorbed_surface += flux_at * (1.0 - refl);
             let dir = reflect3(w.ray.dir, n_oppose);
-            spawn(
+            let child = spawn(
                 stack,
                 r,
                 cfg,
@@ -823,6 +909,8 @@ fn apply_response(
                 false, // a mirror reflection is specular, not total internal reflection
                 min_flux,
             );
+            let children = child.map(|id| (ChildRole::Reflect, id)).into_iter().collect();
+            push_event(r, cfg, w, point, opl_at, interact(children));
         }
         SurfaceResponse::DielectricFresnel { ar_residual } => {
             r.report.note_exact(PhysicsFeature::DielectricFresnel);
@@ -831,12 +919,16 @@ fn apply_response(
                 None => {
                     // Total internal reflection: R = 1, primary path.
                     let dir = reflect3(w.ray.dir, n_oppose);
-                    spawn_tir(stack, r, cfg, w, point, dir, flux_at, opl_at, min_flux);
+                    let child =
+                        spawn_tir(stack, r, cfg, w, point, dir, flux_at, opl_at, min_flux);
+                    let children = child.map(|id| (ChildRole::Tir, id)).into_iter().collect();
+                    push_event(r, cfg, w, point, opl_at, interact(children));
                 }
                 Some(dir_t) => {
                     let refl = (reflectance(cos_i, n1, n2) * ar).clamp(0.0, 1.0);
                     let tr = 1.0 - refl;
-                    spawn(
+                    let mut children = Vec::new();
+                    if let Some(id) = spawn(
                         stack,
                         r,
                         cfg,
@@ -848,10 +940,12 @@ fn apply_response(
                         false,
                         false,
                         min_flux,
-                    );
+                    ) {
+                        children.push((ChildRole::Transmit, id));
+                    }
                     if cfg.ghosts && refl > 0.0 {
                         let dir_r = reflect3(w.ray.dir, n_oppose);
-                        spawn(
+                        if let Some(id) = spawn(
                             stack,
                             r,
                             cfg,
@@ -863,12 +957,15 @@ fn apply_response(
                             true,
                             false,
                             min_flux,
-                        );
+                        ) {
+                            children.push((ChildRole::Reflect, id));
+                        }
                     } else if refl > 0.0 {
                         // Ghosts off: the reflected flux is not followed, but it is
                         // still named rather than lost.
                         r.ledger.truncated_flux += flux_at * refl;
                     }
+                    push_event(r, cfg, w, point, opl_at, interact(children));
                 }
             }
         }
@@ -884,14 +981,16 @@ fn apply_response(
                         .reject(CapabilityIssue::UnsupportedSurfaceResponse { surface });
                     r.ledger.numerical_loss += flux_at;
                     r.terminations.record(TerminationReason::UnsupportedPhysics);
+                    push_event(r, cfg, w, point, opl_at, interact(Vec::new()));
                     return;
                 }
             };
             r.ledger.absorbed_surface += flux_at * (1.0 - refl - tr).max(0.0);
+            let mut children = Vec::new();
             // Reflected branch (specular).
             if refl > 0.0 {
                 let dir_r = reflect3(w.ray.dir, n_oppose);
-                spawn(
+                if let Some(id) = spawn(
                     stack,
                     r,
                     cfg,
@@ -903,7 +1002,9 @@ fn apply_response(
                     w.ghost,
                     false,
                     min_flux,
-                );
+                ) {
+                    children.push((ChildRole::Reflect, id));
+                }
             }
             // Transmitted branch: Snell across a real medium transition, else
             // undeviated (§9.6).
@@ -913,7 +1014,7 @@ fn apply_response(
                 } else {
                     w.ray.dir
                 };
-                spawn(
+                if let Some(id) = spawn(
                     stack,
                     r,
                     cfg,
@@ -925,8 +1026,11 @@ fn apply_response(
                     w.ghost,
                     false,
                     min_flux,
-                );
+                ) {
+                    children.push((ChildRole::Transmit, id));
+                }
             }
+            push_event(r, cfg, w, point, opl_at, interact(children));
         }
         // A thin lens on a body patch has no meaning: the bend depends on the
         // hit position in a lens plane the patch does not define. Standalone
@@ -936,12 +1040,15 @@ fn apply_response(
                 .reject(CapabilityIssue::UnsupportedSurfaceResponse { surface });
             r.ledger.numerical_loss += flux_at;
             r.terminations.record(TerminationReason::UnsupportedPhysics);
+            push_event(r, cfg, w, point, opl_at, interact(Vec::new()));
         }
     }
 }
 
 /// Push a child branch, or deposit its flux in `truncated_flux` if it is born
-/// already below threshold — so a split conserves flux exactly.
+/// already below threshold — so a split conserves flux exactly. Returns the
+/// child's path id when a branch was actually pushed, so the event log can name
+/// it.
 #[allow(clippy::too_many_arguments)]
 fn spawn(
     stack: &mut Vec<RayWork>,
@@ -955,19 +1062,19 @@ fn spawn(
     ghost: bool,
     from_tir: bool,
     min_flux: f64,
-) {
+) -> Option<PathId> {
     let depth = parent.depth + 1;
     let ghost_depth = parent.ghost_depth + u32::from(ghost && !parent.ghost);
     let is_ghost = parent.ghost || ghost;
     if flux < min_flux {
         r.ledger.truncated_flux += flux;
         r.terminations.record(TerminationReason::FluxThreshold);
-        return;
+        return None;
     }
     if depth > cfg.max_depth {
         r.ledger.truncated_flux += flux;
         r.terminations.record(TerminationReason::MaxDepth);
-        return;
+        return None;
     }
     let path_id = r.new_path();
     let ray = match Ray3::new(point, dir) {
@@ -975,7 +1082,7 @@ fn spawn(
         Err(_) => {
             r.ledger.numerical_loss += flux;
             r.terminations.record(TerminationReason::NumericalFailure);
-            return;
+            return None;
         }
     };
     stack.push(RayWork {
@@ -990,6 +1097,7 @@ fn spawn(
         from_tir,
         ghost: is_ghost,
     });
+    Some(path_id)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1003,7 +1111,7 @@ fn spawn_tir(
     flux: f64,
     opl: f64,
     min_flux: f64,
-) {
+) -> Option<PathId> {
     // TIR is the primary path (R = 1), so it does not increment the ghost budget.
     spawn(
         stack,
@@ -1017,7 +1125,7 @@ fn spawn_tir(
         parent.ghost,
         true,
         min_flux,
-    );
+    )
 }
 
 /// A probe detector continues the same branch just past the face, unchanged.

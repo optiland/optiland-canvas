@@ -1509,6 +1509,46 @@ impl Canvas {
         )
     }
 
+    /// Extract the ordered surface chain the axial ray of `source_id` threads
+    /// on its way to `detector_id` — the sequence prescription (`oc-seq3`
+    /// JSON) a sequential consumer (an Optiland emitter, a paraxial ladder)
+    /// reads instead of predicting the beam path statically. Throws when no 3D
+    /// scene is loaded, when the ray never reaches the detector (the error
+    /// names every branch's fate), or when it reaches it along more than one
+    /// chain (the error names the chains).
+    #[wasm_bindgen(js_name = sequenceJSON)]
+    pub fn sequence_json(&self, source_id: f64, detector_id: f64) -> Result<String, JsError> {
+        let Some(scene) = &self.scene3 else {
+            return Err(JsError::new("no 3D scene loaded"));
+        };
+        oc_trace::sequence3::extract_sequence3(
+            scene,
+            oc_core::id::SourceId(source_id as u64),
+            oc_core::id::DetectorId(detector_id as u64),
+            self.revision,
+        )
+        .map(|p| p.to_json())
+        .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// [`Canvas::sequence_json`] for a declared
+    /// [`PrimaryPathIntent`](oc_core::scene3::PrimaryPathIntent): resolves the
+    /// intent's source/detector pair and stamps the intent id into the
+    /// prescription.
+    #[wasm_bindgen(js_name = sequenceForIntentJSON)]
+    pub fn sequence_for_intent_json(&self, intent_id: f64) -> Result<String, JsError> {
+        let Some(scene) = &self.scene3 else {
+            return Err(JsError::new("no 3D scene loaded"));
+        };
+        oc_trace::sequence3::extract_for_intent(
+            scene,
+            oc_core::id::PathIntentId(intent_id as u64),
+            self.revision,
+        )
+        .map(|p| p.to_json())
+        .map_err(|e| JsError::new(&e.to_string()))
+    }
+
     /// Set the plane the 2D Canvas slices/projects (§10.1). `u` and `v` are the
     /// in-plane axes; they must be perpendicular. Throws on a degenerate or
     /// sheared basis. The view is derived, so this does not bump the revision.
@@ -3189,6 +3229,28 @@ mod scene3_tests {
         let readout = c.detector_result_json(det_id);
         assert!(readout.contains("\"hits\":"), "{readout}");
         assert!(!readout.contains("\"hits\":0,"), "beam must reach the detector: {readout}");
+    }
+
+    #[test]
+    fn sequence_extraction_reads_the_default_scene() {
+        let mut c = Canvas::new();
+        c.new_default_scene3();
+        let (src_id, det_id) = {
+            let s = c.scene3.as_ref().unwrap();
+            (s.sources[0].id.raw() as f64, s.detectors[0].common.id.0 as f64)
+        };
+
+        // The axial ray threads the singlet's two faces on its way to the
+        // detector, and the prescription says so in beam order.
+        let json = c.sequence_json(src_id, det_id).unwrap();
+        let p = oc_core::seq3::SequencePrescription3::from_json(&json).unwrap();
+        assert_eq!(p.hits.len(), 2, "front + back of the singlet: {json}");
+        assert!(p.hits.iter().all(|h| h.kind == oc_core::seq3::SeqHitKind::Body));
+        assert_eq!(p.hits[0].object, p.hits[1].object);
+        assert_ne!(p.hits[0].patch, p.hits[1].patch);
+        assert!(p.hits[0].cum_arc_mm < p.terminal.cum_arc_mm);
+        // The unknown-id error path lives in oc-trace's sequence3 tests:
+        // constructing a JsError panics on non-wasm targets.
     }
 
     #[test]

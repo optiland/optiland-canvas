@@ -638,6 +638,7 @@ name = "oc-py"
 version = "0.0.1"
 dependencies = [
  "oc-core",
+ "oc-trace",
  "pyo3",
  "serde_json",
 ]

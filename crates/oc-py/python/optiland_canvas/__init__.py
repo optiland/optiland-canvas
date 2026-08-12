@@ -37,6 +37,8 @@ __all__ = [
     "seq_from_optic",
     "scene_to_seq",
     "seq_to_scene",
+    "scene3_sequence",
+    "scene3_sequence_for_intent",
     "validate",
     "load",
     "save",
@@ -69,6 +71,27 @@ def seq_to_scene(seq: dict | str) -> str:
     """``.ocanvas`` JSON rebuilt from a sequential-prescription dict/JSON."""
     seq_json = seq if isinstance(seq, str) else json.dumps(seq)
     return _native.seq_to_scene(seq_json)
+
+
+def scene3_sequence(scene: Any, source_id: int, detector_id: int, revision: int = 0) -> dict:
+    """The ``oc-seq3`` axial-ray sequence prescription of a 3D scene.
+
+    Traces the axial ray of ``source_id`` through the scene (v1 documents
+    migrate on load) and returns the ordered surface chain that reaches
+    ``detector_id``, as a dict. Raises ``ValueError`` when the ray never
+    reaches the detector (the message lists every branch's fate) or reaches it
+    along more than one chain.
+    """
+    return json.loads(
+        _native.scene3_sequence(_as_ocanvas_json(scene), source_id, detector_id, revision)
+    )
+
+
+def scene3_sequence_for_intent(scene: Any, intent_id: int, revision: int = 0) -> dict:
+    """:func:`scene3_sequence` for a declared primary-path intent."""
+    return json.loads(
+        _native.scene3_sequence_for_intent(_as_ocanvas_json(scene), intent_id, revision)
+    )
 
 
 def validate(scene: Any) -> int:

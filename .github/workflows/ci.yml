@@ -5,6 +5,9 @@ on:
     branches: [main]
   push:
     branches: [main]
+  # Artifact builds from a branch (kernel bumps are cut from feature branches
+  # while the repo stays private — no registry to publish to yet).
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -119,3 +122,39 @@ jobs:
           name: playwright-report
           path: web/playwright-report/
           retention-days: 7
+
+  # The oc-py kernel wheel, stamped like the CV-B tarball: the version's
+  # +<sha9> build metadata is the kernel commit, so a consumer vendoring both
+  # packagings can hold the browser and the backend kernel to ONE stamp
+  # (optikit-v2's CI checks exactly that). Retires with ADR-12 (PyPI publish
+  # once public), same as the tarball's npm route.
+  kernel-wheel:
+    name: kernel wheel (oc-py, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: stamp wheel version with the kernel commit
+        shell: bash
+        run: |
+          SHA=$(git rev-parse --short=9 HEAD)
+          sed -i -E "s/^version = \"([0-9][^\"+]*)\"/version = \"\1+${SHA}\"/" crates/oc-py/pyproject.toml
+          grep '^version' crates/oc-py/pyproject.toml
+      - name: build abi3 wheel
+        working-directory: crates/oc-py
+        run: |
+          pip install maturin
+          maturin build --release --out dist
+      - name: upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: oc-py-wheel-${{ matrix.os }}
+          path: crates/oc-py/dist/*.whl
+          retention-days: 30

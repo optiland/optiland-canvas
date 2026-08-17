@@ -133,7 +133,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -145,7 +144,15 @@ jobs:
         shell: bash
         run: |
           SHA=$(git rev-parse --short=9 HEAD)
-          sed -i -E "s/^version = \"([0-9][^\"+]*)\"/version = \"\1+${SHA}\"/" crates/oc-py/pyproject.toml
+          # `-i.bak`, not a bare `-i`: BSD sed (macOS) reads the NEXT argument
+          # as the backup suffix, so `-i -E` swallows the `-E`, falls back to
+          # BRE, and dies on the undefined \1. The suffixed form is the one
+          # spelling GNU and BSD both accept.
+          sed -i.bak -E "s/^version = \"([0-9][^\"+]*)\"/version = \"\1+${SHA}\"/" crates/oc-py/pyproject.toml
+          rm -f crates/oc-py/pyproject.toml.bak
+          # The stamp IS the contract: an unstamped wheel would install happily
+          # and quietly break a consumer's one-commit pin. Fail here instead.
+          grep -q "^version = \".*+${SHA}\"$" crates/oc-py/pyproject.toml
           grep '^version' crates/oc-py/pyproject.toml
       - name: build abi3 wheel
         working-directory: crates/oc-py

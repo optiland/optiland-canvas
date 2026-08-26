@@ -5,6 +5,10 @@ on:
     branches: [main]
   push:
     branches: [main]
+  # Artifact builds from a branch. Kernel bumps are cut from feature branches
+  # while the repo stays private — there is no registry to publish to yet, so
+  # a consumer vendors the artifacts this workflow uploads.
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -83,3 +87,88 @@ jobs:
           name: playwright-report
           path: web/playwright-report/
           retention-days: 7
+
+  # ---------------------------------------------------------------------
+  # The oc-py kernel wheel, stamped like the CV-B tarball: the version's
+  # +<sha9> build metadata is the kernel commit, so a consumer vendoring both
+  # packagings can hold the browser and the backend kernel to ONE stamp
+  # (optikit-v2's kernel-stamp job checks exactly that). Retires with ADR-12
+  # (PyPI publish once public), same as the tarball's npm route.
+  #
+  # Split in two because linux and the rest want different things. Linux goes
+  # through crates/oc-py/Dockerfile, which pins ubuntu:22.04 — maturin tags a
+  # wheel with the glibc it linked against, and building on the runner image
+  # directly would follow whatever ubuntu-latest is this month (24.04 = glibc
+  # 2.39 today), silently raising the wheel's floor and narrowing where it
+  # installs. The pinned base holds it at manylinux_2_35. Windows and macOS
+  # have no such moving floor and build on the runner.
+  # ---------------------------------------------------------------------
+  kernel-wheel-linux:
+    name: kernel wheel (oc-py, linux/${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+      # arm64 is emulated. It is slow (the Rust build runs under QEMU) and
+      # that is the accepted cost: GitHub's native ARM runners are not free
+      # for private repositories, and the Jetson this wheel targets cannot be
+      # a runner. Drop this step and set runs-on: ubuntu-24.04-arm the day the
+      # repo goes public.
+      - if: matrix.arch == 'arm64'
+        uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: build abi3 wheel
+        run: |
+          docker buildx build \
+            --platform linux/${{ matrix.arch }} \
+            -f crates/oc-py/Dockerfile \
+            --build-arg STAMP=$(git rev-parse --short=9 HEAD) \
+            -o type=local,dest=dist \
+            .
+          ls -l dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oc-py-wheel-linux-${{ matrix.arch }}
+          path: dist/*.whl
+          retention-days: 30
+
+  kernel-wheel:
+    name: kernel wheel (oc-py, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [windows-latest, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: stamp wheel version with the kernel commit
+        shell: bash
+        run: |
+          SHA=$(git rev-parse --short=9 HEAD)
+          # `-i.bak`, not a bare `-i`: BSD sed (macOS) reads the NEXT argument
+          # as the backup suffix, so `-i -E` swallows the `-E`, falls back to
+          # BRE, and dies on the undefined \1. The suffixed form is the one
+          # spelling GNU and BSD both accept. Kept identical to the sed in
+          # crates/oc-py/Dockerfile so the two cannot drift.
+          sed -i.bak -E "s/^version = \"([0-9][^\"+]*)\"/version = \"\1+${SHA}\"/" crates/oc-py/pyproject.toml
+          rm -f crates/oc-py/pyproject.toml.bak
+          # The stamp IS the contract: an unstamped wheel would install happily
+          # and quietly break a consumer's one-commit pin. Fail here instead.
+          grep -q "^version = \".*+${SHA}\"$" crates/oc-py/pyproject.toml
+          grep '^version' crates/oc-py/pyproject.toml
+      - name: build abi3 wheel
+        working-directory: crates/oc-py
+        run: |
+          pip install maturin
+          maturin build --release --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oc-py-wheel-${{ matrix.os }}
+          path: crates/oc-py/dist/*.whl
+          retention-days: 30

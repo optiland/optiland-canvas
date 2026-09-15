@@ -35,6 +35,25 @@
 //! assertions (and prints a note) so the ordinary `cargo test` stays green.
 //! For the least-noisy numbers add `-- --test-threads=1`. Tolerances default to
 //! 35 % (CPU) / 60 % (GPU) and can be overridden with `OC_PERF_TOL`.
+//!
+//! ## Why the sampling looks generous
+//!
+//! `min` is the right estimator here, but it is only as good as its sample
+//! count, and a rep cap that binds on a sub-millisecond workload throws that
+//! away. This gate used to cap CPU paths at 200 reps: at ~0.25 ms a trace that
+//! is 48 ms of sampling, and the resulting `min` moved by **20-40 % between
+//! runs** on an idle machine. The tolerance is 35 %, so `f64_ref_2000x8` (the
+//! shortest path, and the one whose baseline has no headroom) failed roughly one
+//! run in three for no reason at all.
+//!
+//! So the reps are governed by the time budget, not a cap. The cap remains only
+//! where a single rep is genuinely slow (a software GPU adapter traces in tens of
+//! milliseconds, and there is no point spending a whole budget on one). This
+//! costs a few seconds and takes the spread to ~6 %.
+//!
+//! Note that this cannot mask a regression: more samples only ever lower a `min`,
+//! and a slower code path raises it regardless of how well it is sampled. The
+//! committed baselines stay valid for the same reason.
 
 use std::hint::black_box;
 use std::time::Instant;
@@ -59,6 +78,17 @@ const SLA_RAYS: u32 = 2000;
 
 const CPU_TOL_DEFAULT: f64 = 0.35;
 const GPU_TOL_DEFAULT: f64 = 0.60;
+
+/// Sampling budget for one CPU measurement.
+///
+/// The CPU paths are sub-millisecond, so this is thousands of reps for `min` to
+/// choose from. Measured spread on an idle 24-thread box: ~42 % at the old
+/// 200-rep cap, ~10 % at 0.4 s uncapped, ~6 % here.
+const CPU_BUDGET_S: f64 = 0.8;
+/// Warmup reps before a CPU measurement. The f64 reference is rayon-parallel and
+/// its pool parks between calls, so the first reps pay a wake-up that has nothing
+/// to do with the tracer.
+const CPU_WARMUP: u32 = 10;
 
 // ------------------------------------------------------------------ scene ----
 
@@ -136,9 +166,18 @@ fn calibration_ns() -> f64 {
     ns
 }
 
-/// Best (minimum) single-iteration time in nanoseconds. Min is the least-noisy
-/// estimator of "how fast can this run", robust to scheduler jitter. Runs until
-/// `max_reps` or `budget_s`, whichever comes first, after warming up.
+/// Best (minimum) single-iteration time in nanoseconds.
+///
+/// `min` is the least-noisy estimator of "how fast can this run": jitter only
+/// ever makes a sample slower, so the floor is the signal. It is only as good as
+/// its sample count, though, which is what `max_reps` is dangerous for.
+///
+/// **`max_reps` must not bind on a fast path.** `budget_s` already bounds the
+/// wall time on its own, because the budget is checked after every rep, so a cap
+/// buys nothing there and costs the estimate its samples. Pass `u32::MAX` unless
+/// a single rep is slow enough that finishing the budget would be a waste
+/// (a software GPU adapter, which traces in tens of milliseconds). See the
+/// module docs for what capping a 0.25 ms workload at 200 reps did to this gate.
 fn best_ns(budget_s: f64, warmup: u32, max_reps: u32, mut f: impl FnMut()) -> f64 {
     for _ in 0..warmup {
         f();
@@ -216,7 +255,7 @@ fn perf_regression() {
         // f64 reference tracer.
         {
             let key = format!("f64_ref_{rays}x{DEPTH}");
-            let ns = best_ns(0.4, 3, 200, || {
+            let ns = best_ns(CPU_BUDGET_S, CPU_WARMUP, u32::MAX, || {
                 black_box(trace_f64(black_box(&scene), black_box(&cfg)));
             });
             let units = ns / cal;
@@ -228,7 +267,7 @@ fn perf_regression() {
         {
             let key = format!("f32_cpu_{rays}x{DEPTH}");
             let gs = GpuScene::build(&scene, LAMBDA_D);
-            let ns = best_ns(0.4, 3, 200, || {
+            let ns = best_ns(CPU_BUDGET_S, CPU_WARMUP, u32::MAX, || {
                 black_box(oc_gpu::cpu::trace(black_box(&gs), DEPTH));
             });
             let units = ns / cal;
@@ -263,9 +302,16 @@ fn perf_regression() {
             for &rays in &RAY_COUNTS {
                 let gs = GpuScene::build(&build_scene(rays), LAMBDA_D);
                 let _ = tracer.trace(&gs, DEPTH); // warm pipeline
-                // Software adapters are slow: smaller rep cap, larger budget.
-                let (budget, reps) = if is_real_gpu { (0.5, 120) } else { (1.0, 20) };
-                let ns = best_ns(budget, 2, reps, || {
+
+                // A real adapter traces in ~0.1 ms, so the budget governs and
+                // the cap must not bind. A software adapter takes tens of ms,
+                // which is the one case where a cap earns its keep.
+                let (budget, warmup, reps) = if is_real_gpu {
+                    (0.5, 5, u32::MAX)
+                } else {
+                    (1.0, 2, 20)
+                };
+                let ns = best_ns(budget, warmup, reps, || {
                     black_box(tracer.trace(black_box(&gs), DEPTH));
                 });
                 let ms = ns / 1.0e6;

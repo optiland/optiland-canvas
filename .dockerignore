@@ -1,0 +1,15 @@
+# Build context for crates/oc-py/Dockerfile. The wheel build needs the cargo
+# workspace and nothing else; everything below is either regenerated inside
+# the image or irrelevant to it, and shipping it only slows the context upload.
+.git
+target
+web/node_modules
+web/pkg
+web/dist
+web/test-results
+web/playwright-report
+__pycache__
+*.pyc
+*.egg-info
+.pytest_cache
+crates/oc-py/dist

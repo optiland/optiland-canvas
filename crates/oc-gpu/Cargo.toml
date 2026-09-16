@@ -34,7 +34,10 @@ wgpu = { version = "22.1", optional = true }
 pollster = { version = "0.3", optional = true }
 
 [dev-dependencies]
-oc-trace.workspace = true
+# `trace3` is enabled so the 3D f32 preview can be cross-validated against the
+# f64 reference (the cpu3_vs_f64 suite). It is additive: the 2D cross_validate
+# test still uses the default 2D tracer.
+oc-trace = { workspace = true, features = ["trace3"] }
 serde_json.workspace = true
 
 [[example]]

@@ -377,9 +377,10 @@ impl DetectorResponse {
 /// What a surface does to a ray that reaches it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SurfaceResponse {
-    /// An uncoated dielectric interface: full vector Fresnel, with `ar_residual`
-    /// scaling the reflectance. **Not a coating model.** It is one number, and a
-    /// coating is a stack.
+    /// An uncoated dielectric interface: scalar Fresnel, the unpolarized average
+    /// of the s and p reflectances, with `ar_residual` scaling it. Polarization
+    /// is not modelled, here or anywhere in the kernel. **Not a coating model**
+    /// either: it is one number, and a coating is a stack.
     DielectricFresnel {
         ar_residual: SpectralScalar,
     },

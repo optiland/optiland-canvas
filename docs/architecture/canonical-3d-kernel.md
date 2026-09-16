@@ -7,13 +7,19 @@ assumption. Why, and what it costs, is [ADR
 0001](adr/0001-scene3-is-canonical-2d-is-a-view.md). This page is the contract
 the migration is held to.
 
-**Status: PR 3D-04 of 12.** The f64 reference tracer is real: it traces skew rays
+**Status: 3D-00 through 3D-09 landed.** The f64 reference tracer traces skew rays
 through 3D bodies with grouped event search, containment-plus-priority media, 3D
 Snell/Fresnel/TIR, area detectors, apertures, and an energy ledger that closes.
-It is the authority the interactive f32/GPU preview (next) will be validated
-against. The 3D scene model, geometry, and tracer are behind off-by-default
-feature flags, and the shipped engine is exactly the 2D one the README describes.
-See [migration state](#migration-state).
+The f32 CPU preview and the WGSL shader are validated against it. The browser
+boots into a `Scene3` and edits it, in a 2D cross-section or a 3D model view, so
+the sentence above now describes the shipped app rather than a plan.
+
+Still open: **3D-10** (PyO3 direct trace) is contingent under
+[ADR 001](adr/0001-scene3-is-canonical-2d-is-a-view.md) and its scope revision;
+**3D-11** is the canonical rename, of which only the claim updates are done; the
+skew cross-validation corpus against Optiland is not written; and the WGSL tracer
+is not wired to the browser, which still previews with the f32 CPU path. See
+[migration state](#migration-state).
 
 ## One kernel
 
@@ -153,9 +159,12 @@ exactly one conversion module. Gating it would have forced `oc-openuc2` to keep 
 duplicate axis mapping, which is the drift that rule exists to prevent.
 
 The **model** layer (`Scene3`, 3D geometry, the 3D tracer, the 3D preview) is
-behind a feature flag that is **off by default**, so the shipped engine cannot
-reach a half-built scene model and the migration cannot regress the browser while
-it is in progress.
+still behind feature flags that are **off by default** for a library consumer, so
+a crate that wants the 2D engine alone gets exactly that. The browser stopped
+being such a consumer when 3D-09 landed: `oc-wasm` turns on `scene3`, `trace3`
+and `gpu3`, boots into a `Scene3`, and takes every displayed number from the f64
+3D reference. The flags now mark what a dependent crate opts into rather than
+finished work from unfinished work.
 
 | Flag | Crate | Gates |
 |---|---|---|
@@ -175,13 +184,13 @@ it is the CPU f32 oracle the shader is validated against.
 | 3D-02 | `Scene3` schema, `.ocanvas` v2, v1 migration | **done** |
 | 3D-03 | 3D analytic geometry and containment | **done** |
 | 3D-04 | the f64 full-3D reference tracer | **done** |
-| 3D-05 | the exact planar reducer and legacy compatibility | next |
-| 3D-06 | 3D sources, detectors, apertures, authoring constructors | |
-| 3D-07 | CPU f32 3D preview | |
-| 3D-08 | WebGPU full-3D preview | |
-| 3D-09 | the 2D slice/projection UI over `Scene3` | |
-| 3D-10 | PyO3 direct trace API and the Optiland wrapper | |
-| 3D-11 | cleanup, canonical rename, claim updates | |
+| 3D-05 | the exact planar reducer and legacy compatibility | **done** |
+| 3D-06 | 3D sources, detectors, apertures, authoring constructors | **done** |
+| 3D-07 | CPU f32 3D preview | **done** |
+| 3D-08 | WebGPU full-3D preview | **done**, not yet reachable from the browser |
+| 3D-09 | the 2D slice/projection UI over `Scene3` | **done** |
+| 3D-10 | PyO3 direct trace API | contingent; the Optiland wrapper is withdrawn |
+| 3D-11 | cleanup, canonical rename, claim updates | claims updated; rename pending |
 
 What each suite owes, and which PR owes it, is
 [acceptance-manifest.md](acceptance-manifest.md).
@@ -189,7 +198,14 @@ What each suite owes, and which PR owes it, is
 ## Definition of done
 
 The project may call itself a 3D non-sequential engine only when **all** of
-these are true. Until then the README says 2D, because it is.
+these are true.
+
+Thirteen of the fifteen hold as of 3D-09. The two that do not: Python still
+round-trips scene files instead of calling the tracer, which is 3D-10; and the
+Optiland cross-validation corpus is still meridional, with no skew systems and no
+`validation/systems_3d.json`, which 3D-04 owed and did not deliver. Until those
+close, the README describes a 3D kernel with a 2D-first canvas, which is what it
+is.
 
 - `.ocanvas` v2 stores explicit 3D construction;
 - a skew ray with all three direction components traces through a 3D refractive

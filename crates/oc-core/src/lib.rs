@@ -23,6 +23,8 @@
 //! off-by-default **`scene3`** feature, so the shipped engine cannot reach a
 //! half-built scene model while the migration is in progress.
 
+#[cfg(feature = "scene3")]
+pub mod build3;
 pub mod coordinates;
 pub mod fragment;
 pub mod geom;
@@ -33,11 +35,17 @@ pub mod material;
 #[cfg(feature = "scene3")]
 pub mod migrate_v1;
 #[cfg(feature = "scene3")]
+pub mod planar_reduce;
+#[cfg(feature = "scene3")]
 pub mod profile2;
 pub mod scene;
 #[cfg(feature = "scene3")]
 pub mod scene3;
 pub mod seq;
+#[cfg(feature = "scene3")]
+pub mod seq3;
+#[cfg(feature = "scene3")]
+pub mod source3;
 pub mod vec;
 pub mod vec3;
 
@@ -55,6 +63,11 @@ pub use scene::{
     SurfaceSpec, OCANVAS_FORMAT, OCANVAS_VERSION,
 };
 pub use seq::{FieldType, SeqAperture, SeqMaterial, SeqSurface, SeqSystem};
+#[cfg(feature = "scene3")]
+pub use seq3::{
+    SeqAction, SeqHit3, SeqHitKind, SeqLaunch3, SeqTerminal3, SequencePrescription3, SEQ3_FORMAT,
+    SEQ3_VERSION,
+};
 pub use vec::{perp, Isometry2, Vec2};
 pub use vec3::{
     Aabb3, Isometry3, Isometry3Error, Plane3, Plane3Error, Ray3, Ray3Error, Vec3, MIN_NORM,

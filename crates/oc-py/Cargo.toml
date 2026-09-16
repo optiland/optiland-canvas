@@ -18,7 +18,12 @@ name = "_native"
 crate-type = ["cdylib"]
 
 [dependencies]
-oc-core = { workspace = true }
+# `scene3` for the canonical 3D scene model: `scene3_sequence` loads a v2
+# document and extracts the axial-ray surface chain.
+oc-core = { workspace = true, features = ["scene3"] }
+# The f64 reference tracer, serial (no rayon in the wheel): sequence extraction
+# traces exactly one launch ray, so parallel transport buys nothing here.
+oc-trace = { path = "../oc-trace", default-features = false, features = ["trace3"] }
 serde_json = { workspace = true }
 
 [dependencies.pyo3]

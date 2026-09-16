@@ -13,11 +13,19 @@
 //! same `n_rays × max_segs` segment layout and are cross-validated against the
 //! f64 reference tracer (`oc-trace`) — the project's top safeguard (§10.1).
 
+#[cfg(feature = "gpu3")]
+pub mod buffers3;
 pub mod color;
 pub mod cpu;
+#[cfg(feature = "gpu3")]
+pub mod cpu3;
 #[cfg(feature = "gpu")]
 pub mod gpu;
+#[cfg(all(feature = "gpu", feature = "gpu3"))]
+pub mod gpu3;
 pub mod scene;
+#[cfg(feature = "gpu3")]
+pub mod scene3;
 
 pub use scene::{BuildOpts, GpuScene, GpuSeg, SEG_GHOST, SEG_TIR, SEG_VALID};
 

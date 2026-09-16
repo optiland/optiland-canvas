@@ -21,6 +21,9 @@
       #abbeLabel { opacity: 0.75; margin-top: 4px; min-height: 15px; }
       #dock { bottom: 12px; right: 14px; width: 250px; }
       #dock h3 { margin: 0 0 6px; font-size: 12px; color: #7fd6ff; }
+      #detModes { margin: 0 0 6px; gap: 6px; }
+      #detModes .m4btn { padding: 2px 10px; }
+      #detModes .m4btn.active { background: #1d4e6b; color: #e8f6ff; border-color: #3a86b0; }
       #hist { display: block; border-radius: 4px; background: #04060a; }
       #dockNums { opacity: 0.8; margin-top: 4px; }
       label.row { display: flex; align-items: center; gap: 6px; margin: 4px 0; }
@@ -100,6 +103,9 @@
       #tools button { background: #12203a; color: #cdd6e4; border: 1px solid #24344d; border-radius: 6px;
         padding: 4px 10px; cursor: pointer; font: inherit; }
       #tools button.active { background: #1d4e6b; color: #e8f6ff; border-color: #3a86b0; }
+      #view3dctl { top: 58px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 5px; }
+      #view3dctl .v3d-sep { opacity: 0.4; font-size: 10px; margin: 0 2px 0 6px; }
+      #view3dctl .m4btn.active { background: #1d4e6b; color: #e8f6ff; border-color: #3a86b0; }
       /* inspector cards — compact pop-ups (positioned in JS, many at once). */
       .card { width: 158px; padding: 7px 8px; }
       .card h3 { margin: 0 0 5px; font-size: 12px; color: #7fd6ff; cursor: move;
@@ -116,6 +122,8 @@
         border: 1px solid #24344d; border-radius: 4px; padding: 1px 4px; font: inherit; }
       .field input:disabled { opacity: 0.4; }
       .field .u { width: 18px; opacity: 0.45; text-align: right; }
+      .field select.c3-resp { flex: 1; min-width: 0; background: #0a1220; color: #e8f6ff;
+        border: 1px solid #24344d; border-radius: 4px; padding: 1px 3px; font: inherit; }
       button.pin { background: none; border: none; cursor: pointer; padding: 0; opacity: 0.45; font-size: 11px; }
       button.pin.pinned { opacity: 1; }
       .sub { opacity: 0.7; margin-top: 2px; min-height: 14px; font-size: 11px; }
@@ -137,6 +145,21 @@
         padding: 3px 8px; cursor: pointer; font: inherit; }
       .m4btn:hover { background: #1a2c48; }
       .m4btn:disabled { opacity: 0.4; cursor: default; }
+      .m4btn.active { background: #1d4e6b; color: #e8f6ff; border-color: #3a86b0; }
+      /* 3D preview badge (§10.3): never labels a legacy result full 3D */
+      .badge3d { margin-left: auto; font-size: 10px; padding: 2px 7px; border-radius: 10px;
+        border: 1px solid #2a3a52; background: #0e1626; color: #8fa2bd; white-space: nowrap; }
+      .badge3d.full_3d { border-color: #2f6f4f; background: #10261b; color: #7fffa0; }
+      .badge3d.exact_planar { border-color: #2c5170; background: #0e1f2c; color: #7fd6ff; }
+      .badge3d.legacy_planar { border-color: #6b5a2a; background: #241f10; color: #ffd678; }
+      .obj3d { margin-top: 5px; display: flex; flex-direction: column; gap: 2px; }
+      .obj3d:empty { display: none; }
+      .obj3d .row { display: flex; gap: 6px; align-items: baseline; font-size: 10px;
+        padding: 2px 5px; border: 1px solid #16202f; border-radius: 5px; background: #0b1220; }
+      .obj3d .oid { color: #7fd6ff; }
+      .obj3d .okind { color: #cdd6e4; }
+      .obj3d .opos { margin-left: auto; opacity: 0.55; font-variant-numeric: tabular-nums; }
+      .obj3d .planar { color: #ffd678; }
       /* layers */
       #layerList { display: flex; flex-direction: column; gap: 2px; }
       .layer-row { display: flex; align-items: center; gap: 4px; padding: 2px 4px; border-radius: 4px; cursor: pointer; }
@@ -176,16 +199,40 @@
     <canvas id="view"></canvas>
 
     <div class="panel" id="hud">
-      <div><b>Optiland Canvas</b> — M5 "it's an Optiland tool"</div>
-      <div>drag the lens · hover the Abbe map · save/open .ocanvas, layers, history &amp; wavefront →</div>
+      <div><b>Optiland Canvas</b> — always 3D</div>
+      <div>drag &amp; double-click the lens to edit · hover the Abbe map for glass · toggle 2D ⇄ 3D above</div>
       <div id="stat"></div>
     </div>
 
     <div class="panel" id="controls">
-      <h3>material — Abbe map</h3>
+      <h3 id="abbeHead">material — Abbe map</h3>
       <canvas id="abbe" width="228" height="180"></canvas>
       <div id="abbeLabel">hover to preview glass</div>
-      <label class="row">ray density <input type="range" id="density" min="8" max="120" value="16" /></label>
+      <label class="row" style="border-top:1px solid #16202f; padding-top:7px; margin-top:7px">source
+        <select id="srcType" style="flex:1; background:#0a1220; color:#e8f6ff; border:1px solid #24344d; border-radius:4px; padding:2px 4px; font:inherit">
+          <option value="collimated_rect">collimated · rectangular</option>
+          <option value="collimated_disc">collimated · round</option>
+          <option value="point">point · cone</option>
+          <option value="lambertian">diffuse disc (Lambertian)</option>
+        </select></label>
+      <label class="row"><span id="srcL0" style="width:38px">⌀ Y</span>
+        <input type="number" id="srcP0" value="20" min="0" step="0.5" style="width:60px; background:#0a1220; color:#e8f6ff; border:1px solid #24344d; border-radius:4px; padding:2px 4px; font:inherit" />
+        <span id="srcU0" style="opacity:0.5">mm</span></label>
+      <label class="row" id="srcRow1"><span id="srcL1" style="width:38px">⌀ X</span>
+        <input type="number" id="srcP1" value="0.5" min="0" step="0.5" style="width:60px; background:#0a1220; color:#e8f6ff; border:1px solid #24344d; border-radius:4px; padding:2px 4px; font:inherit" />
+        <span style="opacity:0.5">mm</span></label>
+      <label class="row"><span style="width:38px">λ</span>
+        <select id="wlPreset" style="flex:1; background:#0a1220; color:#e8f6ff; border:1px solid #24344d; border-radius:4px; padding:2px 4px; font:inherit">
+          <option value="white">white (visible)</option>
+          <option value="d">d — 587.6 nm (He)</option>
+          <option value="fdc">F, d, C (Fraunhofer)</option>
+          <option value="gfedc">g, F, e, d, C</option>
+          <option value="custom">custom list…</option>
+        </select></label>
+      <label class="row" id="wlRow"><span style="width:38px">nm</span>
+        <input type="text" id="wlList" placeholder="e.g. 486, 588, 656" title="comma-separated wavelengths in nm (outside 380–780 nm shows yellow)" style="flex:1; background:#0a1220; color:#e8f6ff; border:1px solid #24344d; border-radius:4px; padding:2px 4px; font:inherit" /></label>
+      <div class="row" id="wlSwatches" style="gap:3px; flex-wrap:wrap; min-height:14px; padding-left:38px"></div>
+      <label class="row">ray density <input type="range" id="density" min="8" max="240" value="16" /></label>
       <label class="row"><input type="checkbox" id="ghosts" /> ghost layer</label>
       <label class="row">ghost bounces
         <input type="number" id="ghostBounces" value="2" min="0" max="8" step="1"
@@ -193,70 +240,79 @@
           style="width:52px; background:#0a1220; color:#e8f6ff; border:1px solid #24344d; border-radius:4px; padding:2px 4px; font:inherit" /></label>
       <label class="row">ghost opacity <input type="range" id="ghostOpacity" min="0" max="100" value="45" /></label>
       <label class="row"><input type="checkbox" id="tir" checked /> TIR highlight</label>
-      <label class="row"><input type="checkbox" id="gridBox" /> grid
+      <label class="row"><input type="checkbox" id="gridBox" checked /> grid
         <span style="opacity:0.6">spacing</span>
         <input type="number" id="gridSpacing" value="5" min="0.5" step="0.5" style="width:48px; background:#0a1220; color:#e8f6ff; border:1px solid #24344d; border-radius:4px; padding:2px 4px; font:inherit" />
         <span style="opacity:0.5">mm</span></label>
     </div>
 
     <div class="panel" id="dock">
-      <h3>detector — irradiance (reference f64)</h3>
-      <canvas id="hist" width="228" height="90"></canvas>
+      <h3 id="detHead">detector — heatmap (f64)</h3>
+      <div class="m4row" id="detModes">
+        <button class="m4btn active" id="detHeatmap" title="2D binning: incident flux per detector cell">heatmap</button>
+        <button class="m4btn" id="detSpot" title="spot diagram: the actual ray-detector intersection points">spot</button>
+      </div>
+      <canvas id="hist" width="228" height="150"></canvas>
       <div id="dockNums">—</div>
     </div>
 
-    <!-- M4: layers · undo tree · variation gallery -->
+    <!-- Scene dock: the 3D scene inspector + the .ocanvas handoff. -->
     <div class="panel" id="m4dock">
-      <!-- M5: the Optiland handoff (§6) — save/open the frozen .ocanvas format -->
+      <!-- The canonical 3D scene: its objects, the preview-mode badge, the
+           meridional-slab slider, and open-a-scene. -->
+      <div class="m4-sec">
+        <h4>3D scene <span class="h4-sub">— objects</span></h4>
+        <div class="m4row">
+          <button class="m4btn" id="open3d" title="Open an .ocanvas (v1 or v2) into the canonical 3D scene">⤒ open</button>
+          <input type="file" id="open3dFile" accept=".ocanvas,application/json" hidden />
+          <span id="preview3dBadge" class="badge3d" title="How this scene is traced (§10.3)">no 3D scene</span>
+        </div>
+        <label class="m4row" id="slice3dRow" style="display:none">
+          slice ±<span id="slice3dLabel">∞</span> mm
+          <input type="range" id="slice3d" min="0" max="50" step="0.5" value="0" />
+        </label>
+        <div class="m4row">
+          <button class="m4btn" id="drawMirror" title="draw a round fold mirror: arm, then click-drag in the 2D cross-section">＋ draw mirror</button>
+          <button class="m4btn" id="addElement" title="add a round optical element (configure each face: mirror / absorb / clear)">＋ element</button>
+        </div>
+        <div class="m4row">
+          <button class="m4btn" id="addAperture" title="add a circular aperture stop">＋ aperture</button>
+          <button class="m4btn" id="addPrism" title="add a dispersing glass prism">＋ prism</button>
+        </div>
+        <div class="m4row">
+          <button class="m4btn" id="addDetector" title="add an area detector (movable/tiltable; add as many as you like)">＋ detector</button>
+        </div>
+        <div id="objects3d" class="obj3d"></div>
+        <div id="preview3dMsg" class="m4hint">The scientifically-correct f64 3D trace. In the 2D view its rays are projected onto the meridional Y–Z plane; the slice slider thins them to a slab about it.</div>
+      </div>
+      <!-- The Optiland handoff (§6) — save the frozen .ocanvas format. -->
       <div class="m4-sec">
         <h4>Scene <span class="h4-sub">— .ocanvas → Optiland</span></h4>
         <div class="m4row">
-          <button class="m4btn" id="saveScene" title="Download this design as an .ocanvas file — the handoff to Optiland (optiland_canvas.to_optic)">⤓ save .ocanvas</button>
-          <button class="m4btn" id="openScene" title="Open an .ocanvas file">⤒ open</button>
-          <input type="file" id="openSceneFile" accept=".ocanvas,application/json" hidden />
+          <button class="m4btn" id="saveScene" title="Download this design as a v2 .ocanvas file — the handoff to Optiland (optiland_canvas.to_optic)">⤓ save .ocanvas</button>
         </div>
-        <div id="sceneMsg" class="m4hint">Save exports the frozen, versioned .ocanvas; hand it to Optiland in Python.</div>
-      </div>
-      <div class="m4-sec">
-        <h4>Layers</h4>
-        <div id="layerList"></div>
-        <div class="m4row">
-          <button class="m4btn" id="addLayer">+ layer</button>
-          <button class="m4btn" id="assignLayer" title="move the selected element onto the active layer">assign sel</button>
-        </div>
-        <label class="m4row"><input type="checkbox" id="onionBox" /> onion-skin hidden layers</label>
-      </div>
-      <div class="m4-sec">
-        <h4>History <span class="h4-sub">— undo tree</span></h4>
-        <div class="m4row">
-          <button class="m4btn" id="undoBtn" title="Ctrl+Z">↶ undo</button>
-          <button class="m4btn" id="redoBtn" title="Ctrl+Shift+Z">↷ redo</button>
-        </div>
-        <div id="histWrap"><canvas id="histCanvas"></canvas></div>
-        <div id="histLabel"></div>
-        <div class="m4hint">Each dot is a saved state; gold is where you are. Editing after an undo starts a new branch, so nothing is lost. Hover a dot to read it, click to jump.</div>
-      </div>
-      <div class="m4-sec">
-        <h4>Variants</h4>
-        <div class="m4row"><button class="m4btn" id="saveVariant">＋ save current as variant</button></div>
-        <div id="galleryGrid"></div>
+        <div id="sceneMsg" class="m4hint">Save exports the frozen, versioned 3D scene; open one above. Hand it to Optiland in Python.</div>
       </div>
     </div>
 
-    <!-- M4: wavefront scrub (§5.5) -->
-    <div class="panel" id="wavefront">
-      <label><input type="checkbox" id="wfToggle" /> wavefront</label>
-      <button id="wfPlay" disabled>▶</button>
-      <input type="range" id="wfSlider" min="0" max="100" step="0.001" value="100" disabled />
-      <span id="wfLabel">off</span>
-    </div>
-
-    <!-- M3: tool palette -->
+    <!-- View toggle: the same 3D scene, drawn as the meridional cross-section
+         (Zemax-style Y–Z layout) or as an orbitable 3D model. -->
     <div class="panel" id="tools">
-      <button id="tool-select">◈ select</button>
-      <button id="tool-draw">✎ draw</button>
-      <button id="tool-pin">📌 pin</button>
-      <span id="m3hint" class="sub"></span>
+      <button id="view-2d" class="active" title="the meridional Y–Z cross-section, editable like v1">◧ 2D cross-section</button>
+      <button id="view-3d" title="an orbitable 3D model of the same system">◳ 3D model</button>
+      <span id="viewHint" class="sub"></span>
+    </div>
+
+    <!-- 3D view controls: reset, canonical presets, perspective toggle. Shown
+         only while the 3D model view is active. -->
+    <div class="panel" id="view3dctl" style="display:none">
+      <button class="m4btn" id="v3dReset" title="re-frame at the default 3/4 view">⟲ reset</button>
+      <span class="v3d-sep">view</span>
+      <button class="m4btn" id="v3dIso" title="3/4 isometric">iso</button>
+      <button class="m4btn" id="v3dFront" title="meridional Y–Z, face-on">front</button>
+      <button class="m4btn" id="v3dTop" title="looking down the vertical">top</button>
+      <button class="m4btn" id="v3dSide" title="end-on down the optical axis">side</button>
+      <button class="m4btn" id="v3dPersp" title="toggle perspective / orthographic">persp</button>
     </div>
 
     <!-- M3: inspector-card template — cloned per element (many open at once) -->
@@ -283,14 +339,39 @@
       </div>
     </template>
 
-    <!-- M3: freehand fit — complexity slider (§5.3) -->
-    <div class="panel" id="fitpanel" style="display:none">
-      <h3>fit complexity — cost of manufacturability</h3>
-      <label class="row">simple <input type="range" id="fitSlider" min="0" max="5" value="1" /> precise</label>
-      <div id="fitLabel" class="sub"></div>
-      <label class="row" style="justify-content:center"><input type="checkbox" id="fitMirror" /> mirror (reflective)</label>
-      <div><button id="fitCommit">commit</button><button id="fitCancel">cancel</button></div>
-    </div>
+    <!-- 3D inspector card — Scene3 element, cloned per body (many at once). -->
+    <template id="card3dTemplate">
+      <div class="panel card">
+        <h3><span class="c-title">#0</span><span class="c-hdrbtns"><button class="c-pinpos" title="pin card location">📍</button><button class="c-close" title="close">✕</button></span></h3>
+        <div class="field"><span>x</span><input type="number" data-name="x" /><span class="u">mm</span></div>
+        <div class="field"><span>y</span><input type="number" data-name="y" /><span class="u">mm</span></div>
+        <div class="field"><span>tilt</span><input type="number" data-name="rot" step="1" /><span class="u">°</span></div>
+        <div class="c3-singlet">
+          <div class="field"><span>r1</span><input type="number" data-name="r1" /><span class="u">mm</span></div>
+          <div class="field"><span>r2</span><input type="number" data-name="r2" /><span class="u">mm</span></div>
+          <div class="field"><span>t</span><input type="number" data-name="thickness" /><span class="u">mm</span></div>
+          <div class="field"><span>ca</span><input type="number" data-name="semiAperture" /><span class="u">mm</span></div>
+          <div class="field"><span>k1</span><input type="number" data-name="conic1" /><span class="u"></span></div>
+          <div class="field"><span>k2</span><input type="number" data-name="conic2" /><span class="u"></span></div>
+        </div>
+        <div class="c3-glass" style="display:none">
+          <div class="field"><span>nd</span><input type="number" data-name="nd" step="0.001" /><span class="u"></span></div>
+          <div class="field"><span>Vd</span><input type="number" data-name="vd" step="0.1" /><span class="u"></span></div>
+        </div>
+        <div class="c3-aperture" style="display:none">
+          <div class="field"><span>min r</span><input type="number" data-name="apMin" step="0.5" min="0" /><span class="u">mm</span></div>
+          <div class="field"><span>max r</span><input type="number" data-name="apMax" step="0.5" min="0" /><span class="u">mm</span></div>
+        </div>
+        <div class="c3-surface" style="display:none">
+          <div class="field"><span>front</span><select data-name="front" class="c3-resp">
+            <option value="mirror">mirror</option><option value="absorb">absorb</option>
+            <option value="clear">clear</option><option value="refract">refract</option></select></div>
+          <div class="field"><span>back</span><select data-name="back" class="c3-resp">
+            <option value="mirror">mirror</option><option value="absorb">absorb</option>
+            <option value="clear">clear</option><option value="refract">refract</option></select></div>
+        </div>
+      </div>
+    </template>
 
     <script type="module" src="/src/main.ts"></script>
 

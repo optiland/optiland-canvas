@@ -15,6 +15,8 @@ pub mod bvh3;
 #[cfg(feature = "trace3")]
 pub mod result3;
 #[cfg(feature = "trace3")]
+pub mod sequence3;
+#[cfg(feature = "trace3")]
 pub mod tracer3;
 
 pub use fresnel::{
@@ -24,9 +26,11 @@ pub use tracer::{trace, DetectorResult, Segment, TraceConfig, TraceResult};
 
 #[cfg(feature = "trace3")]
 pub use result3::{
-    Approximation, CapabilityIssue, CapabilityReport, DetectorHit3, DetectorResult3, EnergyLedger,
-    LaunchRay3, PhysicsFeature, Segment3, SegmentFlags, TerminationReason, TerminationSummary,
-    TraceResult3,
+    Approximation, CapabilityIssue, CapabilityReport, ChildRole, DetectorHit3, DetectorResult3,
+    EnergyLedger, LaunchRay3, PhysicsFeature, Segment3, SegmentFlags, TerminationReason,
+    TerminationSummary, TraceEvent3, TraceEventKind, TraceResult3,
 };
 #[cfg(feature = "trace3")]
-pub use tracer3::{trace3, TraceConfig3};
+pub use sequence3::{axial_launch, extract_for_intent, extract_sequence3, SequenceError};
+#[cfg(feature = "trace3")]
+pub use tracer3::{launch_from_scene, launch_from_source, trace3, trace_scene3, TraceConfig3};

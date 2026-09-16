@@ -147,9 +147,21 @@ impl GpuTracer {
         let mut slot = self.buffers.borrow_mut();
         if slot.is_none() {
             let params_buf = uniform_buf(&self.device, std::mem::size_of::<GpuParams>());
-            let prims = storage_buf(&self.device, "prims", need_prims * std::mem::size_of::<GpuPrim>());
-            let elems = storage_buf(&self.device, "elems", need_elems * std::mem::size_of::<GpuElem>());
-            let rays = storage_buf(&self.device, "rays", need_rays * std::mem::size_of::<GpuRay>());
+            let prims = storage_buf(
+                &self.device,
+                "prims",
+                need_prims * std::mem::size_of::<GpuPrim>(),
+            );
+            let elems = storage_buf(
+                &self.device,
+                "elems",
+                need_elems * std::mem::size_of::<GpuElem>(),
+            );
+            let rays = storage_buf(
+                &self.device,
+                "rays",
+                need_rays * std::mem::size_of::<GpuRay>(),
+            );
             let segs = seg_buf(&self.device, seg_bytes);
             let staging = staging_buf(&self.device, seg_bytes);
             let bind_group = self.make_bind_group(&params_buf, &prims, &elems, &rays, &segs);
@@ -174,17 +186,29 @@ impl GpuTracer {
         // a storage buffer identity actually changed.
         let mut rebuild_bg = false;
         if need_prims > b.cap_prims {
-            b.prims = storage_buf(&self.device, "prims", need_prims * std::mem::size_of::<GpuPrim>());
+            b.prims = storage_buf(
+                &self.device,
+                "prims",
+                need_prims * std::mem::size_of::<GpuPrim>(),
+            );
             b.cap_prims = need_prims;
             rebuild_bg = true;
         }
         if need_elems > b.cap_elems {
-            b.elems = storage_buf(&self.device, "elems", need_elems * std::mem::size_of::<GpuElem>());
+            b.elems = storage_buf(
+                &self.device,
+                "elems",
+                need_elems * std::mem::size_of::<GpuElem>(),
+            );
             b.cap_elems = need_elems;
             rebuild_bg = true;
         }
         if need_rays > b.cap_rays {
-            b.rays = storage_buf(&self.device, "rays", need_rays * std::mem::size_of::<GpuRay>());
+            b.rays = storage_buf(
+                &self.device,
+                "rays",
+                need_rays * std::mem::size_of::<GpuRay>(),
+            );
             b.cap_rays = need_rays;
             rebuild_bg = true;
         }
@@ -204,10 +228,12 @@ impl GpuTracer {
         // Upload the current scene into the (reused) buffers.
         self.queue.write_buffer(&b.params, 0, cast_slice(&[params]));
         if !scene.prims.is_empty() {
-            self.queue.write_buffer(&b.prims, 0, cast_slice(&scene.prims));
+            self.queue
+                .write_buffer(&b.prims, 0, cast_slice(&scene.prims));
         }
         if !scene.elems.is_empty() {
-            self.queue.write_buffer(&b.elems, 0, cast_slice(&scene.elems));
+            self.queue
+                .write_buffer(&b.elems, 0, cast_slice(&scene.elems));
         }
         if !scene.rays.is_empty() {
             self.queue.write_buffer(&b.rays, 0, cast_slice(&scene.rays));

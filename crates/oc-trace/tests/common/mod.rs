@@ -221,6 +221,22 @@ pub fn add_mirror(
     )
 }
 
+pub fn add_thin_lens(
+    scene: &mut Scene3,
+    pos: Vec3,
+    normal: Vec3,
+    half: f64,
+    focal_length_mm: f64,
+) -> ObjectId {
+    push_surface(
+        scene,
+        pos,
+        normal,
+        half,
+        SurfaceResponse::ThinLens { focal_length_mm },
+    )
+}
+
 pub fn add_beamsplitter(
     scene: &mut Scene3,
     pos: Vec3,
@@ -268,6 +284,33 @@ pub fn add_circular_aperture(
     id
 }
 
+pub fn add_annular_aperture(
+    scene: &mut Scene3,
+    pos: Vec3,
+    normal: Vec3,
+    inner: f64,
+    outer: f64,
+    mask: f64,
+) -> ObjectId {
+    let id = next_id(scene);
+    let mut common = ObjectCommon::new(id, LayerId(0));
+    common.transform = facing(pos, normal);
+    scene.apertures.push(Aperture3 {
+        common,
+        shape: ApertureShape3 {
+            plane_local: Plane3::XY,
+            clear_opening: PlanarShape2::Annulus {
+                inner_mm: inner,
+                outer_mm: outer,
+            },
+            outer_extent: Some(PlanarShape2::Disc { radius_mm: mask }),
+        },
+        interaction: ApertureInteraction::Absorb,
+        primary_stop_for: Vec::new(),
+    });
+    id
+}
+
 pub fn add_rect_aperture(
     scene: &mut Scene3,
     pos: Vec3,
@@ -303,18 +346,91 @@ pub fn add_rect_detector(
     hh: f64,
     bins: [usize; 2],
 ) -> ObjectId {
+    add_detector(
+        scene,
+        pos,
+        normal,
+        DetectorGeometry3::Rectangle {
+            half_width_mm: hw,
+            half_height_mm: hh,
+        },
+        bins,
+    )
+}
+
+pub fn add_disc_detector(
+    scene: &mut Scene3,
+    pos: Vec3,
+    normal: Vec3,
+    radius_mm: f64,
+    bins: [usize; 2],
+) -> ObjectId {
+    add_detector(
+        scene,
+        pos,
+        normal,
+        DetectorGeometry3::Disc { radius_mm },
+        bins,
+    )
+}
+
+pub fn add_annulus_detector(
+    scene: &mut Scene3,
+    pos: Vec3,
+    normal: Vec3,
+    inner_mm: f64,
+    outer_mm: f64,
+    bins: [usize; 2],
+) -> ObjectId {
+    add_detector(
+        scene,
+        pos,
+        normal,
+        DetectorGeometry3::Annulus { inner_mm, outer_mm },
+        bins,
+    )
+}
+
+fn add_detector(
+    scene: &mut Scene3,
+    pos: Vec3,
+    normal: Vec3,
+    geometry: DetectorGeometry3,
+    bins: [usize; 2],
+) -> ObjectId {
     let id = next_id(scene);
     let mut common = ObjectCommon::new(id, LayerId(0));
     common.transform = facing(pos, normal);
     scene.detectors.push(Detector3 {
         common,
-        geometry: DetectorGeometry3::Rectangle {
-            half_width_mm: hw,
-            half_height_mm: hh,
-        },
+        geometry,
         bins,
         response: DetectorResponse::Unity,
         termination: DetectorTermination::Terminate,
+    });
+    id
+}
+
+/// An aperture with a polygon clear opening inside a disc mask.
+pub fn add_polygon_aperture(
+    scene: &mut Scene3,
+    pos: Vec3,
+    normal: Vec3,
+    opening: Vec<Vec2>,
+    mask: f64,
+) -> ObjectId {
+    let id = next_id(scene);
+    let mut common = ObjectCommon::new(id, LayerId(0));
+    common.transform = facing(pos, normal);
+    scene.apertures.push(Aperture3 {
+        common,
+        shape: ApertureShape3 {
+            plane_local: Plane3::XY,
+            clear_opening: PlanarShape2::Polygon { vertices: opening },
+            outer_extent: Some(PlanarShape2::Disc { radius_mm: mask }),
+        },
+        interaction: ApertureInteraction::Absorb,
+        primary_stop_for: Vec::new(),
     });
     id
 }

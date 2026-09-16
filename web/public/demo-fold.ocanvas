@@ -1,0 +1,245 @@
+{
+  "format": "ocanvas",
+  "version": 2,
+  "dimension": 3,
+  "bodies": [],
+  "surfaces": [
+    {
+      "common": {
+        "id": 1,
+        "transform": {
+          "rot_xyzw": [
+            -0.23975573278605314,
+            -0.39959288797675524,
+            0.0,
+            0.8847839919859644
+          ],
+          "pos": [
+            0.0,
+            0.0,
+            0.0
+          ]
+        },
+        "layer": 0,
+        "locked": false,
+        "label": "",
+        "visible": true
+      },
+      "geometry": {
+        "Plane": {
+          "shape": {
+            "Rectangle": {
+              "half_width_mm": 8.0,
+              "half_height_mm": 8.0
+            }
+          }
+        }
+      },
+      "response_front": {
+        "Mirror": {
+          "reflectivity": {
+            "Constant": 0.95
+          }
+        }
+      },
+      "response_back": {
+        "Mirror": {
+          "reflectivity": {
+            "Constant": 0.95
+          }
+        }
+      }
+    }
+  ],
+  "apertures": [],
+  "detectors": [
+    {
+      "common": {
+        "id": 2,
+        "transform": {
+          "rot_xyzw": [
+            0.9486832980505139,
+            0.0,
+            0.0,
+            0.316227766016838
+          ],
+          "pos": [
+            0.0,
+            9.0,
+            12.0
+          ]
+        },
+        "layer": 0,
+        "locked": false,
+        "label": "",
+        "visible": true
+      },
+      "geometry": {
+        "Rectangle": {
+          "half_width_mm": 8.0,
+          "half_height_mm": 8.0
+        }
+      },
+      "bins": [
+        48,
+        48
+      ],
+      "response": "Unity",
+      "termination": "Terminate"
+    }
+  ],
+  "sources": [
+    {
+      "id": 0,
+      "transform": {
+        "rot_xyzw": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "pos": [
+          -20.0,
+          0.0,
+          0.0
+        ]
+      },
+      "spatial": {
+        "Rectangle": {
+          "half_width_mm": 3.0,
+          "half_height_mm": 0.25
+        }
+      },
+      "angular": {
+        "Direction": {
+          "local_dir": [
+            1.0,
+            0.0,
+            0.0
+          ]
+        }
+      },
+      "spectrum": {
+        "Monochromatic": 0.58756
+      },
+      "flux": 1.0,
+      "samples": {
+        "spatial_samples": 9,
+        "angular_samples": 1,
+        "seed": 1,
+        "sequence": "Grid"
+      }
+    }
+  ],
+  "views": [],
+  "env": {
+    "ambient_index": 1.0,
+    "ambient_absorption": "None",
+    "wavelengths": [
+      [
+        0.58756,
+        1.0
+      ]
+    ]
+  },
+  "layers": [
+    {
+      "name": "Layer 0",
+      "visible": true,
+      "opacity": 1.0
+    }
+  ],
+  "catalog": {
+    "glasses": [
+      {
+        "name": "N-BK7",
+        "sell": {
+          "b": [
+            1.03961212,
+            0.231792344,
+            1.01046945
+          ],
+          "c": [
+            0.00600069867,
+            0.0200179144,
+            103.560653
+          ]
+        },
+        "nd": 1.5168001097398938,
+        "vd": 64.16641023507295
+      },
+      {
+        "name": "F2",
+        "sell": {
+          "b": [
+            1.34533359,
+            0.209073176,
+            0.937357162
+          ],
+          "c": [
+            0.00997743871,
+            0.0470450767,
+            111.886764
+          ]
+        },
+        "nd": 1.6200402929345499,
+        "vd": 36.365893010309826
+      },
+      {
+        "name": "N-SF11",
+        "sell": {
+          "b": [
+            1.73759695,
+            0.313747346,
+            1.89878101
+          ],
+          "c": [
+            0.013188707,
+            0.0623068142,
+            155.23629
+          ]
+        },
+        "nd": 1.7847202174912626,
+        "vd": 25.67954760100289
+      },
+      {
+        "name": "N-LAK22",
+        "sell": {
+          "b": [
+            1.14229176,
+            0.535138441,
+            1.04083092
+          ],
+          "c": [
+            0.00585673287,
+            0.019808638,
+            75.8450272
+          ]
+        },
+        "nd": 1.6507449312219062,
+        "vd": 54.97829369154724
+      },
+      {
+        "name": "FusedSilica",
+        "sell": {
+          "b": [
+            0.6961663,
+            0.4079426,
+            0.8974794
+          ],
+          "c": [
+            0.00467914825849,
+            0.013512063073959999,
+            97.93400253792099
+          ]
+        },
+        "nd": 1.4584637505239135,
+        "vd": 67.82047811745134
+      }
+    ]
+  },
+  "intent": {
+    "primary_paths": []
+  },
+  "next_id": 3
+}

@@ -9,13 +9,16 @@
 //   • Complexity slider  — slide the fit up/down the ladder, rays change live
 //   • Inspector cards    — double-click an element for a compact pop-up card;
 //                          many can be open at once, each follows its element,
-//                          every parameter is a numeric twin of a handle (§5.2)
+//                          every parameter is a numeric twin of a handle (§5.2).
+//                          The floating-window engine lives in ./cards; this
+//                          module supplies the legacy-scene data adapter.
 //   • Grid + snapping     — a spaced grid; drag snaps to it (Shift → axis /
 //                          vertex snaps instead) (§5.2)
 //   • Clipboard           — Del delete · Ctrl+C/V copy/paste · Ctrl+D duplicate
 //   • Pin tool            — lock a parameter, or a whole element (ghosted) (§5.1)
 
 import type { Canvas } from "../pkg/oc_wasm.js";
+import { createCardManager, type CardSource } from "./cards";
 
 type V2 = { x: number; y: number };
 type Tool = "select" | "draw" | "pin";
@@ -35,6 +38,14 @@ export interface AppCtx {
   render: () => void;   // main.ts renderView
   refresh: () => void;  // main.ts refreshReference (f64 detector numbers, on idle)
   demoLensId: number;
+  /// True when a canonical 3D scene owns the canvas (§10.1): the v1 element
+  /// layer is a hidden legacy scene, so its picking/selection is suppressed
+  /// (pan and zoom still work). The Scene3 view owns interaction then.
+  threeDActive?: () => boolean;
+  /// False when another view (the orbitable 3D model) owns the canvas entirely:
+  /// M3 then skips pan/zoom too, so it does not fight the 3D camera. Defaults to
+  /// always-on. The 2D cross-section view keeps this true so its pan/zoom work.
+  viewActive?: () => boolean;
   // --- M4 hooks (§5.2/§5.6). Optional so M3 stays usable standalone. ---
   /// Snapshot the settled scene into the undo tree (§5.2). Deduped in Rust.
   commit?: (label: string) => void;
@@ -62,6 +73,10 @@ export function initM3(app: AppCtx): {
   getSelected: () => number;
 } {
   const { scene, view } = app;
+  // The 2D cross-section view lets M3 own pan/zoom; the 3D model view takes the
+  // canvas over entirely, so M3 stands down (its handlers no-op) to avoid a tug
+  // of war with the orbit camera.
+  const viewOn = () => app.viewActive?.() ?? true;
   let tool: Tool = "select";
   let selected = app.demoLensId; // -1 = nothing selected
   let snapOn = false;
@@ -108,6 +123,9 @@ export function initM3(app: AppCtx): {
   // centre. Elements on hidden layers aren't pickable — make the layer visible
   // to edit it (§5.6).
   function pick(wx: number, wy: number): number {
+    // A 3D scene owns the canvas: the v1 element layer is hidden legacy state, so
+    // nothing here is pickable (empty-space drag still pans, wheel still zooms).
+    if (app.threeDActive?.()) return -1;
     const ovs = overlays().filter((o) => layerShown(o.layer));
     for (const o of ovs) {
       const poly = outlineOf(o.id);
@@ -130,47 +148,169 @@ export function initM3(app: AppCtx): {
     return (rh.x - p.x) ** 2 + (rh.y - p.y) ** 2 < 2.5 * 2.5; // within 2.5 mm
   };
 
-  // ================= tool palette =======================================
-  const toolBtns: Record<Tool, HTMLButtonElement> = {
-    select: el("tool-select"),
-    draw: el("tool-draw"),
-    pin: el("tool-pin"),
+  // ================= inspector cards — legacy-scene adapter (§5.2) =======
+  // The floating-window engine is in ./cards; this adapter is the element-
+  // specific half: what a card shows (render) and how its fields write back to
+  // the v1 scene (wire/commitCard).
+  const cardTemplate = el<HTMLTemplateElement>("cardTemplate");
+
+  // Write a card's field values back to the scene (unless the element is locked).
+  function commitCard(id: number, root: HTMLElement) {
+    if (scene.isElementLocked(id)) { cardMgr.render(id); return; }
+    const val = (n: string) => Number((root.querySelector(`input[data-name="${n}"]`) as HTMLInputElement).value);
+    scene.setElementPos(id, val("x"), val("y"));
+    scene.setElementRotDeg(id, val("rot"));
+    if (scene.singletParamsJson(id) !== "null") {
+      scene.setSingletParams(
+        id, val("radius1"), val("radius2"), val("thickness"),
+        val("half_ap1"), val("half_ap2"), val("conic_k1"), val("conic_k2"),
+      );
+    }
+    app.render(); app.refresh();
+  }
+
+  const cardSource: CardSource = {
+    template: cardTemplate,
+    toScreen: app.toScreen,
+    render2d: app.render,
+    anchorWorld: (id) => {
+      const o = overlayOf(id);
+      return o ? { x: o.x, y: o.y } : null;
+    },
+    render(id, root) {
+      const t = JSON.parse(scene.elementTransformJson(id));
+      if (!t) return false; // element vanished (deleted)
+      const q = (sel: string) => root.querySelector(sel) as HTMLElement;
+      const kind = overlayOf(id)?.kind ?? "element";
+      q(".c-title").textContent = `#${id} · ${kind}`;
+      const locked = scene.isElementLocked(id);
+      (q(".c-lock") as HTMLInputElement).checked = locked;
+
+      const setV = (name: string, v: number) => {
+        const inp = root.querySelector(`input[data-name="${name}"]`) as HTMLInputElement;
+        if (document.activeElement !== inp) inp.value = String(Number(v.toFixed(4)));
+        inp.disabled = locked;
+      };
+      setV("x", t.x); setV("y", t.y); setV("rot", t.rot_deg);
+
+      const sp = JSON.parse(scene.singletParamsJson(id));
+      q(".c-singlet").style.display = sp ? "block" : "none";
+      if (sp) for (const name of SINGLET_FIELDS) setV(name, sp[name]);
+
+      const fit: (Fit & { current: number }) | null = JSON.parse(scene.elementFitJson(id));
+      q(".c-fit").style.display = fit ? "block" : "none";
+      if (fit) {
+        (q(".c-fitslider") as HTMLInputElement).value = String(fit.current);
+        const r = fit.rungs[fit.current];
+        q(".c-fitlabel").textContent = `${r.name} · ${r.residual_um.toFixed(2)} µm`;
+      }
+
+      const pinned: string[] = JSON.parse(scene.pinnedParamsJson(id));
+      root.querySelectorAll<HTMLButtonElement>("button.pin[data-name]").forEach((btn) => {
+        const on = pinned.includes(btn.dataset.name!);
+        btn.classList.toggle("pinned", on);
+        btn.textContent = on ? "📌" : "📍";
+      });
+      return true;
+    },
+    wire(id, root, api) {
+      const q = <T extends HTMLElement>(sel: string) => root.querySelector(sel) as T;
+      q<HTMLInputElement>(".c-lock").addEventListener("change", (e) => {
+        scene.setElementLocked(id, (e.target as HTMLInputElement).checked);
+        api.rerender(id); app.render(); commit("lock");
+      });
+      q<HTMLInputElement>(".c-fitslider").addEventListener("input", (e) => {
+        const res = scene.setElementFitRung(id, Number((e.target as HTMLInputElement).value));
+        if (res >= 0) q(".c-fitlabel").textContent = `residual ${res.toFixed(2)} µm`;
+        app.render(); app.refresh(); // ← rays visibly change as you slide (§5.3)
+        commitSoon("fit complexity");
+      });
+      root.querySelectorAll<HTMLInputElement>("input[data-name]").forEach((input) => {
+        const name = input.dataset.name!;
+        const step = STEP[name] ?? 0.25;
+        let before = "";
+        input.addEventListener("focus", () => { before = input.value; });
+        input.addEventListener("keydown", (e) => {
+          if (e.key === "Escape") { input.value = before; input.blur(); commitCard(id, root); }
+          e.stopPropagation(); // keep field keys out of the global shortcuts
+        });
+        input.addEventListener("input", () => { commitCard(id, root); commitSoon("edit params"); });
+        input.addEventListener("wheel", (e) => { // hover-scroll scrubs (§5.2)
+          e.preventDefault();
+          const dir = e.deltaY < 0 ? 1 : -1;
+          input.value = String(Number((Number(input.value) + dir * step * (e.shiftKey ? 10 : 1)).toFixed(6)));
+          commitCard(id, root); commitSoon("edit params");
+        }, { passive: false });
+      });
+      root.querySelectorAll<HTMLButtonElement>("button.pin[data-name]").forEach((btn) => {
+        const name = btn.dataset.name!;
+        btn.addEventListener("click", () => {
+          scene.setParamPinned(id, name, !scene.isParamPinned(id, name));
+          api.rerender(id); commit("pin");
+        });
+      });
+    },
   };
+
+  const cardMgr = createCardManager(cardSource);
+
+  // ================= tool palette =======================================
+  // The v1 select/draw/pin palette is retired in the always-3D app (the Scene3
+  // view owns editing). When its buttons/fit panel are absent, these lookups are
+  // null and the tool concept degrades to a no-op: pan/zoom and the shared grid
+  // are all m3 still contributes, and both work without a palette.
+  const maybe = <T extends HTMLElement>(id: string) => document.getElementById(id) as T | null;
+  const toolBtns: Partial<Record<Tool, HTMLButtonElement | null>> = {
+    select: maybe<HTMLButtonElement>("tool-select"),
+    draw: maybe<HTMLButtonElement>("tool-draw"),
+    pin: maybe<HTMLButtonElement>("tool-pin"),
+  };
+  const hasTools = !!toolBtns.select;
   function setTool(t: Tool) {
+    if (t === "draw" && !hasFit) return; // no fit panel → drawing is disabled
     if (t !== "draw") cancelDraw();
     tool = t;
-    for (const k of Object.keys(toolBtns) as Tool[]) toolBtns[k].classList.toggle("active", k === t);
+    if (!hasTools) return;
+    for (const k of Object.keys(toolBtns) as Tool[]) toolBtns[k]?.classList.toggle("active", k === t);
     view.style.cursor = t === "draw" ? "crosshair" : t === "pin" ? "not-allowed" : "grab";
-    el("m3hint").textContent =
+    const hint = maybe("m3hint");
+    if (hint) hint.textContent =
       t === "draw" ? "drag to sketch a surface · release to fit"
       : t === "pin" ? "click an element to lock it (ghosted)"
       : "drag · dbl-click inspect · scroll=zoom · drag bg=pan · 0 resets";
     app.render();
   }
-  for (const k of Object.keys(toolBtns) as Tool[]) toolBtns[k].onclick = () => setTool(k);
+  if (hasTools) for (const k of Object.keys(toolBtns) as Tool[]) {
+    const btn = toolBtns[k];
+    if (btn) btn.onclick = () => setTool(k);
+  }
 
   // ================= keyboard: tools, clipboard, delete, nudge ==========
   window.addEventListener("keydown", (e) => {
     if (e.target instanceof HTMLInputElement) return; // let fields have their keys
     const mod = e.ctrlKey || e.metaKey;
+    // A 3D scene owns element editing: the clipboard/delete/nudge verbs act on
+    // the Scene3 selection (handled in slice3d), so defer them here.
+    const in3d = app.threeDActive?.() ?? false;
     if (e.key === "Shift") { snapOn = true; return; }
-    if (mod && (e.key === "c" || e.key === "C")) { copySelection(); e.preventDefault(); return; }
-    if (mod && (e.key === "v" || e.key === "V")) { pasteClipboard(); e.preventDefault(); return; }
-    if (mod && (e.key === "x" || e.key === "X")) { copySelection(); deleteSelection(); e.preventDefault(); return; }
-    if (mod && (e.key === "d" || e.key === "D")) { copySelection(); pasteClipboard(); e.preventDefault(); return; }
-    if (e.key === "Delete" || e.key === "Backspace") { deleteSelection(); e.preventDefault(); return; }
-    if (e.key === "Escape") { closeAllCards(); deselect(); return; }
-    if (e.key.startsWith("Arrow")) { nudge(e.key); e.preventDefault(); return; }
+    if (!in3d && mod && (e.key === "c" || e.key === "C")) { copySelection(); e.preventDefault(); return; }
+    if (!in3d && mod && (e.key === "v" || e.key === "V")) { pasteClipboard(); e.preventDefault(); return; }
+    if (!in3d && mod && (e.key === "x" || e.key === "X")) { copySelection(); deleteSelection(); e.preventDefault(); return; }
+    if (!in3d && mod && (e.key === "d" || e.key === "D")) { copySelection(); pasteClipboard(); e.preventDefault(); return; }
+    if (!in3d && (e.key === "Delete" || e.key === "Backspace")) { deleteSelection(); e.preventDefault(); return; }
+    if (e.key === "Escape") { cardMgr.closeAll(); deselect(); return; }
+    if (!in3d && e.key.startsWith("Arrow")) { nudge(e.key); e.preventDefault(); return; }
     if (mod) return; // don't hijack other shortcuts
-    if (e.key === "v") setTool("select");
-    else if (e.key === "d") setTool("draw");
-    else if (e.key === "p") setTool("pin");
-    else if (e.key === "0") { app.resetView(); positionAllCards(); app.render(); }
-    else if (e.key === "+" || e.key === "=") { app.zoomAt(window.innerWidth / 2, window.innerHeight / 2, 1.12); positionAllCards(); app.render(); }
-    else if (e.key === "-" || e.key === "_") { app.zoomAt(window.innerWidth / 2, window.innerHeight / 2, 1 / 1.12); positionAllCards(); app.render(); }
+    if (hasTools && e.key === "v") setTool("select");
+    else if (hasTools && e.key === "d") setTool("draw");
+    else if (hasTools && e.key === "p") setTool("pin");
+    else if (!viewOn()) return; // the view keys below belong to the active view
+    else if (e.key === "0") { app.resetView(); cardMgr.positionAll(); app.render(); }
+    else if (e.key === "+" || e.key === "=") { app.zoomAt(window.innerWidth / 2, window.innerHeight / 2, 1.12); cardMgr.positionAll(); app.render(); }
+    else if (e.key === "-" || e.key === "_") { app.zoomAt(window.innerWidth / 2, window.innerHeight / 2, 1 / 1.12); cardMgr.positionAll(); app.render(); }
   });
   window.addEventListener("keyup", (e) => { if (e.key === "Shift") snapOn = false; });
-  window.addEventListener("resize", () => positionAllCards());
+  window.addEventListener("resize", () => cardMgr.positionAll());
 
   function nudge(arrow: string) {
     if (selected < 0) return;
@@ -190,8 +330,8 @@ export function initM3(app: AppCtx): {
     const del = selected;
     if (!scene.deleteElement(del)) return;
     // ids above `del` shift down by one; keep the open cards in step.
-    closeCard(del);
-    for (const c of cards) if (c.id > del) c.id -= 1;
+    cardMgr.close(del);
+    cardMgr.shiftIdsAfter(del);
     deselect();
     afterSceneEdit("delete");
   }
@@ -200,17 +340,18 @@ export function initM3(app: AppCtx): {
     pasteN++;
     const off = gridOn() ? gridStep() : 5;
     const id = scene.pasteElement(clipboard, off * pasteN, -off * pasteN);
-    if (id >= 0) { selected = id; openCard(id); afterSceneEdit("paste"); }
+    if (id >= 0) { selected = id; cardMgr.open(id); afterSceneEdit("paste"); }
   }
-  function afterSceneEdit(label = "edit") { renderAllCards(); positionAllCards(); app.render(); app.refresh(); commit(label); }
+  function afterSceneEdit(label = "edit") { cardMgr.renderAll(); cardMgr.positionAll(); app.render(); app.refresh(); commit(label); }
 
   // ================= view: zoom + pan ===================================
   let pan: { x: number; y: number } | null = null;
   const startPan = (e: PointerEvent) => { pan = { x: e.clientX, y: e.clientY }; view.setPointerCapture(e.pointerId); };
   view.addEventListener("wheel", (e) => {
+    if (!viewOn()) return; // the 3D model view owns the wheel
     e.preventDefault();
     app.zoomAt(e.clientX, e.clientY, e.deltaY < 0 ? 1.12 : 1 / 1.12); // zoom to cursor
-    positionAllCards();
+    cardMgr.positionAll();
     app.render();
   }, { passive: false });
 
@@ -220,12 +361,13 @@ export function initM3(app: AppCtx): {
   let gridMark: V2 | null = null;
 
   view.addEventListener("pointerdown", (e) => {
+    if (!viewOn()) return; // the 3D model view owns the canvas
     if (e.button === 1) { startPan(e); e.preventDefault(); return; } // middle-drag pans anywhere
     if (tool === "draw") return startDraw(e);
     const p = app.toWorld(e.clientX, e.clientY);
     if (tool === "pin") {
       const id = pick(p.x, p.y);
-      if (id >= 0) { scene.setElementLocked(id, !scene.isElementLocked(id)); selected = id; renderCardOf(id); app.render(); commit("lock"); }
+      if (id >= 0) { scene.setElementLocked(id, !scene.isElementLocked(id)); selected = id; cardMgr.render(id); app.render(); commit("lock"); }
       return;
     }
     // select tool — the rotation handle lives *outside* the body, so grab it
@@ -254,7 +396,7 @@ export function initM3(app: AppCtx): {
     if (pan) {
       app.panBy(e.clientX - pan.x, e.clientY - pan.y);
       pan = { x: e.clientX, y: e.clientY };
-      positionAllCards();
+      cardMgr.positionAll();
       app.render();
       return;
     }
@@ -278,8 +420,7 @@ export function initM3(app: AppCtx): {
       }
       scene.setElementPos(drag.id, x, y);
     }
-    const c = cardOf(drag.id);
-    if (c) { renderCard(c); positionCard(c); } // the card follows its element
+    cardMgr.refresh(drag.id); // the card follows its element
     app.render();
   });
 
@@ -306,7 +447,7 @@ export function initM3(app: AppCtx): {
     if (tool !== "select") return;
     const p = app.toWorld(e.clientX, e.clientY);
     const id = pick(p.x, p.y);
-    if (id >= 0) { selected = id; openCard(id); app.render(); }
+    if (id >= 0) { selected = id; cardMgr.open(id); app.render(); }
   });
 
   // ================= draw tool (freehand → fit, §5.3) ===================
@@ -314,12 +455,14 @@ export function initM3(app: AppCtx): {
   let drawingNow = false;                      // pointer is down and sketching
   let pendingFit: Fit | null = null;
   let pendingRung = 0;
-  const fitPanel = el("fitpanel");
-  const fitSlider = el<HTMLInputElement>("fitSlider");
-  const fitLabel = el("fitLabel");
-  const fitMirror = el<HTMLInputElement>("fitMirror");
+  const fitPanel = maybe("fitpanel");
+  const fitSlider = maybe<HTMLInputElement>("fitSlider");
+  const fitLabel = maybe("fitLabel");
+  const fitMirror = maybe<HTMLInputElement>("fitMirror");
+  const hasFit = !!fitPanel;
 
   function startDraw(e: PointerEvent) {
+    if (!hasFit) return;
     cancelDraw();
     const p = app.toWorld(e.clientX, e.clientY);
     stroke = [p.x, p.y];
@@ -343,231 +486,33 @@ export function initM3(app: AppCtx): {
     if (json === "null") { stroke = null; app.render(); return; }
     pendingFit = JSON.parse(json);
     pendingRung = pendingFit!.chosen;
-    fitSlider.value = String(pendingRung);
+    if (fitSlider) fitSlider.value = String(pendingRung);
     updateFitLabel();
-    fitPanel.style.display = "block";
+    if (fitPanel) fitPanel.style.display = "block";
     app.render();
   }
   function updateFitLabel() {
-    if (!pendingFit) return;
+    if (!pendingFit || !fitLabel) return;
     const r = pendingFit.rungs[pendingRung];
     const dof = r.dof > 1000 ? "free" : String(r.dof);
     fitLabel.textContent = `${r.name} · ${dof} dof · residual ${r.residual_um.toFixed(2)} µm`;
   }
-  fitSlider.oninput = () => { pendingRung = Number(fitSlider.value); updateFitLabel(); app.render(); };
-  el("fitCommit").onclick = () => {
+  if (fitSlider) fitSlider.oninput = () => { pendingRung = Number(fitSlider.value); updateFitLabel(); app.render(); };
+  if (hasFit) maybe<HTMLButtonElement>("fitCommit")!.onclick = () => {
     if (!stroke || !pendingFit) return;
     const id = scene.addFittedElement(
       new Float64Array(stroke), 1.0, pendingRung, DRAW_THICKNESS,
-      DRAW_GLASS.nd, DRAW_GLASS.vd, fitMirror.checked, // ← draw a mirror instead of glass
+      DRAW_GLASS.nd, DRAW_GLASS.vd, fitMirror!.checked, // ← draw a mirror instead of glass
     );
     cancelDraw();
     if (id >= 0) { selected = id; setTool("select"); }
     app.render(); app.refresh();
     if (id >= 0) commit("draw"); // undo-tree snapshot (§5.2)
   };
-  el("fitCancel").onclick = () => { cancelDraw(); app.render(); };
+  if (hasFit) maybe<HTMLButtonElement>("fitCancel")!.onclick = () => { cancelDraw(); app.render(); };
   function cancelDraw() {
     stroke = null; drawingNow = false; pendingFit = null;
-    fitPanel.style.display = "none";
-  }
-
-  // ================= inspector cards (multiple, pop-up, §5.2) ===========
-  const cardTemplate = el<HTMLTemplateElement>("cardTemplate");
-  // A card tracks its element by an `offset` from the element's screen position
-  // (so it follows as you drag the element), unless its location is `pinned`, in
-  // which case it stays at an absolute screen position `abs`.
-  type Card = {
-    id: number;
-    root: HTMLElement;
-    offset: { dx: number; dy: number };
-    pinned: boolean;
-    abs: { left: number; top: number } | null;
-  };
-  const cards: Card[] = [];
-  let zTop = 40;
-  const cardOf = (id: number): Card | undefined => cards.find((c) => c.id === id);
-
-  function openCard(id: number) {
-    const existing = cardOf(id);
-    if (existing) { renderCard(existing); positionCard(existing); existing.root.style.zIndex = String(++zTop); return; }
-    const frag = cardTemplate.content.cloneNode(true) as DocumentFragment;
-    const root = frag.querySelector(".card") as HTMLElement;
-    document.body.appendChild(root);
-    // Stagger new cards diagonally so those anchored to nearby elements don't
-    // land exactly on top of each other (drag / pin them from there).
-    const n = cards.length % 6;
-    const card: Card = { id, root, offset: { dx: 22 + n * 16, dy: -24 + n * 16 }, pinned: false, abs: null };
-    cards.push(card);
-    wireCard(card);
-    renderCard(card);
-    positionCard(card);
-    root.style.zIndex = String(++zTop);
-  }
-  function closeCard(id: number) {
-    const i = cards.findIndex((c) => c.id === id);
-    if (i >= 0) { cards[i].root.remove(); cards.splice(i, 1); }
-  }
-  function closeAllCards() { for (const c of cards) c.root.remove(); cards.length = 0; }
-  const renderCardOf = (id: number) => { const c = cardOf(id); if (c) renderCard(c); };
-  function renderAllCards() { for (const c of [...cards]) renderCard(c); }
-  function positionAllCards() { for (const c of cards) positionCard(c); }
-
-  // Record where a card sits: either its absolute position (if pinned) or its
-  // offset from the element (so it keeps following after being dragged).
-  function anchorCard(card: Card, left: number, top: number) {
-    if (card.pinned) { card.abs = { left, top }; return; }
-    const o = overlayOf(card.id);
-    if (o) { const s = app.toScreen(o); card.offset = { dx: left - s.x, dy: top - s.y }; }
-  }
-
-  function wireCard(card: Card) {
-    const q = <T extends HTMLElement>(sel: string) => card.root.querySelector(sel) as T;
-    card.root.addEventListener("pointerdown", () => { card.root.style.zIndex = String(++zTop); });
-    q<HTMLButtonElement>(".c-close").addEventListener("click", () => closeCard(card.id));
-
-    // pin the card's *location* (park it; it stops following the element).
-    q<HTMLButtonElement>(".c-pinpos").addEventListener("click", () => {
-      const r = card.root.getBoundingClientRect();
-      card.pinned = !card.pinned;
-      anchorCard(card, r.left, r.top);
-      renderCard(card);
-    });
-
-    // drag the card by its header (so overlapping cards can be pulled apart).
-    const header = q<HTMLElement>("h3");
-    let grab: { x: number; y: number } | null = null;
-    header.addEventListener("pointerdown", (e) => {
-      if ((e.target as HTMLElement).closest("button")) return; // buttons aren't drag
-      const r = card.root.getBoundingClientRect();
-      grab = { x: e.clientX - r.left, y: e.clientY - r.top };
-      card.root.style.zIndex = String(++zTop);
-      header.setPointerCapture(e.pointerId);
-      e.preventDefault();
-    });
-    header.addEventListener("pointermove", (e) => {
-      if (!grab) return;
-      const pw = card.root.offsetWidth, ph = card.root.offsetHeight;
-      const left = Math.min(Math.max(0, e.clientX - grab.x), window.innerWidth - pw);
-      const top = Math.min(Math.max(0, e.clientY - grab.y), window.innerHeight - ph);
-      card.root.style.left = `${left}px`;
-      card.root.style.top = `${top}px`;
-      anchorCard(card, left, top);
-      app.render(); // redraw the leader line to track the card
-    });
-    const endCardDrag = (e: PointerEvent) => {
-      if (!grab) return;
-      grab = null;
-      try { header.releasePointerCapture(e.pointerId); } catch { /* ignore */ }
-    };
-    header.addEventListener("pointerup", endCardDrag);
-    header.addEventListener("pointercancel", endCardDrag);
-    q<HTMLInputElement>(".c-lock").addEventListener("change", (e) => {
-      scene.setElementLocked(card.id, (e.target as HTMLInputElement).checked);
-      renderCard(card); app.render(); commit("lock");
-    });
-    q<HTMLInputElement>(".c-fitslider").addEventListener("input", (e) => {
-      const res = scene.setElementFitRung(card.id, Number((e.target as HTMLInputElement).value));
-      if (res >= 0) q(".c-fitlabel").textContent = `residual ${res.toFixed(2)} µm`;
-      app.render(); app.refresh(); // ← rays visibly change as you slide (§5.3)
-      commitSoon("fit complexity");
-    });
-    card.root.querySelectorAll<HTMLInputElement>("input[data-name]").forEach((input) => {
-      const name = input.dataset.name!;
-      const step = STEP[name] ?? 0.25;
-      let before = "";
-      input.addEventListener("focus", () => { before = input.value; });
-      input.addEventListener("keydown", (e) => {
-        if (e.key === "Escape") { input.value = before; input.blur(); commitCard(card); }
-        e.stopPropagation(); // keep field keys out of the global shortcuts
-      });
-      input.addEventListener("input", () => { commitCard(card); commitSoon("edit params"); });
-      input.addEventListener("wheel", (e) => { // hover-scroll scrubs (§5.2)
-        e.preventDefault();
-        const dir = e.deltaY < 0 ? 1 : -1;
-        input.value = String(Number((Number(input.value) + dir * step * (e.shiftKey ? 10 : 1)).toFixed(6)));
-        commitCard(card); commitSoon("edit params");
-      }, { passive: false });
-    });
-    card.root.querySelectorAll<HTMLButtonElement>("button.pin[data-name]").forEach((btn) => {
-      const name = btn.dataset.name!;
-      btn.addEventListener("click", () => {
-        scene.setParamPinned(card.id, name, !scene.isParamPinned(card.id, name));
-        renderCard(card); commit("pin");
-      });
-    });
-  }
-
-  function commitCard(card: Card) {
-    if (scene.isElementLocked(card.id)) { renderCard(card); return; }
-    const val = (n: string) => Number((card.root.querySelector(`input[data-name="${n}"]`) as HTMLInputElement).value);
-    scene.setElementPos(card.id, val("x"), val("y"));
-    scene.setElementRotDeg(card.id, val("rot"));
-    if (scene.singletParamsJson(card.id) !== "null") {
-      scene.setSingletParams(
-        card.id, val("radius1"), val("radius2"), val("thickness"),
-        val("half_ap1"), val("half_ap2"), val("conic_k1"), val("conic_k2"),
-      );
-    }
-    app.render(); app.refresh();
-  }
-
-  function renderCard(card: Card) {
-    const t = JSON.parse(scene.elementTransformJson(card.id));
-    if (!t) { closeCard(card.id); return; } // element vanished (deleted)
-    const q = (sel: string) => card.root.querySelector(sel) as HTMLElement;
-    const kind = overlayOf(card.id)?.kind ?? "element";
-    q(".c-title").textContent = `#${card.id} · ${kind}`;
-    const locked = scene.isElementLocked(card.id);
-    (q(".c-lock") as HTMLInputElement).checked = locked;
-    const pinBtn = q(".c-pinpos");
-    pinBtn.classList.toggle("pinned", card.pinned);
-    pinBtn.textContent = card.pinned ? "📌" : "📍";
-
-    const setV = (name: string, v: number) => {
-      const inp = card.root.querySelector(`input[data-name="${name}"]`) as HTMLInputElement;
-      if (document.activeElement !== inp) inp.value = String(Number(v.toFixed(4)));
-      inp.disabled = locked;
-    };
-    setV("x", t.x); setV("y", t.y); setV("rot", t.rot_deg);
-
-    const sp = JSON.parse(scene.singletParamsJson(card.id));
-    q(".c-singlet").style.display = sp ? "block" : "none";
-    if (sp) for (const name of SINGLET_FIELDS) setV(name, sp[name]);
-
-    const fit: (Fit & { current: number }) | null = JSON.parse(scene.elementFitJson(card.id));
-    q(".c-fit").style.display = fit ? "block" : "none";
-    if (fit) {
-      (q(".c-fitslider") as HTMLInputElement).value = String(fit.current);
-      const r = fit.rungs[fit.current];
-      q(".c-fitlabel").textContent = `${r.name} · ${r.residual_um.toFixed(2)} µm`;
-    }
-
-    const pinned: string[] = JSON.parse(scene.pinnedParamsJson(card.id));
-    card.root.querySelectorAll<HTMLButtonElement>("button.pin[data-name]").forEach((btn) => {
-      const on = pinned.includes(btn.dataset.name!);
-      btn.classList.toggle("pinned", on);
-      btn.textContent = on ? "📌" : "📍";
-    });
-  }
-
-  // Place a card: at its pinned absolute position, or at its element + offset.
-  function positionCard(card: Card) {
-    const pw = card.root.offsetWidth || 176, ph = card.root.offsetHeight || 220;
-    let left: number, top: number;
-    if (card.pinned && card.abs) {
-      ({ left, top } = card.abs);
-    } else {
-      const o = overlayOf(card.id);
-      if (!o) return;
-      const s = app.toScreen(o);
-      left = s.x + card.offset.dx;
-      top = s.y + card.offset.dy;
-    }
-    left = Math.min(Math.max(0, left), window.innerWidth - pw);
-    top = Math.min(Math.max(0, top), window.innerHeight - ph);
-    card.root.style.left = `${left}px`;
-    card.root.style.top = `${top}px`;
+    if (fitPanel) fitPanel.style.display = "none";
   }
 
   function deselect() { selected = -1; app.render(); }
@@ -646,22 +591,7 @@ export function initM3(app: AppCtx): {
 
     // 2b. leader lines — a thin connector from each open card to its element,
     //     so you can tell which card belongs to which when they're pulled apart.
-    for (const card of cards) {
-      const o = overlayOf(card.id);
-      if (!o) continue;
-      const s = app.toScreen(o);
-      // Anchor on the card's *border* (never the element itself) so the line is
-      // always drawn — even when the card overlaps the element near the axis.
-      const a = anchorOnCard(s.x, s.y, card.root.getBoundingClientRect());
-      ctx.strokeStyle = card.id === selected ? "rgba(127,214,255,0.6)" : "rgba(127,214,255,0.32)";
-      ctx.lineWidth = 1;
-      ctx.setLineDash([4, 3]);
-      line(ctx, s.x, s.y, a.x, a.y);
-      ctx.setLineDash([]);
-      ctx.fillStyle = "rgba(127,214,255,0.8)";
-      ctx.beginPath(); ctx.arc(s.x, s.y, 2.5, 0, Math.PI * 2); ctx.fill();
-      ctx.beginPath(); ctx.arc(a.x, a.y, 2, 0, Math.PI * 2); ctx.fill();
-    }
+    cardMgr.drawLeaders(ctx, selected);
 
     // 3. snap feedback — glowing guides (axis/vertex) or a grid marker (§5.2).
     if (lastSnap && lastSnap.snaps.length) {
@@ -704,12 +634,12 @@ export function initM3(app: AppCtx): {
 
   // Re-sync UI to the scene after an external mutation the module didn't drive
   // (undo/redo/jump, a layer edit): clamp the selection and refresh open cards
-  // (renderCard self-closes any whose element vanished).
+  // (the card source's render self-closes any whose element vanished).
   function sync() {
     const n = scene.elementCount();
     if (selected >= n) selected = n > 0 ? n - 1 : -1;
-    renderAllCards();
-    positionAllCards();
+    cardMgr.renderAll();
+    cardMgr.positionAll();
   }
 
   setTool("select");
@@ -718,19 +648,4 @@ export function initM3(app: AppCtx): {
 
 function line(ctx: CanvasRenderingContext2D, x0: number, y0: number, x1: number, y1: number) {
   ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
-}
-
-// The point on rectangle `r`'s border nearest to `(px, py)`. For a point outside
-// the box this is the clamp; for a point inside it projects to the closest edge
-// (so a card overlapping its element still shows a connector).
-function anchorOnCard(px: number, py: number, r: DOMRect): { x: number; y: number } {
-  const cx = Math.min(Math.max(px, r.left), r.right);
-  const cy = Math.min(Math.max(py, r.top), r.bottom);
-  if (cx !== px || cy !== py) return { x: cx, y: cy };
-  const dl = px - r.left, dr = r.right - px, dt = py - r.top, db = r.bottom - py;
-  const m = Math.min(dl, dr, dt, db);
-  if (m === dl) return { x: r.left, y: py };
-  if (m === dr) return { x: r.right, y: py };
-  if (m === dt) return { x: px, y: r.top };
-  return { x: px, y: r.bottom };
 }

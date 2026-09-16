@@ -24,3 +24,9 @@ rayon = { workspace = true, optional = true }
 
 [dev-dependencies]
 serde_json.workspace = true
+
+# CV-A: the headless Scene3 trace runner (§16). Needs the 3D reference tracer, so
+# it is skipped by a default `cargo build`; run with `--features trace3`.
+[[example]]
+name = "scene3_trace"
+required-features = ["trace3"]

@@ -2,11 +2,12 @@
 # Scenes are scratch output, except where they are content: the committed
 # examples, the module fragments the openUC2 catalogue serves to the browser
 # (without these the catalogue loads but every module reports missing optics),
-# and the schema fixtures a test `include_str!`s (without these the test does not
-# compile).
+# the schema fixtures a test `include_str!`s (without these the test does not
+# compile), and the 3D-preview demos the slice3d Playwright spec opens.
 *.ocanvas
 !examples/**/*.ocanvas
 !web/public/catalog/**/*.ocanvas
+!web/public/demo-*.ocanvas
 !crates/*/tests/data/**/*.ocanvas
 
 # web shell

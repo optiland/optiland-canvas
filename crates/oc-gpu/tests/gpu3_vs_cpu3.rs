@@ -235,6 +235,77 @@ fn tracer_or_skip() -> Option<Gpu3Tracer> {
     }
 }
 
+/// With ghosts on, a ray splits at every interface, so its tree can outgrow the
+/// shader's per-ray segment budget. The shader must trace the CPU mirror's tree
+/// when it fits, and must report a budget that is too small instead of returning
+/// a thinner tree.
+#[test]
+fn ghost_trees_match_cpu_and_a_short_budget_is_reported() {
+    let Some(tracer) = tracer_or_skip() else {
+        return;
+    };
+
+    let mut scene = Scene3::new();
+    push_body(
+        &mut scene,
+        SolidGeometry3::Sphere { radius_mm: 8.0 },
+        glass(1.5),
+    );
+    scene.validate().unwrap();
+    let rays = [
+        (Vec3::new(-20.0, 0.0, 0.0), Vec3::X),
+        (Vec3::new(-20.0, 3.0, 0.0), Vec3::X),
+        (Vec3::new(-20.0, 2.5, -2.5), Vec3::X),
+    ];
+    let ghosts = BuildOpts {
+        ghosts: true,
+        flux_eps: 1e-9,
+        max_ghost: 2,
+    };
+    let gpu_scene = GpuScene3::build_with_rays(&scene, &emitted(&rays), ghosts);
+    assert!(gpu_scene.rejected.is_empty(), "{:?}", gpu_scene.rejected);
+
+    let cpu = cpu3::trace_segments(&gpu_scene, MAX_DEPTH);
+    let longest = cpu.iter().map(Vec::len).max().unwrap();
+    assert!(
+        longest > 2,
+        "the fixture must branch; longest ray has {longest} segments"
+    );
+
+    // Too small a budget is reported, never silently clipped.
+    let short = tracer.trace_checked(&gpu_scene, MAX_DEPTH, 2);
+    assert!(
+        short.budget_truncated > 0,
+        "a 2-segment budget must be reported"
+    );
+    assert_eq!(short.stack_truncated, 0);
+
+    // A budget that holds the tree reproduces the CPU mirror, ghosts included.
+    let budget = (longest as u32).next_power_of_two().max(MAX_SEGS);
+    let full = tracer.trace_checked(&gpu_scene, MAX_DEPTH, budget);
+    assert!(
+        full.is_complete(),
+        "budget {budget}: {} rays over budget",
+        full.budget_truncated
+    );
+    let pos_tol = tol(gpu_scene.norm.scale);
+    assert_eq!(cpu.len(), full.segments.len(), "ray count");
+    for (ri, (csegs, gsegs)) in cpu.iter().zip(&full.segments).enumerate() {
+        assert_eq!(csegs.len(), gsegs.len(), "ray {ri}: segment count");
+        for (i, (c, g)) in csegs.iter().zip(gsegs).enumerate() {
+            assert_eq!(c.flags, g.flags, "ray {ri} seg {i}: flags");
+            assert_seg(c, g, pos_tol, ri, i, rays[ri]);
+        }
+    }
+    assert!(
+        full.segments
+            .iter()
+            .flatten()
+            .any(|s| s.flags & cpu3::SEG_GHOST != 0),
+        "the fixture must trace at least one ghost branch"
+    );
+}
+
 #[test]
 fn sphere_box_cylinder_match_cpu() {
     let Some(tracer) = tracer_or_skip() else {

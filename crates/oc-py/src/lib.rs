@@ -5,10 +5,13 @@
 //! the neutral sequential prescription into an Optiland `Optic` and back, so
 //! there is exactly one implementation of "what a lens is" and it is in Rust.
 //!
-//! The three exchanges crossing this boundary are all JSON strings:
+//! The exchanges crossing this boundary are all JSON strings:
 //! - [`scene_to_seq`] `.ocanvas` → sequential-prescription JSON (+ fidelity notes)
 //! - [`seq_to_scene`] sequential-prescription JSON → `.ocanvas`
 //! - [`validate`] parse-and-version-check an `.ocanvas` document
+//! - [`scene3_sequence`] `.ocanvas` (v1 or v2) → `oc-seq3` axial-ray sequence
+//!   prescription for one source/detector pair — the 3D, trace-derived sibling
+//!   of [`scene_to_seq`]
 
 use oc_core::{Scene, SeqSystem, OCANVAS_FORMAT, OCANVAS_VERSION};
 use pyo3::exceptions::PyValueError;
@@ -46,6 +49,53 @@ fn validate(ocanvas_json: &str) -> PyResult<u32> {
     Ok(scene.version)
 }
 
+/// Extract the ordered surface chain the axial ray of `source_id` threads on
+/// its way to `detector_id`, from an `.ocanvas` document (v1 documents migrate
+/// on load). Returns `oc-seq3` prescription JSON.
+///
+/// Raises `ValueError` when the document does not parse, the ids are unknown,
+/// the axial ray never reaches the detector (the message lists every branch's
+/// fate), or it reaches it along more than one chain (the message lists the
+/// chains).
+#[pyfunction]
+#[pyo3(signature = (ocanvas_json, source_id, detector_id, revision = 0))]
+fn scene3_sequence(
+    ocanvas_json: &str,
+    source_id: u64,
+    detector_id: u64,
+    revision: u64,
+) -> PyResult<String> {
+    let (scene, _report) = oc_core::migrate_v1::load_any(ocanvas_json).map_err(to_py_err)?;
+    oc_trace::sequence3::extract_sequence3(
+        &scene,
+        oc_core::id::SourceId(source_id),
+        oc_core::id::DetectorId(detector_id),
+        revision,
+    )
+    .map(|p| p.to_json())
+    .map_err(to_py_err)
+}
+
+/// [`scene3_sequence`] for a declared primary-path intent: resolves the
+/// intent's source/detector pair and stamps the intent id into the
+/// prescription.
+#[pyfunction]
+#[pyo3(signature = (ocanvas_json, intent_id, revision = 0))]
+fn scene3_sequence_for_intent(
+    ocanvas_json: &str,
+    intent_id: u64,
+    revision: u64,
+) -> PyResult<String> {
+    let (scene, _report) = oc_core::migrate_v1::load_any(ocanvas_json).map_err(to_py_err)?;
+    oc_trace::sequence3::extract_for_intent(
+        &scene,
+        oc_core::id::PathIntentId(intent_id),
+        revision,
+    )
+    .map(|p| p.to_json())
+    .map_err(to_py_err)
+}
+
 /// The `.ocanvas` schema version this build writes.
 #[pyfunction]
 fn format_version() -> u32 {
@@ -80,6 +130,8 @@ fn to_py_err<E: std::fmt::Display>(e: E) -> PyErr {
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(scene_to_seq, m)?)?;
     m.add_function(wrap_pyfunction!(seq_to_scene, m)?)?;
+    m.add_function(wrap_pyfunction!(scene3_sequence, m)?)?;
+    m.add_function(wrap_pyfunction!(scene3_sequence_for_intent, m)?)?;
     m.add_function(wrap_pyfunction!(normalize, m)?)?;
     m.add_function(wrap_pyfunction!(validate, m)?)?;
     m.add_function(wrap_pyfunction!(format_version, m)?)?;

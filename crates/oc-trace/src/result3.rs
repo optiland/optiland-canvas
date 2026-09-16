@@ -74,6 +74,77 @@ pub struct DetectorHit3 {
     pub ghost_depth: u32,
 }
 
+/// The role a spawned child branch plays at an interaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildRole {
+    /// Continued through the interface (Snell across a real transition, or
+    /// undeviated where both sides share a medium).
+    Transmit,
+    /// Specular reflection: a mirror, a splitter's reflected arm, or a Fresnel
+    /// ghost.
+    Reflect,
+    /// Total internal reflection (R = 1, the primary path).
+    Tir,
+    /// The ideal thin-lens bend of a standalone surface.
+    ThinLens,
+}
+
+/// What an event-log entry records (see [`TraceEvent3`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum TraceEventKind {
+    /// An interaction with a body patch or a standalone surface. `children`
+    /// lists the branches actually spawned, in spawn order; an entry that
+    /// terminated the branch (absorber, unsupported response, every child
+    /// culled) has an empty list.
+    Interact {
+        surface: SurfaceRef,
+        /// True for a closed body's patch, false for a standalone surface.
+        body: bool,
+        /// Unit normal at the hit, oriented against the incident ray.
+        normal: Vec3,
+        /// Refractive index of the medium the ray arrived through.
+        n1: f64,
+        /// Refractive index on the far side (equal to `n1` at a zero-thickness
+        /// surface).
+        n2: f64,
+        children: Vec<(ChildRole, PathId)>,
+    },
+    /// The branch met a detector face. `terminal` follows the detector's
+    /// termination policy; a probe records the hit and the branch continues
+    /// under the same path id.
+    DetectorHit {
+        detector: DetectorId,
+        uv: Vec2,
+        terminal: bool,
+    },
+    /// The branch was absorbed by an opaque aperture mask.
+    ApertureBlocked { aperture: ApertureId },
+    /// Nothing ahead: the branch left the scene bounds.
+    Escaped,
+}
+
+/// One entry of the opt-in event log (`TraceConfig3::record_events`).
+///
+/// Segments record where flux *went*; events record what *happened* and to
+/// which scene object, which is what sequence extraction and interaction-level
+/// diagnostics need. Within one path id, entries appear in propagation order;
+/// entries of different branches interleave. With the parallel feature, path
+/// ids are only unique per launch ray — single-launch traces (the sequence
+/// extractor's case) are unambiguous.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TraceEvent3 {
+    pub path_id: PathId,
+    pub parent: Option<PathId>,
+    pub depth: u32,
+    pub ghost: bool,
+    /// World-space event point in mm.
+    pub point: Vec3,
+    /// Cumulative optical path length at the event, in mm.
+    pub opl_mm: f64,
+    pub lambda_um: f64,
+    pub kind: TraceEventKind,
+}
+
 /// An area detector's accumulated readout (§6.9, §9.7).
 ///
 /// Flux density is `incident / area`, and the area is a real `mm²` — the thing a
@@ -134,6 +205,7 @@ impl DetectorResult3 {
         Some(self.incident_flux.iter().map(|f| f / area).collect())
     }
 
+    #[cfg(feature = "parallel")]
     pub(crate) fn merge(&mut self, other: &DetectorResult3) {
         for (a, b) in self.incident_flux.iter_mut().zip(&other.incident_flux) {
             *a += *b;
@@ -194,6 +266,7 @@ impl EnergyLedger {
         }
     }
 
+    #[cfg(feature = "parallel")]
     pub(crate) fn merge(&mut self, o: &EnergyLedger) {
         self.launched += o.launched;
         self.detected_incident += o.detected_incident;
@@ -257,6 +330,7 @@ impl TerminationSummary {
         }
     }
 
+    #[cfg(feature = "parallel")]
     pub(crate) fn merge(&mut self, o: &TerminationSummary) {
         self.detector += o.detector;
         self.absorbed_volume += o.absorbed_volume;
@@ -284,6 +358,7 @@ pub enum PhysicsFeature {
     DielectricFresnel,
     Mirror,
     ExplicitRt,
+    ThinLens,
     VolumeAbsorption,
     SpectralResponse,
 }
@@ -378,6 +453,7 @@ impl CapabilityReport {
         }
     }
 
+    #[cfg(feature = "parallel")]
     pub(crate) fn merge(&mut self, o: &CapabilityReport) {
         for f in &o.exact {
             self.note_exact(*f);
@@ -410,4 +486,6 @@ pub struct TraceResult3 {
     pub ledger: EnergyLedger,
     pub terminations: TerminationSummary,
     pub capability_report: CapabilityReport,
+    /// The event log, empty unless `TraceConfig3::record_events` was set.
+    pub events: Vec<TraceEvent3>,
 }

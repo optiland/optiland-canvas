@@ -7,8 +7,9 @@
 
 import init, { Canvas } from "../pkg/oc_wasm.js";
 import { initM3 } from "./m3";
-import { initM4, type M4 } from "./m4";
 import { RayLayer } from "./rays";
+import { initSlice3d, type Slice3d } from "./slice3d";
+import { initViewport3d, type Viewport3d } from "./viewport3d";
 import { initOpenUc2 } from "./features/openuc2/OpenUc2Page";
 
 const SCALE = 6.5; // px per mm
@@ -66,22 +67,27 @@ async function main() {
   // M3 module (draw / inspect / snap / pin). It owns element manipulation on the
   // canvas; assigned near the end once renderView/refreshReference exist.
   let m3: { overlay: (ctx: CanvasRenderingContext2D) => void; sync: () => void; getSelected: () => number } | null = null;
-  // M4 module (layers / undo tree / wavefront scrub / variation gallery).
-  let m4: M4 | null = null;
+  // The canonical 3D scene, drawn two ways: the meridional cross-section (slice3d)
+  // and an orbitable 3D model (viewport3d). A toggle picks which owns the canvas.
+  let slice3d: Slice3d | null = null;
+  let viewport3d: Viewport3d | null = null;
+  type ViewMode = "2d" | "3d";
+  let viewMode: ViewMode = "2d";
+  const in3dModel = () => viewMode === "3d";
+  // Re-trace the f64 3D path for whichever view is currently showing.
+  const refreshActive3d = () => { if (in3dModel()) viewport3d?.refresh(); else slice3d?.refresh(); };
+  // The body the material picker targets: the active view's selection.
+  const selectedBody3d = () => (in3dModel() ? viewport3d?.selectedBody() : slice3d?.selectedBody()) ?? -1;
 
   // Layer cache the m3 overlay reads each frame (avoids re-parsing layer JSON per
   // element); refreshed whenever a layer changes. Also feeds onion-skinning.
   type LayerInfo = { id: number; visible: boolean; opacity: number };
-  let layerCache: LayerInfo[] = JSON.parse(scene.layersJson());
-  const refreshLayerCache = () => { layerCache = JSON.parse(scene.layersJson()); };
-  const onionBox = document.getElementById("onionBox") as HTMLInputElement;
+  const layerCache: LayerInfo[] = JSON.parse(scene.layersJson());
 
-  // Snapshot the settled scene into the undo tree (§5.2). Deduped in Rust, so
-  // it is safe to call from every settle point; a real change also invalidates
-  // the wavefront cache and repaints the M4 panels.
+  // Snapshot the settled v1 scene into the undo tree (§5.2). Deduped in Rust.
+  // Only the (hidden) v1 legacy paths reach this in the always-3D app.
   function autoCommit(label: string) {
-    const id = scene.commit(label);
-    if (id >= 0) m4?.onSceneChanged();
+    scene.commit(label);
   }
 
   const glasses: Glass[] = JSON.parse(scene.abbeGlassesJson());
@@ -125,20 +131,68 @@ async function main() {
   const rays = new RayLayer();
   const EXPOSURE = 1.0;
 
+  // Grid controls — shared by both views (drag snapping reads the same DOM).
+  const gridBox = document.getElementById("gridBox") as HTMLInputElement;
+  const gridSpacing = document.getElementById("gridSpacing") as HTMLInputElement;
+
+  // The meridional grid + optical-axis reference for the 2D cross-section view.
+  // View-agnostic (main owns it) so it shows regardless of which module draws the
+  // elements — the always-3D app boots into 3D, and the grid must still be there.
+  function draw2dGrid(W: number, H: number) {
+    if (gridBox.checked) {
+      const sp = Math.max(0.1, Number(gridSpacing.value) || 5);
+      const tl = toWorld(0, 0), br = toWorld(W, H);
+      const x0 = Math.floor(Math.min(tl.x, br.x) / sp) * sp, x1 = Math.ceil(Math.max(tl.x, br.x) / sp) * sp;
+      const y0 = Math.floor(Math.min(tl.y, br.y) / sp) * sp, y1 = Math.ceil(Math.max(tl.y, br.y) / sp) * sp;
+      if ((x1 - x0) / sp <= 600 && (y1 - y0) / sp <= 600) {
+        ctx.lineWidth = 1;
+        for (let gx = x0; gx <= x1 + 1e-9; gx += sp) {
+          const s = toScreen({ x: gx, y: 0 });
+          ctx.strokeStyle = Math.abs(gx) < 1e-9 ? "rgba(120,150,190,0.22)" : "rgba(120,150,190,0.07)";
+          ctx.beginPath(); ctx.moveTo(s.x, 0); ctx.lineTo(s.x, H); ctx.stroke();
+        }
+        for (let gy = y0; gy <= y1 + 1e-9; gy += sp) {
+          const s = toScreen({ x: 0, y: gy });
+          ctx.strokeStyle = Math.abs(gy) < 1e-9 ? "rgba(120,150,190,0.22)" : "rgba(120,150,190,0.07)";
+          ctx.beginPath(); ctx.moveTo(0, s.y); ctx.lineTo(W, s.y); ctx.stroke();
+        }
+      }
+    }
+    // Zemax-convention labels: the horizontal optical axis reads as Z, the
+    // vertical height as Y — the meridional Y–Z plane a lens designer expects.
+    // Internally these are canvas +X and +Y (§4.1); the labels are presentation.
+    const axisY = toScreen({ x: 0, y: 0 }).y, axisX = toScreen({ x: 0, y: 0 }).x;
+    ctx.fillStyle = "rgba(150,175,210,0.55)";
+    ctx.font = "11px ui-monospace, monospace";
+    ctx.fillText("Z", W - 16, axisY - 6);
+    ctx.fillText("Y", axisX + 6, 14);
+  }
+
   // --- interactive view -------------------------------------------------
   function renderView() {
     const t0 = performance.now();
-    // 9 floats/segment: ax ay bx by r g b flux flags. In wavefront-scrub mode
-    // (§5.5) the segments come from the reference tracer, clipped at the scrub
-    // time; otherwise the interactive f32 path draws the live picture.
-    const wavefront = m4?.wavefrontActive() ?? false;
-    const segs = wavefront ? m4!.wavefrontSegments() : scene.traceColored();
-    const traceMs = performance.now() - t0;
-    const gOpacity = Number(ghostOpacity.value) / 100;
-    const showTir = tirBox.checked;
     const W = w(), H = h();
     const dpr = window.devicePixelRatio || 1;
-    const { count, tirDots } = rays.draw(segs, toScreen, {
+    const gOpacity = Number(ghostOpacity.value) / 100;
+    const showTir = tirBox.checked;
+
+    // Ray segments (9 floats: ax ay bx by r g b flux flags) + the screen mapping
+    // RayLayer should apply. The 3D model view projects each 3D endpoint through
+    // its camera already, so its segments are in screen px (identity map); the 2D
+    // view yields meridional-plane coordinates mapped world→screen by `toScreen`.
+    // Either way the same HDR RayLayer draws them — one renderer, spectral colour,
+    // ghost layer and TIR shared across both views.
+    let segs: Float32Array | number[];
+    let mapScreen: (p: V2) => V2;
+    if (in3dModel()) {
+      segs = viewport3d!.raySegments();
+      mapScreen = (p) => p;
+    } else {
+      segs = slice3d?.active() ? slice3d.raySegments() : scene.traceColored();
+      mapScreen = toScreen;
+    }
+    const traceMs = performance.now() - t0;
+    const { count, tirDots } = rays.draw(segs, mapScreen, {
       ghostOpacity: gOpacity,
       exposure: EXPOSURE,
       dpr,
@@ -146,26 +200,11 @@ async function main() {
       height: H,
     });
 
-    // Compose: dark background, faint axis + detector, then add the ray layer.
+    // Compose: dark background, the view's scaffold, then add the ray layer.
     ctx.fillStyle = "#06080d";
     ctx.fillRect(0, 0, W, H);
-    // Optical axis is world y = 0, so it pans/zooms with the scene (not fixed
-    // at screen centre — otherwise a stray line lingers after panning).
-    const axisY = toScreen({ x: 0, y: 0 }).y;
-    ctx.strokeStyle = "rgba(120,140,170,0.16)";
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(0, axisY);
-    ctx.lineTo(W, axisY);
-    ctx.stroke();
-    const d0 = toScreen({ x: 52, y: -7 });
-    const d1 = toScreen({ x: 52, y: 7 });
-    ctx.strokeStyle = "rgba(127,214,255,0.4)";
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.moveTo(d0.x, d0.y);
-    ctx.lineTo(d1.x, d1.y);
-    ctx.stroke();
+    if (in3dModel()) viewport3d!.drawScaffold(ctx, W, H);
+    else draw2dGrid(W, H);
 
     // Add the device-resolution ray layer 1:1 (bypass the dpr transform).
     ctx.save();
@@ -185,16 +224,16 @@ async function main() {
       }
     }
 
-    // M3 overlay: element outlines, selection handles, snap guides, and the
-    // freehand fit preview. It owns on-canvas manipulation, so the old fixed
-    // lens-handle ellipse is retired in its favour.
-    m3?.overlay(ctx);
-    // M4 overlay: the sweeping wavefront front (§5.5), drawn on top.
-    m4?.overlay(ctx);
+    // Overlays: element cross-sections / wireframe, selection handles, cards.
+    if (in3dModel()) viewport3d!.overlay(ctx);
+    else {
+      if (!slice3d?.active()) m3?.overlay(ctx);
+      slice3d?.overlay(ctx, toScreen);
+    }
 
-    const mode = wavefront ? " · wavefront scrub" : "";
     const ms = performance.now() - t0;
-    stat.textContent = `${count} segs · ${ms.toFixed(1)} ms (trace ${traceMs.toFixed(1)}) · ${committed.name} nd ${committed.nd.toFixed(4)} V ${committed.vd.toFixed(1)}${mode}`;
+    const view = in3dModel() ? " · 3D model" : "";
+    stat.textContent = `${count} segs · ${ms.toFixed(1)} ms (trace ${traceMs.toFixed(1)}) · ${committed.name} nd ${committed.nd.toFixed(4)} V ${committed.vd.toFixed(1)}${view}`;
   }
 
   // --- Abbe picker (§5.4) -----------------------------------------------
@@ -234,11 +273,12 @@ async function main() {
       actx.arc(abX(gl.vd), abY(gl.nd), 2.2, 0, Math.PI * 2);
       actx.fill();
     }
-    // committed marker
+    // committed marker (the active target's current glass)
+    const cm = curCommitted();
     actx.strokeStyle = "#ffd678";
     actx.lineWidth = 1.5;
     actx.beginPath();
-    actx.arc(abX(committed.vd), abY(committed.nd), 4, 0, Math.PI * 2);
+    actx.arc(abX(cm.vd), abY(cm.nd), 4, 0, Math.PI * 2);
     actx.stroke();
     // cursor preview
     if (cursor) {
@@ -267,6 +307,38 @@ async function main() {
     scene.setElementAbbe(lensId, g.nd, g.vd);
   }
 
+  // The Abbe picker retargets the selected 3D body's glass when a 3D scene is
+  // active, else the v1 demo lens. `committed3d` is the selected body's glass to
+  // revert to when the cursor leaves the map without clicking.
+  let committed3d: Glass | null = null;
+  const glassTarget = () => (slice3d?.active() ? selectedBody3d() : -1);
+  const readGlass3d = (id: number): Glass | null => {
+    const g = JSON.parse(scene.bodyGlassJSON(id));
+    return g ? { name: "custom", nd: g.nd, vd: g.vd } : null;
+  };
+  // The glass marker to draw on the map: the selected 3D body's, or the v1 lens'.
+  const curCommitted = (): Glass => (slice3d?.active() && committed3d ? committed3d : committed);
+
+  // Live preview as the cursor moves over the map.
+  function previewGlass(nd: number, vd: number) {
+    const id = glassTarget();
+    if (id >= 0) { scene.setBodyGlassAbbe(id, nd, vd); refreshActive3d(); }
+    else scene.setElementAbbe(lensId, nd, vd);
+    renderView();
+  }
+  // Commit the clicked glass.
+  function commitGlass(g: Glass) {
+    const id = glassTarget();
+    if (id >= 0) { scene.setBodyGlassAbbe(id, g.nd, g.vd); committed3d = { ...g }; refreshActive3d(); }
+    else applyGlass(g);
+  }
+  // Revert the preview to the committed glass when the cursor leaves.
+  function revertGlass() {
+    const id = glassTarget();
+    if (id >= 0) { if (committed3d) scene.setBodyGlassAbbe(id, committed3d.nd, committed3d.vd); refreshActive3d(); }
+    else applyGlass(committed);
+  }
+
   abbe.addEventListener("pointermove", (e) => {
     const rect = abbe.getBoundingClientRect();
     const px = e.clientX - rect.left, py = e.clientY - rect.top;
@@ -278,8 +350,7 @@ async function main() {
     if (ok) {
       abbeLabel.textContent = snap ? `${snap.name} — nd ${nd.toFixed(4)}, V ${vd.toFixed(1)}`
         : `custom — nd ${nd.toFixed(4)}, V ${vd.toFixed(1)}`;
-      scene.setElementAbbe(lensId, nd, vd); // live preview: chromatic spread re-converges
-      renderView();
+      previewGlass(nd, vd); // live preview: chromatic spread re-converges
     } else {
       abbeLabel.textContent = "unobtainable — no glass exists here";
     }
@@ -291,14 +362,14 @@ async function main() {
     const nd = snap ? snap.nd : abNd(py);
     const vd = snap ? snap.vd : abVd(px);
     if (scene.isObtainable(nd, vd)) {
-      applyGlass(snap ?? { name: "custom", nd, vd });
+      commitGlass(snap ?? { name: "custom", nd, vd });
       renderView();
       refreshReference();
-      autoCommit("glass"); // undo-tree snapshot (§5.2)
+      if (!slice3d?.active()) autoCommit("glass"); // v1 undo-tree snapshot (§5.2)
     }
   });
   abbe.addEventListener("pointerleave", () => {
-    applyGlass(committed); // revert preview to the committed glass
+    revertGlass(); // revert preview to the committed glass
     drawAbbe();
     renderView();
     refreshReference();
@@ -306,6 +377,7 @@ async function main() {
 
   // --- detector dock (f64 reference numbers, on idle) --------------------
   function refreshReference() {
+    if (slice3d?.active()) return refresh3dDetector();
     const info = JSON.parse(scene.detectorJson(0));
     hctx.clearRect(0, 0, hist.width, hist.height);
     if (!info || info.hits === 0) {
@@ -324,21 +396,261 @@ async function main() {
     dockNums.textContent = `hits ${info.hits} · flux ${info.flux.toFixed(3)} · centroid y ${cen} mm · OPL ${Number(info.opl).toFixed(2)} mm`;
   }
 
+  // The 3D area detector's f64 analysis (§6.9), true 3D — not a slice of a 2D
+  // analysis. Two modes: the 2D binning heatmap (incident flux per cell) and the
+  // spot diagram (the actual ray-detector intersection points). The numbers line
+  // is the same reference readout under both.
+  type DetMode = "heatmap" | "spot";
+  let detMode: DetMode = "heatmap";
+  const detHead = document.getElementById("detHead")!;
+
+  // The centred square drawing region of the dock canvas (detectors are square-ish).
+  function detSquare() {
+    const s = Math.min(hist.width, hist.height);
+    return { s, ox: (hist.width - s) / 2, oy: (hist.height - s) / 2 };
+  }
+
+  // An inferno-like ramp for the flux heatmap: dark → violet → orange → white.
+  function heatColor(t: number): string {
+    const stops: [number, number, number, number][] = [
+      [0.0, 6, 4, 20], [0.25, 70, 20, 110], [0.5, 170, 45, 90],
+      [0.75, 240, 120, 40], [1.0, 250, 250, 190],
+    ];
+    t = Math.max(0, Math.min(1, t));
+    for (let i = 1; i < stops.length; i++) {
+      if (t <= stops[i][0]) {
+        const [t0, r0, g0, b0] = stops[i - 1];
+        const [t1, r1, g1, b1] = stops[i];
+        const f = (t - t0) / (t1 - t0 || 1);
+        return `rgb(${(r0 + (r1 - r0) * f) | 0},${(g0 + (g1 - g0) * f) | 0},${(b0 + (b1 - b0) * f) | 0})`;
+      }
+    }
+    return "rgb(250,250,190)";
+  }
+
+  // 2D binning: paint the nu×nv incident-flux grid as a heatmap. Detector v
+  // increases upward, canvas y downward, so the rows are flipped.
+  function drawHeatmap(info: { bins: [number, number]; incident: number[] }) {
+    const [nu, nv] = info.bins;
+    const cells = info.incident;
+    const max = Math.max(...cells, 1e-12);
+    const { s, ox, oy } = detSquare();
+    const cw = s / nu, ch = s / nv;
+    for (let v = 0; v < nv; v++) {
+      for (let u = 0; u < nu; u++) {
+        hctx.fillStyle = heatColor(cells[v * nu + u] / max);
+        hctx.fillRect(ox + u * cw, oy + (nv - 1 - v) * ch, Math.ceil(cw), Math.ceil(ch));
+      }
+    }
+    hctx.strokeStyle = "rgba(127,214,255,0.25)";
+    hctx.strokeRect(ox + 0.5, oy + 0.5, s - 1, s - 1);
+  }
+
+  // Spot diagram: the actual ray-detector hits, scaled into the face and coloured
+  // by wavelength (the linear-light rgb the tracer records, normalized to a dot).
+  function drawSpot(detId: number) {
+    const a = detId >= 0 ? scene.detectorHitsF32(detId) : scene.firstDetectorHitsF32();
+    const { s, ox, oy } = detSquare();
+    hctx.fillStyle = "#04060a";
+    hctx.fillRect(ox, oy, s, s);
+    hctx.strokeStyle = "rgba(127,214,255,0.25)";
+    hctx.strokeRect(ox + 0.5, oy + 0.5, s - 1, s - 1);
+    // Crosshair at the face centre.
+    hctx.strokeStyle = "rgba(127,214,255,0.12)";
+    hctx.beginPath();
+    hctx.moveTo(ox + s / 2, oy); hctx.lineTo(ox + s / 2, oy + s);
+    hctx.moveTo(ox, oy + s / 2); hctx.lineTo(ox + s, oy + s / 2);
+    hctx.stroke();
+    if (a.length < 3) return;
+    const hw = a[0] || 1, hh = a[1] || 1, n = a[2];
+    for (let i = 0; i < n; i++) {
+      const k = 3 + i * 6;
+      const u = a[k], v = a[k + 1];
+      const r = a[k + 2], g = a[k + 3], b = a[k + 4];
+      const m = Math.max(r, g, b, 1e-6);
+      const px = ox + (u / hw * 0.5 + 0.5) * s;
+      const py = oy + (1 - (v / hh * 0.5 + 0.5)) * s; // flip v to screen-down
+      hctx.fillStyle = `rgb(${(r / m * 255) | 0},${(g / m * 255) | 0},${(b / m * 255) | 0})`;
+      hctx.fillRect(px - 0.75, py - 0.75, 1.7, 1.7);
+    }
+  }
+
+  function refresh3dDetector() {
+    hctx.clearRect(0, 0, hist.width, hist.height);
+    // Show the selected detector if one is selected, else the first — so a scene
+    // with several detectors reports whichever the user is inspecting.
+    const sel = selectedBody3d();
+    const selInfo = sel >= 0 ? JSON.parse(scene.detectorResultJSON(sel)) : null;
+    const detId = selInfo ? sel : -1;
+    const info = selInfo ?? JSON.parse(scene.firstDetectorResultJSON());
+    if (!info || info.hits === 0) {
+      dockNums.textContent = info ? "no rays on detector" : "no detector";
+      return;
+    }
+    if (detMode === "spot") drawSpot(detId);
+    else drawHeatmap(info);
+    const c = info.centroid ? `(${info.centroid[0].toFixed(2)}, ${info.centroid[1].toFixed(2)})` : "—";
+    const opl = info.meanOpl == null ? "—" : Number(info.meanOpl).toFixed(2);
+    const tag = detId >= 0 ? `#${detId} · ` : "";
+    dockNums.textContent = `${tag}hits ${info.hits} · flux ${Number(info.totalIncident).toFixed(3)} · centroid ${c} mm · OPL ${opl} mm`;
+  }
+
+  // Detector analysis-mode toggle (heatmap ⇄ spot).
+  const detHeatBtn = document.getElementById("detHeatmap") as HTMLButtonElement;
+  const detSpotBtn = document.getElementById("detSpot") as HTMLButtonElement;
+  function setDetMode(m: DetMode) {
+    detMode = m;
+    detHeatBtn.classList.toggle("active", m === "heatmap");
+    detSpotBtn.classList.toggle("active", m === "spot");
+    detHead.textContent = `detector — ${m === "spot" ? "spot diagram" : "heatmap"} (f64)`;
+    refreshReference();
+  }
+  detHeatBtn.onclick = () => setDetMode("heatmap");
+  detSpotBtn.onclick = () => setDetMode("spot");
+
   // --- controls ----------------------------------------------------------
-  ghostsBox.addEventListener("change", () => { scene.setGhosts(ghostsBox.checked); m4?.onSceneChanged(); renderView(); });
-  ghostOpacity.addEventListener("input", renderView);
-  tirBox.addEventListener("change", renderView);
-  // Ghost bounce cap: retrace live; the reference dock + wavefront recompute too.
+  // These knobs feed both tracers: `setGhosts`/`setMaxGhostBounces` set the
+  // Canvas fields that v1 and the 3D `cfg3` both read, so a change re-traces
+  // whichever scene is active (the 3D path via `slice3d.refresh()`).
+  ghostsBox.addEventListener("change", () => {
+    scene.setGhosts(ghostsBox.checked);
+    refreshActive3d();
+    renderView();
+  });
+  ghostOpacity.addEventListener("input", renderView); // a RayLayer render param
+  tirBox.addEventListener("change", renderView);       // a render overlay toggle
   ghostBounces.addEventListener("change", () => {
     scene.setMaxGhostBounces(Number(ghostBounces.value) || 2);
-    m4?.onSceneChanged(); // invalidate the wavefront (ghost depth changed)
+    refreshActive3d();
     renderView();
     refreshReference();
   });
-  // Ray density: source 0 is the beam. Live retrace while sliding; the reference
-  // dock (heavier) recomputes only on release.
-  density.addEventListener("input", () => { scene.setSourceRays(0, Number(density.value)); renderView(); });
-  density.addEventListener("change", () => { refreshReference(); autoCommit("ray density"); });
+  // Grid toggle / spacing repaint the view (snapping reads the same DOM live).
+  gridBox.addEventListener("change", renderView);
+  gridSpacing.addEventListener("input", renderView);
+  // --- light source picker (§6.6) ---------------------------------------
+  // Collimated (rect/round), point (cone), or diffuse disc. The params and their
+  // labels follow the type; `ray density` is the total ray count, mapped to the
+  // right sampling dimension by `setSourceConfig`. In 3D all of this drives the
+  // Scene3 source; in the (hidden) v1 fallback density still drives the v1 beam.
+  const srcType = document.getElementById("srcType") as HTMLSelectElement;
+  const srcP0 = document.getElementById("srcP0") as HTMLInputElement;
+  const srcP1 = document.getElementById("srcP1") as HTMLInputElement;
+  const srcL0 = document.getElementById("srcL0")!;
+  const srcU0 = document.getElementById("srcU0")!;
+  const srcL1 = document.getElementById("srcL1")!;
+  const srcRow1 = document.getElementById("srcRow1")!;
+
+  // Sensible starting params per source type (the param means a different thing
+  // for each, so a type switch resets rather than reinterpreting the old number).
+  const SRC_DEFAULTS: Record<string, [number, number]> = {
+    collimated_rect: [20, 0.5],
+    collimated_disc: [20, 0],
+    point: [5, 0], // cone half-angle in degrees
+    lambertian: [10, 0],
+  };
+
+  function updateSrcLabels() {
+    const t = srcType.value;
+    srcRow1.style.display = t === "collimated_rect" ? "" : "none";
+    if (t === "point") { srcL0.textContent = "cone"; srcU0.textContent = "°"; }
+    else { srcL0.textContent = t === "collimated_rect" ? "⌀ Y" : "⌀"; srcU0.textContent = "mm"; srcL1.textContent = "⌀ X"; }
+  }
+
+  // Push the current picker state to the Scene3 source and re-trace.
+  function applySource() {
+    if (!slice3d?.active()) { scene.setSourceRays(0, Number(density.value)); return; }
+    scene.setSourceConfig(srcType.value, Number(srcP0.value) || 1, Number(srcP1.value) || 1, Number(density.value));
+    refreshActive3d();
+  }
+
+  srcType.addEventListener("change", () => {
+    const d = SRC_DEFAULTS[srcType.value];
+    if (d) { srcP0.value = String(d[0]); srcP1.value = String(d[1]); }
+    updateSrcLabels(); applySource(); renderView(); refreshReference();
+  });
+  srcP0.addEventListener("input", () => { applySource(); renderView(); });
+  srcP1.addEventListener("input", () => { applySource(); renderView(); });
+  srcP0.addEventListener("change", refreshReference);
+  srcP1.addEventListener("change", refreshReference);
+
+  // Ray density: the beam's total ray count. Live retrace while sliding.
+  density.addEventListener("input", () => { applySource(); renderView(); });
+  density.addEventListener("change", () => {
+    refreshReference();
+    if (!slice3d?.active()) autoCommit("ray density");
+  });
+
+  // --- wavelength picker (§5.5) -----------------------------------------
+  // A preset (white, or Fraunhofer lines) or a custom list of wavelengths in nm.
+  // The swatches show each line's rendered colour (a wavelength outside the
+  // visible band is drawn yellow, matching the rays). Wavelengths drive real
+  // dispersion, so a change re-traces.
+  const wlPreset = document.getElementById("wlPreset") as HTMLSelectElement;
+  const wlList = document.getElementById("wlList") as HTMLInputElement;
+  const wlSwatches = document.getElementById("wlSwatches")!;
+  const WL_PRESETS: Record<string, number[]> = {
+    // White: nine equal lines across the visible band (the default beam).
+    white: [420, 450, 480, 510, 540, 570, 600, 630, 660],
+    d: [587.56],
+    fdc: [486.13, 587.56, 656.27],
+    gfedc: [435.83, 486.13, 546.07, 587.56, 656.27],
+  };
+
+  const parseWlList = () =>
+    wlList.value.split(/[\s,]+/).map(Number).filter((x) => Number.isFinite(x) && x > 0);
+
+  function renderSwatches(nm: number[]) {
+    wlSwatches.replaceChildren();
+    for (const w of nm) {
+      const dot = document.createElement("span");
+      dot.title = `${w} nm`;
+      dot.style.cssText =
+        `width:12px; height:12px; border-radius:3px; display:inline-block; background:${scene.wavelengthCssColor(w)}; box-shadow:0 0 0 1px #0006`;
+      wlSwatches.appendChild(dot);
+    }
+  }
+
+  // Push a wavelength list to the source and re-trace (no-op on an empty list).
+  function applyWavelengths(nm: number[]) {
+    if (nm.length === 0) { renderSwatches([]); return; }
+    scene.setSourceWavelengths(new Float64Array(nm), new Float64Array(0));
+    renderSwatches(nm);
+    refreshActive3d();
+  }
+
+  wlPreset.addEventListener("change", () => {
+    const custom = wlPreset.value === "custom";
+    wlList.disabled = !custom;
+    if (custom) { wlList.focus(); applyWavelengths(parseWlList()); }
+    else { applyWavelengths(WL_PRESETS[wlPreset.value]); renderView(); refreshReference(); }
+  });
+  wlList.addEventListener("input", () => { wlPreset.value = "custom"; wlList.disabled = false; applyWavelengths(parseWlList()); renderView(); });
+  wlList.addEventListener("change", refreshReference);
+
+  // Sync the picker from the current Scene3 source (called after boot, since the
+  // 3D scene is created later in init).
+  function syncSourcePicker() {
+    const s = JSON.parse(scene.firstSourceJSON());
+    if (s) {
+      srcType.value = s.kind;
+      srcP0.value = String(Number(s.p0.toFixed(2)));
+      srcP1.value = String(Number(s.p1.toFixed(2)));
+      density.value = String(Math.min(240, Math.max(8, Math.round(s.samples))));
+    }
+    updateSrcLabels();
+    // Wavelengths: match a known preset, else fall back to a custom list.
+    const arr = (JSON.parse(scene.firstSourceWavelengthsJSON()) as { nm: number }[] | null) ?? [];
+    const nm = arr.map((o) => Number(o.nm.toFixed(2)));
+    const preset = Object.keys(WL_PRESETS).find(
+      (k) => WL_PRESETS[k].length === nm.length && WL_PRESETS[k].every((v, i) => Math.abs(v - nm[i]) < 0.5),
+    );
+    wlPreset.value = preset ?? "custom";
+    wlList.disabled = wlPreset.value !== "custom";
+    wlList.value = preset === "white" ? "" : nm.join(", ");
+    renderSwatches(nm);
+  }
+  updateSrcLabels();
 
   // --- drag the lens (fallback; M3 module takes over when loaded) --------
   let dragging = false;
@@ -381,35 +693,99 @@ async function main() {
     render: renderView,
     refresh: refreshReference,
     demoLensId: lensId,
-    // M4 hooks (§5.2/§5.6).
+    threeDActive: () => slice3d?.active() ?? false,
+    viewActive: () => !in3dModel(),
+    // Layer hooks are inert in the always-3D app (the hidden v1 scene has one
+    // layer), but M3 keeps them for standalone use.
     commit: autoCommit,
     layerVisible: (id) => layerCache[id]?.visible ?? true,
     layerOpacity: (id) => layerCache[id]?.opacity ?? 1,
-    onionSkin: () => onionBox.checked,
+    onionSkin: () => false,
   });
-  m4 = initM4({
-    scene,
-    view,
-    toScreen,
-    render: renderView,
-    refresh: refreshReference,
-    commit: autoCommit,
-    getSelected: () => m3!.getSelected(),
-    syncM3: () => m3!.sync(),
-    refreshLayers: refreshLayerCache,
-  });
-  // Freeze the demo scene as the undo-tree root so undo doesn't walk back into
-  // the empty start document (§5.2).
-  scene.historyReset("scene");
-  m4.refreshPanels();
 
-  // --- M5: save / open .ocanvas — the Optiland handoff (§6) ---------------
-  // Save downloads the frozen .ocanvas document; Open loads one back (Rust
-  // version-checks it and re-roots the undo history). This closes the loop for a
-  // non-Python user: sketch here, save, then `optiland_canvas.to_optic(file)`.
+  // The two views over the canonical 3D scene. Both read the same Scene3 in Rust
+  // and trace the same authoritative f64 path; they differ only in projection and
+  // interaction. `owns` gates each view's pointer/keyboard handlers so only the
+  // visible one edits the scene.
+  slice3d = initSlice3d({
+    scene, view, toScreen, toWorld, render: renderView,
+    owns: () => !in3dModel(),
+    // When a 3D body is selected, aim the Abbe picker at its glass; the readout
+    // dock follows the selected detector when a scene has more than one.
+    onSelect: (id) => { committed3d = readGlass3d(id); drawAbbe(); refresh3dDetector(); },
+  });
+  viewport3d = initViewport3d({
+    scene, view, render: renderView,
+    owns: () => in3dModel(),
+    onSelect: (id) => { committed3d = readGlass3d(id); drawAbbe(); refresh3dDetector(); },
+    detectorRefresh: refreshReference,
+  });
+
+  // Always-3D: the app boots straight into the canonical 3D scene — a singlet
+  // traced by the f64 3D engine in the Y–Z plane (§4.1), shown as the meridional
+  // cross-section. The v1 freeform layer stays initialized but hidden (its
+  // picking is suppressed via `threeDActive`), so pan/zoom still work.
+  slice3d.bootDefault();
+  syncSourcePicker();
+
+  // --- 2D ⇄ 3D view toggle ----------------------------------------------
+  const view2dBtn = document.getElementById("view-2d") as HTMLButtonElement;
+  const view3dBtn = document.getElementById("view-3d") as HTMLButtonElement;
+  function setViewMode(m: ViewMode) {
+    if (m === viewMode) return;
+    viewMode = m;
+    view2dBtn.classList.toggle("active", m === "2d");
+    view3dBtn.classList.toggle("active", m === "3d");
+    // The draw-mirror tool is a 2D cross-section action; disable it in 3D.
+    document.getElementById("drawMirror")?.toggleAttribute("disabled", m === "3d");
+    // The 3D view-controls bar is shown only in the 3D model view.
+    document.getElementById("view3dctl")!.style.display = m === "3d" ? "flex" : "none";
+    // Hand interaction to the incoming view and stand the other one down (close
+    // its stray cards). Refresh the incoming view's cached geometry/trace from
+    // Rust so an edit made in the other view is reflected — both are views of the
+    // one Scene3, and each caches its own cross-section/objects.
+    if (m === "3d") { slice3d!.standDown(); viewport3d!.activate(slice3d!.selectedBody()); }
+    else { viewport3d!.standDown(); slice3d!.refresh(); slice3d!.setSelected(viewport3d!.selectedBody()); }
+    drawAbbe();
+    renderView();
+    refreshReference();
+  }
+  view2dBtn.onclick = () => setViewMode("2d");
+  view3dBtn.onclick = () => setViewMode("3d");
+
+  // 3D view controls (reset / presets / perspective).
+  document.getElementById("v3dReset")!.onclick = () => viewport3d!.resetView();
+  document.getElementById("v3dIso")!.onclick = () => viewport3d!.setPreset("iso");
+  document.getElementById("v3dFront")!.onclick = () => viewport3d!.setPreset("front");
+  document.getElementById("v3dTop")!.onclick = () => viewport3d!.setPreset("top");
+  document.getElementById("v3dSide")!.onclick = () => viewport3d!.setPreset("side");
+  const perspBtn = document.getElementById("v3dPersp") as HTMLButtonElement;
+  perspBtn.onclick = () => {
+    const on = !viewport3d!.isPerspective();
+    viewport3d!.setPerspective(on);
+    perspBtn.classList.toggle("active", on);
+  };
+
+  // Adders: element (round plate, per-face response), aperture (circular stop),
+  // prism (dispersing glass triangle). Each spawns at a sensible spot, then opens
+  // its card so it can be positioned / configured. `focusObject` re-reads + selects.
+  const addAndFocus = (id: number) => {
+    if (id < 0) return;
+    (in3dModel() ? viewport3d! : slice3d!).focusObject(id);
+    renderView();
+    refreshReference();
+  };
+  document.getElementById("addElement")!.onclick = () => addAndFocus(scene.addPlanarElement(25, 0, 8, 45));
+  document.getElementById("addAperture")!.onclick = () => addAndFocus(scene.addAperture(-20, 0, 5, 0));
+  document.getElementById("addPrism")!.onclick = () => addAndFocus(scene.addPrism(-40, 0, 16, 0, 1.62, 36));
+  document.getElementById("addDetector")!.onclick = () => addAndFocus(scene.addAreaDetector(40, 0, 8, 0));
+
+  // --- save .ocanvas — the Optiland handoff (§6) --------------------------
+  // Save downloads the canonical 3D scene (the one the user actually edits) as a
+  // frozen, versioned v2 document. This closes the loop for a non-Python user:
+  // design here, save, then `optiland_canvas.to_optic(file)`. Opening a scene is
+  // in the 3D-scene panel above (it loads straight into Scene3).
   const saveBtn = document.getElementById("saveScene") as HTMLButtonElement;
-  const openBtn = document.getElementById("openScene") as HTMLButtonElement;
-  const openFile = document.getElementById("openSceneFile") as HTMLInputElement;
   const sceneMsg = document.getElementById("sceneMsg")!;
   const flash = (msg: string, ok = true) => {
     sceneMsg.textContent = msg;
@@ -417,7 +793,7 @@ async function main() {
   };
 
   saveBtn.addEventListener("click", () => {
-    const json = scene.toJSON();
+    const json = scene.scene3JSON() || scene.toJSON();
     const url = URL.createObjectURL(new Blob([json], { type: "application/json" }));
     const a = document.createElement("a");
     a.href = url;
@@ -425,26 +801,6 @@ async function main() {
     a.click();
     URL.revokeObjectURL(url);
     flash(`saved ${a.download} · ${(json.length / 1024).toFixed(1)} kB`);
-  });
-
-  openBtn.addEventListener("click", () => openFile.click());
-  openFile.addEventListener("change", async () => {
-    const file = openFile.files?.[0];
-    if (!file) return;
-    try {
-      scene.loadJSON(await file.text()); // version-checked in Rust; throws on bad input
-      refreshLayerCache();
-      m3?.sync();
-      m4?.onSceneChanged(); // invalidate the wavefront cache + repaint M4 panels
-      drawAbbe();
-      renderView();
-      refreshReference();
-      flash(`opened ${file.name} · ${scene.elementCount()} element(s)`);
-    } catch (err) {
-      flash(`could not open ${file.name}: ${err}`, false);
-    } finally {
-      openFile.value = ""; // let the same file be re-opened
-    }
   });
 
   drawAbbe();

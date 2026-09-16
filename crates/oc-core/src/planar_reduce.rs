@@ -316,6 +316,9 @@ fn response_to_spec(object: u64, r: &SurfaceResponse) -> Result<SurfaceSpec, Red
         SurfaceResponse::ExplicitRt { .. } => {
             Err(unsupported("explicit reflectance/transmittance"))
         }
+        // v1 has no ideal-lens surface either; a thin lens reduced to a plain
+        // plane would silently stop focusing. Refuse.
+        SurfaceResponse::ThinLens { .. } => Err(unsupported("thin lens")),
     }
 }
 

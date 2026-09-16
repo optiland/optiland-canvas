@@ -711,3 +711,37 @@ fn an_aperture_and_detector_match_f64() {
     }
     assert_detector_matches(&scene, det, &rays);
 }
+
+#[test]
+fn a_thin_lens_matches_f64_for_skew_rays() {
+    // The ideal-lens slope law runs in both engines; the f32 preview must land
+    // where the f64 reference does, forward and backward.
+    let mut scene = Scene3::new();
+    let id = scene.alloc_object_id();
+    let mut common = ObjectCommon::new(id, LayerId(0));
+    common.transform = facing(Vec3::ZERO, Vec3::X);
+    let resp = SurfaceResponse::ThinLens {
+        focal_length_mm: 50.0,
+    };
+    scene.surfaces.push(SurfaceObject3 {
+        common,
+        geometry: SurfaceGeometry3::Plane {
+            shape: PlanarShape2::Rectangle {
+                half_width_mm: 20.0,
+                half_height_mm: 20.0,
+            },
+        },
+        response_front: resp.clone(),
+        response_back: resp,
+    });
+    scene.validate().unwrap();
+
+    let rays = [
+        (Vec3::new(-30.0, 0.001, 0.0), Vec3::X),
+        (Vec3::new(-30.0, 5.0, 0.0), Vec3::X),
+        (Vec3::new(-30.0, 0.0, -8.0), Vec3::X),
+        (Vec3::new(-30.0, 7.0, -4.0), Vec3::X),
+        (Vec3::new(30.0, 6.0, -2.0), Vec3::NEG_X),
+    ];
+    assert_landing_matches(&scene, &rays);
+}

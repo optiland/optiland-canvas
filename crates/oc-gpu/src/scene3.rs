@@ -755,6 +755,9 @@ fn classify_surface(r: &TwoSidedSurfaceResponse) -> Result<u32, String> {
         SurfaceResponse::ExplicitRt { .. } => {
             Err("explicit R/T body surface (not yet in the f32 preview)".into())
         }
+        SurfaceResponse::ThinLens { .. } => {
+            Err("thin lens on a body patch (only standalone surfaces carry it)".into())
+        }
     }
 }
 
@@ -861,6 +864,10 @@ pub enum GpuResponse {
     Mirror { r: f32 },
     Dielectric { ar: f32 },
     ExplicitRt { r: f32, t: f32 },
+    /// Ideal thin lens; `f` is the focal length in NORMALIZED units
+    /// (`focal_length_mm / norm.scale`), so the slope law `u' = u − h/f`
+    /// works directly on normalized hit heights.
+    ThinLens { f: f32 },
 }
 
 fn constant(s: &SpectralScalar) -> Result<f32, String> {
@@ -872,9 +879,12 @@ fn constant(s: &SpectralScalar) -> Result<f32, String> {
     }
 }
 
-fn compile_response(r: &SurfaceResponse) -> Result<GpuResponse, String> {
+fn compile_response(r: &SurfaceResponse, scale: f64) -> Result<GpuResponse, String> {
     Ok(match r {
         SurfaceResponse::Absorber => GpuResponse::Absorber,
+        SurfaceResponse::ThinLens { focal_length_mm } => GpuResponse::ThinLens {
+            f: (focal_length_mm / scale) as f32,
+        },
         SurfaceResponse::Mirror { reflectivity } => GpuResponse::Mirror {
             r: constant(reflectivity)?,
         },
@@ -921,8 +931,8 @@ fn compile_surface(s: &SurfaceObject3, norm: &Norm) -> Result<GpuSurface3, Strin
         rot,
         pos,
         shape,
-        front: compile_response(&s.response_front)?,
-        back: compile_response(&s.response_back)?,
+        front: compile_response(&s.response_front, norm.scale)?,
+        back: compile_response(&s.response_back, norm.scale)?,
         object: s.common.id.0,
     })
 }

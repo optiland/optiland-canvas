@@ -8,9 +8,12 @@ git-friendly, exactly as [v1](ocanvas-format.md) is.
 Why it had to break is [ADR 0001](architecture/adr/0001-scene3-is-canonical-2d-is-a-view.md);
 what it costs is below.
 
-**Status: PR 3D-02.** The schema and the migration exist. Nothing traces from a
-`Scene3` yet, and the browser still reads and writes v1. v2 becomes the default
-writer in PR 3D-11, not before.
+**Status: live.** A `Scene3` traces, and the browser holds one. It opens both v1
+and v2, and it saves v2, falling back to the v1 writer only when no 3D scene is
+loaded. v1 stays readable, and the v1 export stays for a consumer that needs it.
+
+The type is still spelled `Scene3` below. Renaming it to `Scene`, with the 2D
+types moving under `legacy_planar`, is the rest of PR 3D-11 and has not happened.
 
 ## The header
 

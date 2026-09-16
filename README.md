@@ -2,19 +2,19 @@
 
 A browser-based, real-time optical sketchpad. Draw an optical system and watch the light move.
 
-Rust → WebAssembly → WebGPU. Part of the [Optiland](https://github.com/optiland/optiland) family: use the canvas to *ideate*, then hand the design off to Optiland for rigorous analysis.
+Rust → WebAssembly, with a WebGPU compute tracer in the kernel: native today, not yet wired into the browser build, which previews on the f32 CPU path. Part of the [Optiland](https://github.com/optiland/optiland) family: use the canvas to *ideate*, then hand the design off to Optiland for rigorous analysis.
 
 > **The one rule: there is never a "run" button.** Move a lens and the light moves. Drag a mirror to a grazing angle and total internal reflection lights up while you are still dragging. Every trade-off resolves toward sub-16 ms feedback; exact numbers settle once you let go, computed by an f64 reference tracer.
 
-**Status:** M0–M5 complete and green, under active development (see the [roadmap](#roadmap)).
+**Status:** M0–M5 complete and green, and the canonical 3D kernel (PRs 3D-00 to 3D-09) has landed. Under active development (see the [roadmap](#roadmap)).
 
 ---
 
 ## What it is
 
-Optiland Canvas is a tool for the *ideation* phase of optical design, the part before you commit to a prescription. It is a 2D (meridional-plane), non-sequential geometric ray tracer wrapped in a canvas-style UI: sketch lenses, mirrors, and prisms freehand, drag them around, and see refraction, reflection, TIR, dispersion, and stray-light ghosts update live. When a design is worth pursuing, export it to [Optiland](https://github.com/optiland/optiland), the Python engine for optimization, tolerancing, and full analysis.
+Optiland Canvas is a tool for the *ideation* phase of optical design, the part before you commit to a prescription. The physical model is a 3D non-sequential geometric ray tracer, and the canvas is a view over it: place lenses, mirrors, prisms and stops, drag them around, and see refraction, reflection, TIR, dispersion, and stray-light ghosts update live. You edit in a meridional cross-section by default and can switch to a 3D model view; both drive the same scene. When a design is worth pursuing, export it to [Optiland](https://github.com/optiland/optiland), the Python engine for optimization, tolerancing, and full analysis.
 
-**Why 2D.** For a rotationally symmetric system the meridional cross-section *is* the design. For prisms and folded paths, the top-down plane is how designers already sketch. 2D is also where a full retrace fits inside a 16 ms frame.
+**Why a cross-section is still the default view.** For a rotationally symmetric system the meridional cross-section *is* the design, and for prisms and folded paths the top-down plane is how designers already sketch. What changed with the 3D kernel is underneath: rays carry all three direction components, so a skew ray, a fold out of the plane, and a detector with real `mm²` cells are traced rather than approximated, and the cross-section draws where those rays cross it.
 
 ## Features
 
@@ -26,18 +26,19 @@ Optiland Canvas is a tool for the *ideation* phase of optical design, the part b
 - Live detectors: irradiance histogram, flux-weighted centroid, optical path length.
 
 **Interaction**
-- Draw a surface freehand and it's fit to a parametric curve (`line → arc → conic → asphere → spline`) with a complexity slider that trades manufacturability against fit residual in real time.
+- Two views over one scene: a meridional cross-section and an orbitable 3D model. Elements drag, tilt and snap to the grid in either, and the rays retrace while you drag.
 - Every parameter has an on-canvas handle and a numeric twin. Drag the handle or scrub the number, and the light follows. No Apply button, no modal dialogs.
 - Pop-up inspector cards (several at once, one per element), an adjustable grid with snapping, copy/paste/delete, per-parameter and whole-element pinning, plus zoom & pan.
+- Add a round element or a fold mirror from the scene dock, and choose the source (collimated, point cone, Lambertian disc) and how densely it samples.
 
 **Workflow**
-- Layers with show/hide and per-layer opacity; onion-skin hidden layers to compare candidate architectures superimposed, and flip between them.
-- A non-linear undo tree: every settled edit snapshots the scene, branches are visible in a sidebar, and you can jump to any of them (not just a flat undo stack).
-- A variation gallery: save designs as live, independently-traced thumbnails and compare them on the same detector, then click to load one.
-- Wavefront scrub: a timeline that draws rays only up to a propagation time *t* (clipped by cumulative optical path length), so you can watch the front sweep through the system.
+
+The M4 workflow panels (layers with onion-skinning, the non-linear undo tree, the variation gallery, the wavefront scrub) were built against the 2D scene and were retired from the UI when the canvas became a view over the 3D one. Their code is still in the tree; re-exposing them over `Scene3` has not been done. The freehand fit (`oc-fit`: stroke to `line → arc → conic → asphere → spline` with a complexity slider) is in the same position, engine present and drawing tool not currently wired.
+
+What the app carries today: the detector dock (irradiance heatmap or spot diagram, with hits, flux, centroid and OPL) and the Abbe glass map as the material picker.
 
 **Under the hood**
-- Two-tier tracer: a fast f32 path (GPU compute via `wgpu`, with a CPU fallback) draws the picture; an exact f64 reference computes every displayed *number*. Numbers never come from the fast path.
+- Two-tier tracer: a fast f32 path draws the picture, an exact f64 reference computes every displayed *number*, and numbers never come from the fast path. The f32 path has a `wgpu` compute backend and a CPU mirror; the browser build runs the CPU mirror today.
 - Scene state lives in Rust; the browser holds only UI state.
 - `.ocanvas`: a plain-JSON, human-readable, diffable scene format.
 
@@ -54,7 +55,7 @@ npm install
 npm run dev          # builds the wasm, starts Vite; open the printed URL
 ```
 
-Then pick the draw tool and sketch a lens surface, slide the complexity slider, double-click an element to inspect it, drag it around, and scroll to zoom. A WebGPU-capable browser uses the GPU tracer; others fall back to CPU.
+The app opens on a biconvex singlet lit by a collimated white beam, with a detector downstream. Double-click an element to inspect it, drag it to move, use the handle to tilt it, and scroll to zoom. `◳ 3D model` swaps the cross-section for an orbit view of the same scene. Add a fold mirror or a round element from the scene dock. Every number comes from the f64 reference tracer; the picture comes from the f32 CPU tracer, since the WebGPU path in `oc-gpu` is not wired into the browser yet.
 
 Prefer the engine without the UI?
 
@@ -161,8 +162,9 @@ untouched and remains the default route.
 
 `oc-core` never learns what a cube is. openUC2 is an adapter on top of the generic
 core, and what it needed from the core (scene fragments, rigid batch transforms,
-scene-table merging, removal remaps) was added generically. Canvas is still 2D,
-one layer is traced at a time, and every number still comes from the f64 tracer.
+scene-table merging, removal remaps) was added generically. This route still runs
+on the 2D engine: one layer is traced at a time, in the plane, and every number
+still comes from the f64 tracer. Porting it onto the 3D scene has not been done.
 
 Start with [`docs/openuc2/architecture.md`](docs/openuc2/architecture.md), or open
 [the folded-singlet demo](examples/openuc2/README.md):
@@ -203,14 +205,14 @@ Each milestone ships something you can open and play with.
 - ✅ **M1: It moves.** GPU/CPU interactive tracer; drag a lens, light follows at 60 fps.
 - ✅ **M2: It's optics.** Glass catalog, Abbe picker, dispersion, spectral rendering, ghosts, TIR, live detectors.
 - ✅ **M3: It's precise.** Freehand→fit with a complexity slider, numeric inspector, grid, snapping, clipboard, pinning, zoom/pan.
-- ✅ **M4: It's a workflow.** Layers with onion-skinning, a non-linear undo tree, a live variation gallery, and wavefront scrub.
+- ✅ **M4: It's a workflow.** Layers with onion-skinning, a non-linear undo tree, a live variation gallery, and wavefront scrub. Shipped, then retired from the UI when the canvas became a view over the 3D scene. The code is still in the tree, unexposed.
 - ✅ **M5: It's an Optiland tool.** Frozen, versioned `.ocanvas` format; round-trip import/export against the Optiland engine; PyO3 bindings (`optiland_canvas`). See [the handoff](#the-handoff-to-optiland).
 - ⬜ **M6: It's fast.** Performance hardening; WebGL2 / CPU fallback path.
 - ⬜ **M7: It's a canvas.** GRIN painting: brush strokes that *are* the optics.
 
 **Out of scope** (that's what Optiland is for): interference, diffraction, polarization ray tracing, coatings beyond scalar R/T, thermal, tolerancing, and optimization.
 
-3D was on that list until recently. It is now being built: the canonical scene model becomes 3D, and this 2D canvas becomes a fast slice through it. Nothing is wired up yet, so everything above still describes the engine as it ships. [ADR 0001](docs/architecture/adr/0001-scene3-is-canonical-2d-is-a-view.md) has the reasoning and the costs; [the contract](docs/architecture/canonical-3d-kernel.md) is what the work has to satisfy.
+3D was on that list until the canonical-3D migration, which has now landed. The scene model is 3D, the f64 reference tracer traces skew rays through it, and this canvas is a view over that scene rather than the model itself. Three pieces are still open: the WGSL full-3D preview is written and validated but not wired into the browser, which previews with the f32 CPU tracer; Python round-trips scene files rather than calling the tracer; and the `Scene3` to `Scene` rename is pending. [ADR 0001](docs/architecture/adr/0001-scene3-is-canonical-2d-is-a-view.md) has the reasoning and the costs; [the contract](docs/architecture/canonical-3d-kernel.md) tracks what remains.
 
 ## License
 

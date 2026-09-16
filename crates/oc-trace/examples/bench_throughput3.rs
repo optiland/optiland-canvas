@@ -17,11 +17,7 @@
 //!   RAYON_NUM_THREADS=1 cargo run --release -p oc-trace --features trace3 \
 //!       --example bench_throughput3
 
-use oc_core::{
-    build3::SingletGeom,
-    scene3::Scene3,
-    Spectrum, Vec3, LAMBDA_D,
-};
+use oc_core::{build3::SingletGeom, scene3::Scene3, Spectrum, Vec3, LAMBDA_D};
 use oc_trace::{trace_scene3, TraceConfig3};
 use std::time::Instant;
 

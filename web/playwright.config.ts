@@ -23,6 +23,8 @@ export default defineConfig({
   projects: [
     {
       name: "chromium",
+      // Needs a GPU; runs only in the opt-in project below.
+      testIgnore: /webgpu\.spec\.ts/,
       use: {
         ...devices["Desktop Chrome"],
         // After the device spread, which carries its own 1280x720 and would
@@ -34,6 +36,24 @@ export default defineConfig({
         viewport: { width: 1600, height: 900 },
       },
     },
+    // A real GPU, opt-in: OC_WEBGPU=1 npx playwright test --project=webgpu.
+    // OC_WEBGPU_CHANNEL picks an installed browser (e.g. chrome), and
+    // OC_WEBGPU_HEADED=1 shows the window.
+    ...(process.env.OC_WEBGPU
+      ? [
+          {
+            name: "webgpu",
+            testMatch: /webgpu\.spec\.ts/,
+            use: {
+              ...devices["Desktop Chrome"],
+              viewport: { width: 1600, height: 900 },
+              channel: process.env.OC_WEBGPU_CHANNEL ?? "chromium",
+              headless: !process.env.OC_WEBGPU_HEADED,
+              launchOptions: { args: ["--enable-unsafe-webgpu"] },
+            },
+          },
+        ]
+      : []),
   ],
   webServer: {
     command: `npm run build && npx vite preview --port ${PORT} --strictPort`,

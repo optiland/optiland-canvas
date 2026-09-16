@@ -10,6 +10,7 @@ import { initM3 } from "./m3";
 import { RayLayer } from "./rays";
 import { initSlice3d, type Slice3d } from "./slice3d";
 import { initViewport3d, type Viewport3d } from "./viewport3d";
+import { createFastPreview } from "./fastpreview";
 import { initOpenUc2 } from "./features/openuc2/OpenUc2Page";
 
 const SCALE = 6.5; // px per mm
@@ -50,6 +51,10 @@ async function main() {
 
   // --- scene -------------------------------------------------------------
   const scene = new Canvas();
+  // The interactive 3D picture: WebGPU when the browser has a device, the CPU
+  // f32 mirror until then and otherwise. Created before anything can render,
+  // because the status line reads it.
+  const fast = createFastPreview();
   // Ghost reflection-generation cap G (§4.2): the only bounce knob. The primary
   // path through the elements is auto-sized to the scene, so element count is
   // unlimited; this just bounds the stray-light explosion. 2 catches the classic
@@ -233,7 +238,7 @@ async function main() {
 
     const ms = performance.now() - t0;
     const view = in3dModel() ? " · 3D model" : "";
-    stat.textContent = `${count} segs · ${ms.toFixed(1)} ms (trace ${traceMs.toFixed(1)}) · ${committed.name} nd ${committed.nd.toFixed(4)} V ${committed.vd.toFixed(1)}${view}`;
+    stat.textContent = `${count} segs · ${ms.toFixed(1)} ms (trace ${traceMs.toFixed(1)}) · ${committed.name} nd ${committed.nd.toFixed(4)} V ${committed.vd.toFixed(1)}${view} · ${fast.label()}`;
   }
 
   // --- Abbe picker (§5.4) -----------------------------------------------
@@ -708,14 +713,14 @@ async function main() {
   // interaction. `owns` gates each view's pointer/keyboard handlers so only the
   // visible one edits the scene.
   slice3d = initSlice3d({
-    scene, view, toScreen, toWorld, render: renderView,
+    scene, view, toScreen, toWorld, render: renderView, fast,
     owns: () => !in3dModel(),
     // When a 3D body is selected, aim the Abbe picker at its glass; the readout
     // dock follows the selected detector when a scene has more than one.
     onSelect: (id) => { committed3d = readGlass3d(id); drawAbbe(); refresh3dDetector(); },
   });
   viewport3d = initViewport3d({
-    scene, view, render: renderView,
+    scene, view, render: renderView, fast,
     owns: () => in3dModel(),
     onSelect: (id) => { committed3d = readGlass3d(id); drawAbbe(); refresh3dDetector(); },
     detectorRefresh: refreshReference,
@@ -727,6 +732,23 @@ async function main() {
   // picking is suppressed via `threeDActive`), so pan/zoom still work.
   slice3d.bootDefault();
   syncSourcePicker();
+  // The status line names the preview backend; repaint once it is chosen.
+  void fast.ready.then(() => renderView());
+
+  // `?debug` exposes the scene and both fast paths to the opt-in WebGPU browser
+  // test (web/tests/webgpu.spec.ts). The app itself never reads it.
+  if (new URLSearchParams(location.search).has("debug")) {
+    (window as unknown as { __ocDebug: unknown }).__ocDebug = {
+      scene,
+      fast,
+      ready: fast.ready,
+      cpuProjected: () => scene.traceProjected3DFast(),
+      // Through the app's own backend choice, as a drag would ask.
+      fastProjected: () => new Promise((resolve) => fast.requestProjected(scene, resolve)),
+      gpuProjected: () => fast.gpu()?.traceProjected3D(scene) ?? Promise.resolve(null),
+      exactProjected: () => scene.traceProjected3D(),
+    };
+  }
 
   // --- 2D ⇄ 3D view toggle ----------------------------------------------
   const view2dBtn = document.getElementById("view-2d") as HTMLButtonElement;

@@ -140,6 +140,11 @@ struct RFace {
 const SEG_VALID: u32 = 1u;
 const SEG_TIR: u32 = 2u;
 const SEG_GHOST: u32 = 4u;
+// GPU-only: the CPU mirror has neither limit. Set on a ray's first segment when
+// its tree ran out of segment budget, or lost a branch to the full stack, so the
+// host can widen the budget or draw the CPU picture instead.
+const SEG_TRUNC_BUDGET: u32 = 8u;
+const SEG_TRUNC_STACK: u32 = 16u;
 
 // Face-shape kinds.
 const SHAPE_RECT: u32 = 0u;
@@ -825,12 +830,16 @@ struct Work {
 
 var<private> stack: array<Work, 64>;
 var<private> sp: u32;
+// A branch was dropped because the stack was full (see SEG_TRUNC_STACK).
+var<private> stack_dropped: bool;
 
 fn push(w: Work, min_flux: f32) {
     if (w.depth > params.max_depth || w.flux < min_flux) { return; }
     if (sp < STACK) {
         stack[sp] = w;
         sp = sp + 1u;
+    } else {
+        stack_dropped = true;
     }
 }
 
@@ -908,13 +917,19 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let m0 = region_optics(launch_o, lambda);
     sp = 0u;
+    stack_dropped = false;
     stack[0] = Work(launch_o, launch_d, flux0, 0u, 0u, m0.x, m0.y, 0u);
     sp = 1u;
 
     var seg_count = 0u;
     var branches = 0u;
+    var budget_hit = false;
     loop {
-        if (sp == 0u || seg_count >= params.max_segs) { break; }
+        if (sp == 0u) { break; }
+        if (seg_count >= params.max_segs) {
+            budget_hit = true;
+            break;
+        }
         sp = sp - 1u;
         let w = stack[sp];
         branches = branches + 1u;
@@ -950,6 +965,15 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>) {
                 push(pw, min_flux);
             }
         }
+    }
+
+    // A ray whose tree did not fit is marked on its first segment; a truncated
+    // ray always has one.
+    if (seg_count > 0u && (budget_hit || stack_dropped)) {
+        var mark = 0u;
+        if (budget_hit) { mark = mark | SEG_TRUNC_BUDGET; }
+        if (stack_dropped) { mark = mark | SEG_TRUNC_STACK; }
+        segs[base].flags = segs[base].flags | mark;
     }
 }
 

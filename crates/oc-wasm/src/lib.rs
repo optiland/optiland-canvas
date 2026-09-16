@@ -32,6 +32,8 @@ use oc_trace::{trace_scene3, TraceConfig3};
 
 /// The openUC2 mode (§15.2). The freeform Canvas above does not know it exists.
 pub mod openuc2;
+// The WebGPU half of the interactive 3D preview.
+pub mod gpu_preview;
 
 /// Cross-section of the 3D scene with the view plane (§10.4), for drawing the
 /// optical elements in the 2D layout.
@@ -1625,43 +1627,14 @@ impl Canvas {
     /// [`Canvas::trace_projected_3d`], traced on the fast CPU f32 path (`cpu3`) so
     /// it can update every pointer-move during a drag. The picture, not the
     /// numbers — settle with the f64 method for anything displayed.
+    /// `GpuPreview3::traceProjected3D` draws the same picture on WebGPU.
     #[wasm_bindgen(js_name = traceProjected3DFast)]
     pub fn trace_projected_3d_fast(&self) -> Vec<f32> {
-        let Some(scene) = &self.scene3 else {
+        let Some(job) = self.fast_scene() else {
             return Vec::new();
         };
-        let gpu = oc_gpu::scene3::GpuScene3::build(
-            scene,
-            oc_gpu::scene3::BuildOpts {
-                ghosts: self.ghosts,
-                flux_eps: 1e-4,
-                max_ghost: self.max_ghost,
-            },
-        );
-        let per_ray = oc_gpu::cpu3::trace_segments(&gpu, 32);
-        let plane = &self.view_plane;
-        let mut out = Vec::new();
-        for segs in &per_ray {
-            for s in segs {
-                let a = plane.to_local(s.a);
-                let b = plane.to_local(s.b);
-                let [r, g, b_] = wavelength_um_to_linear(s.lambda_um);
-                out.extend_from_slice(&[
-                    a.x as f32,
-                    a.y as f32,
-                    b.x as f32,
-                    b.y as f32,
-                    r,
-                    g,
-                    b_,
-                    s.flux,
-                    s.flags as f32,
-                    plane.signed_distance(s.a) as f32,
-                    plane.signed_distance(s.b) as f32,
-                ]);
-            }
-        }
-        out
+        let per_ray = oc_gpu::cpu3::trace_segments(&job, FAST_DEPTH);
+        pack_projected(&per_ray, &self.view_plane)
     }
 
     /// Trace the authoritative f64 path and return every segment in **world
@@ -1704,40 +1677,13 @@ impl Canvas {
     /// [`Canvas::trace_world_3d`], traced on the fast CPU f32 path (`cpu3`) so it
     /// can drive drag-time preview frames. The picture, not the numbers — the
     /// settled frame and every displayed number come from the f64 method (§4.1).
+    /// `GpuPreview3::traceWorld3D` draws the same picture on WebGPU.
     #[wasm_bindgen(js_name = traceWorld3DFast)]
     pub fn trace_world_3d_fast(&self) -> Vec<f32> {
-        let Some(scene) = &self.scene3 else {
+        let Some(job) = self.fast_scene() else {
             return Vec::new();
         };
-        let gpu = oc_gpu::scene3::GpuScene3::build(
-            scene,
-            oc_gpu::scene3::BuildOpts {
-                ghosts: self.ghosts,
-                flux_eps: 1e-4,
-                max_ghost: self.max_ghost,
-            },
-        );
-        let per_ray = oc_gpu::cpu3::trace_segments(&gpu, 32);
-        let mut out = Vec::new();
-        for segs in &per_ray {
-            for s in segs {
-                let [r, g, b] = wavelength_um_to_linear(s.lambda_um);
-                out.extend_from_slice(&[
-                    s.a.x as f32,
-                    s.a.y as f32,
-                    s.a.z as f32,
-                    s.b.x as f32,
-                    s.b.y as f32,
-                    s.b.z as f32,
-                    r,
-                    g,
-                    b,
-                    s.flux,
-                    s.flags as f32,
-                ]);
-            }
-        }
-        out
+        pack_world(&oc_gpu::cpu3::trace_segments(&job, FAST_DEPTH))
     }
 
     /// CV-C: rigidly move a batch of loaded-scene objects by one delta —
@@ -2550,7 +2496,82 @@ impl Canvas {
     }
 }
 
+/// Interaction depth of the interactive f32 trace, on the CPU mirror or the GPU
+/// (§4.1). One constant, so the two pictures cannot drift apart.
+pub(crate) const FAST_DEPTH: u32 = 32;
+
+/// Pack f32 segments into the projected 11-float layout of
+/// [`Canvas::trace_projected_3d`].
+pub(crate) fn pack_projected(per_ray: &[Vec<oc_gpu::cpu3::SegOut3>], plane: &Plane3) -> Vec<f32> {
+    let mut out = Vec::new();
+    for segs in per_ray {
+        for s in segs {
+            let a = plane.to_local(s.a);
+            let b = plane.to_local(s.b);
+            let [r, g, b_] = wavelength_um_to_linear(s.lambda_um);
+            out.extend_from_slice(&[
+                a.x as f32,
+                a.y as f32,
+                b.x as f32,
+                b.y as f32,
+                r,
+                g,
+                b_,
+                s.flux,
+                s.flags as f32,
+                plane.signed_distance(s.a) as f32,
+                plane.signed_distance(s.b) as f32,
+            ]);
+        }
+    }
+    out
+}
+
+/// Pack f32 segments into the world-frame 11-float layout of
+/// [`Canvas::trace_world_3d`].
+pub(crate) fn pack_world(per_ray: &[Vec<oc_gpu::cpu3::SegOut3>]) -> Vec<f32> {
+    let mut out = Vec::new();
+    for segs in per_ray {
+        for s in segs {
+            let [r, g, b] = wavelength_um_to_linear(s.lambda_um);
+            out.extend_from_slice(&[
+                s.a.x as f32,
+                s.a.y as f32,
+                s.a.z as f32,
+                s.b.x as f32,
+                s.b.y as f32,
+                s.b.z as f32,
+                r,
+                g,
+                b,
+                s.flux,
+                s.flags as f32,
+            ]);
+        }
+    }
+    out
+}
+
 impl Canvas {
+    /// The compiled f32 scene the interactive preview traces, on the CPU mirror
+    /// or the GPU. `None` until a 3D scene is loaded.
+    pub(crate) fn fast_scene(&self) -> Option<oc_gpu::scene3::GpuScene3> {
+        let scene = self.scene3.as_ref()?;
+        Some(oc_gpu::scene3::GpuScene3::build(
+            scene,
+            oc_gpu::scene3::BuildOpts {
+                ghosts: self.ghosts,
+                flux_eps: 1e-4,
+                max_ghost: self.max_ghost,
+            },
+        ))
+    }
+
+    /// The view plane, by value, for a trace that outlives this borrow.
+    pub(crate) fn view_plane_copy(&self) -> Plane3 {
+        self.view_plane
+    }
+
     /// The f64 trace configuration, stamped with the current revision (§3.3).
     fn cfg3(&self) -> TraceConfig3 {
         TraceConfig3 {

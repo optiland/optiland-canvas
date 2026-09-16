@@ -9,6 +9,18 @@
 //!
 //! The shader is validated against the CPU f32 tracer, never against f64: that
 //! isolates a WGSL bug from an f32-precision gap (`gpu3_vs_cpu3`, §15.5).
+//!
+//! One code path serves native callers and the browser.
+//! [`Gpu3Tracer::trace_async`] submits the work and awaits the read-back.
+//! Natively, `device.poll(Wait)` finishes the work before the await and
+//! [`Gpu3Tracer::trace`] blocks on it, so the parity and performance suites run
+//! the code a browser runs. In a browser the poll returns at once and the event
+//! loop resolves the mapping.
+//!
+//! The shader has two limits the CPU mirror lacks: a 64-deep branch stack and a
+//! per-ray segment budget. It marks a ray that outgrew either, and
+//! [`Gpu3Trace`] counts those rays, so a caller can widen the budget or draw the
+//! CPU picture instead of one with branches missing.
 
 use crate::buffers3::{
     Aperture3Buf, Body3Buf, Detector3Buf, Face3Buf, Gpu3Buffers, Params3, Ray3Buf, Seg3Buf,
@@ -17,9 +29,63 @@ use crate::buffers3::{
 use crate::cpu3::{SegOut3, SEG_GHOST, SEG_TIR};
 use crate::scene3::GpuScene3;
 use bytemuck::cast_slice;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
 
 const SEG_VALID: u32 = 1;
+/// Set by the shader on a ray's first segment when the ray used its whole
+/// segment budget with branches still waiting.
+const SEG_TRUNC_BUDGET: u32 = 8;
+/// Set by the shader on a ray's first segment when a branch was dropped because
+/// the 64-deep stack was full.
+const SEG_TRUNC_STACK: u32 = 16;
+
+/// Why a tracer could not be created.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Gpu3InitError {
+    /// No adapter matched.
+    NoAdapter,
+    /// The adapter refused the device, with the backend's message.
+    Device(String),
+    /// The device rejected the shader or the pipeline, with the backend's message.
+    Pipeline(String),
+}
+
+/// Why a trace returned no picture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Gpu3Error {
+    /// A trace on this tracer is still in flight. The two would share one
+    /// staging buffer.
+    Busy,
+    /// The segment buffer could not be mapped for read-back.
+    Readback,
+    /// The device reported an error (a lost device, a validation failure). The
+    /// tracer refuses every later trace.
+    Device(String),
+}
+
+/// One GPU trace: per-ray segments, plus the rays the shader cut short.
+#[derive(Debug, Clone)]
+pub struct Gpu3Trace {
+    /// Per-ray world-millimetre segments, the shape of
+    /// [`crate::cpu3::trace_segments`].
+    pub segments: Vec<Vec<SegOut3>>,
+    /// Rays that used their whole segment budget with branches left. A larger
+    /// budget fixes these.
+    pub budget_truncated: usize,
+    /// Rays that lost a branch to the full stack. No budget fixes these.
+    pub stack_truncated: usize,
+}
+
+impl Gpu3Trace {
+    /// Every ray's branch tree fit, so the picture is the CPU mirror's.
+    pub fn is_complete(&self) -> bool {
+        self.budget_truncated == 0 && self.stack_truncated == 0
+    }
+}
 
 /// A ready-to-use compute device and pipeline for the 3D preview.
 pub struct Gpu3Tracer {
@@ -28,6 +94,10 @@ pub struct Gpu3Tracer {
     pipeline: wgpu::ComputePipeline,
     layout: wgpu::BindGroupLayout,
     buffers: RefCell<Option<Buffers>>,
+    /// A trace is between submit and read-back.
+    busy: Cell<bool>,
+    /// The first device error reported in a browser, or a failed read-back.
+    device_error: Arc<Mutex<Option<String>>>,
     pub adapter_info: wgpu::AdapterInfo,
 }
 
@@ -59,44 +129,87 @@ struct Buffers {
 impl Gpu3Tracer {
     /// Create a tracer, preferring a real high-performance adapter and falling
     /// back to the software adapter. Returns `None` if neither is available.
+    ///
+    /// Panics when a device accepts the adapter but rejects the shader, so a
+    /// broken backend fails a test loudly instead of skipping it. Set
+    /// `WGPU_BACKEND` (for example `vulkan`) to steer around such a backend.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new() -> Option<Self> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
-            ..Default::default()
-        });
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            force_fallback_adapter: false,
-            compatible_surface: None,
-        }))
-        .or_else(|| {
-            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::LowPower,
-                force_fallback_adapter: true,
-                compatible_surface: None,
-            }))
-        })?;
-        Self::from_adapter(&adapter)
+        init_or_panic(pollster::block_on(Self::new_async()))
     }
 
     /// Build a tracer on a specific adapter (per-device benchmarking / gates).
+    /// Same failure rules as [`Gpu3Tracer::new`].
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn from_adapter(adapter: &wgpu::Adapter) -> Option<Self> {
+        init_or_panic(pollster::block_on(Self::from_adapter_async(adapter)))
+    }
+
+    /// Create a tracer without blocking. In a browser only WebGPU is tried.
+    pub async fn new_async() -> Result<Self, Gpu3InitError> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: backends(),
+            ..Default::default()
+        });
+        let preferred = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                force_fallback_adapter: false,
+                compatible_surface: None,
+            })
+            .await;
+        let adapter = match preferred {
+            Some(adapter) => adapter,
+            None => instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::LowPower,
+                    force_fallback_adapter: true,
+                    compatible_surface: None,
+                })
+                .await
+                .ok_or(Gpu3InitError::NoAdapter)?,
+        };
+        Self::from_adapter_async(&adapter).await
+    }
+
+    /// Build a tracer on a specific adapter without blocking.
+    pub async fn from_adapter_async(adapter: &wgpu::Adapter) -> Result<Self, Gpu3InitError> {
         let adapter_info = adapter.get_info();
         // The 3D path binds eight storage buffers (the object arrays plus the two
         // arenas and the segment output) — the WebGPU default ceiling, but above
         // the downlevel default of four, so lift just that one limit.
         let mut limits = wgpu::Limits::downlevel_defaults();
         limits.max_storage_buffers_per_shader_stage = 8;
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("oc-gpu3 device"),
-                required_features: wgpu::Features::empty(),
-                required_limits: limits,
-                memory_hints: wgpu::MemoryHints::Performance,
-            },
-            None,
-        ))
-        .ok()?;
+        let (device, queue) = adapter
+            .request_device(
+                &wgpu::DeviceDescriptor {
+                    label: Some("oc-gpu3 device"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: limits,
+                    memory_hints: wgpu::MemoryHints::Performance,
+                },
+                None,
+            )
+            .await
+            .map_err(|e| Gpu3InitError::Device(e.to_string()))?;
+
+        let device_error = Arc::new(Mutex::new(None));
+        // wgpu's default handler panics. In a browser a panic poisons the whole
+        // wasm module, the user's scene with it, so record the error and let the
+        // next trace report it. Native callers keep the panic.
+        #[cfg(target_arch = "wasm32")]
+        {
+            let sink = Arc::clone(&device_error);
+            device.on_uncaptured_error(Box::new(move |e| {
+                record(&sink, &e.to_string());
+            }));
+        }
+
+        // Shader and pipeline errors are caught on every platform and returned,
+        // so the caller decides what they mean: `new` panics, the browser keeps
+        // the CPU mirror.
+        device.push_error_scope(wgpu::ErrorFilter::Internal);
+        device.push_error_scope(wgpu::ErrorFilter::Validation);
 
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("trace3"),
@@ -133,169 +246,242 @@ impl Gpu3Tracer {
             cache: None,
         });
 
-        Some(Self {
+        let validation = device.pop_error_scope().await;
+        let internal = device.pop_error_scope().await;
+        if let Some(e) = validation.or(internal) {
+            return Err(Gpu3InitError::Pipeline(e.to_string()));
+        }
+
+        Ok(Self {
             device,
             queue,
             pipeline,
             layout,
             buffers: RefCell::new(None),
+            busy: Cell::new(false),
+            device_error,
             adapter_info,
         })
     }
 
     /// Trace `scene` for up to `max_depth` interactions, with a per-ray segment
     /// budget of `max_segs`. Returns per-ray world-millimetre segment lists (the
-    /// same shape as [`crate::cpu3::trace_segments`]).
+    /// same shape as [`crate::cpu3::trace_segments`]). Blocks.
+    ///
+    /// It does not report truncation; use [`Gpu3Tracer::trace_checked`] when a
+    /// ray tree may outgrow `max_segs`.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn trace(&self, scene: &GpuScene3, max_depth: u32, max_segs: u32) -> Vec<Vec<SegOut3>> {
+        self.trace_checked(scene, max_depth, max_segs).segments
+    }
+
+    /// [`Gpu3Tracer::trace`] with the truncation counts. Blocks; panics if the
+    /// device fails.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn trace_checked(&self, scene: &GpuScene3, max_depth: u32, max_segs: u32) -> Gpu3Trace {
+        match pollster::block_on(self.trace_async(scene, max_depth, max_segs)) {
+            Ok(trace) => trace,
+            Err(e) => panic!("3D GPU trace failed: {e:?}"),
+        }
+    }
+
+    /// Trace `scene` and await the read-back.
+    ///
+    /// Drive the future to completion. Dropping it between submit and read-back
+    /// leaves the staging buffer mapped, and wgpu refuses to map it again.
+    pub async fn trace_async(
+        &self,
+        scene: &GpuScene3,
+        max_depth: u32,
+        max_segs: u32,
+    ) -> Result<Gpu3Trace, Gpu3Error> {
+        self.check_device()?;
+        if self.busy.replace(true) {
+            return Err(Gpu3Error::Busy);
+        }
+        let _busy = BusyGuard(&self.busy);
+
         let bufs = Gpu3Buffers::from_scene(scene, max_depth, max_segs);
         let n_rays = bufs.rays.len();
         let n_segs = n_rays * max_segs as usize;
         if n_segs == 0 {
-            return vec![Vec::new(); n_rays];
+            return Ok(Gpu3Trace {
+                segments: vec![Vec::new(); n_rays],
+                budget_truncated: 0,
+                stack_truncated: 0,
+            });
         }
         let seg_bytes = (n_segs * std::mem::size_of::<Seg3Buf>()) as wgpu::BufferAddress;
+        let signal = MapSignal::default();
 
-        // wgpu forbids zero-sized buffers, so clamp every capacity to >= 1.
-        let need_bodies = bufs.bodies.len().max(1);
-        let need_surfaces = bufs.surfaces.len().max(1);
-        let need_apertures = bufs.apertures.len().max(1);
-        let need_detectors = bufs.detectors.len().max(1);
-        let need_rays = bufs.rays.len().max(1);
-        let need_verts = bufs.verts.len().max(1);
-        let need_faces = bufs.faces.len().max(1);
-
-        let mut slot = self.buffers.borrow_mut();
-        if slot.is_none() {
-            let params = uniform_buf(&self.device, std::mem::size_of::<Params3>());
-            let bodies = storage_buf(&self.device, "bodies3", need_bodies * S_BODY);
-            let surfaces = storage_buf(&self.device, "surfaces3", need_surfaces * S_SURF);
-            let apertures = storage_buf(&self.device, "apertures3", need_apertures * S_APER);
-            let detectors = storage_buf(&self.device, "detectors3", need_detectors * S_DET);
-            let rays = storage_buf(&self.device, "rays3", need_rays * S_RAY);
-            let verts = storage_buf(&self.device, "verts3", need_verts * S_VERT);
-            let faces = storage_buf(&self.device, "faces3", need_faces * S_FACE);
-            let segs = seg_buf(&self.device, seg_bytes);
-            let staging = staging_buf(&self.device, seg_bytes);
-            let bind_group = self.make_bind_group(
-                &params, &bodies, &surfaces, &apertures, &detectors, &rays, &verts, &faces, &segs,
-            );
-            *slot = Some(Buffers {
-                params,
-                bodies,
-                surfaces,
-                apertures,
-                detectors,
-                rays,
-                verts,
-                faces,
-                segs,
-                staging,
-                bind_group,
-                cap_bodies: need_bodies,
-                cap_surfaces: need_surfaces,
-                cap_apertures: need_apertures,
-                cap_detectors: need_detectors,
-                cap_rays: need_rays,
-                cap_verts: need_verts,
-                cap_faces: need_faces,
-                cap_segs: n_segs,
-                cap_stage_bytes: seg_bytes as usize,
-            });
-        }
-        let b = slot.as_mut().unwrap();
-
-        let mut rebuild = false;
-        macro_rules! grow {
-            ($field:ident, $cap:ident, $need:expr, $label:literal, $stride:expr) => {
-                if $need > b.$cap {
-                    b.$field = storage_buf(&self.device, $label, $need * $stride);
-                    b.$cap = $need;
-                    rebuild = true;
-                }
-            };
-        }
-        grow!(bodies, cap_bodies, need_bodies, "bodies3", S_BODY);
-        grow!(surfaces, cap_surfaces, need_surfaces, "surfaces3", S_SURF);
-        grow!(
-            apertures,
-            cap_apertures,
-            need_apertures,
-            "apertures3",
-            S_APER
-        );
-        grow!(
-            detectors,
-            cap_detectors,
-            need_detectors,
-            "detectors3",
-            S_DET
-        );
-        grow!(rays, cap_rays, need_rays, "rays3", S_RAY);
-        grow!(verts, cap_verts, need_verts, "verts3", S_VERT);
-        grow!(faces, cap_faces, need_faces, "faces3", S_FACE);
-        if n_segs > b.cap_segs {
-            b.segs = seg_buf(&self.device, seg_bytes);
-            b.cap_segs = n_segs;
-            rebuild = true;
-        }
-        if seg_bytes as usize > b.cap_stage_bytes {
-            b.staging = staging_buf(&self.device, seg_bytes);
-            b.cap_stage_bytes = seg_bytes as usize;
-        }
-        if rebuild {
-            b.bind_group = self.make_bind_group(
-                &b.params,
-                &b.bodies,
-                &b.surfaces,
-                &b.apertures,
-                &b.detectors,
-                &b.rays,
-                &b.verts,
-                &b.faces,
-                &b.segs,
-            );
-        }
-
-        self.queue
-            .write_buffer(&b.params, 0, cast_slice(&[bufs.params]));
-        write_if(&self.queue, &b.bodies, &bufs.bodies);
-        write_if(&self.queue, &b.surfaces, &bufs.surfaces);
-        write_if(&self.queue, &b.apertures, &bufs.apertures);
-        write_if(&self.queue, &b.detectors, &bufs.detectors);
-        write_if(&self.queue, &b.rays, &bufs.rays);
-        write_if(&self.queue, &b.verts, &bufs.verts);
-        write_if(&self.queue, &b.faces, &bufs.faces);
-
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        encoder.clear_buffer(&b.segs, 0, Some(seg_bytes));
         {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("trace3 pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &b.bind_group, &[]);
-            pass.dispatch_workgroups((n_rays as u32).div_ceil(64), 1, 1);
+            // wgpu forbids zero-sized buffers, so clamp every capacity to >= 1.
+            let need_bodies = bufs.bodies.len().max(1);
+            let need_surfaces = bufs.surfaces.len().max(1);
+            let need_apertures = bufs.apertures.len().max(1);
+            let need_detectors = bufs.detectors.len().max(1);
+            let need_rays = bufs.rays.len().max(1);
+            let need_verts = bufs.verts.len().max(1);
+            let need_faces = bufs.faces.len().max(1);
+
+            let mut slot = self.buffers.borrow_mut();
+            if slot.is_none() {
+                let params = uniform_buf(&self.device, std::mem::size_of::<Params3>());
+                let bodies = storage_buf(&self.device, "bodies3", need_bodies * S_BODY);
+                let surfaces = storage_buf(&self.device, "surfaces3", need_surfaces * S_SURF);
+                let apertures = storage_buf(&self.device, "apertures3", need_apertures * S_APER);
+                let detectors = storage_buf(&self.device, "detectors3", need_detectors * S_DET);
+                let rays = storage_buf(&self.device, "rays3", need_rays * S_RAY);
+                let verts = storage_buf(&self.device, "verts3", need_verts * S_VERT);
+                let faces = storage_buf(&self.device, "faces3", need_faces * S_FACE);
+                let segs = seg_buf(&self.device, seg_bytes);
+                let staging = staging_buf(&self.device, seg_bytes);
+                let bind_group = self.make_bind_group(
+                    &params, &bodies, &surfaces, &apertures, &detectors, &rays, &verts, &faces,
+                    &segs,
+                );
+                *slot = Some(Buffers {
+                    params,
+                    bodies,
+                    surfaces,
+                    apertures,
+                    detectors,
+                    rays,
+                    verts,
+                    faces,
+                    segs,
+                    staging,
+                    bind_group,
+                    cap_bodies: need_bodies,
+                    cap_surfaces: need_surfaces,
+                    cap_apertures: need_apertures,
+                    cap_detectors: need_detectors,
+                    cap_rays: need_rays,
+                    cap_verts: need_verts,
+                    cap_faces: need_faces,
+                    cap_segs: n_segs,
+                    cap_stage_bytes: seg_bytes as usize,
+                });
+            }
+            let b = slot.as_mut().unwrap();
+
+            let mut rebuild = false;
+            macro_rules! grow {
+                ($field:ident, $cap:ident, $need:expr, $label:literal, $stride:expr) => {
+                    if $need > b.$cap {
+                        b.$field = storage_buf(&self.device, $label, $need * $stride);
+                        b.$cap = $need;
+                        rebuild = true;
+                    }
+                };
+            }
+            grow!(bodies, cap_bodies, need_bodies, "bodies3", S_BODY);
+            grow!(surfaces, cap_surfaces, need_surfaces, "surfaces3", S_SURF);
+            grow!(
+                apertures,
+                cap_apertures,
+                need_apertures,
+                "apertures3",
+                S_APER
+            );
+            grow!(
+                detectors,
+                cap_detectors,
+                need_detectors,
+                "detectors3",
+                S_DET
+            );
+            grow!(rays, cap_rays, need_rays, "rays3", S_RAY);
+            grow!(verts, cap_verts, need_verts, "verts3", S_VERT);
+            grow!(faces, cap_faces, need_faces, "faces3", S_FACE);
+            if n_segs > b.cap_segs {
+                b.segs = seg_buf(&self.device, seg_bytes);
+                b.cap_segs = n_segs;
+                rebuild = true;
+            }
+            if seg_bytes as usize > b.cap_stage_bytes {
+                b.staging = staging_buf(&self.device, seg_bytes);
+                b.cap_stage_bytes = seg_bytes as usize;
+            }
+            if rebuild {
+                b.bind_group = self.make_bind_group(
+                    &b.params,
+                    &b.bodies,
+                    &b.surfaces,
+                    &b.apertures,
+                    &b.detectors,
+                    &b.rays,
+                    &b.verts,
+                    &b.faces,
+                    &b.segs,
+                );
+            }
+
+            self.queue
+                .write_buffer(&b.params, 0, cast_slice(&[bufs.params]));
+            write_if(&self.queue, &b.bodies, &bufs.bodies);
+            write_if(&self.queue, &b.surfaces, &bufs.surfaces);
+            write_if(&self.queue, &b.apertures, &bufs.apertures);
+            write_if(&self.queue, &b.detectors, &bufs.detectors);
+            write_if(&self.queue, &b.rays, &bufs.rays);
+            write_if(&self.queue, &b.verts, &bufs.verts);
+            write_if(&self.queue, &b.faces, &bufs.faces);
+
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            encoder.clear_buffer(&b.segs, 0, Some(seg_bytes));
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("trace3 pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, &b.bind_group, &[]);
+                pass.dispatch_workgroups((n_rays as u32).div_ceil(64), 1, 1);
+            }
+            encoder.copy_buffer_to_buffer(&b.segs, 0, &b.staging, 0, seg_bytes);
+            self.queue.submit(Some(encoder.finish()));
+
+            let callback = signal.clone();
+            b.staging
+                .slice(0..seg_bytes)
+                .map_async(wgpu::MapMode::Read, move |r| callback.complete(r));
         }
-        encoder.copy_buffer_to_buffer(&b.segs, 0, &b.staging, 0, seg_bytes);
-        self.queue.submit(Some(encoder.finish()));
 
-        let slice = b.staging.slice(0..seg_bytes);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
+        // Natively this finishes the submission and runs the map callback. In a
+        // browser it returns at once, and the event loop resolves the mapping.
         self.device.poll(wgpu::Maintain::Wait);
-        rx.recv().unwrap().unwrap();
+        let mapped = signal.wait().await;
 
-        let data = slice.get_mapped_range();
+        let slot = self.buffers.borrow();
+        let b = slot
+            .as_ref()
+            .expect("buffers exist once a trace was submitted");
+        if mapped.is_err() {
+            // The staging buffer's map state is unknown now; refuse later traces
+            // rather than risk mapping it twice.
+            record(&self.device_error, "segment read-back could not be mapped");
+            return Err(Gpu3Error::Readback);
+        }
+        let data = b.staging.slice(0..seg_bytes).get_mapped_range();
         let raw: &[Seg3Buf] = &cast_slice::<u8, Seg3Buf>(&data)[..n_segs];
         let out = decode(raw, scene, n_rays, max_segs as usize);
         drop(data);
         b.staging.unmap();
-        out
+        self.check_device()?;
+        Ok(out)
+    }
+
+    fn check_device(&self) -> Result<(), Gpu3Error> {
+        let slot = self
+            .device_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match slot.as_ref() {
+            Some(msg) => Err(Gpu3Error::Device(msg.clone())),
+            None => Ok(()),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -329,10 +515,114 @@ impl Gpu3Tracer {
     }
 }
 
-/// Decode the raw segment buffer into per-ray world-millimetre segment lists.
-fn decode(raw: &[Seg3Buf], scene: &GpuScene3, n_rays: usize, max_segs: usize) -> Vec<Vec<SegOut3>> {
-    let mut out = Vec::with_capacity(n_rays);
+/// Which backends to try. Natively `WGPU_BACKEND` narrows the choice; a browser
+/// offers only WebGPU.
+#[cfg(not(target_arch = "wasm32"))]
+fn backends() -> wgpu::Backends {
+    wgpu::util::backend_bits_from_env().unwrap_or(wgpu::Backends::all())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn backends() -> wgpu::Backends {
+    wgpu::Backends::BROWSER_WEBGPU
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn init_or_panic(result: Result<Gpu3Tracer, Gpu3InitError>) -> Option<Gpu3Tracer> {
+    match result {
+        Ok(tracer) => Some(tracer),
+        Err(Gpu3InitError::NoAdapter) => None,
+        Err(Gpu3InitError::Device(msg)) => {
+            eprintln!("3D GPU: the adapter refused the device: {msg}");
+            None
+        }
+        Err(Gpu3InitError::Pipeline(msg)) => panic!("3D GPU pipeline rejected: {msg}"),
+    }
+}
+
+/// Keep the first error; later ones are usually its consequences.
+fn record(slot: &Mutex<Option<String>>, msg: &str) {
+    let mut slot = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if slot.is_none() {
+        *slot = Some(msg.to_string());
+    }
+}
+
+/// A one-shot for the staging buffer's map callback. It resolves under
+/// `pollster` natively and under the browser's executor, and it is `Send`,
+/// which the native callback bound requires.
+#[derive(Clone, Default)]
+struct MapSignal(Arc<Mutex<MapState>>);
+
+#[derive(Default)]
+struct MapState {
+    result: Option<Result<(), wgpu::BufferAsyncError>>,
+    waker: Option<Waker>,
+}
+
+impl MapSignal {
+    fn complete(&self, result: Result<(), wgpu::BufferAsyncError>) {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.result = Some(result);
+        if let Some(waker) = state.waker.take() {
+            waker.wake();
+        }
+    }
+
+    fn wait(&self) -> MapWait {
+        MapWait(self.clone())
+    }
+}
+
+struct MapWait(MapSignal);
+
+impl Future for MapWait {
+    type Output = Result<(), wgpu::BufferAsyncError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut state = self
+            .0
+             .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match state.result.take() {
+            Some(result) => Poll::Ready(result),
+            None => {
+                state.waker = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }
+    }
+}
+
+/// Clears the busy flag however the trace ends.
+struct BusyGuard<'a>(&'a Cell<bool>);
+
+impl Drop for BusyGuard<'_> {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
+
+/// Decode the raw segment buffer into per-ray world-millimetre segment lists,
+/// counting the rays the shader marked as cut short.
+fn decode(raw: &[Seg3Buf], scene: &GpuScene3, n_rays: usize, max_segs: usize) -> Gpu3Trace {
+    let mut segments = Vec::with_capacity(n_rays);
+    let mut budget_truncated = 0;
+    let mut stack_truncated = 0;
     for r in 0..n_rays {
+        let first = raw[r * max_segs].flags;
+        if first & SEG_VALID != 0 {
+            if first & SEG_TRUNC_BUDGET != 0 {
+                budget_truncated += 1;
+            }
+            if first & SEG_TRUNC_STACK != 0 {
+                stack_truncated += 1;
+            }
+        }
         let mut v = Vec::new();
         for i in 0..max_segs {
             let s = raw[r * max_segs + i];
@@ -349,9 +639,13 @@ fn decode(raw: &[Seg3Buf], scene: &GpuScene3, n_rays: usize, max_segs: usize) ->
                 flags: s.flags & (SEG_TIR | SEG_GHOST),
             });
         }
-        out.push(v);
+        segments.push(v);
     }
-    out
+    Gpu3Trace {
+        segments,
+        budget_truncated,
+        stack_truncated,
+    }
 }
 
 // Struct strides, one place so the buffer allocations cannot disagree with the

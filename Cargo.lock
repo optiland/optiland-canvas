@@ -657,6 +657,7 @@ dependencies = [
 name = "oc-wasm"
 version = "0.0.1"
 dependencies = [
+ "js-sys",
  "oc-core",
  "oc-fit",
  "oc-gpu",
@@ -664,6 +665,7 @@ dependencies = [
  "oc-trace",
  "serde_json",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
 ]
 
 [[package]]

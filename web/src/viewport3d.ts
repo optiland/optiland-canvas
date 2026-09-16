@@ -16,6 +16,7 @@
 
 import type { Canvas } from "../pkg/oc_wasm.js";
 import { createCardManager, type CardSource } from "./cards";
+import type { FastPreview } from "./fastpreview";
 
 type V2 = { x: number; y: number };
 type V3 = { x: number; y: number; z: number };
@@ -75,6 +76,9 @@ export function initViewport3d(opts: {
   owns: () => boolean;
   onSelect?: (id: number) => void;
   detectorRefresh?: () => void;
+  /** The interactive f32 picture, on WebGPU or the CPU mirror. Without it the
+   *  view calls the CPU mirror directly. */
+  fast?: FastPreview;
 }): Viewport3d {
   const { scene, view, render } = opts;
   const owns = () => opts.owns();
@@ -152,9 +156,31 @@ export function initViewport3d(opts: {
 
   const objectsPanel = document.getElementById("objects3d");
 
+  // A fast frame can arrive after `retrace` returns (WebGPU), so it is drawn only
+  // when it is newer than the picture on screen, and never over an exact frame of
+  // the same scene.
+  let shownExact = false;
   function retrace(fast = false) {
-    segs = fast ? scene.traceProjected3DFast() : scene.traceProjected3D();
-    tracedRevision = scene.sceneRevision();
+    if (!fast) {
+      opts.fast?.settled();
+      segs = scene.traceProjected3D();
+      tracedRevision = scene.sceneRevision();
+      shownExact = true;
+      return;
+    }
+    if (!opts.fast) {
+      segs = scene.traceProjected3DFast();
+      tracedRevision = scene.sceneRevision();
+      shownExact = false;
+      return;
+    }
+    opts.fast.requestProjected(scene, (f) => {
+      if (f.revision < tracedRevision || (f.revision === tracedRevision && shownExact)) return;
+      segs = f.segs;
+      tracedRevision = f.revision;
+      shownExact = false;
+      if (f.late) render();
+    });
   }
   function refreshGeometry() { xsec = JSON.parse(scene.sceneCrossSectionJSON()); }
   // Re-read the objects and repaint the shared inspector panel (same rows as the
@@ -233,7 +259,9 @@ export function initViewport3d(opts: {
 
   // --- rays --------------------------------------------------------------
   function raySegments(): Float32Array {
-    if (scene.sceneRevision() !== tracedRevision) retrace();
+    // A stale picture is retraced exactly, unless a GPU frame for a newer
+    // revision is already on its way (then the old picture holds until it lands).
+    if (scene.sceneRevision() !== tracedRevision && !opts.fast?.pending()) retrace();
     const B = basis();
     const out: number[] = [];
     for (let i = 0; i + STRIDE <= segs.length; i += STRIDE) {

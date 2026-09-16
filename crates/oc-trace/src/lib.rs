@@ -29,4 +29,4 @@ pub use result3::{
     TraceResult3,
 };
 #[cfg(feature = "trace3")]
-pub use tracer3::{trace3, TraceConfig3};
+pub use tracer3::{launch_from_scene, launch_from_source, trace3, trace_scene3, TraceConfig3};

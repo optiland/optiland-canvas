@@ -327,8 +327,11 @@ pub fn trace(scene: &GpuScene, max_depth: u32) -> Vec<GpuSeg> {
         let launch_o = Vec2::new(r.ox, r.oy);
         let launch_d = Vec2::new(r.dx, r.dy).normalize();
         // Only the launch ray needs a from-scratch medium lookup.
-        let launch_medium =
-            element_index(scene, region_elem(scene, launch_o + EPS_M * launch_d), lambda);
+        let launch_medium = element_index(
+            scene,
+            region_elem(scene, launch_o + EPS_M * launch_d),
+            lambda,
+        );
         push(
             &mut stack,
             &mut sp,

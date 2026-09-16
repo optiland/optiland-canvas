@@ -10,5 +10,23 @@ pub mod bvh;
 pub mod fresnel;
 pub mod tracer;
 
-pub use fresnel::{beer_lambert, critical_angle, reflect, reflectance, refract};
+#[cfg(feature = "trace3")]
+pub mod bvh3;
+#[cfg(feature = "trace3")]
+pub mod result3;
+#[cfg(feature = "trace3")]
+pub mod tracer3;
+
+pub use fresnel::{
+    beer_lambert, critical_angle, reflect, reflect3, reflectance, refract, refract3,
+};
 pub use tracer::{trace, DetectorResult, Segment, TraceConfig, TraceResult};
+
+#[cfg(feature = "trace3")]
+pub use result3::{
+    Approximation, CapabilityIssue, CapabilityReport, DetectorHit3, DetectorResult3, EnergyLedger,
+    LaunchRay3, PhysicsFeature, Segment3, SegmentFlags, TerminationReason, TerminationSummary,
+    TraceResult3,
+};
+#[cfg(feature = "trace3")]
+pub use tracer3::{trace3, TraceConfig3};

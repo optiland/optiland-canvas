@@ -293,6 +293,87 @@ fn validate_table(field: &str, lambda_um: &[f64], values: &[f64]) -> Result<(), 
     Ok(())
 }
 
+/// Linear interpolation of a validated wavelength table, honouring the
+/// out-of-range policy. `None` means the sample fell outside the range under
+/// [`OutOfRangePolicy::Error`] — the caller (the tracer) turns that into a typed
+/// capability issue rather than inventing a value (§6.7).
+///
+/// The table is assumed valid: strictly increasing, at least two samples, matched
+/// lengths. That is the load-time contract [`validate_table`] enforces, so this
+/// never has to re-check it.
+fn interp_table(xs: &[f64], ys: &[f64], x: f64, out_of_range: OutOfRangePolicy) -> Option<f64> {
+    let n = xs.len();
+    if x < xs[0] {
+        return match out_of_range {
+            OutOfRangePolicy::Error => None,
+            OutOfRangePolicy::Clamp => Some(ys[0]),
+            OutOfRangePolicy::Zero => Some(0.0),
+        };
+    }
+    if x > xs[n - 1] {
+        return match out_of_range {
+            OutOfRangePolicy::Error => None,
+            OutOfRangePolicy::Clamp => Some(ys[n - 1]),
+            OutOfRangePolicy::Zero => Some(0.0),
+        };
+    }
+    // The interval `[xs[i], xs[i+1]]` containing `x`. `partition_point` is a
+    // binary search, so this stays cheap for a long table.
+    let i = xs.partition_point(|&v| v <= x).saturating_sub(1).min(n - 2);
+    let (x0, x1) = (xs[i], xs[i + 1]);
+    let f = if x1 > x0 { (x - x0) / (x1 - x0) } else { 0.0 };
+    Some(ys[i] + f * (ys[i + 1] - ys[i]))
+}
+
+impl SpectralScalar {
+    /// The value at `lambda_um`, or `None` if out of range under
+    /// [`OutOfRangePolicy::Error`].
+    pub fn sample(&self, lambda_um: f64) -> Option<f64> {
+        match self {
+            Self::Constant(v) => Some(*v),
+            Self::Tabulated {
+                lambda_um: xs,
+                values,
+                out_of_range,
+                ..
+            } => interp_table(xs, values, lambda_um, *out_of_range),
+        }
+    }
+}
+
+impl AbsorptionModel {
+    /// The attenuation coefficient (`mm⁻¹`) at `lambda_um`, or `None` if out of
+    /// range under [`OutOfRangePolicy::Error`]. Absorption-free models return `0`.
+    pub fn sample(&self, lambda_um: f64) -> Option<f64> {
+        match self {
+            Self::None => Some(0.0),
+            Self::Constant { alpha_per_mm } => Some(*alpha_per_mm),
+            Self::Tabulated {
+                lambda_um: xs,
+                alpha_per_mm,
+                out_of_range,
+                ..
+            } => interp_table(xs, alpha_per_mm, lambda_um, *out_of_range),
+        }
+    }
+}
+
+impl DetectorResponse {
+    /// Quantum efficiency at `lambda_um`, or `None` if out of range under
+    /// [`OutOfRangePolicy::Error`]. [`DetectorResponse::Unity`] detects everything.
+    pub fn efficiency_at(&self, lambda_um: f64) -> Option<f64> {
+        match self {
+            Self::Unity => Some(1.0),
+            Self::Tabulated {
+                lambda_um: xs,
+                efficiency,
+                out_of_range,
+                ..
+            } => interp_table(xs, efficiency, lambda_um, *out_of_range),
+        }
+    }
+}
+
 /// What a surface does to a ray that reaches it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SurfaceResponse {
@@ -1703,21 +1784,22 @@ impl Scene3 {
 }
 
 // ---------------------------------------------------------------------------
-// Promotion (skeleton; the geometric checks land with the geometry, PR 3D-03)
+// Promotion (§6.4, §6.5)
 // ---------------------------------------------------------------------------
 
-/// Whether a body can take a construction rule, and what is unresolved if not.
+/// Whether a body can take a construction rule, and why not if it cannot.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PromotionCheck {
-    /// Every check this build can run passed.
+    /// Every check passed: the construction produces a closed body.
     Ok,
     /// Refused, with the reason.
     No(String),
-    /// The cheap checks pass; the geometric ones are not implemented yet.
+    /// A check that could not be decided.
     ///
-    /// This is not "probably fine". A promotion that reports this has **not**
-    /// been shown to produce a closed volume, and PR 3D-03 is what turns it into
-    /// [`PromotionCheck::Ok`] or [`PromotionCheck::No`].
+    /// The revolve and extrude validators run in full (`crate::geom3::profile`),
+    /// so neither returns this today. It is kept for a future construction whose
+    /// validation is genuinely partial, rather than letting such a case
+    /// masquerade as [`Ok`](PromotionCheck::Ok).
     Undecided(String),
 }
 
@@ -1755,16 +1837,17 @@ pub struct PromotionReport {
     pub body: BodyId,
     pub from: ProfileConstruction3,
     pub to: ProfileConstruction3,
-    /// Checks that could not be run yet. Empty once PR 3D-03 lands.
+    /// Checks that could not be decided. Empty now that the revolve and extrude
+    /// validators run in full.
     pub undecided: Vec<String>,
 }
 
-/// Can `body` be revolved about local `+X`?
+/// Can `body` be revolved about local `+X`? (§6.4)
 ///
-/// Only the checks that need no geometry engine run here. §6.4's real
-/// conditions, that the profile is mirror-symmetric about local `Y = 0`, that
-/// the extracted meridian does not self-intersect, that `r >= 0`, and that the
-/// volume closes, arrive with PR 3D-03.
+/// The full geometric test now runs (`crate::geom3::profile::validate_revolvable`):
+/// the loop closes, is mirror-symmetric about local `Y = 0`, keeps every conic on
+/// the optical axis, and does not cross itself. A profile that fails any of these
+/// is refused with the reason, not revolved into a body that does not close.
 pub fn can_promote_to_revolved(body: &Body3) -> PromotionCheck {
     let p = match &body.geometry {
         SolidGeometry3::Profile(p) => p,
@@ -1776,14 +1859,18 @@ pub fn can_promote_to_revolved(body: &Body3) -> PromotionCheck {
     if !p.profile.is_finite() {
         return PromotionCheck::No("profile has a non-finite value".to_string());
     }
-    PromotionCheck::Undecided(
-        "mirror symmetry about Y=0, meridian self-intersection, and volume closure \
-         are checked by the geometry engine (PR 3D-03)"
-            .to_string(),
-    )
+    match crate::geom3::profile::validate_revolvable(&p.profile) {
+        Ok(()) => PromotionCheck::Ok,
+        Err(why) => PromotionCheck::No(why),
+    }
 }
 
-/// Can `body` be extruded between `z_min` and `z_max`?
+/// Can `body` be extruded between `z_min` and `z_max`? (§6.5)
+///
+/// The `XY` loop must close and not cross itself
+/// (`crate::geom3::profile::validate_extrudable`); the limits must be finite and
+/// ordered. No symmetry is required — an extrusion has no axis to be symmetric
+/// about.
 pub fn can_promote_to_extruded(body: &Body3, z_min: f64, z_max: f64) -> PromotionCheck {
     let p = match &body.geometry {
         SolidGeometry3::Profile(p) => p,
@@ -1801,10 +1888,10 @@ pub fn can_promote_to_extruded(body: &Body3, z_min: f64, z_max: f64) -> Promotio
     if z_min >= z_max {
         return PromotionCheck::No("z_min >= z_max bounds no volume".to_string());
     }
-    PromotionCheck::Undecided(
-        "profile closure and self-intersection are checked by the geometry engine (PR 3D-03)"
-            .to_string(),
-    )
+    match crate::geom3::profile::validate_extrudable(&p.profile) {
+        Ok(()) => PromotionCheck::Ok,
+        Err(why) => PromotionCheck::No(why),
+    }
 }
 
 /// Give a body an explicit 3D construction.

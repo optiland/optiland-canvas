@@ -21,9 +21,10 @@ without a reason.
 | [`oc-core/src/coordinates.rs`](../../crates/oc-core/src/coordinates.rs) | always on | 3D-01 ✅ | frame mappings: round trip, handedness, meridional compatibility |
 | [`oc-core/src/vec3.rs`](../../crates/oc-core/src/vec3.rs) | always on | 3D-01 ✅ | `Isometry3` compose/inverse/round-trip, quaternion validation and canonicalization, `Ray3` normalization, conservative `Aabb3` |
 | [`oc-core/tests/scene3.rs`](../../crates/oc-core/tests/scene3.rs) | `scene3` | 3D-02 ✅ | v2 schema, validation, v1 migration, id stability |
-| [`oc-core/tests/geom3.rs`](../../crates/oc-core/tests/geom3.rs) | `scene3` | 3D-03 | analytic intersection, analytic normals, containment, AABBs, fuzz |
-| [`oc-trace/tests/analytic3.rs`](../../crates/oc-trace/tests/analytic3.rs) | `trace3` | 3D-04 | 3D optical fixtures; the proof the engine is not merely meridional |
-| [`oc-trace/tests/energy3.rs`](../../crates/oc-trace/tests/energy3.rs) | `trace3` | 3D-04 | the energy ledger closes |
+| [`oc-core/tests/geom3.rs`](../../crates/oc-core/tests/geom3.rs) | `scene3` | 3D-03 ✅ | analytic intersection, analytic normals, containment, AABBs, dedup, transform invariance |
+| [`oc-core/tests/geom3_fuzz.rs`](../../crates/oc-core/tests/geom3_fuzz.rs) | `scene3` | 3D-03 ✅ | seeded fuzz: no-NaN, `t > t_min`, unit normals, placement invariance, conservative AABB, scale invariance |
+| [`oc-trace/tests/analytic3.rs`](../../crates/oc-trace/tests/analytic3.rs) | `trace3` | 3D-04 ✅ | 3D optical fixtures; the proof the engine is not merely meridional |
+| [`oc-trace/tests/energy3.rs`](../../crates/oc-trace/tests/energy3.rs) | `trace3` | 3D-04 ✅ | the energy ledger closes |
 | [`oc-trace/tests/planar_equivalence.rs`](../../crates/oc-trace/tests/planar_equivalence.rs) | `trace3` | 3D-05 | the 2D path is an exact reduction of the 3D one |
 | [`oc-gpu/tests/cpu3_vs_f64.rs`](../../crates/oc-gpu/tests/cpu3_vs_f64.rs) | `gpu3` | 3D-07 | 3D f32 CPU against the f64 reference |
 | [`oc-gpu/tests/gpu3_vs_cpu3.rs`](../../crates/oc-gpu/tests/gpu3_vs_cpu3.rs) | `gpu3` | 3D-08 | 3D WGSL against the 3D f32 CPU mirror |
@@ -132,8 +133,17 @@ lands, so a suite cannot go missing without a command going red.
 
 ```sh
 cargo test --workspace --exclude oc-py
+# The scene3-gated 3D suites (scene3, geom3, geom3_fuzz) report zero tests above,
+# because the flag is off by default; CI turns it on in a scoped step so they run:
+cargo test -p oc-core --features scene3
+cargo clippy -p oc-core --features scene3 --all-targets -- -D warnings
+# The trace3-gated suites (analytic3, energy3) the same way; trace3 implies scene3:
+cargo test -p oc-trace --features trace3
+cargo clippy -p oc-trace --features trace3 --all-targets -- -D warnings
+
 cargo test -p oc-core --test scene3
 cargo test -p oc-core --test geom3
+cargo test -p oc-core --test geom3_fuzz
 cargo test -p oc-trace --test analytic3
 cargo test -p oc-trace --test energy3
 cargo test -p oc-trace --test planar_equivalence

@@ -2,7 +2,7 @@
 
 A browser-based, real-time optical sketchpad. Draw an optical system and watch the light move.
 
-Rust → WebAssembly, with a WebGPU compute tracer in the kernel: native today, not yet wired into the browser build, which previews on the f32 CPU path. Part of the [Optiland](https://github.com/optiland/optiland) family: use the canvas to *ideate*, then hand the design off to Optiland for rigorous analysis.
+Rust → WebAssembly, with WebGPU for heavy scenes where the browser offers it. Part of the [Optiland](https://github.com/optiland/optiland) family: use the canvas to *ideate*, then hand the design off to Optiland for rigorous analysis.
 
 > **The one rule: there is never a "run" button.** Move a lens and the light moves. Drag a mirror to a grazing angle and total internal reflection lights up while you are still dragging. Every trade-off resolves toward sub-16 ms feedback; exact numbers settle once you let go, computed by an f64 reference tracer.
 
@@ -38,7 +38,7 @@ The M4 workflow panels (layers with onion-skinning, the non-linear undo tree, th
 What the app carries today: the detector dock (irradiance heatmap or spot diagram, with hits, flux, centroid and OPL) and the Abbe glass map as the material picker.
 
 **Under the hood**
-- Two-tier tracer: a fast f32 path draws the picture, an exact f64 reference computes every displayed *number*, and numbers never come from the fast path. The f32 path has a `wgpu` compute backend and a CPU mirror; the browser build runs the CPU mirror today.
+- Two-tier tracer: a fast f32 path draws the picture, an exact f64 reference computes every displayed *number*, and numbers never come from the fast path. The f32 path has a `wgpu` compute backend and a CPU mirror; in the browser the WebGPU backend takes over from about 5,000 segments a frame, where it becomes the faster of the two.
 - Scene state lives in Rust; the browser holds only UI state.
 - `.ocanvas`: a plain-JSON, human-readable, diffable scene format.
 
@@ -55,7 +55,7 @@ npm install
 npm run dev          # builds the wasm, starts Vite; open the printed URL
 ```
 
-The app opens on a biconvex singlet lit by a collimated white beam, with a detector downstream. Double-click an element to inspect it, drag it to move, use the handle to tilt it, and scroll to zoom. `◳ 3D model` swaps the cross-section for an orbit view of the same scene. Add a fold mirror or a round element from the scene dock. Every number comes from the f64 reference tracer; the picture comes from the f32 CPU tracer, since the WebGPU path in `oc-gpu` is not wired into the browser yet.
+The app opens on a biconvex singlet lit by a collimated white beam, with a detector downstream. Double-click an element to inspect it, drag it to move, use the handle to tilt it, and scroll to zoom. `◳ 3D model` swaps the cross-section for an orbit view of the same scene. Add a fold mirror or a round element from the scene dock. Every number comes from the f64 reference tracer. The picture comes from the f32 tracer, on the CPU for light scenes and on WebGPU for heavy ones when the browser has a device; the status line says which.
 
 Prefer the engine without the UI?
 
@@ -212,7 +212,7 @@ Each milestone ships something you can open and play with.
 
 **Out of scope** (that's what Optiland is for): interference, diffraction, polarization ray tracing, coatings beyond scalar R/T, thermal, tolerancing, and optimization.
 
-3D was on that list until the canonical-3D migration, which has now landed. The scene model is 3D, the f64 reference tracer traces skew rays through it, and this canvas is a view over that scene rather than the model itself. Three pieces are still open: the WGSL full-3D preview is written and validated but not wired into the browser, which previews with the f32 CPU tracer; Python round-trips scene files rather than calling the tracer; and the `Scene3` to `Scene` rename is pending. [ADR 0001](docs/architecture/adr/0001-scene3-is-canonical-2d-is-a-view.md) has the reasoning and the costs; [the contract](docs/architecture/canonical-3d-kernel.md) tracks what remains.
+3D was on that list until the canonical-3D migration, which has now landed. The scene model is 3D, the f64 reference tracer traces skew rays through it, and this canvas is a view over that scene rather than the model itself. Two pieces are still open: Python round-trips scene files rather than calling the tracer, and the `Scene3` to `Scene` rename is pending. [ADR 0001](docs/architecture/adr/0001-scene3-is-canonical-2d-is-a-view.md) has the reasoning and the costs; [the contract](docs/architecture/canonical-3d-kernel.md) tracks what remains.
 
 ## License
 

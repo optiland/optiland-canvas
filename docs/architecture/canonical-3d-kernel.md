@@ -17,9 +17,9 @@ the sentence above now describes the shipped app rather than a plan.
 Still open: **3D-10** (PyO3 direct trace) is contingent under
 [ADR 001](adr/0001-scene3-is-canonical-2d-is-a-view.md) and its scope revision;
 **3D-11** is the canonical rename, of which only the claim updates are done; the
-skew cross-validation corpus against Optiland is not written; and the WGSL tracer
-is not wired to the browser, which still previews with the f32 CPU path. See
-[migration state](#migration-state).
+skew cross-validation corpus against Optiland is not written. The WGSL tracer
+draws the browser's preview for heavy scenes, on browsers with WebGPU, and the
+CPU f32 mirror draws the rest. See [migration state](#migration-state).
 
 ## One kernel
 
@@ -187,7 +187,7 @@ it is the CPU f32 oracle the shader is validated against.
 | 3D-05 | the exact planar reducer and legacy compatibility | **done** |
 | 3D-06 | 3D sources, detectors, apertures, authoring constructors | **done** |
 | 3D-07 | CPU f32 3D preview | **done** |
-| 3D-08 | WebGPU full-3D preview | **done**, not yet reachable from the browser |
+| 3D-08 | WebGPU full-3D preview | **done**; draws the browser preview for heavy scenes |
 | 3D-09 | the 2D slice/projection UI over `Scene3` | **done** |
 | 3D-10 | PyO3 direct trace API | contingent; the Optiland wrapper is withdrawn |
 | 3D-11 | cleanup, canonical rename, claim updates | claims updated; rename pending |

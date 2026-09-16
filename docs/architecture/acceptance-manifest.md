@@ -163,6 +163,13 @@ cargo clippy --workspace --all-targets --all-features
 
 cd web && npm ci && npm run build && npm run test:e2e
 cd crates/oc-py && pip install -e '.[test]' && pytest -q
+
+# The WebGPU preview in a real browser, against the CPU mirror. Needs a GPU, so
+# it is not in CI; it also logs the CPU/GPU timing sweep.
+cd web && OC_WEBGPU=1 npx playwright test --project=webgpu
+# Where wgpu picks DX12 and FXC rejects shader3.wgsl (seen on Windows), steer
+# the native GPU suites to another backend:
+WGPU_BACKEND=vulkan cargo test -p oc-gpu --features gpu3 --test gpu3_vs_cpu3
 ```
 
 ### Arrives with the epic

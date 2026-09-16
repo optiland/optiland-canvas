@@ -23,13 +23,15 @@ wasm-opt = false
 oc-core = { path = "../oc-core", features = ["scene3"] }
 # The freehand-stroke fitter (M3, §5.3). Pure geometry; wasm-clean.
 oc-fit = { path = "../oc-fit" }
-# CPU-only interactive backend (no wgpu): the guaranteed-portable path that
-# compiles to wasm32 today. The WebGPU backend is enabled in the browser build
-# via oc-gpu's `gpu` feature once the WebGPU device is wired to the canvas.
-# `gpu3` adds the f32 CPU 3D tracer (`cpu3`) — the interactive picture for the 3D
-# preview (§4.1: f32 draws, f64 settles), without pulling in wgpu (that lives
-# behind `gpu`, which stays off for wasm).
-oc-gpu = { path = "../oc-gpu", default-features = false, features = ["gpu3"] }
+# The interactive 3D picture (§4.1: f32 draws, f64 settles). `gpu3` brings the f32
+# CPU mirror (`cpu3`), the portable path every browser gets. `gpu` adds the wgpu
+# backend, which in a wasm build talks to the browser's WebGPU: the web shell uses
+# it through `GpuPreview3` when the browser has a device and keeps the CPU mirror
+# otherwise.
+oc-gpu = { path = "../oc-gpu", default-features = false, features = ["gpu3", "gpu"] }
+# `GpuPreview3` hands WebGPU read-backs to JavaScript as promises.
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
 # The exact f64 reference tracer, serial (no rayon) so it runs in wasm. Displayed
 # metrics come from here, never the f32 interactive path (§4.1). `trace3` adds the
 # f64 full-3D reference path (PR 3D-04), the authority behind the 3D preview.

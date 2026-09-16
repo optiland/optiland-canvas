@@ -13,6 +13,7 @@
 
 import type { Canvas } from "../pkg/oc_wasm.js";
 import { createCardManager, type CardSource } from "./cards";
+import type { FastPreview } from "./fastpreview";
 
 type V2 = { x: number; y: number };
 
@@ -56,6 +57,9 @@ export function initSlice3d(opts: {
   owns?: () => boolean;
   /** A body was selected/inspected (for the Abbe picker to target). */
   onSelect?: (id: number) => void;
+  /** The interactive f32 picture, on WebGPU or the CPU mirror. Without it the
+   *  view calls the CPU mirror directly. */
+  fast?: FastPreview;
 }): Slice3d {
   const { scene, view, toScreen, toWorld, render } = opts;
   const owns = () => opts.owns?.() ?? true;
@@ -145,10 +149,31 @@ export function initSlice3d(opts: {
   }
 
   // `fast` uses the interactive f32 path (during a drag); the default settles on
-  // the authoritative f64 reference.
+  // the authoritative f64 reference. A fast frame can arrive after this returns
+  // (WebGPU), so it is drawn only when it is newer than the picture on screen,
+  // and never over an exact frame of the same scene.
+  let shownExact = false;
   function retrace(fast = false) {
-    segs = fast ? scene.traceProjected3DFast() : scene.traceProjected3D();
-    tracedRevision = scene.sceneRevision();
+    if (!fast) {
+      opts.fast?.settled();
+      segs = scene.traceProjected3D();
+      tracedRevision = scene.sceneRevision();
+      shownExact = true;
+      return;
+    }
+    if (!opts.fast) {
+      segs = scene.traceProjected3DFast();
+      tracedRevision = scene.sceneRevision();
+      shownExact = false;
+      return;
+    }
+    opts.fast.requestProjected(scene, (f) => {
+      if (f.revision < tracedRevision || (f.revision === tracedRevision && shownExact)) return;
+      segs = f.segs;
+      tracedRevision = f.revision;
+      shownExact = false;
+      if (f.late) render();
+    });
   }
 
   // The element outlines follow the geometry: refreshed on load and on every drag
@@ -558,7 +583,9 @@ export function initSlice3d(opts: {
   // to the same HDR RayLayer as v1, so 3D rays get the identical spectral colour,
   // tonemap, ghost layer, and TIR handling.
   function raySegments(): Float32Array {
-    if (scene.sceneRevision() !== tracedRevision) retrace();
+    // A stale picture is retraced exactly, unless a GPU frame for a newer
+    // revision is already on its way (then the old picture holds until it lands).
+    if (scene.sceneRevision() !== tracedRevision && !opts.fast?.pending()) retrace();
     const out: number[] = [];
     for (let i = 0; i + STRIDE <= segs.length; i += STRIDE) {
       const range = slabRange(segs[i + 9], segs[i + 10]);

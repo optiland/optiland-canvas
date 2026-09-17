@@ -9,9 +9,10 @@ import init, { Canvas } from "../pkg/oc_wasm.js";
 import { initM3 } from "./m3";
 import { RayLayer } from "./rays";
 import { initSlice3d, type Slice3d } from "./slice3d";
-import { initViewport3d, type Viewport3d } from "./viewport3d";
+import { initView3dThree, type FrameReport, type View3dThree } from "./render3d/view3d";
 import { createFastPreview } from "./fastpreview";
 import { initOpenUc2 } from "./features/openuc2/OpenUc2Page";
+import { heatRgb } from "./heat";
 
 const SCALE = 6.5; // px per mm
 type V2 = { x: number; y: number };
@@ -73,9 +74,12 @@ async function main() {
   // canvas; assigned near the end once renderView/refreshReference exist.
   let m3: { overlay: (ctx: CanvasRenderingContext2D) => void; sync: () => void; getSelected: () => number } | null = null;
   // The canonical 3D scene, drawn two ways: the meridional cross-section (slice3d)
-  // and an orbitable 3D model (viewport3d). A toggle picks which owns the canvas.
+  // and an orbitable 3D model on the GPU (render3d/). A toggle picks which owns
+  // the canvas. `?render3d=webgl` forces the WebGL2 backend and `?render3d=off`
+  // simulates a browser with no usable 3D renderer.
   let slice3d: Slice3d | null = null;
-  let viewport3d: Viewport3d | null = null;
+  let viewport3d: View3dThree | null = null;
+  const params = new URLSearchParams(location.search);
   type ViewMode = "2d" | "3d";
   let viewMode: ViewMode = "2d";
   const in3dModel = () => viewMode === "3d";
@@ -175,29 +179,22 @@ async function main() {
 
   // --- interactive view -------------------------------------------------
   function renderView() {
+    // The GPU 3D view paints on its own animation frame; ask it for one.
+    if (in3dModel()) {
+      viewport3d?.invalidate();
+      return;
+    }
     const t0 = performance.now();
     const W = w(), H = h();
     const dpr = window.devicePixelRatio || 1;
     const gOpacity = Number(ghostOpacity.value) / 100;
     const showTir = tirBox.checked;
 
-    // Ray segments (9 floats: ax ay bx by r g b flux flags) + the screen mapping
-    // RayLayer should apply. The 3D model view projects each 3D endpoint through
-    // its camera already, so its segments are in screen px (identity map); the 2D
-    // view yields meridional-plane coordinates mapped world→screen by `toScreen`.
-    // Either way the same HDR RayLayer draws them — one renderer, spectral colour,
-    // ghost layer and TIR shared across both views.
-    let segs: Float32Array | number[];
-    let mapScreen: (p: V2) => V2;
-    if (in3dModel()) {
-      segs = viewport3d!.raySegments();
-      mapScreen = (p) => p;
-    } else {
-      segs = slice3d?.active() ? slice3d.raySegments() : scene.traceColored();
-      mapScreen = toScreen;
-    }
+    // Ray segments (9 floats: ax ay bx by r g b flux flags) in meridional-plane
+    // coordinates, mapped world→screen by `toScreen`.
+    const segs = slice3d?.active() ? slice3d.raySegments() : scene.traceColored();
     const traceMs = performance.now() - t0;
-    const { count, tirDots } = rays.draw(segs, mapScreen, {
+    const { count, tirDots } = rays.draw(segs, toScreen, {
       ghostOpacity: gOpacity,
       exposure: EXPOSURE,
       dpr,
@@ -205,11 +202,10 @@ async function main() {
       height: H,
     });
 
-    // Compose: dark background, the view's scaffold, then add the ray layer.
+    // Compose: dark background, the grid, then add the ray layer.
     ctx.fillStyle = "#06080d";
     ctx.fillRect(0, 0, W, H);
-    if (in3dModel()) viewport3d!.drawScaffold(ctx, W, H);
-    else draw2dGrid(W, H);
+    draw2dGrid(W, H);
 
     // Add the device-resolution ray layer 1:1 (bypass the dpr transform).
     ctx.save();
@@ -229,16 +225,20 @@ async function main() {
       }
     }
 
-    // Overlays: element cross-sections / wireframe, selection handles, cards.
-    if (in3dModel()) viewport3d!.overlay(ctx);
-    else {
-      if (!slice3d?.active()) m3?.overlay(ctx);
-      slice3d?.overlay(ctx, toScreen);
-    }
+    // Overlays: element cross-sections, selection handles, cards.
+    if (!slice3d?.active()) m3?.overlay(ctx);
+    slice3d?.overlay(ctx, toScreen);
 
-    const ms = performance.now() - t0;
+    writeStatus({ count, ms: performance.now() - t0, traceMs });
+  }
+
+  // The status line. In the 3D view it also names the presentation backend,
+  // which is a different subsystem from the ray-preview backend before it.
+  function writeStatus({ count, ms, traceMs }: FrameReport) {
+    const three = in3dModel() ? viewport3d : null;
     const view = in3dModel() ? " · 3D model" : "";
-    stat.textContent = `${count} segs · ${ms.toFixed(1)} ms (trace ${traceMs.toFixed(1)}) · ${committed.name} nd ${committed.nd.toFixed(4)} V ${committed.vd.toFixed(1)}${view} · ${fast.label()}`;
+    const render = three ? ` · ${three.backendLabel()}` : "";
+    stat.textContent = `${count} segs · ${ms.toFixed(1)} ms (trace ${traceMs.toFixed(1)}) · ${committed.name} nd ${committed.nd.toFixed(4)} V ${committed.vd.toFixed(1)}${view} · ${fast.label()}${render}`;
   }
 
   // --- Abbe picker (§5.4) -----------------------------------------------
@@ -415,22 +415,10 @@ async function main() {
     return { s, ox: (hist.width - s) / 2, oy: (hist.height - s) / 2 };
   }
 
-  // An inferno-like ramp for the flux heatmap: dark → violet → orange → white.
+  // The flux heatmap ramp (heat.ts), shared with the 3D view's detector faces.
   function heatColor(t: number): string {
-    const stops: [number, number, number, number][] = [
-      [0.0, 6, 4, 20], [0.25, 70, 20, 110], [0.5, 170, 45, 90],
-      [0.75, 240, 120, 40], [1.0, 250, 250, 190],
-    ];
-    t = Math.max(0, Math.min(1, t));
-    for (let i = 1; i < stops.length; i++) {
-      if (t <= stops[i][0]) {
-        const [t0, r0, g0, b0] = stops[i - 1];
-        const [t1, r1, g1, b1] = stops[i];
-        const f = (t - t0) / (t1 - t0 || 1);
-        return `rgb(${(r0 + (r1 - r0) * f) | 0},${(g0 + (g1 - g0) * f) | 0},${(b0 + (b1 - b0) * f) | 0})`;
-      }
-    }
-    return "rgb(250,250,190)";
+    const [r, g, b] = heatRgb(t);
+    return `rgb(${r},${g},${b})`;
   }
 
   // 2D binning: paint the nu×nv incident-flux grid as a heatmap. Detector v
@@ -719,11 +707,25 @@ async function main() {
     // dock follows the selected detector when a scene has more than one.
     onSelect: (id) => { committed3d = readGlass3d(id); drawAbbe(); refresh3dDetector(); },
   });
-  viewport3d = initViewport3d({
-    scene, view, render: renderView, fast,
+  const onSelect3d = (id: number) => { committed3d = readGlass3d(id); drawAbbe(); refresh3dDetector(); };
+  viewport3d = initView3dThree({
+    scene,
+    view,
+    canvas: document.getElementById("view3d") as HTMLCanvasElement,
+    render: renderView,
+    fast,
     owns: () => in3dModel(),
-    onSelect: (id) => { committed3d = readGlass3d(id); drawAbbe(); refresh3dDetector(); },
+    onSelect: onSelect3d,
     detectorRefresh: refreshReference,
+    rayOptions: () => ({
+      ghostOpacity: Number(ghostOpacity.value) / 100,
+      showTir: tirBox.checked,
+    }),
+    grid: () => ({ on: gridBox.checked, spacing: Math.max(0.1, Number(gridSpacing.value) || 5) }),
+    status: writeStatus,
+    forceWebGL: params.get("render3d") === "webgl",
+    disable: params.get("render3d") === "off",
+    timing: params.has("debug"),
   });
 
   // Always-3D: the app boots straight into the canonical 3D scene — a singlet
@@ -734,6 +736,8 @@ async function main() {
   syncSourcePicker();
   // The status line names the preview backend; repaint once it is chosen.
   void fast.ready.then(() => renderView());
+  // The GPU 3D view's code loads in idle time after startup.
+  setTimeout(() => viewport3d?.prefetch(), 2000);
 
   // `?debug` exposes the scene and both fast paths to the opt-in WebGPU browser
   // test (web/tests/webgpu.spec.ts). The app itself never reads it.
@@ -747,6 +751,17 @@ async function main() {
       fastProjected: () => new Promise((resolve) => fast.requestProjected(scene, resolve)),
       gpuProjected: () => fast.gpu()?.traceProjected3D(scene) ?? Promise.resolve(null),
       exactProjected: () => scene.traceProjected3D(),
+      // The GPU 3D view's camera, statistics, and pixel probe (tests).
+      render3d: viewport3d?.debug ?? null,
+      // The active view, drawn now (for timing the 2D view).
+      renderView: () => {
+        const t0 = performance.now();
+        renderView();
+        return performance.now() - t0;
+      },
+      setViewMode: (m: "2d" | "3d") => setViewMode(m),
+      // The selection the active view (and the material picker) targets.
+      selectedBody3d: () => selectedBody3d(),
     };
   }
 
@@ -762,6 +777,8 @@ async function main() {
     document.getElementById("drawMirror")?.toggleAttribute("disabled", m === "3d");
     // The 3D view-controls bar is shown only in the 3D model view.
     document.getElementById("view3dctl")!.style.display = m === "3d" ? "flex" : "none";
+    // The GPU view's appearance options belong to it alone.
+    document.getElementById("view3dopts")!.style.display = m === "3d" ? "flex" : "none";
     // Hand interaction to the incoming view and stand the other one down (close
     // its stray cards). Refresh the incoming view's cached geometry/trace from
     // Rust so an edit made in the other view is reflected — both are views of the
@@ -787,6 +804,8 @@ async function main() {
     viewport3d!.setPerspective(on);
     perspBtn.classList.toggle("active", on);
   };
+  // The GPU view restores the last projection used in this browser.
+  perspBtn.classList.toggle("active", viewport3d!.isPerspective());
 
   // Adders: element (round plate, per-face response), aperture (circular stop),
   // prism (dispersing glass triangle). Each spawns at a sensible spot, then opens

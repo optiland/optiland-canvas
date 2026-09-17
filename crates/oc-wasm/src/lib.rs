@@ -39,6 +39,9 @@ pub mod gpu_preview;
 /// optical elements in the 2D layout.
 mod xsection;
 
+/// Render descriptors and display meshes for the GPU 3D view.
+pub mod render_view;
+
 /// State kept for an element drawn freehand: its fitted ladder (§5.3) so the
 /// complexity slider can re-swap the front surface with no refit, plus the
 /// extrusion depth used to close the body.
@@ -143,6 +146,11 @@ pub struct Canvas {
     /// Bumped on every mutation of `scene3`, so an async f64 result carrying an
     /// older revision is discarded rather than shown (§3.3, §13).
     revision: u64,
+    /// Per-object geometry/transform/material revisions for the GPU 3D view.
+    render_tracker: render_view::RenderTracker,
+    /// The area detectors' flux maps from the most recent
+    /// [`Canvas::trace_projected_3d`] (see [`Canvas::last_detector_maps_f32`]).
+    detector_maps: std::cell::RefCell<Vec<f32>>,
 }
 
 #[wasm_bindgen]
@@ -166,6 +174,8 @@ impl Canvas {
             view_plane: Plane3::XY,
             slice_thickness: 0.0,
             revision: 0,
+            render_tracker: render_view::RenderTracker::default(),
+            detector_maps: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -1593,12 +1603,18 @@ impl Canvas {
     /// so the browser draws 3D rays through the identical HDR `RayLayer`),
     /// `flags` is bit1=TIR bit2=ghost, and `dist_*` is the signed distance of each
     /// endpoint from the plane so the UI can slab-filter (§10.4). Empty if no scene.
+    ///
+    /// The same trace also fills the detectors' flux maps, read with
+    /// [`Canvas::last_detector_maps_f32`], so the 3D view can paint them without
+    /// tracing again.
     #[wasm_bindgen(js_name = traceProjected3D)]
     pub fn trace_projected_3d(&self) -> Vec<f32> {
         let Some(scene) = &self.scene3 else {
+            self.detector_maps.borrow_mut().clear();
             return Vec::new();
         };
         let res = trace_scene3(scene, &self.cfg3());
+        *self.detector_maps.borrow_mut() = pack_detector_maps(scene, &res);
         let plane = &self.view_plane;
         let mut out = Vec::with_capacity(res.segments.len() * 11);
         for s in &res.segments {
@@ -1621,6 +1637,18 @@ impl Canvas {
             ]);
         }
         out
+    }
+
+    /// The incident-flux maps of the area detectors, from the most recent
+    /// [`Canvas::trace_projected_3d`] call (the same f64 trace and the same cells
+    /// as [`Canvas::detector_result_json`]'s `incident`). Flat f32 layout
+    /// `[count, (id, nu, nv, halfW, halfH, cell × nu·nv) × count]`, cells
+    /// row-major from local `(-halfW, -halfH)`. A picture of the numbers for
+    /// painting a detector face; read the numbers themselves from the f64
+    /// readout. Empty before the first trace or with no 3D scene.
+    #[wasm_bindgen(js_name = lastDetectorMapsF32)]
+    pub fn last_detector_maps_f32(&self) -> Vec<f32> {
+        self.detector_maps.borrow().clone()
     }
 
     /// The **interactive** f32 projection (§4.1): the same 11-float layout as
@@ -1999,45 +2027,6 @@ impl Canvas {
         id as f64
     }
 
-    /// An extruded body's local profile + z-extents, for drawing a prism in 3D:
-    /// `{zMin, zMax, points:[[x,y],...]}` (polygon vertices, local frame), or
-    /// `null` if `id` is not an extruded profile body.
-    #[wasm_bindgen(js_name = bodyExtrudeJSON)]
-    pub fn body_extrude_json(&self, id: f64) -> String {
-        use oc_core::profile2::Curve2;
-        use oc_core::scene3::SolidGeometry3;
-        let Some(scene) = &self.scene3 else {
-            return "null".into();
-        };
-        let Some(b) = scene.bodies.iter().find(|b| b.common.id.0 == id as u64) else {
-            return "null".into();
-        };
-        let SolidGeometry3::Profile(p) = &b.geometry else {
-            return "null".into();
-        };
-        let ProfileConstruction3::ExtrudeLocalZ { z_min_mm, z_max_mm } = p.construction else {
-            return "null".into();
-        };
-        let mut pts: Vec<String> = Vec::new();
-        for e in &p.profile.edges {
-            match &e.curve {
-                Curve2::Line { a, .. } => pts.push(format!("[{},{}]", a.x, a.y)),
-                Curve2::Polyline { points } => {
-                    for q in points {
-                        pts.push(format!("[{},{}]", q.x, q.y));
-                    }
-                }
-                _ => {}
-            }
-        }
-        format!(
-            "{{\"zMin\":{},\"zMax\":{},\"points\":[{}]}}",
-            z_min_mm,
-            z_max_mm,
-            pts.join(",")
-        )
-    }
-
     /// Set a surface object's meridional tilt (its normal's X–Y angle, degrees).
     /// Bumps the revision. `false` for a non-surface id.
     #[wasm_bindgen(js_name = setSurfaceTiltZDeg)]
@@ -2223,6 +2212,25 @@ impl Canvas {
         }
     }
 
+    /// What the GPU 3D view draws: one descriptor per body, surface, aperture,
+    /// and detector, with independent geometry, transform, and material
+    /// revisions (`render_view`). JSON array; `[]` if no scene is loaded. Call it
+    /// when the scene revision moves, not per frame.
+    #[wasm_bindgen(js_name = renderObjectsJSON)]
+    pub fn render_objects_json(&mut self) -> String {
+        match &self.scene3 {
+            Some(scene) => render_view::render_objects_json(scene, &mut self.render_tracker),
+            None => "[]".into(),
+        }
+    }
+
+    /// The display mesh of object `id` in its local frame, or `undefined`. A
+    /// picture of the analytic geometry, never traced (`oc_core::display_mesh`).
+    #[wasm_bindgen(js_name = renderMesh)]
+    pub fn render_mesh(&self, id: f64) -> Option<render_view::RenderMesh> {
+        render_view::render_mesh(self.scene3.as_ref()?, id as u64)
+    }
+
     /// The 3D objects for the inspector: each body's id, geometry kind, 3D
     /// construction, whether its third dimension is resolved, and its world
     /// position. JSON array `[{id,kind,construction,is3d,pos:[x,y,z]}]`; empty if
@@ -2325,6 +2333,50 @@ impl Canvas {
                 q[3]
             ));
         }
+        format!("[{}]", items.join(","))
+    }
+
+    /// The scene's light sources in the [`Canvas::scene_objects_json`] item shape,
+    /// with `kind: "source"` and `construction` naming the emitting aperture
+    /// (`rectangle`, `disc`, `point`, `line`). Only the 3D model view lists
+    /// them: it draws a source glyph, and the 2D cross-section does not. A source
+    /// moves and rotates through the same setters as any object.
+    #[wasm_bindgen(js_name = sourceObjectsJSON)]
+    pub fn source_objects_json(&self) -> String {
+        use oc_core::scene3::SpatialDistribution3 as S;
+        let Some(scene) = &self.scene3 else {
+            return "[]".into();
+        };
+        let items: Vec<String> = scene
+            .sources
+            .iter()
+            .map(|s| {
+                let construction = match s.spatial {
+                    S::Rectangle { .. } => "rectangle",
+                    S::Disc { .. } => "disc",
+                    S::Point => "point",
+                    S::LineLegacy { .. } => "line",
+                };
+                let p = s.transform.pos;
+                let q = s.transform.rot_xyzw;
+                let rot_z = (2.0 * q[2].atan2(q[3])).to_degrees();
+                format!(
+                    "{{\"id\":{},\"kind\":\"source\",\"construction\":{},\"is3d\":{},\"body\":false,\"pos\":[{},{},{}],\"radius\":{},\"rotZ\":{},\"rot\":[{},{},{},{}]}}",
+                    s.id.0,
+                    json_str(construction),
+                    !s.spatial.is_legacy(),
+                    p.x,
+                    p.y,
+                    p.z,
+                    source_radius(s),
+                    rot_z,
+                    q[0],
+                    q[1],
+                    q[2],
+                    q[3]
+                )
+            })
+            .collect();
         format!("[{}]", items.join(","))
     }
 
@@ -2499,6 +2551,39 @@ impl Canvas {
 /// Interaction depth of the interactive f32 trace, on the CPU mirror or the GPU
 /// (§4.1). One constant, so the two pictures cannot drift apart.
 pub(crate) const FAST_DEPTH: u32 = 32;
+
+/// Pack a trace's area-detector maps into the layout of
+/// [`Canvas::last_detector_maps_f32`]. A legacy line probe has no area and is
+/// left out.
+fn pack_detector_maps(scene: &Scene3, res: &oc_trace::TraceResult3) -> Vec<f32> {
+    let mut out = vec![0.0];
+    let mut count = 0;
+    for d in &res.detectors {
+        let Some(det) = scene
+            .detectors
+            .iter()
+            .find(|x| x.common.id.0 == d.detector.0)
+        else {
+            continue;
+        };
+        let [nu, nv] = d.bins;
+        if !det.geometry.has_area() || d.incident_flux.len() != nu * nv {
+            continue;
+        }
+        let (hw, hh) = detector_half_extents(det);
+        out.extend_from_slice(&[
+            d.detector.0 as f32,
+            nu as f32,
+            nv as f32,
+            hw as f32,
+            hh as f32,
+        ]);
+        out.extend(d.incident_flux.iter().map(|&v| v as f32));
+        count += 1;
+    }
+    out[0] = count as f32;
+    out
+}
 
 /// Pack f32 segments into the projected 11-float layout of
 /// [`Canvas::trace_projected_3d`].
@@ -2886,6 +2971,21 @@ fn detector_half_extents(d: &oc_core::scene3::Detector3) -> (f64, f64) {
     }
 }
 
+/// A coarse radius for a source's glyph (proximity picking): its aperture plus
+/// the housing margin, or a few mm for a point.
+pub(crate) fn source_radius(s: &oc_core::scene3::Source3) -> f64 {
+    use oc_core::scene3::SpatialDistribution3 as S;
+    match s.spatial {
+        S::Rectangle {
+            half_width_mm,
+            half_height_mm,
+        } => half_width_mm.hypot(half_height_mm) + 1.0,
+        S::Disc { radius_mm } => radius_mm + 1.0,
+        S::LineLegacy { half_width_mm } => half_width_mm,
+        S::Point => 2.0,
+    }
+}
+
 /// A body's geometry kind and 3D construction, for the inspector.
 fn body_kind_construction(b: &oc_core::scene3::Body3) -> (&'static str, &'static str) {
     use oc_core::scene3::SolidGeometry3;
@@ -3253,6 +3353,64 @@ mod scene3_tests {
     }
 
     #[test]
+    fn the_projected_trace_leaves_the_detector_maps_of_the_readout() {
+        let mut c = Canvas::new();
+        assert!(c.last_detector_maps_f32().is_empty());
+        c.new_default_scene3();
+        assert!(!c.trace_projected_3d().is_empty());
+        let maps = c.last_detector_maps_f32();
+        assert_eq!(maps[0], 1.0, "one area detector");
+        let det_id = c.scene3.as_ref().unwrap().detectors[0].common.id.0;
+        assert_eq!(maps[1] as u64, det_id);
+        let (nu, nv) = (maps[2] as usize, maps[3] as usize);
+        let cells = &maps[6..];
+        assert_eq!(cells.len(), nu * nv);
+
+        // The same cells as the f64 readout, to f32 rounding.
+        let readout: serde_json::Value =
+            serde_json::from_str(&c.detector_result_json(det_id as f64)).unwrap();
+        assert_eq!(readout["bins"][0].as_u64().unwrap() as usize, nu);
+        let incident = readout["incident"].as_array().unwrap();
+        assert_eq!(incident.len(), cells.len());
+        for (a, b) in cells.iter().zip(incident) {
+            let b = b.as_f64().unwrap();
+            assert!((*a as f64 - b).abs() <= 1e-6 * b.abs().max(1e-12));
+        }
+        assert!(
+            cells.iter().any(|v| *v > 0.0),
+            "the beam reaches the detector"
+        );
+
+        // A scene with no detector leaves an empty map list.
+        let id = det_id as f64;
+        assert!(c.delete_object_3d(id));
+        c.trace_projected_3d();
+        assert_eq!(c.last_detector_maps_f32(), vec![0.0]);
+    }
+
+    #[test]
+    fn sources_are_listed_for_the_3d_view_only() {
+        let mut c = Canvas::new();
+        assert_eq!(c.source_objects_json(), "[]");
+        c.new_default_scene3();
+        let v: serde_json::Value = serde_json::from_str(&c.source_objects_json()).unwrap();
+        let items = v.as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["kind"], "source");
+        assert_eq!(items[0]["construction"], "rectangle");
+        assert_eq!(items[0]["is3d"], true);
+        // The shared object list is unchanged: the 2D view has no source glyph.
+        assert!(!c.scene_objects_json().contains("\"source\""));
+        // A source moves and turns through the generic setters.
+        let id = items[0]["id"].as_f64().unwrap();
+        assert!(c.set_object_position(id, -40.0, 3.0, 0.0));
+        assert!(c.set_object_rotation_z_deg(id, 10.0));
+        let v: serde_json::Value = serde_json::from_str(&c.source_objects_json()).unwrap();
+        assert_eq!(v[0]["pos"][1].as_f64().unwrap(), 3.0);
+        assert!((v[0]["rotZ"].as_f64().unwrap() - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
     fn sequence_extraction_reads_the_default_scene() {
         let mut c = Canvas::new();
         c.new_default_scene3();
@@ -3315,11 +3473,9 @@ mod scene3_tests {
         let mut c = Canvas::new();
         c.new_default_scene3();
 
-        // A prism: a body, glass-editable, with a drawable extruded outline.
+        // A prism: a glass-editable extruded body.
         let pid = c.add_prism(-40.0, 0.0, 16.0, 10.0, 1.62, 36.0);
         assert!(pid >= 0.0);
-        let ext = c.body_extrude_json(pid);
-        assert!(ext.contains("\"zMin\":") && ext.contains("\"points\":[["), "{ext}");
         assert!(c.scene_objects_json().contains("\"construction\":\"extruded\""));
         assert!(c.body_glass_json(pid).contains("\"nd\":1.62"));
 

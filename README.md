@@ -27,6 +27,8 @@ Optiland Canvas is a tool for the *ideation* phase of optical design, the part b
 
 **Interaction**
 - Two views over one scene: a meridional cross-section and an orbitable 3D model. Elements drag, tilt and snap to the grid in either, and the rays retrace while you drag.
+- The 3D model draws the parts as solids: clear glass, mirrors, blackened stops, and detectors, under a choice of four studio lightings and five backgrounds, with rays either drawn over the parts or hidden by opaque ones.
+- In the 3D model, each detector face shows its flux map from the exact trace, and the light source has a glyph you can pick and move. Ray width is adjustable, and the view settings are remembered in the browser.
 - Every parameter has an on-canvas handle and a numeric twin. Drag the handle or scrub the number, and the light follows. No Apply button, no modal dialogs.
 - Pop-up inspector cards (several at once, one per element), an adjustable grid with snapping, copy/paste/delete, per-parameter and whole-element pinning, plus zoom & pan.
 - Add a round element or a fold mirror from the scene dock, and choose the source (collimated, point cone, Lambertian disc) and how densely it samples.
@@ -40,6 +42,7 @@ What the app carries today: the detector dock (irradiance heatmap or spot diagra
 **Under the hood**
 - Two-tier tracer: a fast f32 path draws the picture, an exact f64 reference computes every displayed *number*, and numbers never come from the fast path. The f32 path has a `wgpu` compute backend and a CPU mirror; in the browser the WebGPU backend takes over from about 5,000 segments a frame, where it becomes the faster of the two.
 - Scene state lives in Rust; the browser holds only UI state.
+- The 3D model view renders through three.js (WebGPU, with a WebGL2 fallback) as a disposable picture of the Rust scene. Its meshes are tessellated in Rust from the analytic geometry the tracer uses, and nothing it draws is a measurement: the glass is display shading, not a second ray trace. See [the renderer report](docs/3d-renderer-implementation-report.md).
 - `.ocanvas`: a plain-JSON, human-readable, diffable scene format.
 
 ## Try it
@@ -55,7 +58,7 @@ npm install
 npm run dev          # builds the wasm, starts Vite; open the printed URL
 ```
 
-The app opens on a biconvex singlet lit by a collimated white beam, with a detector downstream. Double-click an element to inspect it, drag it to move, use the handle to tilt it, and scroll to zoom. `◳ 3D model` swaps the cross-section for an orbit view of the same scene. Add a fold mirror or a round element from the scene dock. Every number comes from the f64 reference tracer. The picture comes from the f32 tracer, on the CPU for light scenes and on WebGPU for heavy ones when the browser has a device; the status line says which.
+The app opens on a biconvex singlet lit by a collimated white beam, with a detector downstream. Double-click an element to inspect it, drag it to move, use the handle to tilt it, and scroll to zoom. `◳ 3D model` swaps the cross-section for an orbit view of the same scene, drawn on the GPU; its lighting, background, exposure and ray visibility sit in a bar at the bottom. Add a fold mirror or a round element from the scene dock. Every number comes from the f64 reference tracer. The picture comes from the f32 tracer, on the CPU for light scenes and on WebGPU for heavy ones when the browser has a device; the status line says which, and in the 3D view it also names the backend that draws the solids.
 
 Prefer the engine without the UI?
 

@@ -201,7 +201,11 @@ export class CameraRig {
     this.touch();
   }
 
-  /** Fit `bounds` into about 84% of the view, looking at its centre. */
+  /** Horizontal pixels on each side covered by the app's side panels, which
+   *  framing keeps the assembly clear of. */
+  sideInset = 0;
+
+  /** Fit `bounds` into about 84% of the free view, looking at its centre. */
   frame(bounds: Bounds3 | null) {
     if (!bounds || !Number.isFinite(bounds.min.x)) {
       this.target = v3(0, 0, 0);
@@ -224,7 +228,8 @@ export class CameraRig {
         }
       }
     }
-    this.scale = Math.max(0.5, Math.min((this.width * 0.42) / mx, (this.height * 0.42) / my));
+    const freeWidth = Math.max(this.width * 0.4, this.width - 2 * this.sideInset);
+    this.scale = Math.max(0.5, Math.min((freeWidth * 0.42) / mx, (this.height * 0.42) / my));
     this.sceneRadius = Math.max(10, 0.5 * Math.hypot(hi.x - lo.x, hi.y - lo.y, hi.z - lo.z));
     // Far enough that the whole assembly sits in front of the perspective eye.
     this.distance = Math.max(500, 4 * this.sceneRadius);

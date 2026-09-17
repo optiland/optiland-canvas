@@ -113,6 +113,19 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
   let clipboard = -1;
   let pasteN = 0;
   let lastTraceMs = 0;
+  // The scene revision the render proxies were last synced at.
+  let syncedRevision = -1;
+
+  /** Bring the GPU proxies up to date with Rust, if the scene moved. */
+  function syncRender(force = false) {
+    if (!renderer) return;
+    const rev = scene.sceneRevision();
+    if (!force && rev === syncedRevision) return;
+    const t0 = performance.now();
+    const descriptors = JSON.parse(scene.renderObjectsJSON());
+    renderer.syncScene(descriptors, (id) => scene.renderMesh(id), t0);
+    syncedRevision = rev;
+  }
 
   function select(id: number) {
     selected = id;
@@ -148,7 +161,6 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
   const objectsPanel = document.getElementById("objects3d");
   function refreshObjects() {
     objList = JSON.parse(scene.sceneObjectsJSON());
-    renderer?.setPlaceholders(objList.map((o) => ({ id: o.id, pos: [o.pos[0], o.pos[1], o.pos[2]], radius: o.radius })));
     if (!objectsPanel) return;
     objectsPanel.replaceChildren();
     for (const o of objList) {
@@ -199,7 +211,19 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
     return { min: lo, max: hi };
   }
 
+  // The side panels cover the canvas edges; framing keeps the assembly between them.
+  function panelInset(): number {
+    let inset = 0;
+    for (const id of ["m4dock", "controls", "dock"]) {
+      const r = document.getElementById(id)?.getBoundingClientRect();
+      if (!r || r.width === 0) continue;
+      inset = Math.max(inset, r.left < window.innerWidth / 2 ? r.right : window.innerWidth - r.left);
+    }
+    return Math.min(inset, window.innerWidth * 0.3);
+  }
+
   function frameScene() {
+    rig.sideInset = panelInset();
     const hw = hardwareBounds();
     if (!hw) { rig.frame(null); return; }
     const lo = { ...hw.min }, hi = { ...hw.max };
@@ -233,6 +257,7 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
         renderer = await mod.OpticalRenderer3D.create(canvas, { forceWebGL: opts.forceWebGL });
         backend = renderer.backend;
         refreshObjects();
+        syncRender(true);
       } catch (e) {
         console.warn("3D renderer unavailable.", e);
         failure = e instanceof Error ? e.message : String(e);
@@ -272,6 +297,7 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
     let count = 0;
     let tir: V2[] = [];
     if (renderer) {
+      syncRender();
       renderer.setGrid(grid.on, grid.spacing);
       renderer.resize(W, H, quality.pixelRatio(dpr));
       renderer.render(rig);
@@ -579,7 +605,7 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
   return {
     kind: "three",
     invalidate,
-    refresh: () => { retrace(false); refreshObjects(); cards.renderAll(); invalidate(); },
+    refresh: () => { retrace(false); refreshObjects(); syncRender(true); cards.renderAll(); invalidate(); },
     selectedBody: () => selected,
     activate,
     standDown,

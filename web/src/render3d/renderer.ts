@@ -18,17 +18,17 @@
 // so an idle view costs nothing.
 
 import * as THREE from "three/webgpu";
+import type { RenderMesh } from "../../pkg/oc_wasm.js";
 import type { Bounds3, CameraRig } from "./camera";
+import { MaterialLibrary } from "./materials";
 import { Scaffold, type ScaffoldTheme } from "./scaffold";
-import type { RenderBackend, RenderStats } from "./types";
+import { SceneRenderCache, type SyncReport } from "./scene-cache";
+import type { RenderBackend, RenderObjectDescriptor, RenderStats } from "./types";
 
 export type RendererOptions = {
   /** Use the WebGL2 backend even where WebGPU exists (tests, comparisons). */
   forceWebGL?: boolean;
 };
-
-/** A temporary stand-in for a scene object (Phase 1, before the mesh bridge). */
-export type Placeholder = { id: number; pos: [number, number, number]; radius: number };
 
 type Internals = {
   _animation?: { stop(): void };
@@ -41,9 +41,10 @@ export class OpticalRenderer3D {
   private readonly ortho = new THREE.OrthographicCamera();
   private readonly persp = new THREE.PerspectiveCamera();
   private readonly scaffold = new Scaffold();
-  private readonly placeholders = new THREE.Group();
-  private readonly placeholderMaterial = new THREE.MeshBasicNodeMaterial({ color: 0x7fb6e0, wireframe: true });
-  private readonly sphere = new THREE.IcosahedronGeometry(1, 2);
+  private readonly materials = new MaterialLibrary();
+  private readonly cache = new SceneRenderCache(this.materials);
+  private lastSync: SyncReport | null = null;
+  private lastSyncMs = 0;
   private cssWidth = 1;
   private cssHeight = 1;
   private dpr = 1;
@@ -65,8 +66,12 @@ export class OpticalRenderer3D {
     this.scene.name = "optiland-canvas-3d";
     this.scene.background = new THREE.Color(0x06080d);
     this.scene.add(this.scaffold.root);
-    this.placeholders.name = "placeholders";
-    this.scene.add(this.placeholders);
+    this.scene.add(this.cache.root);
+    // Phase 2 lighting: enough to read the shapes.
+    this.scene.add(new THREE.HemisphereLight(0xdfe8ff, 0x1a1c22, 1.2));
+    const key = new THREE.DirectionalLight(0xffffff, 1.5);
+    key.position.set(-1, 2, 1.5);
+    this.scene.add(key);
     this.scaffold.layout(null, this.gridSpacing, this.gridOn, this.groundOn, this.theme);
   }
 
@@ -99,24 +104,23 @@ export class OpticalRenderer3D {
     this.renderer.setSize(this.cssWidth, this.cssHeight, false);
   }
 
-  /** Temporary Phase 1 stand-ins: a wire sphere per object. */
-  setPlaceholders(items: Placeholder[]) {
-    this.placeholders.clear();
-    const lo = { x: Infinity, y: Infinity, z: Infinity };
-    const hi = { x: -Infinity, y: -Infinity, z: -Infinity };
-    for (const it of items) {
-      const m = new THREE.Mesh(this.sphere, this.placeholderMaterial);
-      m.position.set(...it.pos);
-      m.scale.setScalar(Math.max(0.5, it.radius));
-      m.userData.objectId = it.id;
-      this.placeholders.add(m);
-      const r = Math.max(0.5, it.radius);
-      lo.x = Math.min(lo.x, it.pos[0] - r); hi.x = Math.max(hi.x, it.pos[0] + r);
-      lo.y = Math.min(lo.y, it.pos[1] - r); hi.y = Math.max(hi.y, it.pos[1] + r);
-      lo.z = Math.min(lo.z, it.pos[2] - r); hi.z = Math.max(hi.z, it.pos[2] + r);
+  /** Bring the render proxies up to the Rust scene's current descriptors.
+   *  Only changed revisions do work (scene-cache.ts). `syncMs` covers the
+   *  whole sync, including the wasm calls the caller made to get `descriptors`
+   *  when it passes `startedAt`. */
+  syncScene(
+    descriptors: RenderObjectDescriptor[],
+    fetchMesh: (id: number) => RenderMesh | undefined,
+    startedAt = performance.now(),
+  ): SyncReport {
+    const report = this.cache.sync(descriptors, fetchMesh);
+    this.lastSync = report;
+    if (report.meshBuilds || report.added || report.removed || report.transformed) {
+      this.bounds = this.cache.bounds();
+      this.relayout();
     }
-    this.bounds = Number.isFinite(lo.x) ? { min: lo, max: hi } : null;
-    this.relayout();
+    this.lastSyncMs = performance.now() - startedAt;
+    return report;
   }
 
   setGrid(on: boolean, spacing: number) {
@@ -195,13 +199,17 @@ export class OpticalRenderer3D {
       lines: info.render.lines,
       geometries: info.memory.geometries,
       textures: info.memory.textures,
+      meshBuilds: this.cache.meshBuilds,
+      meshBuildsLastSync: this.lastSync?.meshBuilds ?? 0,
+      meshBuildMs: this.lastSync?.meshBuildMs ?? 0,
+      syncMs: this.lastSyncMs,
+      cachedObjects: this.cache.size,
     };
   }
 
   dispose() {
-    this.placeholders.clear();
-    this.sphere.dispose();
-    this.placeholderMaterial.dispose();
+    this.cache.dispose();
+    this.materials.dispose();
     this.scaffold.dispose();
     void this.renderer.dispose();
   }

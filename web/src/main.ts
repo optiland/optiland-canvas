@@ -766,6 +766,7 @@ async function main() {
       status: writeStatus,
       forceWebGL: params.get("render3d") === "webgl",
       disable: params.get("render3d") === "off",
+      timing: params.has("debug"),
     });
 
   // Always-3D: the app boots straight into the canonical 3D scene — a singlet
@@ -791,6 +792,15 @@ async function main() {
       exactProjected: () => scene.traceProjected3D(),
       // The GPU 3D view's camera, statistics, and pixel probe (tests).
       render3d: threeView()?.debug ?? null,
+      // The active view, drawn now; for the legacy benchmark comparison.
+      renderView: () => {
+        const t0 = performance.now();
+        renderView();
+        return performance.now() - t0;
+      },
+      setViewMode: (m: "2d" | "3d") => setViewMode(m),
+      // The selection the active view (and the material picker) targets.
+      selectedBody3d: () => selectedBody3d(),
     };
   }
 

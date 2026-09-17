@@ -5,8 +5,9 @@
 //   hover     a faint glow that grows toward the silhouette
 //   selection a stronger glow plus a thin outline of the object's creases
 // Both are drawn after the glass so they stay visible on clear bodies. The
-// outline ignores depth, so a selected object's outline is visible even where
-// another object covers it. The colour follows the background.
+// outline is the object's crease lines from Rust (rims, corners, outlines) and
+// ignores depth, so a selected object's outline is visible even where another
+// object covers it. The colour follows the background.
 
 import * as THREE from "three/webgpu";
 import { abs, dot, float, normalView, positionViewDirection, uniform } from "three/tsl";
@@ -85,10 +86,8 @@ export class CueLayer {
   private replace(old: Cue | null, id: number, selected: boolean): Cue | null {
     if (old) {
       old.glow.removeFromParent();
-      if (old.outline) {
-        old.outline.removeFromParent();
-        old.outline.geometry.dispose();
-      }
+      // The outline's geometry belongs to the render cache.
+      old.outline?.removeFromParent();
     }
     const e = id >= 0 ? this.cache.get(id) : undefined;
     if (!e || !(e.root instanceof THREE.Mesh)) return null;
@@ -98,8 +97,8 @@ export class CueLayer {
     glow.raycast = () => {};
     e.root.add(glow);
     let outline: THREE.LineSegments | null = null;
-    if (selected) {
-      outline = new THREE.LineSegments(new THREE.EdgesGeometry(geometry, 25), this.outlineMaterial);
+    if (selected && e.edges) {
+      outline = new THREE.LineSegments(e.edges, this.outlineMaterial);
       outline.renderOrder = 31;
       outline.raycast = () => {};
       e.root.add(outline);

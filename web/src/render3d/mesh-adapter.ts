@@ -18,6 +18,7 @@ export function readMesh(mesh: RenderMesh): RenderMeshData & { note: string | nu
       normals: mesh.normals(),
       indices: mesh.indices(),
       groups: mesh.groups(),
+      edges: mesh.edges(),
       bounds: mesh.bounds(),
       note: mesh.note() ?? null,
     };
@@ -40,6 +41,29 @@ export function buildGeometry(data: RenderMeshData): THREE.BufferGeometry {
   // Bounds come from Rust, so three.js does not walk the vertices for them.
   const b = data.bounds;
   g.boundingBox = new THREE.Box3(new THREE.Vector3(b[0], b[1], b[2]), new THREE.Vector3(b[3], b[4], b[5]));
+  g.boundingSphere = g.boundingBox.getBoundingSphere(new THREE.Sphere());
+  return g;
+}
+
+/** The mesh's crease lines as their own small line geometry, or null. The
+ *  vertices are copied rather than shared, so each geometry can be disposed on
+ *  its own. */
+export function buildEdgeGeometry(data: RenderMeshData): THREE.BufferGeometry | null {
+  const e = data.edges;
+  if (e.length < 2) return null;
+  const pos = new Float32Array(e.length * 3);
+  for (let i = 0; i < e.length; i++) {
+    const v = e[i] * 3;
+    pos[i * 3] = data.positions[v];
+    pos[i * 3 + 1] = data.positions[v + 1];
+    pos[i * 3 + 2] = data.positions[v + 2];
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+  g.boundingBox = new THREE.Box3(
+    new THREE.Vector3(data.bounds[0], data.bounds[1], data.bounds[2]),
+    new THREE.Vector3(data.bounds[3], data.bounds[4], data.bounds[5]),
+  );
   g.boundingSphere = g.boundingBox.getBoundingSphere(new THREE.Sphere());
   return g;
 }

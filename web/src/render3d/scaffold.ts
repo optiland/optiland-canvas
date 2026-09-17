@@ -4,9 +4,13 @@
 // that snaps to 5 mm lands on a line drawn 5 mm apart. The ground sits below the
 // lowest component rather than through the optical axis, so lenses stand on it
 // visually instead of being sliced by it. It has no optical meaning.
+//
+// The grid's material is built once. Its geometry depends only on the pitch and
+// the patch size (rounded to a power of two), so moving the assembly moves the
+// grid without rebuilding anything.
 
 import * as THREE from "three/webgpu";
-import { attribute, float, length, positionLocal, smoothstep, uniform } from "three/tsl";
+import { abs, attribute, float, length, mix, positionLocal, positionWorld, smoothstep, step, uniform } from "three/tsl";
 import type { Bounds3 } from "./camera";
 
 export type ScaffoldTheme = {
@@ -17,11 +21,6 @@ export type ScaffoldTheme = {
   ground: THREE.Color | null;
 };
 
-const colorUniform = (c: THREE.Color) => uniform(c);
-const floatUniform = (v: number) => uniform(v);
-type ColorUniform = ReturnType<typeof colorUniform>;
-type FloatUniform = ReturnType<typeof floatUniform>;
-
 const AXIS_COLORS: [number, number, number][] = [
   [0.59, 0.69, 0.82], // +X, the optical axis (labelled "Z")
   [0.59, 0.82, 0.69], // +Y, vertical ("Y")
@@ -31,13 +30,17 @@ const AXIS_COLORS: [number, number, number][] = [
 export class Scaffold {
   readonly root = new THREE.Group();
   private axes: THREE.LineSegments;
-  private grid: THREE.LineSegments | null = null;
+  private grid: THREE.LineSegments;
   private ground: THREE.Mesh;
-  private gridColor = colorUniform(new THREE.Color(0.47, 0.59, 0.75));
-  private gridOpacity = floatUniform(0.35);
-  private gridExtent = floatUniform(100);
+  private gridColor = uniform(new THREE.Color(0.47, 0.59, 0.75));
+  private gridOpacity = uniform(0.35);
+  private gridExtent = uniform(100);
+  private gridPitch = uniform(5);
   private gridKey = "";
+  private gridMaterial: THREE.LineBasicNodeMaterial;
   private groundMaterial: THREE.MeshStandardNodeMaterial;
+  /** Grid geometries built since start (diagnostics). */
+  gridBuilds = 0;
   /** Length of the drawn axes, mm. */
   axisLength = 18;
   groundY = 0;
@@ -46,6 +49,22 @@ export class Scaffold {
     this.root.name = "scaffold";
     this.axes = makeAxes();
     this.root.add(this.axes);
+
+    this.gridMaterial = new THREE.LineBasicNodeMaterial({ transparent: true, depthWrite: false });
+    // Fade with distance from the patch centre so the grid never ends in a hard
+    // edge. A line lying on a world axis (x = 0 for lines along z, z = 0 for
+    // lines along x) is drawn brighter, as in the 2D grid.
+    const fade = smoothstep(this.gridExtent, this.gridExtent.mul(0.35), length(positionLocal.xz));
+    const offAxis = mix(abs(positionWorld.x), abs(positionWorld.z), attribute("alongX", "float"));
+    const onAxis = step(offAxis, this.gridPitch.mul(0.01));
+    this.gridMaterial.colorNode = this.gridColor;
+    this.gridMaterial.opacityNode = fade.mul(this.gridOpacity).mul(float(1).add(onAxis.mul(1.6))).min(1);
+    this.gridMaterial.name = "grid";
+    this.grid = new THREE.LineSegments(new THREE.BufferGeometry(), this.gridMaterial);
+    this.grid.name = "grid";
+    this.grid.renderOrder = -1;
+    this.grid.frustumCulled = false;
+    this.root.add(this.grid);
 
     this.groundMaterial = new THREE.MeshStandardNodeMaterial({ roughness: 0.92, metalness: 0 });
     this.ground = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), this.groundMaterial);
@@ -56,8 +75,8 @@ export class Scaffold {
     this.root.add(this.ground);
   }
 
-  /** Place the ground, grid, and axes for an assembly that occupies `bounds`,
-   *  centred near `centre`. `spacing` is the grid pitch in mm. */
+  /** Place the ground, grid, and axes for an assembly that occupies `bounds`.
+   *  `spacing` is the grid pitch in mm. */
   layout(bounds: Bounds3 | null, spacing: number, gridOn: boolean, groundOn: boolean, theme: ScaffoldTheme) {
     const lo = bounds?.min ?? { x: -40, y: -20, z: -20 };
     const hi = bounds?.max ?? { x: 40, y: 20, z: 20 };
@@ -70,34 +89,30 @@ export class Scaffold {
 
     const sp = Math.max(0.1, spacing);
     // A patch that covers the assembly generously, capped so a fine pitch on a
-    // large scene does not become a million lines.
-    let half = Math.ceil((0.9 * size + 20) / sp);
-    half = Math.max(8, Math.min(200, half));
-    const ox = Math.round(cx / sp) * sp, oz = Math.round(cz / sp) * sp;
-    const key = `${sp}|${half}|${ox}|${oz}`;
+    // large scene does not become a million lines. A power of two, so small
+    // changes in the assembly's size do not rebuild the grid.
+    const need = Math.ceil((0.9 * size + 20) / sp);
+    const half = Math.max(8, Math.min(256, 2 ** Math.ceil(Math.log2(need))));
+    const key = `${sp}|${half}`;
     if (key !== this.gridKey) {
       this.gridKey = key;
-      if (this.grid) {
-        this.root.remove(this.grid);
-        this.grid.geometry.dispose();
-        (this.grid.material as THREE.Material).dispose();
-      }
-      this.grid = makeGrid(sp, half, ox, oz, this.gridColor, this.gridOpacity, this.gridExtent);
-      this.root.add(this.grid);
+      this.grid.geometry.dispose();
+      this.grid.geometry = makeGridGeometry(sp, half);
+      this.gridBuilds++;
     }
     this.gridExtent.value = half * sp;
-    this.grid!.position.y = this.groundY;
-    // A small lift keeps the lines off the ground plane without z-fighting;
-    // polygon offset alone is not reliable across both backends for lines.
-    this.grid!.position.y += Math.max(0.01, 1e-4 * size);
-    this.grid!.visible = gridOn;
+    this.gridPitch.value = sp;
+    // Snapped to the pitch, so the lines stay on world multiples of it. A small
+    // lift keeps the lines off the ground plane without z-fighting.
+    this.grid.position.set(Math.round(cx / sp) * sp, this.groundY + Math.max(0.01, 1e-4 * size), Math.round(cz / sp) * sp);
+    this.grid.visible = gridOn;
 
     this.gridColor.value.copy(theme.grid);
     this.gridOpacity.value = theme.gridOpacity;
 
     const extent = 2 * half * sp + 4 * size;
     this.ground.scale.set(extent, extent, 1);
-    this.ground.position.set(ox, this.groundY, oz);
+    this.ground.position.set(this.grid.position.x, this.groundY, this.grid.position.z);
     this.ground.visible = groundOn && theme.ground !== null;
     if (theme.ground) this.groundMaterial.color.copy(theme.ground);
   }
@@ -115,10 +130,8 @@ export class Scaffold {
   dispose() {
     this.axes.geometry.dispose();
     (this.axes.material as THREE.Material).dispose();
-    if (this.grid) {
-      this.grid.geometry.dispose();
-      (this.grid.material as THREE.Material).dispose();
-    }
+    this.grid.geometry.dispose();
+    this.gridMaterial.dispose();
     this.ground.geometry.dispose();
     this.groundMaterial.dispose();
   }
@@ -142,47 +155,21 @@ function makeAxes(): THREE.LineSegments {
   return axes;
 }
 
-function makeGrid(
-  sp: number,
-  half: number,
-  ox: number,
-  oz: number,
-  color: ColorUniform,
-  opacity: FloatUniform,
-  extent: FloatUniform,
-): THREE.LineSegments {
+/** Grid lines in the patch's local frame, centred on its origin. */
+function makeGridGeometry(sp: number, half: number): THREE.BufferGeometry {
   const n = 2 * half + 1;
   const pos = new Float32Array(n * 2 * 6);
-  const emph = new Float32Array(n * 2 * 2);
+  const alongX = new Float32Array(n * 2 * 2);
   let k = 0, e = 0;
   const L = half * sp;
   for (let i = -half; i <= half; i++) {
-    const x = ox + i * sp;
-    const z = oz + i * sp;
-    // Lines along Z (constant x), then along X (constant z), in grid-local
-    // coordinates relative to (ox, oz) so the shader fade is centred.
-    pos.set([i * sp, 0, -L, i * sp, 0, L], k); k += 6;
-    pos.set([-L, 0, i * sp, L, 0, i * sp], k); k += 6;
-    // The world axes read brighter, as in the 2D grid.
-    const onX = Math.abs(x) < 1e-9 ? 1 : 0;
-    const onZ = Math.abs(z) < 1e-9 ? 1 : 0;
-    emph.set([onX, onX], e); e += 2;
-    emph.set([onZ, onZ], e); e += 2;
+    pos.set([i * sp, 0, -L, i * sp, 0, L], k); k += 6; // along z
+    alongX.set([0, 0], e); e += 2;
+    pos.set([-L, 0, i * sp, L, 0, i * sp], k); k += 6; // along x
+    alongX.set([1, 1], e); e += 2;
   }
   const g = new THREE.BufferGeometry();
   g.setAttribute("position", new THREE.BufferAttribute(pos, 3));
-  g.setAttribute("emph", new THREE.BufferAttribute(emph, 1));
-  const m = new THREE.LineBasicNodeMaterial({ transparent: true, depthWrite: false });
-  // Fade with distance from the patch centre so the grid never ends in a hard
-  // edge; the world axis lines are brighter.
-  const fade = smoothstep(extent, extent.mul(0.35), length(positionLocal.xz));
-  const emphasis = float(1).add(attribute("emph", "float").mul(1.6));
-  m.colorNode = color;
-  m.opacityNode = fade.mul(opacity).mul(emphasis).min(1);
-  const grid = new THREE.LineSegments(g, m);
-  grid.name = "grid";
-  grid.position.set(ox, 0, oz);
-  grid.renderOrder = -1;
-  grid.frustumCulled = false;
-  return grid;
+  g.setAttribute("alongX", new THREE.BufferAttribute(alongX, 1));
+  return g;
 }

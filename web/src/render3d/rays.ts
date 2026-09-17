@@ -59,6 +59,7 @@ export class RayBuffer {
   readonly depthOnly = new THREE.MeshBasicNodeMaterial({ colorWrite: false });
   inkMode = false;
   count = 0;
+  uploads = 0;
 
   constructor() {
     this.buffer = this.allocate(1024);
@@ -170,6 +171,7 @@ export class RayBuffer {
     this.buffer.needsUpdate = true;
     this.object.geometry.setDrawRange(0, count * 2);
     this.count = count;
+    this.uploads++;
     return { count, tir, ms: performance.now() - t0 };
   }
 

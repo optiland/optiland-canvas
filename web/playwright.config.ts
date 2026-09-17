@@ -23,8 +23,8 @@ export default defineConfig({
   projects: [
     {
       name: "chromium",
-      // Needs a GPU; runs only in the opt-in project below.
-      testIgnore: /webgpu\.spec\.ts/,
+      // Need a GPU or a local baseline; they run only in the opt-in projects below.
+      testIgnore: /webgpu\.spec\.ts|render3d-(visual|bench)\.spec\.ts/,
       use: {
         ...devices["Desktop Chrome"],
         // After the device spread, which carries its own 1280x720 and would
@@ -43,12 +43,50 @@ export default defineConfig({
       ? [
           {
             name: "webgpu",
-            testMatch: /webgpu\.spec\.ts/,
+            // The GPU 3D view suite runs here too, on a real WebGPU device.
+            testMatch: /webgpu\.spec\.ts|render3d\.spec\.ts/,
             use: {
               ...devices["Desktop Chrome"],
               viewport: { width: 1600, height: 900 },
               channel: process.env.OC_WEBGPU_CHANNEL ?? "chromium",
               headless: !process.env.OC_WEBGPU_HEADED,
+              launchOptions: { args: ["--enable-unsafe-webgpu"] },
+            },
+          },
+        ]
+      : []),
+    // Screenshot regressions of the GPU 3D view, opt-in because the baselines
+    // are per machine and backend: OC_VISUAL=1 npx playwright test --project=visual
+    // (add --update-snapshots to record). OC_VISUAL_CHANNEL picks the browser.
+    ...(process.env.OC_VISUAL
+      ? [
+          {
+            name: "visual",
+            testMatch: /render3d-visual\.spec\.ts/,
+            use: {
+              ...devices["Desktop Chrome"],
+              viewport: { width: 1280, height: 800 },
+              deviceScaleFactor: 1,
+              channel: process.env.OC_VISUAL_CHANNEL ?? "chrome",
+              launchOptions: { args: ["--enable-unsafe-webgpu"] },
+            },
+          },
+        ]
+      : []),
+    // The renderer benchmark: OC_BENCH=1 npx playwright test --project=bench.
+    // Writes test-results/render3d-bench.{json,md}. OC_BENCH_CHANNEL picks the
+    // browser (default: the installed Chrome, for a real WebGPU device).
+    ...(process.env.OC_BENCH
+      ? [
+          {
+            name: "bench",
+            testMatch: /render3d-bench\.spec\.ts/,
+            timeout: 600_000,
+            use: {
+              ...devices["Desktop Chrome"],
+              viewport: { width: 1600, height: 900 },
+              deviceScaleFactor: 1,
+              channel: process.env.OC_BENCH_CHANNEL ?? "chrome",
               launchOptions: { args: ["--enable-unsafe-webgpu"] },
             },
           },

@@ -14,7 +14,7 @@
 import * as THREE from "three/webgpu";
 import type { RenderMesh } from "../../pkg/oc_wasm.js";
 import type { Bounds3 } from "./camera";
-import { buildGeometry, readMesh } from "./mesh-adapter";
+import { buildEdgeGeometry, buildGeometry, readMesh } from "./mesh-adapter";
 import type { MaterialLibrary } from "./materials";
 import type { RenderObjectDescriptor } from "./types";
 
@@ -27,6 +27,9 @@ export type CachedRenderable = {
   materialRevision: number;
   /** Why the object is drawn as an outline instead of a solid, if it is. */
   note: string | null;
+  /** The mesh's crease lines (from Rust), shared by the crease overlay and the
+   *  selection outline; owned and disposed by the cache. */
+  edges: THREE.BufferGeometry | null;
 };
 
 export type SyncReport = {
@@ -71,9 +74,10 @@ export class SceneRenderCache {
       live.add(d.id);
       let e = this.entries.get(d.id);
       if (!e || e.geometryRevision !== d.geometryRevision) {
+        // Timed as a whole: the wasm mesh fetch, the geometry, the crease lines,
+        // and any cue that follows the geometry.
         const t0 = performance.now();
         const next = this.build(d, fetchMesh, e);
-        report.meshBuildMs += performance.now() - t0;
         if (!next) continue;
         report.meshBuilds++;
         if (!e) report.added++;
@@ -83,6 +87,7 @@ export class SceneRenderCache {
         this.place(e, d);
         this.style(e, d);
         this.onRebuilt(d.id);
+        report.meshBuildMs += performance.now() - t0;
         continue;
       }
       if (e.transformRevision !== d.transformRevision) {
@@ -117,10 +122,12 @@ export class SceneRenderCache {
     if (!wasm) return null;
     const data = readMesh(wasm);
     const geometry = buildGeometry(data);
+    const edges = data.topology === "triangles" ? buildEdgeGeometry(data) : null;
     const lines = data.topology === "lines";
     let root: THREE.Mesh | THREE.LineSegments;
     if (old && (old.root instanceof THREE.LineSegments) === lines) {
       old.root.geometry.dispose();
+      old.edges?.dispose();
       old.root.geometry = geometry;
       root = old.root;
       // Geometry changed: the crease lines follow on the next style().
@@ -141,6 +148,7 @@ export class SceneRenderCache {
       transformRevision: -1,
       materialRevision: -1,
       note: data.note ?? d.error,
+      edges,
     };
   }
 
@@ -165,21 +173,14 @@ export class SceneRenderCache {
       (d.kind === "lens" || d.kind === "prism" || d.kind === "solid");
     const existing = e.root.children.find((c) => c.userData.crease) as THREE.LineSegments | undefined;
     if (!want) {
-      if (existing) {
-        e.root.remove(existing);
-        existing.geometry.dispose();
-      }
+      if (existing) e.root.remove(existing);
       return;
     }
-    if (existing && existing.userData.geometryRevision === e.geometryRevision) return;
-    if (existing) {
-      e.root.remove(existing);
-      existing.geometry.dispose();
-    }
-    // 25 degrees: the rim and prism corners, not the smooth faces.
-    const lines = new THREE.LineSegments(new THREE.EdgesGeometry(e.root.geometry, 25), this.materials.crease());
+    if (existing && existing.geometry === e.edges) return;
+    if (existing) e.root.remove(existing);
+    if (!e.edges) return;
+    const lines = new THREE.LineSegments(e.edges, this.materials.crease());
     lines.userData.crease = true;
-    lines.userData.geometryRevision = e.geometryRevision;
     lines.renderOrder = 1;
     lines.raycast = () => {};
     e.root.add(lines);
@@ -208,12 +209,11 @@ export class SceneRenderCache {
     return out;
   }
 
-  /** Remove a proxy and free its geometries (materials are shared). Crease
-   *  lines are this cache's; other children (cues) belong to their owners. */
+  /** Remove a proxy and free its geometries (materials are shared). */
   private release(e: CachedRenderable) {
     this.root.remove(e.root);
     e.root.geometry.dispose();
-    for (const c of e.root.children) if (c.userData.crease) (c as THREE.LineSegments).geometry.dispose();
+    e.edges?.dispose();
   }
 
   dispose() {

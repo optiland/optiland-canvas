@@ -19,6 +19,8 @@ export const SETTLE_DELAY_MS = 150;
 
 export class QualityController {
   state: RenderQualityState = "settled";
+  /** Times the view has entered the interactive state (diagnostics). */
+  episodes = 0;
   private timer: number | undefined;
   /** Held while a pointer gesture is in progress, so a slow drag with pauses
    *  longer than the settle delay does not flip back and forth. */
@@ -82,6 +84,7 @@ export class QualityController {
   private set(state: RenderQualityState) {
     if (state === this.state) return;
     this.state = state;
+    if (state === "interactive") this.episodes++;
     this.onChange(state);
   }
 }

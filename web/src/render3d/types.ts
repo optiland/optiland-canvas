@@ -86,6 +86,8 @@ export type RenderMeshData = {
   indices: Uint32Array;
   /** Triples [start, count, FaceGroup]. */
   groups: Uint32Array;
+  /** Crease lines as vertex-index pairs (rims, corners, outlines). */
+  edges: Uint32Array;
   /** [minx, miny, minz, maxx, maxy, maxz], local frame. */
   bounds: Float32Array;
 };
@@ -121,8 +123,23 @@ export type RenderStats = {
   /** Time to fetch descriptors and meshes across the wasm boundary. */
   syncMs: number;
   rayUploadMs: number;
+  /** Ray buffer uploads since start. */
+  rayUploads: number;
   environmentBuilds: number;
   geometries: number;
   textures: number;
   cachedObjects: number;
+  /** The last frame, broken down (ms). */
+  frame: FrameCost;
+  /** JS heap in use, where the browser reports it (bytes). */
+  jsHeap: number | null;
+};
+
+export type FrameCost = {
+  total: number;
+  trace: number;
+  sync: number;
+  upload: number;
+  render: number;
+  overlay: number;
 };

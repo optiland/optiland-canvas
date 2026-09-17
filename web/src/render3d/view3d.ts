@@ -20,7 +20,14 @@ import { createScene3Cards, type SceneObject } from "./cards3d";
 import { drawAxisLabels, drawNotice, drawSelectionDot, drawTirRings } from "./overlays";
 import { QualityController } from "./quality";
 import type { OpticalRenderer3D } from "./renderer";
-import type { BackgroundId, EnvironmentId, RayVisibilityMode, RenderBackend, RenderStats } from "./types";
+import type {
+  BackgroundId,
+  EnvironmentId,
+  FrameCost,
+  RayVisibilityMode,
+  RenderBackend,
+  RenderStats,
+} from "./types";
 
 // The projected trace layout (traceProjected3D): 11 floats per segment,
 // [au,av,bu,bv, r,g,b, flux, flags, dist_a, dist_b]. With the default XY view
@@ -57,6 +64,23 @@ export type View3dThree = {
 
 export type View3dDebug = {
   ready: () => Promise<RenderBackend>;
+  /** Draw one frame now (outside the animation-frame queue) and report it,
+   *  with the GPU time when timing is on. */
+  renderNow: () => Promise<RenderStats>;
+  /** The current interaction-quality state. */
+  quality: () => string;
+  /** How many times the view has entered the interactive state. */
+  qualityEpisodes: () => number;
+  /** The selected object id, or -1. */
+  selected: () => number;
+  /** Start recording every drawn frame's cost (benchmarks). */
+  startLog: () => void;
+  /** Stop recording and return the frames recorded. */
+  stopLog: () => FrameLogEntry[];
+  /** Orbit the camera as a pointer drag of (dx, dy) px would (benchmarks). */
+  orbit: (dx: number, dy: number) => void;
+  /** Retrace exactly and re-read the scene, as after an external edit. */
+  refresh: () => void;
   camera: () => CameraState;
   stats: () => RenderStats;
   /** Render now and count lit pixels of the GPU canvas (tests). */
@@ -64,6 +88,8 @@ export type View3dDebug = {
   project: (p: V3) => V2;
   hovered: () => number;
 };
+
+export type FrameLogEntry = FrameCost & { meshBuilds: number; raySegments: number; quality: string; dpr: number };
 
 export type View3dOptions = {
   scene: Canvas;
@@ -84,6 +110,8 @@ export type View3dOptions = {
   forceWebGL?: boolean;
   /** Simulate a platform with no usable 3D renderer (tests). */
   disable?: boolean;
+  /** Measure GPU frame time (developer diagnostics). */
+  timing?: boolean;
 };
 
 export function initView3dThree(opts: View3dOptions): View3dThree {
@@ -130,9 +158,19 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
   });
   envSelect?.addEventListener("change", () => {
     settings.environment = envSelect.value as EnvironmentId;
-    renderer?.setEnvironment(settings.environment);
-    invalidate();
+    if (!renderer) return;
+    renderer.setEnvironment(settings.environment);
+    holdFramesWhile(renderer.prepare(rig));
   });
+
+  /** Keep the last picture on screen until `work` is done, then draw. */
+  function holdFramesWhile(work: Promise<void>) {
+    const p = work.catch(() => {}).finally(() => {
+      if (compiling === p) compiling = null;
+      invalidate();
+    });
+    compiling = p;
+  }
   bgSelect?.addEventListener("change", () => {
     settings.background = bgSelect.value as BackgroundId;
     renderer?.setBackground(settings.background);
@@ -164,12 +202,19 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
   let clipboard = -1;
   let pasteN = 0;
   let lastTraceMs = 0;
+  // Trace time since the last drawn frame, including the drag path's fast
+  // traces made in the pointer handler.
+  let traceSinceFrame = 0;
+  // Frames are held while new shader variants compile (a lighting change).
+  let compiling: Promise<void> | null = null;
   // The scene revision the render proxies were last synced at.
   let syncedRevision = -1;
   // The ray picture last uploaded to the GPU (by identity), and its TIR points.
   let uploadedSegs: Float32Array<ArrayBufferLike> | null = null;
   let rayCount = 0;
   let tirPoints: V3[] = [];
+  const cost: FrameCost = { total: 0, trace: 0, sync: 0, upload: 0, render: 0, overlay: 0 };
+  let frameLog: FrameLogEntry[] | null = null;
 
   /** Bring the GPU proxies up to date with Rust, if the scene moved. */
   function syncRender(force = false) {
@@ -216,6 +261,7 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
       });
     }
     lastTraceMs = performance.now() - t0;
+    traceSinceFrame += lastTraceMs;
   }
 
   const objectsPanel = document.getElementById("objects3d");
@@ -314,12 +360,15 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
       }
       try {
         const mod = await import("./renderer");
-        renderer = await mod.OpticalRenderer3D.create(canvas, { forceWebGL: opts.forceWebGL });
+        renderer = await mod.OpticalRenderer3D.create(canvas, { forceWebGL: opts.forceWebGL, timing: opts.timing });
         backend = renderer.backend;
         applySettings();
         refreshObjects();
         syncRender(true);
         renderer.setSelected(selected);
+        // Compile the first picture's shaders before drawing it.
+        rig.setSize(window.innerWidth, window.innerHeight);
+        holdFramesWhile(renderer.prepare(rig));
       } catch (e) {
         console.warn("3D renderer unavailable.", e);
         failure = e instanceof Error ? e.message : String(e);
@@ -348,28 +397,36 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
 
     // A stale picture is retraced exactly, unless a GPU frame for a newer
     // revision is already on its way (then the old picture holds until it lands).
-    let traceMs = 0;
+    if (compiling) return; // the previous frame stays until the shaders are ready
     if (scene.sceneRevision() !== tracedRevision && !opts.fast?.pending()) {
       retrace(false);
       refreshObjects();
-      traceMs = lastTraceMs;
     }
+    const traceMs = traceSinceFrame;
+    traceSinceFrame = 0;
+    let syncMs = 0, uploadMs = 0, renderMs = 0;
 
     const grid = opts.grid();
     const ro = opts.rayOptions();
     if (renderer) {
+      const ts = performance.now();
       syncRender();
+      syncMs = performance.now() - ts;
       if (segs !== uploadedSegs) {
         const up = renderer.updateRays(segs);
         uploadedSegs = segs;
         rayCount = up.count;
         tirPoints = up.tir;
+        uploadMs = up.ms;
       }
       renderer.setGhostOpacity(ro.ghostOpacity);
       renderer.setGrid(grid.on, grid.spacing);
       renderer.resize(W, H, quality.pixelRatio(dpr));
+      const tr = performance.now();
       renderer.render(rig);
+      renderMs = performance.now() - tr;
     }
+    const to = performance.now();
 
     // The overlay: transparent, so the GPU canvas shows through.
     ctx.save();
@@ -392,7 +449,26 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
     }
     ctx.restore();
 
-    opts.status({ count: renderer ? rayCount : 0, ms: performance.now() - t0, traceMs });
+    const t1 = performance.now();
+    Object.assign(cost, {
+      total: t1 - t0,
+      trace: traceMs,
+      sync: syncMs,
+      upload: uploadMs,
+      render: renderMs,
+      overlay: t1 - to,
+    });
+    if (frameLog && renderer) {
+      const s = renderer.stats();
+      frameLog.push({
+        ...cost,
+        meshBuilds: s.meshBuilds ?? 0,
+        raySegments: rayCount,
+        quality: quality.state,
+        dpr: s.dpr ?? 0,
+      });
+    }
+    opts.status({ count: renderer ? rayCount : 0, ms: t1 - t0, traceMs });
   }
 
   // --- picking -------------------------------------------------------------
@@ -633,31 +709,54 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
     }
   };
 
+  const stats = (): RenderStats => ({
+    backend,
+    quality: quality.state,
+    dpr: 0,
+    frames: 0,
+    renderMs: 0,
+    gpuMs: null,
+    drawCalls: 0,
+    triangles: 0,
+    lines: 0,
+    raySegments: rayCount,
+    meshBuilds: 0,
+    meshBuildsLastSync: 0,
+    meshBuildMs: 0,
+    syncMs: 0,
+    rayUploadMs: 0,
+    rayUploads: 0,
+    environmentBuilds: 0,
+    geometries: 0,
+    textures: 0,
+    cachedObjects: objList.length,
+    ...(renderer?.stats() ?? {}),
+    frame: { ...cost },
+    jsHeap: (performance as unknown as { memory?: { usedJSHeapSize: number } }).memory?.usedJSHeapSize ?? null,
+  });
+
   const debug: View3dDebug = {
     ready: () => ensureRenderer(),
+    renderNow: async () => {
+      await ensureRenderer();
+      if (compiling) await compiling;
+      drawFrame();
+      await renderer?.gpuTime();
+      return stats();
+    },
+    quality: () => quality.state,
+    qualityEpisodes: () => quality.episodes,
+    selected: () => selected,
+    startLog: () => { frameLog = []; },
+    orbit: (dx, dy) => { rig.orbit(dx, dy); },
+    refresh: () => { retrace(false); refreshObjects(); syncRender(true); },
+    stopLog: () => {
+      const out = frameLog ?? [];
+      frameLog = null;
+      return out;
+    },
     camera: () => rig.state(),
-    stats: () => ({
-      backend,
-      quality: quality.state,
-      dpr: 0,
-      frames: 0,
-      renderMs: 0,
-      gpuMs: null,
-      drawCalls: 0,
-      triangles: 0,
-      lines: 0,
-      raySegments: segs.length / STRIDE,
-      meshBuilds: 0,
-      meshBuildsLastSync: 0,
-      meshBuildMs: 0,
-      syncMs: 0,
-      rayUploadMs: 0,
-      environmentBuilds: 0,
-      geometries: 0,
-      textures: 0,
-      cachedObjects: objList.length,
-      ...(renderer?.stats() ?? {}),
-    }),
+    stats,
     litPixels: async () => {
       await ensureRenderer();
       if (!renderer) return 0;

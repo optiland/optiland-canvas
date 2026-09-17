@@ -37,6 +37,9 @@ import type {
 export type RendererOptions = {
   /** Use the WebGL2 backend even where WebGPU exists (tests, comparisons). */
   forceWebGL?: boolean;
+  /** Measure GPU time per frame with timestamp queries, where the device has
+   *  them (developer diagnostics; costs a read-back per frame). */
+  timing?: boolean;
 };
 
 type Internals = {
@@ -64,13 +67,16 @@ export class OpticalRenderer3D {
   private dpr = 1;
   private frames = 0;
   private lastRenderMs = 0;
+  private lastGpuMs: number | null = null;
+  private timing = false;
   private gridSpacing = 5;
   private gridOn = true;
   private groundOn = true;
   private bounds: Bounds3 | null = null;
   private theme: ScaffoldTheme;
 
-  private constructor(private readonly renderer: THREE.WebGPURenderer) {
+  private constructor(private readonly renderer: THREE.WebGPURenderer, timing: boolean) {
+    this.timing = timing;
     const backend = (renderer.backend as { isWebGPUBackend?: boolean }).isWebGPUBackend ? "webgpu" : "webgl2";
     this.backend = backend;
     this.scene.name = "optiland-canvas-3d";
@@ -93,6 +99,7 @@ export class OpticalRenderer3D {
       antialias: true,
       forceWebGL: opts.forceWebGL ?? false,
       alpha: false,
+      trackTimestamp: opts.timing ?? false,
     });
     await renderer.init();
     (renderer as unknown as Internals)._animation?.stop();
@@ -102,7 +109,8 @@ export class OpticalRenderer3D {
     renderer.toneMapping = THREE.NeutralToneMapping;
     renderer.toneMappingExposure = 1;
     renderer.outputColorSpace = THREE.SRGBColorSpace;
-    return new OpticalRenderer3D(renderer);
+    const timing = (opts.timing ?? false) && renderer.hasFeature("timestamp-query");
+    return new OpticalRenderer3D(renderer, timing);
   }
 
   resize(cssWidth: number, cssHeight: number, dpr: number) {
@@ -135,10 +143,18 @@ export class OpticalRenderer3D {
     return report;
   }
 
-  /** Lighting preset. Builds its PMREM the first time only. */
+  /** Lighting preset. Builds its PMREM the first time only. Different lights
+   *  mean new shader variants; call `prepare` before the next frame so they
+   *  compile off the main thread's frame instead of stalling it. */
   setEnvironment(id: EnvironmentId) {
     this.environments.setEnvironment(id);
     this.retheme();
+  }
+
+  /** Compile every pipeline the current scene needs, asynchronously. */
+  async prepare(rig: CameraRig): Promise<void> {
+    const cam = this.applyCamera(rig);
+    await this.renderer.compileAsync(this.scene, cam);
   }
 
   /** Background, independent of the lighting. */
@@ -277,6 +293,19 @@ export class OpticalRenderer3D {
     this.rays.object.visible = true;
     this.frames++;
     this.lastRenderMs = performance.now() - t0;
+    if (this.timing) {
+      void this.renderer.resolveTimestampsAsync("render").then((ms) => {
+        if (typeof ms === "number") this.lastGpuMs = ms;
+      });
+    }
+  }
+
+  /** GPU time of the most recent frame the device has reported, or null. */
+  async gpuTime(): Promise<number | null> {
+    if (!this.timing) return null;
+    const ms = await this.renderer.resolveTimestampsAsync("render");
+    if (typeof ms === "number") this.lastGpuMs = ms;
+    return this.lastGpuMs;
   }
 
   /** Light backgrounds: sum the rays into the ink target first. Only the rays,
@@ -315,7 +344,7 @@ export class OpticalRenderer3D {
       dpr: this.dpr,
       frames: this.frames,
       renderMs: this.lastRenderMs,
-      gpuMs: null,
+      gpuMs: this.lastGpuMs,
       drawCalls: info.render.drawCalls,
       triangles: info.render.triangles,
       lines: info.render.lines,
@@ -328,6 +357,7 @@ export class OpticalRenderer3D {
       cachedObjects: this.cache.size,
       environmentBuilds: this.environments.builds,
       raySegments: this.rays.count,
+      rayUploads: this.rays.uploads,
       rayUploadMs: this.lastRayUploadMs,
     };
   }

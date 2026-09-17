@@ -28,6 +28,7 @@ Optiland Canvas is a tool for the *ideation* phase of optical design, the part b
 **Interaction**
 - Two views over one scene: a meridional cross-section and an orbitable 3D model. Elements drag, tilt and snap to the grid in either, and the rays retrace while you drag.
 - The 3D model draws the parts as solids: clear glass, mirrors, blackened stops, and detectors, under a choice of four studio lightings and five backgrounds, with rays either drawn over the parts or hidden by opaque ones.
+- In the 3D model, each detector face shows its flux map from the exact trace, and the light source has a glyph you can pick and move. Ray width is adjustable, and the view settings are remembered in the browser.
 - Every parameter has an on-canvas handle and a numeric twin. Drag the handle or scrub the number, and the light follows. No Apply button, no modal dialogs.
 - Pop-up inspector cards (several at once, one per element), an adjustable grid with snapping, copy/paste/delete, per-parameter and whole-element pinning, plus zoom & pan.
 - Add a round element or a fold mirror from the scene dock, and choose the source (collimated, point cone, Lambertian disc) and how densely it samples.

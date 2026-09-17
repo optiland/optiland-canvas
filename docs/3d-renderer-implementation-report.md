@@ -2,6 +2,8 @@
 
 This report covers the solid 3D renderer that replaces the Canvas 2D wireframe in the 3D model view (branch `3d-solid-renderer`, from `main` at `bf06b13`). It follows §76 of the implementation specification. The numbers come from the benchmark and test suites in this branch, run on the development machine: Windows 11, an NVIDIA RTX 5070, and Chrome 153.
 
+A second round on the same branch added detector hit maps, light-source glyphs, saved view settings, and a ray width setting. [Follow-up](#follow-up-hit-maps-source-glyphs-saved-settings-ray-width) describes them.
+
 Three.js materials give physically plausible display shading, not optical simulation. Nothing in this renderer computes an optical quantity, and nothing it draws is a measurement. Every displayed number still comes from the f64 reference tracer.
 
 ## Baseline (Phase 0)
@@ -40,9 +42,12 @@ Browser (`web/src/render3d/`):
 | `mesh-adapter.ts` | yes | Rust meshes to `BufferGeometry` |
 | `materials.ts` | yes | The shading vocabulary |
 | `environments.ts` | yes | Studio presets, PMREM cache, backgrounds |
-| `rays.ts` | yes | The ray buffer and the light-background ink pass |
+| `rays.ts` | yes | The ray buffer (lines, or strips when wider than 1 px) and the light-background ink pass |
+| `hitmaps.ts` | yes | Detector hit maps from the exact trace's cells |
 | `cues.ts` | yes | Hover and selection cues |
 | `scaffold.ts` | yes | Axes, grid, ground |
+
+`web/src/heat.ts` holds the flux colour ramp that the detector dock and the hit maps share.
 
 `main.ts` chooses the view. The GPU view is the default, and `?renderer=legacy` keeps the old wireframe (`viewport3d.ts`) for comparison. `?render3d=webgl` forces the WebGL2 backend, and `?render3d=off` simulates a browser with no usable renderer. The GPU canvas (`#view3d`) sits under `#view`, which becomes a transparent overlay and still receives the pointer, so the page's DOM ids and event wiring are unchanged.
 
@@ -50,10 +55,13 @@ Browser (`web/src/render3d/`):
 
 - `oc_core::display_mesh` (feature `scene3`) tessellates `Scene3` objects for display. See Geometry.
 - `oc_wasm::render_view` adds two `Canvas` methods:
-  - `renderObjectsJSON()` returns one descriptor per body, surface, aperture and detector: kind, three revisions, visibility, position, quaternion, shading role, front and back roles, display `n_d`, and a picking radius.
+  - `renderObjectsJSON()` returns one descriptor per body, surface, aperture, detector and source: kind, three revisions, visibility, position, quaternion, shading role, front and back roles, display `n_d`, a picking radius, and (for a source) its light's display colour.
   - `renderMesh(id)` returns a `RenderMesh` with `topology()`, `positions()`, `normals()`, `indices()`, `groups()`, `edges()`, `bounds()` and `note()` as typed arrays.
+- The follow-up adds two more:
+  - `lastDetectorMapsF32()` returns the detectors' flux cells from the most recent `traceProjected3D()`.
+  - `sourceObjectsJSON()` lists the sources for the 3D view's object list.
 
-Neither method changes the scene, the tracer, or the `.ocanvas` format.
+None of these methods changes the scene, the tracer, or the `.ocanvas` format.
 
 ### Revisions and the render cache
 
@@ -130,7 +138,7 @@ A 2D-only body (a v1 migration with no authored third dimension) and a profile t
 
 ### Tests
 
-The `display_mesh` tests (14) check:
+The first round's `display_mesh` tests (14) check:
 
 - vertices and normals against the analytic faces, including an even asphere
 - the chord error along a steep meridian
@@ -155,6 +163,9 @@ The `render_view` tests (3) check that each revision moves only with its own con
 | Absorber | Dark, fully rough |
 | Detector faces | Dark teal, mostly specular, light clearcoat; both faces, because the tracer records a crossing from either side |
 | Detector edge | Dark semigloss housing |
+| Detector face with a hit map (follow-up) | The detector finish, with lit cells in the dock's heat colours |
+| Source emitter (follow-up) | Glows in its light's colour |
+| Source housing (follow-up) | Dark satin metal |
 | Slab edge | Neutral grey |
 | No solid (outline) | Dashed orange lines |
 
@@ -194,7 +205,7 @@ Shadows are not implemented. Perspective, occlusion, smooth shading, reflections
   - A segment dimmer than 1e-5 of the brightest is not uploaded.
 - **Buffer:** one interleaved `Float32Array` with 8 floats per vertex: position, linear wavelength colour, relative flux, and ghost flag. It is re-uploaded only when the traced picture changes, and grows by 1.5× when it runs out.
 - **Draw calls:** one `LineSegments` draw for all rays. On light backgrounds there is one more pass (the rays into a half-float target) and one fullscreen quad. The number of scene objects does not grow with the segment count.
-- **Line technique:** 1-pixel lines with 4× MSAA. At the capped pixel ratios they read like the 2D view's lines, so the screen-space strip shader of the spec's Phase B was not built.
+- **Line technique:** 1-pixel lines with 4× MSAA by default. At the capped pixel ratios they read like the 2D view's lines. The follow-up added the spec's Phase B strips as a user setting for wider rays (see Follow-up).
 - **Dark backgrounds:** additive, as in the 2D view. Overlapping wavelengths sum toward white, dispersion shows as colour, and ghosts stay dim. Ghost gain (the 2D control ×8) is a shader uniform, so changing it uploads nothing.
 - **Light backgrounds:** additive light cannot show on a light ground. The rays are summed additively in their own pass, and the sum is laid over the scene as ink:
   - opacity follows the summed brightness, compressed as in the 2D view
@@ -212,11 +223,59 @@ Shadows are not implemented. Perspective, occlusion, smooth shading, reflections
 - The HUD stops short of the view toolbar, so a long status line wraps instead of running under the toolbar.
 - Hover changes the cursor.
 - Selection adds a faint glow and a cyan outline and keeps the object's material. The cyan centre dot remains the drag handle.
-- View settings are local UI state. They are not saved and not written to `.ocanvas`.
+- View settings are display state. In the first round they were not saved. The follow-up remembers them in the browser. They are never written to `.ocanvas`.
+
+## Follow-up: hit maps, source glyphs, saved settings, ray width
+
+### Detector hit maps
+
+Each area detector's face shows its incident-flux cells, the same cells and colours as the detector dock's heatmap ([hit-map.jpg](3d-renderer/hit-map.jpg)).
+
+- **Source of the cells:** `traceProjected3D()` already runs the f64 trace for the rays, and the same trace fills every detector's cells. The call keeps them, and `lastDetectorMapsF32()` hands them over. The map therefore costs no second trace. A Rust test checks that the cells equal `detectorResultJSON().incident`.
+- **Drawing:** one `nu × nv` texture per detector, one texel per cell, nearest filtering, so cells stay cells. The face is the detector's local XY plane, so the shader reads a fragment's cell straight from its local position. No UV channel was added to the mesh.
+- **Scale and colour:** each detector is scaled to its own peak, as the dock is. Empty cells show the plain face. `web/src/heat.ts` holds the ramp, shared with the dock.
+- **Staleness:** a map belongs to one exact trace. While a drag shows the interactive preview, or once the scene has changed since that trace, the maps are hidden until the next exact trace.
+- **Material:** the per-detector material replaces only the active-face slot, through a slot override in the render cache that survives restyles. A detector's first map compiles its shader before the frame that shows it.
+- **Toggle:** "hit maps" in the bottom bar, on by default.
+
+The picture is a view of the readout, not a number: a sharp focus lights one or two cells, as the dock shows it.
+
+### Light-source glyphs
+
+The source used to be invisible, so rays began in empty space. Each source now has a glyph ([source-glyph.jpg](3d-renderer/source-glyph.jpg)):
+
+- **Emitter:** a thin plate the size and shape of the emitting aperture (rectangle or disc). Its front face lies exactly in the emission plane, so no drawn ray starts inside it. A point source is a 1 mm ball.
+- **Housing:** a box or cylinder behind the aperture, a little wider than it (a stem for a point source). It has no size in the scene; the tracer does not see it.
+- **Colour:** the emitter glows in its light's colour, the weighted sum of its lines' ray colours. A white beam is white, and the fold demo's orange line is orange.
+- **Legacy sources:** a legacy line source has no area and is drawn as its line, with a note.
+- **Editing:** sources are selectable, draggable and turnable in the 3D view, through the setters that already took any object id. Their card shows position and tilt. `sourceObjectsJSON()` lists them for this view only; the 2D cross-section draws no glyph, so its object list is unchanged.
+- **Revisions:** geometry follows the spatial and angular distribution, material follows the spectrum.
+- **Tests:** a Rust test checks that the glyph is closed, lies behind the emission plane for both directions, and has its emitter in the plane at the aperture's size. A browser test checks that the exact rays start on the moved glyph's face.
+
+### Saved view settings
+
+Lighting, background, exposure, ray visibility, ray width, hit maps, ground and projection are kept in `localStorage` under `optiland-canvas:view3d`:
+
+- A reload restores them, including the perspective button's state.
+- Each field is checked on load. An unknown or out-of-range value falls back to its default, and unreadable storage (a private window, damaged JSON) gives the defaults.
+- They are browser preferences, not part of the scene or its file.
+
+### Ray width
+
+A "width" slider sets the ray line width from 1 to 6 px (CSS pixels) ([wide-rays.jpg](3d-renderer/wide-rays.jpg)):
+
+- **At 1 px:** the GPU lines as before.
+- **Wider:** one instanced screen-facing quad per segment. Each quad is placed in clip space around its segment, as three.js's `Line2` does, and cut at the near plane in perspective. It has a one-pixel soft edge.
+- **Draw calls:** one, the same as for lines. The material draws both faces in a single pass.
+- **Brightness:** additive and ink rendering, ghost gain and occlusion work as for lines. Brightness per pixel scales by 1/√width, so dense bundles stay readable.
+- **Units:** the width is in CSS pixels, so it holds while a drag lowers the pixel ratio.
+- **Performance:** on the 4-lens ghost scene (118,936 segments), GPU time per frame was 1.6 ms at 1 px, 2.2 ms at 2 px and 3.3 ms at 4 px.
 
 ## Performance
 
 `OC_BENCH=1 npx playwright test --project=bench` (`web/tests/render3d-bench.spec.ts`) writes `test-results/render3d-bench.{json,md}`. The run below used Chrome 153 on the WebGPU backend, a 1600 × 900 viewport, and pixel ratio 1.
+
+These tables were recorded before the follow-up. It adds one object per scene (the source glyph: two more draw calls and a few hundred triangles) and one texture per detector; the wide-ray costs are under Follow-up.
 
 For the GPU view:
 
@@ -276,11 +335,11 @@ GPU resources return to the same counts after adds, deletes and curvature edits.
 
 **Bundle:**
 
-| Asset | Before | After |
-|---|---:|---:|
-| Main JS | 127,091 B (38,894 gzip) | 149,824 B (45,964 gzip) |
-| Renderer chunk (lazy; three.js and render3d) | none | 911,568 B (249,571 gzip) |
-| wasm | 2,199,249 B | 2,310,891 B |
+| Asset | Before | After | After the follow-up |
+|---|---:|---:|---:|
+| Main JS | 127,091 B (38,894 gzip) | 149,824 B (45,964 gzip) | 153,020 B (46,924 gzip) |
+| Renderer chunk (lazy; three.js and render3d) | none | 911,568 B (249,571 gzip) | 918,654 B (251,273 gzip) |
+| wasm | 2,199,249 B | 2,310,891 B | 2,322,541 B |
 
 The three.js WebGPU build does not tree-shake well; almost all of the lazy chunk is three.js. The addons that import the classic `three` build (`RoomEnvironment`, `BufferGeometryUtils`) were deliberately avoided, because they would add the WebGL renderer to the chunk.
 
@@ -288,19 +347,21 @@ The three.js WebGPU build does not tree-shake well; almost all of the lazy chunk
 
 ## Validation
 
-- **Rust:** `display_mesh` (14 tests) and `render_view` (3 tests), described under Geometry. With them:
-  - `cargo test --workspace --exclude oc-py`: 575 passed, 7 failed, 3 ignored. The failures are the same `gpu3_vs_cpu3` tests as in the baseline.
-  - `oc-core --features scene3`: 242 passed.
+- **Rust:** `display_mesh` (15 tests with the source glyph), `render_view` (4) and two `Canvas` tests for the detector maps and the source list. With them:
+  - `cargo test --workspace --exclude oc-py`: 579 passed, 7 failed, 3 ignored. The failures are the same `gpu3_vs_cpu3` tests as in the baseline.
+  - `oc-core --features scene3`: 243 passed.
   - `oc-trace --features trace3`: 85 passed, 1 ignored.
-  - Clippy with `-D warnings` is clean on all three CI steps.
-  - These suites cover the spec's regression requirement for the f64 trace, detector results, OPL, the energy ledger, `.ocanvas`, and the Rust half of the Optiland round trip, and they pass unchanged. This work changes none of that code. The Python bridge job (`pytest` against a live Optiland) was not run locally; nothing in `oc-py` or the `.ocanvas` serializer changed.
+  - Clippy with `-D warnings` is clean on all four CI steps, `oc-py` included.
+  - These suites cover the spec's regression requirement for the f64 trace, detector results, OPL, the energy ledger, `.ocanvas`, and the Rust half of the Optiland round trip, and they pass unchanged. This work changes none of that code.
+- **Python bridge:** the CI job (`pip install '.[test]'`, then `pytest` against a live Optiland) was run locally in a Python 3.12 environment: 38 passed.
 - **Browser, CI project:**
-  - `tests/render3d.spec.ts` (15 tests): opening and backend naming; orbit, pan, zoom and reset; presets, perspective and the `0` key; picking and dragging without a mesh rebuild; the card and the 2D/3D selection hand-off; copy, paste, delete and nudge; lighting, background, exposure and ray visibility leaving the saved scene, the exact trace and the detector readout bit-identical; mesh rebuilds only on geometry edits; the ray buffer (every segment, bounded draws, no re-upload for ghost opacity, depth mode changing depth only); quality states; no idle frames; no resource growth; the forced WebGL2 backend; the no-renderer path with the 2D view still working; and the legacy view.
+  - `tests/render3d.spec.ts` (19 tests): opening and backend naming; orbit, pan, zoom and reset; presets, perspective and the `0` key; picking and dragging without a mesh rebuild; the card and the 2D/3D selection hand-off; copy, paste, delete and nudge; lighting, background, exposure and ray visibility leaving the saved scene, the exact trace and the detector readout bit-identical; mesh rebuilds only on geometry edits; the ray buffer (every segment, bounded draws, no re-upload for ghost opacity, depth mode changing depth only); quality states; no idle frames; no resource growth; the forced WebGL2 backend; the no-renderer path with the 2D view still working; and the legacy view.
+  - The follow-up adds four: the source glyph (picked, dragged, rays starting on its face, turned from its card); hit maps (drawn, hidden during a drag, toggled without touching the optics); wide rays (same segments, same draw count, more pixels); and saved settings (restored after a reload, damaged storage ignored field by field).
   - The existing 3D view-controls test now reads the camera and the GPU picture through the `?debug` hooks.
-  - The full suite (56 tests) passes. Headless CI has no WebGPU device, so this suite runs there on the WebGL2 fallback; the same suite passed locally with the GPU disabled and SwiftShader forced as a stand-in for CI.
+  - The full suite (60 tests) passes. Headless CI has no WebGPU device, so this suite runs there on the WebGL2 fallback; the same suite passes locally on Playwright's bundled Chromium, which also lands on WebGL2.
 - **Browser, opt-in:**
-  - `OC_WEBGPU=1 … --project=webgpu` also runs `render3d.spec.ts` on a real device. With Chrome 153 on the RTX 5070, its 17 tests (these 15 plus the 2 WebGPU preview tests) pass.
-  - `OC_VISUAL=1 … --project=visual` compares 10 screenshots (default scene dark and light, prism, fold mirror, aperture with a second detector, overlapping glass, three lenses with ghosts, selected and hovered lens, occluded rays on the bench in perspective, inspection on grey) at 1% pixel tolerance, with the status line masked. The baselines are for this machine (`*-visual-win32.png`) and are stable across runs.
+  - `OC_WEBGPU=1 … --project=webgpu` also runs `render3d.spec.ts` on a real device. With Chrome 153 on the RTX 5070, its 21 tests (these 19 plus the 2 WebGPU preview tests) pass.
+  - `OC_VISUAL=1 … --project=visual` compares 14 screenshots in 12 tests (default scene dark and light, prism, fold mirror, aperture with a second detector, overlapping glass, three lenses with ghosts, selected and hovered lens, occluded rays on the bench in perspective, inspection on grey, wide rays dark and light, a hit map end-on) at 1% pixel tolerance, with the status line masked. The baselines are for this machine (`*-visual-win32.png`), were re-recorded for the follow-up (every scene now shows its source), and are stable across runs.
 - **Backends seen:** WebGPU (Chrome 153 on the RTX 5070), WebGL2 (forced, and three.js's fallback in Playwright's bundled Chromium), SwiftShader software GL, and "unavailable" (simulated).
 
 ## Limitations
@@ -313,9 +374,16 @@ The three.js WebGPU build does not tree-shake well; almost all of the lazy chunk
 - **Selection glow on glass:** the glow is drawn over the glass. On a clear body it tints the whole silhouette slightly, not only the rim.
 - **Light backgrounds:** rays are ink, and the ink's darkness is a display mapping. On a light ground a bright focus reads as dark, not bright.
 - **First use of a lighting preset:** it takes up to about 0.4 s on WebGPU and about 0.5 s on WebGL2 before the new picture appears. The page stays responsive meanwhile.
-- **Ray lines:** 1 pixel wide. On a high-density display at the settled pixel ratio (1.5) they are thinner than CSS pixels.
-- **View plane:** rays are placed in 3D from the projected trace, which assumes the default XY view plane.
-- **Not drawn:** the light source (it is not an object in the scene list). Detector hit maps are not drawn on the detector face.
+- **Ray lines:** 1 pixel wide by default. On a high-density display at the settled pixel ratio (1.5) they are thinner than CSS pixels; the width setting fixes that.
+- **View plane:** rays are placed in 3D from the projected trace, which assumes the default XY view plane. The app has no control that changes the view plane yet.
+- **Hit maps:**
+  - Each detector is scaled to its own peak, so two detectors' colours are not comparable.
+  - Disc and annular detectors are binned over their bounding square, as the tracer bins them, so their outer cells are partly off the face.
+  - A map is hidden during a drag and returns with the next exact trace.
+- **Source glyphs:**
+  - The housing is invented for display.
+  - A source aimed backwards along its local X gets its housing on the other side. Any other aim is drawn as if along +X.
+  - The 2D cross-section still draws no source.
 - **2D-only bodies:** outlines, not solids.
 - **Shadows:** none.
 - **Legacy view:** still in the tree behind `?renderer=legacy`. It should be removed once the GPU view has seen use.
@@ -336,16 +404,19 @@ The three.js WebGPU build does not tree-shake well; almost all of the lazy chunk
 | Rays occluded | [rays-occluded.jpg](3d-renderer/rays-occluded.jpg) |
 | Perspective | [perspective.jpg](3d-renderer/perspective.jpg) |
 | Inspection lighting on grey | [inspection-grey.jpg](3d-renderer/inspection-grey.jpg) |
+| Hit map, end-on, point source | [hit-map.jpg](3d-renderer/hit-map.jpg) |
+| Rays at 3 px, three lenses with ghosts | [wide-rays.jpg](3d-renderer/wide-rays.jpg) |
+| Disc source glyph, selected | [source-glyph.jpg](3d-renderer/source-glyph.jpg) |
 | Before: the Canvas 2D wireframe | [before-wireframe.jpg](3d-renderer/before-wireframe.jpg) |
 
-The WebGL2 fallback looks the same as WebGPU in side-by-side captures, so it has no separate image.
+The images were re-captured after the follow-up, so every scene shows its source. The WebGL2 fallback looks the same as WebGPU in side-by-side captures, so it has no separate image.
 
-## Not done in this milestone
+## Not done
 
-- The screen-space strip shader for rays (Phase B). 1-pixel lines were sufficient.
+The follow-up built strip rays, saved preferences, source glyphs and hit maps. Still open:
+
 - Shadows.
 - Optional HDRI environments.
-- Saving view preferences.
-- A light-source glyph.
-- Detector hit maps on the active face.
+- Order-independent transparency for glass behind glass.
+- A source glyph in the 2D cross-section.
 - Removing the legacy wireframe view.

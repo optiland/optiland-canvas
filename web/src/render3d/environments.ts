@@ -53,7 +53,7 @@ export const ENVIRONMENTS: EnvironmentPreset[] = [
       lamp: 500,
       boxes: true,
       panels: [
-        { pos: [0, 20, 0], scale: [10, 0.1, 10], intensity: 60 },
+        { pos: [0, 20, 0], scale: [10, 0.1, 10], intensity: 42 },
         { pos: [-16, 14, 6], scale: [0.1, 8, 10], intensity: 40 },
         { pos: [15, 12, -3], scale: [0.1, 6, 8], intensity: 18 },
         { pos: [0, 9, 14.5], scale: [8, 6, 0.1], intensity: 26 },
@@ -274,6 +274,7 @@ export class EnvironmentManager {
       grid: new THREE.Color(grid),
       gridOpacity: s.gridOpacity,
       ground: s.ground === null ? null : new THREE.Color(s.ground),
+      lightBackground: lightBg,
     };
   }
 

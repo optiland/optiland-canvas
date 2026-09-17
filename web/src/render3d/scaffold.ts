@@ -10,7 +10,7 @@
 // grid without rebuilding anything.
 
 import * as THREE from "three/webgpu";
-import { abs, attribute, float, length, mix, positionLocal, positionWorld, smoothstep, step, uniform } from "three/tsl";
+import { abs, attribute, float, length, mix, positionLocal, positionWorld, smoothstep, step, uniform, vertexColor } from "three/tsl";
 import type { Bounds3 } from "./camera";
 
 export type ScaffoldTheme = {
@@ -19,6 +19,8 @@ export type ScaffoldTheme = {
   gridOpacity: number;
   /** Ground plane colour, or null for no ground plane in this environment. */
   ground: THREE.Color | null;
+  /** The background shown is light (darker axis lines read on it). */
+  lightBackground: boolean;
 };
 
 const AXIS_COLORS: [number, number, number][] = [
@@ -36,6 +38,8 @@ export class Scaffold {
   private gridOpacity = uniform(0.35);
   private gridExtent = uniform(100);
   private gridPitch = uniform(5);
+  /** Axis line brightness: full on dark grounds, darkened on light ones. */
+  private axisTone = uniform(1);
   private gridKey = "";
   private gridMaterial: THREE.LineBasicNodeMaterial;
   private groundMaterial: THREE.MeshStandardNodeMaterial;
@@ -48,6 +52,7 @@ export class Scaffold {
   constructor() {
     this.root.name = "scaffold";
     this.axes = makeAxes();
+    (this.axes.material as THREE.LineBasicNodeMaterial).colorNode = vertexColor().rgb.mul(this.axisTone);
     this.root.add(this.axes);
 
     this.gridMaterial = new THREE.LineBasicNodeMaterial({ transparent: true, depthWrite: false });
@@ -66,7 +71,10 @@ export class Scaffold {
     this.grid.frustumCulled = false;
     this.root.add(this.grid);
 
-    this.groundMaterial = new THREE.MeshStandardNodeMaterial({ roughness: 0.92, metalness: 0 });
+    // The ground fades out toward its edge, so it never ends in a visible line.
+    this.groundMaterial = new THREE.MeshStandardNodeMaterial({ roughness: 0.92, metalness: 0, transparent: true });
+    this.groundMaterial.depthWrite = false;
+    this.groundMaterial.opacityNode = float(1).sub(smoothstep(float(0.08), float(0.5), length(positionLocal.xy)));
     this.ground = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), this.groundMaterial);
     this.ground.name = "ground";
     this.ground.rotation.x = -Math.PI / 2;
@@ -109,8 +117,10 @@ export class Scaffold {
 
     this.gridColor.value.copy(theme.grid);
     this.gridOpacity.value = theme.gridOpacity;
+    this.axisTone.value = theme.lightBackground ? 0.35 : 1;
 
-    const extent = 2 * half * sp + 4 * size;
+    // A wide floor: the fade (in unit plane coordinates) happens far out.
+    const extent = 12 * Math.max(half * sp, 2 * size);
     this.ground.scale.set(extent, extent, 1);
     this.ground.position.set(this.grid.position.x, this.groundY, this.grid.position.z);
     this.ground.visible = groundOn && theme.ground !== null;
@@ -147,7 +157,8 @@ function makeAxes(): THREE.LineSegments {
   const g = new THREE.BufferGeometry();
   g.setAttribute("position", new THREE.BufferAttribute(pos, 3));
   g.setAttribute("color", new THREE.BufferAttribute(col, 3));
-  const m = new THREE.LineBasicNodeMaterial({ vertexColors: true, depthTest: false, depthWrite: false, transparent: true });
+  // The colour node (set by Scaffold) reads the vertex colours itself.
+  const m = new THREE.LineBasicNodeMaterial({ depthTest: false, depthWrite: false, transparent: true });
   const axes = new THREE.LineSegments(g, m);
   axes.name = "axes";
   axes.renderOrder = 20;

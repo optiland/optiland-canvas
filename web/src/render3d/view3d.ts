@@ -58,6 +58,9 @@ export type View3dThree = {
   isPerspective: () => boolean;
   /** "render WebGPU" etc., for the status line. */
   backendLabel: () => string;
+  /** Fetch the renderer code in idle time, so the first switch to 3D does not
+   *  wait for the download. No GPU device is created. */
+  prefetch: () => void;
   /** Debug hooks (the `?debug` build of the page reads these). */
   debug: View3dDebug;
 };
@@ -329,6 +332,8 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
   }
 
   function frameScene() {
+    // Frame what Rust holds now, not what the proxies held last frame.
+    syncRender();
     rig.sideInset = panelInset();
     const hw = hardwareBounds();
     if (!hw) { rig.frame(null); return; }
@@ -437,7 +442,7 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
         const B = rig.basis();
         drawTirRings(ctx, tirPoints.map((p) => rig.project(p, B)));
       }
-      drawAxisLabels(ctx, rig, renderer.axisEnds());
+      drawAxisLabels(ctx, rig, renderer.axisEnds(), renderer.lightBackground());
       const so = objList.find((o) => o.id === selected);
       if (so) drawSelectionDot(ctx, rig, { x: so.pos[0], y: so.pos[1], z: so.pos[2] });
       cards.positionAll();
@@ -789,6 +794,13 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
     setPerspective: (on) => { rig.setPerspective(on); invalidate(); },
     isPerspective: () => rig.perspective,
     backendLabel,
+    prefetch: () => {
+      if (opts.disable) return;
+      const idle = (window as { requestIdleCallback?: (cb: () => void) => void }).requestIdleCallback;
+      const go = () => void import("./renderer").catch(() => {});
+      if (idle) idle(go);
+      else setTimeout(go, 1500);
+    },
     debug,
   };
 }

@@ -135,11 +135,15 @@ export class MaterialLibrary {
         }));
       case "detector_active":
         return this.get("detector_active", () => new THREE.MeshPhysicalNodeMaterial({
-          color: new THREE.Color(0.05, 0.16, 0.2),
-          metalness: 0.15,
-          roughness: 0.4,
-          clearcoat: 0.6,
-          clearcoatRoughness: 0.08,
+          // Dark and mostly specular, like a sensor die: it reads as an active
+          // area without glowing when it faces a bright part of the studio.
+          color: new THREE.Color(0.04, 0.13, 0.16),
+          metalness: 0.6,
+          roughness: 0.38,
+          // A light cover-glass sheen; stronger, and a face-on detector turns
+          // into a mirror of the studio lights.
+          clearcoat: 0.25,
+          clearcoatRoughness: 0.2,
         }));
       case "detector_body":
         return this.get("detector_body", () => new THREE.MeshStandardNodeMaterial({

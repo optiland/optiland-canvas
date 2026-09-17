@@ -777,6 +777,8 @@ async function main() {
   syncSourcePicker();
   // The status line names the preview backend; repaint once it is chosen.
   void fast.ready.then(() => renderView());
+  // The GPU 3D view's code loads in idle time after startup.
+  setTimeout(() => threeView()?.prefetch(), 2000);
 
   // `?debug` exposes the scene and both fast paths to the opt-in WebGPU browser
   // test (web/tests/webgpu.spec.ts). The app itself never reads it.

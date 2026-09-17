@@ -34,8 +34,8 @@ type Cue = { id: number; glow: THREE.Mesh; outline: THREE.LineSegments | null; g
 
 export class CueLayer {
   private readonly color = makeColor(DARK_BG_CUE);
-  private readonly hoverMaterial = glowMaterial(this.color, 0.015, 0.22);
-  private readonly selectMaterial = glowMaterial(this.color, 0.04, 0.55);
+  private readonly hoverMaterial = glowMaterial(this.color, 0, 0.18);
+  private readonly selectMaterial = glowMaterial(this.color, 0.02, 0.3);
   private readonly outlineMaterial = new THREE.LineBasicNodeMaterial({
     transparent: true,
     opacity: 0.95,

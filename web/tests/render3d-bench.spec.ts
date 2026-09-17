@@ -178,6 +178,15 @@ test("GPU 3D view benchmark", async ({ page, browser }) => {
     const envs = ["light_studio", "optical_bench", "inspection", "dark_studio"];
     const first: Record<string, number> = {};
     const cached: number[] = [];
+    // Main-thread tasks over 50 ms while lighting switches (shader work that
+    // blocks instead of compiling asynchronously would show here).
+    await page.evaluate(() => {
+      const w = window as any;
+      w.__longTasks = [];
+      new PerformanceObserver((list) => {
+        for (const e of list.getEntries()) w.__longTasks.push(e.duration);
+      }).observe({ type: "longtask" });
+    });
     for (let round = 0; round < 3; round++) {
       for (const env of envs) {
         const t0 = Date.now();
@@ -195,7 +204,15 @@ test("GPU 3D view benchmark", async ({ page, browser }) => {
       persp.push(st.frame.total);
     }
     const st: any = await dbg(page, "window.__ocDebug.render3d.renderNow()");
-    report.switching = { firstEnvironmentMs: first, cachedEnvironmentFrame: stat(cached), environmentBuilds: st.environmentBuilds, projectionFrame: stat(persp) };
+    const longTasks: number[] = await page.evaluate(() => (window as any).__longTasks);
+    report.switching = {
+      firstEnvironmentMs: first,
+      cachedEnvironmentFrame: stat(cached),
+      environmentBuilds: st.environmentBuilds,
+      projectionFrame: stat(persp),
+      longTasks: longTasks.length,
+      longestTaskMs: longTasks.length ? Math.max(...longTasks) : 0,
+    };
   }
 
   // --- memory stress (§71) -------------------------------------------------
@@ -252,7 +269,7 @@ test("GPU 3D view benchmark", async ({ page, browser }) => {
   const c = report.curvature;
   md.push("", `Curvature edits: ${c.edits} edits, ${c.meshBuilds} mesh rebuilds, build ${f(c.meshBuildMs.median)} / ${f(c.meshBuildMs.p95)} ms, sync ${f(c.syncMs.median)} / ${f(c.syncMs.p95)} ms.`);
   const sw = report.switching;
-  md.push("", `Lighting: first use ${Object.entries(sw.firstEnvironmentMs).map(([k, v]) => `${k} ${f(v as number, 0)} ms`).join(", ")}; cached switch frame ${f(sw.cachedEnvironmentFrame.median)} / ${f(sw.cachedEnvironmentFrame.p95)} ms; PMREM builds ${sw.environmentBuilds}. Projection switch frame ${f(sw.projectionFrame.median)} / ${f(sw.projectionFrame.p95)} ms.`);
+  md.push("", `Lighting: first use ${Object.entries(sw.firstEnvironmentMs).map(([k, v]) => `${k} ${f(v as number, 0)} ms`).join(", ")}; cached switch frame ${f(sw.cachedEnvironmentFrame.median)} / ${f(sw.cachedEnvironmentFrame.p95)} ms; PMREM builds ${sw.environmentBuilds}; main-thread tasks over 50 ms during the switches: ${sw.longTasks} (longest ${f(sw.longestTaskMs, 0)} ms). Projection switch frame ${f(sw.projectionFrame.median)} / ${f(sw.projectionFrame.p95)} ms.`);
   md.push("", "| Memory | Geometries | Textures | JS heap (MB) | Cached objects |", "|---|---:|---:|---:|---:|");
   for (const [k, v] of Object.entries(report.memory) as [string, any][]) {
     md.push(`| ${k} | ${v.geometries} | ${v.textures} | ${v.jsHeapMB === null ? "n/a" : f(v.jsHeapMB, 1)} | ${v.cached} |`);

@@ -11,18 +11,19 @@ const LABEL_FONT = "11px ui-monospace, monospace";
 
 /** The axis labels, in the UI's Zemax convention: world +X (the optical axis)
  *  reads "Z", +Y reads "Y", and +Z (out of the meridional plane) reads "X". */
-const AXIS_LABELS: { label: string; color: string }[] = [
-  { label: "Z", color: "rgba(150,175,210,0.85)" },
-  { label: "Y", color: "rgba(150,210,175,0.85)" },
-  { label: "X", color: "rgba(210,175,150,0.85)" },
+const AXIS_LABELS: { label: string; dark: string; light: string }[] = [
+  { label: "Z", dark: "rgba(150,175,210,0.85)", light: "rgba(40,62,96,0.9)" },
+  { label: "Y", dark: "rgba(150,210,175,0.85)", light: "rgba(30,90,55,0.9)" },
+  { label: "X", dark: "rgba(210,175,150,0.85)", light: "rgba(110,62,30,0.9)" },
 ];
 
-export function drawAxisLabels(ctx: CanvasRenderingContext2D, rig: CameraRig, ends: V3[]) {
+/** Axis labels; `lightBackground` picks colours that read on a light ground. */
+export function drawAxisLabels(ctx: CanvasRenderingContext2D, rig: CameraRig, ends: V3[], lightBackground = false) {
   const B = rig.basis();
   ctx.font = LABEL_FONT;
   ends.forEach((end, i) => {
     const p = rig.project(end, B);
-    ctx.fillStyle = AXIS_LABELS[i].color;
+    ctx.fillStyle = lightBackground ? AXIS_LABELS[i].light : AXIS_LABELS[i].dark;
     ctx.fillText(AXIS_LABELS[i].label, p.x + 3, p.y - 3);
   });
 }

@@ -10,6 +10,9 @@
         font: 12px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
       canvas#view { position: fixed; inset: 0; width: 100vw; height: 100vh; cursor: grab; }
       canvas#view.dragging { cursor: grabbing; }
+      /* The GPU 3D view sits under #view, which stays on top as a transparent
+         overlay (labels, cards' leader lines) and receives the pointer. */
+      canvas#view3d { position: fixed; inset: 0; width: 100vw; height: 100vh; display: none; }
       .panel { position: fixed; background: rgba(10,14,22,0.86); border: 1px solid #1e2a3d;
         border-radius: 8px; padding: 10px 12px; backdrop-filter: blur(6px); }
       #hud { top: 12px; left: 14px; pointer-events: none; }
@@ -196,6 +199,7 @@
     </style>
   </head>
   <body>
+    <canvas id="view3d"></canvas>
     <canvas id="view"></canvas>
 
     <div class="panel" id="hud">

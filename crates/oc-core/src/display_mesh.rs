@@ -30,12 +30,20 @@
 //! still treats each of these as the zero-thickness surface it is, and the
 //! thickness is never exported.
 //!
+//! # Feature edges
+//!
+//! Each mesh also lists its creases as line pairs ([`DisplayMesh::edges`]): a
+//! lens's rim rings, a prism's corners and cap outlines, a slab's outlines. They
+//! come from how the mesh was built, not from comparing face normals, so a
+//! renderer can outline a body without analysing its triangles.
+//!
 //! # What cannot be drawn
 //!
 //! A 2D-only body (a v1 migration whose third dimension was never authored) has
 //! no solid to draw. Its mesh is the profile outline as line segments, with a
 //! [`DisplayMesh::note`] that says why, rather than an invented depth (§3.2).
 
+use std::collections::HashSet;
 use std::f64::consts::TAU;
 
 use crate::geom3::primitives::{even_asphere_dsag, even_asphere_sag};
@@ -125,6 +133,8 @@ pub struct DisplayMesh {
     /// Triangles (counter-clockwise seen from outside) or line pairs.
     pub indices: Vec<u32>,
     pub groups: Vec<MeshGroup>,
+    /// Crease lines as vertex-index pairs, each drawn once.
+    pub edges: Vec<u32>,
     /// Local bounds of the vertices; zero for an empty mesh.
     pub bounds_min: [f64; 3],
     pub bounds_max: [f64; 3],
@@ -342,6 +352,7 @@ struct Builder {
     idx: Vec<u32>,
     groups: Vec<MeshGroup>,
     open: Option<(FaceGroup, usize)>,
+    edges: Vec<(u32, u32)>,
 }
 
 impl Builder {
@@ -353,6 +364,19 @@ impl Builder {
             idx: Vec::new(),
             groups: Vec::new(),
             open: None,
+            edges: Vec::new(),
+        }
+    }
+
+    /// A crease line between two vertices.
+    fn edge(&mut self, a: u32, b: u32) {
+        self.edges.push((a, b));
+    }
+
+    /// A closed crease loop through `ids`.
+    fn edge_loop(&mut self, ids: &[u32]) {
+        for (i, &a) in ids.iter().enumerate() {
+            self.edge(a, ids[(i + 1) % ids.len()]);
         }
     }
 
@@ -438,12 +462,33 @@ impl Builder {
             lo = [0.0; 3];
             hi = [0.0; 3];
         }
+        // Several pieces meet at the same crease (a lens face and its rim both
+        // end on the rim ring); keep each line once, by welded position.
+        let key = |p: Vec3| {
+            (
+                (p.x * 1e6).round() as i64,
+                (p.y * 1e6).round() as i64,
+                (p.z * 1e6).round() as i64,
+            )
+        };
+        let mut seen = HashSet::new();
+        let mut edges = Vec::with_capacity(self.edges.len() * 2);
+        for (a, b) in self.edges {
+            let (ka, kb) = (key(self.pos[a as usize]), key(self.pos[b as usize]));
+            if ka == kb {
+                continue;
+            }
+            if seen.insert(if ka <= kb { (ka, kb) } else { (kb, ka) }) {
+                edges.extend_from_slice(&[a, b]);
+            }
+        }
         DisplayMesh {
             topology: self.topology,
             positions,
             normals,
             indices: self.idx,
             groups: self.groups,
+            edges,
             bounds_min: lo,
             bounds_max: hi,
             note,
@@ -729,6 +774,16 @@ fn revolve(profile: &ClosedProfile2, tess: &Tessellation) -> DisplayMesh {
                 m.quad(w[0][j], w[0][j1], w[1][j1], w[1][j]);
             }
         }
+        // Where one profile curve ends and the next begins is a crease ring,
+        // unless it is the pole on the axis.
+        for (s, ring) in [
+            (piece[0], &rings[0]),
+            (piece[piece.len() - 1], &rings[rings.len() - 1]),
+        ] {
+            if s.p.y > 1e-9 * scale {
+                m.edge_loop(ring);
+            }
+        }
     }
     m.finish(None)
 }
@@ -762,6 +817,10 @@ fn extrude(profile: &ClosedProfile2, z_min: f64, z_max: f64, tess: &Tessellation
         for w in verts.windows(2) {
             m.quad(w[0].0, w[1].0, w[1].1, w[0].1);
         }
+        // A curve's two ends are the walls' corners.
+        let (first, last) = (verts[0], verts[verts.len() - 1]);
+        m.edge(first.0, first.1);
+        m.edge(last.0, last.1);
     }
 
     let outline = chain_loop(&pieces, 1e-6 * scale.max(1.0));
@@ -775,6 +834,7 @@ fn extrude(profile: &ClosedProfile2, z_min: f64, z_max: f64, tess: &Tessellation
         for t in &tris {
             m.tri(ids[t[0]], ids[t[1]], ids[t[2]]);
         }
+        m.edge_loop(&ids);
     }
     m.finish(None)
 }
@@ -938,6 +998,7 @@ fn cuboid(h: Vec3) -> DisplayMesh {
                 m.vertex(corner(-1.0, 1.0), n),
             ];
             m.quad(ids[0], ids[1], ids[2], ids[3]);
+            m.edge_loop(&ids);
         }
     }
     m.finish(None)
@@ -977,6 +1038,7 @@ fn cylinder(r: f64, half_len: f64, axis_local: Vec3, tess: &Tessellation) -> Dis
         for j in 0..segs {
             m.tri(c, ring[j], ring[(j + 1) % segs]);
         }
+        m.edge_loop(&ring);
     }
     m.finish(None)
 }
@@ -1142,6 +1204,7 @@ fn fan_slab(
         for j in 0..n {
             m.tri(c, ring[j], ring[(j + 1) % n]);
         }
+        m.edge_loop(&ring);
     }
     m.group(groups.edge);
     let _ = smooth;
@@ -1183,6 +1246,7 @@ fn polygon_slab(
         for t in &tris {
             m.tri(ids[t[0]], ids[t[1]], ids[t[2]]);
         }
+        m.edge_loop(&ids);
     }
     m.group(groups.edge);
     let ccw = signed_area(verts) >= 0.0;
@@ -1208,6 +1272,7 @@ fn polygon_slab(
             m.vertex(frame.at(a, half), nn),
         ];
         m.quad(q[0], q[1], q[2], q[3]);
+        m.edge(q[0], q[3]);
     }
 }
 
@@ -1352,6 +1417,10 @@ fn ring_slab(
             let j1 = (j + 1) % n;
             m.quad(a[j], a[j1], b[j1], b[j]);
         }
+        m.edge_loop(&b);
+        if pin.iter().any(|p| p.length_squared() > 1e-24) {
+            m.edge_loop(&a);
+        }
     }
 
     // Edge walls: the outer one faces away from the centre, the inner one toward
@@ -1444,6 +1513,10 @@ fn revolved_sheet(
                 let j1 = (j + 1) % segs;
                 m.quad(w[0][j], w[0][j1], w[1][j1], w[1][j]);
             }
+        }
+        m.edge_loop(&rings[rings.len() - 1]);
+        if r0 > 0.0 {
+            m.edge_loop(&rings[0]);
         }
     }
     m.group(FaceGroup::Edge);
@@ -1988,6 +2061,45 @@ mod tests {
         assert_watertight(&m);
         assert_faces_outward(&m);
         assert!(signed_volume(&m) > 0.0);
+    }
+
+    /// The crease lines, as welded position pairs.
+    fn edge_lines(m: &DisplayMesh) -> Vec<(Vec3, Vec3)> {
+        m.edges
+            .chunks(2)
+            .map(|e| (vertex(m, e[0] as usize), vertex(m, e[1] as usize)))
+            .collect()
+    }
+
+    #[test]
+    fn creases_are_the_rims_corners_and_outlines() {
+        let t = tess();
+        // A lens: the two rim rings, nothing on its smooth faces.
+        let (s, id) = singlet(SingletGeom::biconvex());
+        let lens = object_mesh(&s, id, &t).unwrap();
+        let rings = edge_lines(&lens);
+        let segs = circle_segments(12.0, &t);
+        assert_eq!(rings.len(), 2 * segs);
+        for (a, b) in &rings {
+            assert!((a.y.hypot(a.z) - 12.0).abs() < 1e-4 && (b.y.hypot(b.z) - 12.0).abs() < 1e-4);
+        }
+        // A prism: three vertical corners and two triangular outlines.
+        let mut s = Scene3::new();
+        let prism = s.add_prism(Vec3::ZERO, 16.0, 0.0, 1.62, 36.0);
+        assert_eq!(object_mesh(&s, prism, &t).unwrap().edges.len() / 2, 9);
+        // A box has twelve edges; a rectangle slab has twelve too.
+        assert_eq!(cuboid(Vec3::new(1.0, 2.0, 3.0)).edges.len() / 2, 12);
+        let det = s.add_area_detector(Vec3::ZERO, Vec3::X, 4.0, 3.0, [4, 4]).0;
+        assert_eq!(object_mesh(&s, det, &t).unwrap().edges.len() / 2, 12);
+        // A sphere has none.
+        assert!(sphere(3.0, &t).edges.is_empty());
+        // No line is listed twice.
+        let mut seen = HashSet::new();
+        for (a, b) in rings {
+            let k = |p: Vec3| ((p.x * 1e4) as i64, (p.y * 1e4) as i64, (p.z * 1e4) as i64);
+            let (ka, kb) = (k(a), k(b));
+            assert!(seen.insert(if ka <= kb { (ka, kb) } else { (kb, ka) }));
+        }
     }
 
     #[test]

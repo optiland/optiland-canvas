@@ -315,6 +315,11 @@ impl RenderMesh {
         self.mesh.indices.clone()
     }
 
+    /// Crease lines as vertex-index pairs (rims, corners, outlines).
+    pub fn edges(&self) -> Vec<u32> {
+        self.mesh.edges.clone()
+    }
+
     /// Triples `[start, count, group]`, the group numbered as `FaceGroup`.
     pub fn groups(&self) -> Vec<u32> {
         self.mesh

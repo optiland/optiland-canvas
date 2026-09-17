@@ -156,34 +156,31 @@ test.describe("draw-mirror tool", () => {
 
 test.describe("3D view controls", () => {
   test("reset, presets, and perspective change the 3D view", async ({ page }) => {
-    await page.goto("/");
+    // The 3D view draws on the GPU; its camera and picture are read through the
+    // page's debug hooks rather than the 2D overlay canvas.
+    await page.goto("/?debug");
     await expect(page.locator("#stat")).toContainText("segs");
     await page.locator("#view-3d").click();
     await expect(page.locator("#view3dctl")).toBeVisible();
+    await page.evaluate(() => (window as any).__ocDebug.render3d.ready());
+    const camera = () => page.evaluate(() => (window as any).__ocDebug.render3d.camera());
 
-    const iso = await frameHash(page);
-    await page.locator("#v3dFront").click(); // meridional face-on: a different frame
-    expect(await frameHash(page)).not.toBe(iso);
+    const iso = await camera();
+    await page.locator("#v3dFront").click(); // meridional face-on: a different view
+    const front = await camera();
+    expect(front.yaw).not.toBeCloseTo(iso.yaw);
+    expect(front.pitch).not.toBeCloseTo(iso.pitch);
 
     await page.locator("#v3dReset").click(); // back to the default 3/4
+    const reset = await camera();
+    expect(reset.yaw).toBeCloseTo(iso.yaw);
+    expect(reset.pitch).toBeCloseTo(iso.pitch);
     await page.locator("#v3dPersp").click(); // perspective on
     await expect(page.locator("#v3dPersp")).toHaveClass(/active/);
-    expect(await litPixels(page)).toBeGreaterThan(150);
+    expect((await camera()).perspective).toBe(true);
+    expect(await page.evaluate(() => (window as any).__ocDebug.render3d.litPixels())).toBeGreaterThan(150);
   });
 });
-
-async function frameHash(page: import("@playwright/test").Page): Promise<number> {
-  return page.evaluate(() => {
-    const c = document.getElementById("view") as HTMLCanvasElement;
-    const ctx = c.getContext("2d")!;
-    const { data, width } = ctx.getImageData(0, 0, c.width, c.height);
-    let h = 0;
-    for (let i = 0; i < data.length; i += 4) {
-      if (data[i] + data[i + 1] + data[i + 2] > 60) { const p = i / 4; h = (h + (p % width) * 3 + ((p / width) | 0) * 7) % 2147483647; }
-    }
-    return h;
-  });
-}
 
 async function litPixels(page: import("@playwright/test").Page): Promise<number> {
   return page.evaluate(() => {

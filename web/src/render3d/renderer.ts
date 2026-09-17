@@ -20,8 +20,10 @@
 import * as THREE from "three/webgpu";
 import type { RenderMesh } from "../../pkg/oc_wasm.js";
 import type { Bounds3, CameraRig } from "./camera";
+import { CueLayer } from "./cues";
 import { EnvironmentManager, luminance } from "./environments";
 import { MaterialLibrary } from "./materials";
+import { RayBuffer, type RayUpload, type RayVisibility } from "./rays";
 import { Scaffold, type ScaffoldTheme } from "./scaffold";
 import { SceneRenderCache, type SyncReport } from "./scene-cache";
 import type {
@@ -51,6 +53,10 @@ export class OpticalRenderer3D {
   private readonly materials = new MaterialLibrary();
   private readonly cache = new SceneRenderCache(this.materials);
   private readonly environments: EnvironmentManager;
+  private readonly cues = new CueLayer(this.cache);
+  private readonly raycaster = new THREE.Raycaster();
+  private readonly rays = new RayBuffer();
+  private lastRayUploadMs = 0;
   private lastSync: SyncReport | null = null;
   private lastSyncMs = 0;
   private cssWidth = 1;
@@ -70,6 +76,9 @@ export class OpticalRenderer3D {
     this.scene.name = "optiland-canvas-3d";
     this.scene.add(this.scaffold.root);
     this.scene.add(this.cache.root);
+    this.scene.add(this.rays.object);
+    this.scene.add(this.rays.inkOverlay);
+    this.cache.onRebuilt = (id) => this.cues.refresh(id);
     this.environments = new EnvironmentManager(renderer, this.scene);
     this.environments.setEnvironment("dark_studio");
     this.theme = this.environments.scaffoldTheme();
@@ -103,6 +112,8 @@ export class OpticalRenderer3D {
     this.dpr = dpr;
     this.renderer.setPixelRatio(dpr);
     this.renderer.setSize(this.cssWidth, this.cssHeight, false);
+    const size = this.renderer.getDrawingBufferSize(new THREE.Vector2());
+    this.rays.setDrawingSize(size.x, size.y);
   }
 
   /** Bring the render proxies up to the Rust scene's current descriptors.
@@ -143,8 +154,47 @@ export class OpticalRenderer3D {
 
   private retheme() {
     this.theme = this.environments.scaffoldTheme();
-    this.materials.setCreaseTone(this.lightBackground());
+    const light = this.lightBackground();
+    this.materials.setCreaseTone(light);
+    this.cues.setLightBackground(light);
+    this.rays.setLightBackground(light);
     this.relayout();
+  }
+
+  /** Upload the traced segments (the 11-float projected layout). */
+  updateRays(segs: Float32Array): RayUpload {
+    const up = this.rays.update(segs);
+    this.lastRayUploadMs = up.ms;
+    return up;
+  }
+
+  setGhostOpacity(opacity: number) {
+    this.rays.setGhostOpacity(opacity);
+  }
+
+  setRayVisibility(mode: RayVisibility) {
+    this.rays.setVisibility(mode);
+  }
+
+  setHovered(id: number) {
+    this.cues.setHovered(id);
+  }
+
+  setSelected(id: number) {
+    this.cues.setSelected(id);
+  }
+
+  /** The object under a CSS-pixel point, by a ray through the render proxies.
+   *  Only an id comes back; the selection itself is the app's. */
+  pick(x: number, y: number, rig: CameraRig): number | null {
+    const cam = this.applyCamera(rig);
+    const ndc = new THREE.Vector2((x / rig.width) * 2 - 1, 1 - (y / rig.height) * 2);
+    this.raycaster.setFromCamera(ndc, cam);
+    for (const hit of this.raycaster.intersectObjects(this.cache.pickables(), false)) {
+      const id = hit.object.userData.objectId;
+      if (typeof id === "number") return id;
+    }
+    return null;
   }
 
   /** The background colour in effect (sRGB hex). */
@@ -221,9 +271,41 @@ export class OpticalRenderer3D {
       internals._nodes.nodeFrame.update();
       (this.renderer.info as { frame: number }).frame = internals._nodes.nodeFrame.frameId;
     }
+    if (this.rays.inkMode) this.renderInkPass(cam);
+    this.rays.object.visible = !this.rays.inkMode;
     this.renderer.render(this.scene, cam);
+    this.rays.object.visible = true;
     this.frames++;
     this.lastRenderMs = performance.now() - t0;
+  }
+
+  /** Light backgrounds: sum the rays into the ink target first. Only the rays,
+   *  and (when rays are occluded) the opaque parts as depth, are drawn. */
+  private renderInkPass(cam: THREE.Camera) {
+    const r = this.renderer;
+    const rays = this.rays;
+    const occluded = rays.getVisibility() === "occluded";
+    const background = this.scene.background;
+    const clear = r.getClearColor(new THREE.Color());
+    const clearAlpha = r.getClearAlpha();
+    this.scene.background = null;
+    r.setClearColor(0x000000, 0);
+    r.setRenderTarget(rays.inkTarget);
+    r.setRenderObjectFunction((object, scene, camera, geometry, material, group, lightsNode, clippingContext, passId) => {
+      if (object === rays.object) {
+        r.renderObject(object, scene, camera, geometry, material, group, lightsNode, clippingContext, passId);
+      } else if (occluded && object.userData.objectId !== undefined && material.depthWrite && !material.transparent) {
+        r.renderObject(object, scene, camera, geometry, rays.depthOnly, group, lightsNode, clippingContext, passId);
+      }
+    });
+    try {
+      r.render(this.scene, cam);
+    } finally {
+      r.setRenderObjectFunction(null);
+      r.setRenderTarget(null);
+      r.setClearColor(clear, clearAlpha);
+      this.scene.background = background;
+    }
   }
 
   stats(): Partial<RenderStats> {
@@ -245,10 +327,14 @@ export class OpticalRenderer3D {
       syncMs: this.lastSyncMs,
       cachedObjects: this.cache.size,
       environmentBuilds: this.environments.builds,
+      raySegments: this.rays.count,
+      rayUploadMs: this.lastRayUploadMs,
     };
   }
 
   dispose() {
+    this.cues.dispose();
+    this.rays.dispose();
     this.cache.dispose();
     this.materials.dispose();
     this.environments.dispose();

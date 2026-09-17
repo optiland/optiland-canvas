@@ -15,13 +15,12 @@
 
 import type { Canvas } from "../../pkg/oc_wasm.js";
 import type { FastPreview } from "../fastpreview";
-import type { RayLayer } from "../rays";
 import { CameraRig, type Bounds3, type CameraPreset, type CameraState, type V2, type V3 } from "./camera";
 import { createScene3Cards, type SceneObject } from "./cards3d";
 import { drawAxisLabels, drawNotice, drawSelectionDot, drawTirRings } from "./overlays";
 import { QualityController } from "./quality";
 import type { OpticalRenderer3D } from "./renderer";
-import type { BackgroundId, EnvironmentId, RenderBackend, RenderStats } from "./types";
+import type { BackgroundId, EnvironmentId, RayVisibilityMode, RenderBackend, RenderStats } from "./types";
 
 // The projected trace layout (traceProjected3D): 11 floats per segment,
 // [au,av,bu,bv, r,g,b, flux, flags, dist_a, dist_b]. With the default XY view
@@ -78,9 +77,7 @@ export type View3dOptions = {
   onSelect?: (id: number) => void;
   detectorRefresh?: () => void;
   fast?: FastPreview;
-  /** Phase 1 ray drawing: the shared HDR ray layer, composited on the overlay. */
-  rays: RayLayer;
-  rayOptions: () => { ghostOpacity: number; exposure: number; showTir: boolean };
+  rayOptions: () => { ghostOpacity: number; showTir: boolean };
   grid: () => { on: boolean; spacing: number };
   /** Write the status line for a finished frame. */
   status: (r: FrameReport) => void;
@@ -109,6 +106,7 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
     background: "match" as BackgroundId,
     exposureEv: 0,
     ground: true,
+    rays: "through" as RayVisibilityMode,
   };
   function applySettings() {
     if (!renderer) return;
@@ -116,13 +114,20 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
     renderer.setBackground(settings.background);
     renderer.setExposure(2 ** settings.exposureEv);
     renderer.setGround(settings.ground);
+    renderer.setRayVisibility(settings.rays);
   }
   const envSelect = document.getElementById("v3dEnv") as HTMLSelectElement | null;
   const bgSelect = document.getElementById("v3dBg") as HTMLSelectElement | null;
   const exposureInput = document.getElementById("v3dExposure") as HTMLInputElement | null;
   const exposureLabel = document.getElementById("v3dExposureVal");
   const groundBox = document.getElementById("v3dGround") as HTMLInputElement | null;
-  for (const el of [envSelect, bgSelect]) el?.addEventListener("keydown", (e) => e.stopPropagation());
+  const raysSelect = document.getElementById("v3dRays") as HTMLSelectElement | null;
+  for (const el of [envSelect, bgSelect, raysSelect]) el?.addEventListener("keydown", (e) => e.stopPropagation());
+  raysSelect?.addEventListener("change", () => {
+    settings.rays = raysSelect.value as RayVisibilityMode;
+    renderer?.setRayVisibility(settings.rays);
+    invalidate();
+  });
   envSelect?.addEventListener("change", () => {
     settings.environment = envSelect.value as EnvironmentId;
     renderer?.setEnvironment(settings.environment);
@@ -161,6 +166,10 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
   let lastTraceMs = 0;
   // The scene revision the render proxies were last synced at.
   let syncedRevision = -1;
+  // The ray picture last uploaded to the GPU (by identity), and its TIR points.
+  let uploadedSegs: Float32Array<ArrayBufferLike> | null = null;
+  let rayCount = 0;
+  let tirPoints: V3[] = [];
 
   /** Bring the GPU proxies up to date with Rust, if the scene moved. */
   function syncRender(force = false) {
@@ -175,7 +184,12 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
 
   function select(id: number) {
     selected = id;
+    renderer?.setSelected(id);
     opts.onSelect?.(id);
+  }
+  function clearSelection() {
+    selected = -1;
+    renderer?.setSelected(-1);
   }
 
   // A fast frame can arrive after `retrace` returns (WebGPU), so it is drawn only
@@ -305,6 +319,7 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
         applySettings();
         refreshObjects();
         syncRender(true);
+        renderer.setSelected(selected);
       } catch (e) {
         console.warn("3D renderer unavailable.", e);
         failure = e instanceof Error ? e.message : String(e);
@@ -341,10 +356,16 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
     }
 
     const grid = opts.grid();
-    let count = 0;
-    let tir: V2[] = [];
+    const ro = opts.rayOptions();
     if (renderer) {
       syncRender();
+      if (segs !== uploadedSegs) {
+        const up = renderer.updateRays(segs);
+        uploadedSegs = segs;
+        rayCount = up.count;
+        tirPoints = up.tir;
+      }
+      renderer.setGhostOpacity(ro.ghostOpacity);
       renderer.setGrid(grid.on, grid.spacing);
       renderer.resize(W, H, quality.pixelRatio(dpr));
       renderer.render(rig);
@@ -355,31 +376,10 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, W, H);
     if (renderer) {
-      const ro = opts.rayOptions();
-      const B = rig.basis();
-      const out = new Float32Array((segs.length / STRIDE) * 9);
-      let k = 0;
-      for (let i = 0; i + STRIDE <= segs.length; i += STRIDE) {
-        const pa = rig.project({ x: segs[i], y: segs[i + 1], z: segs[i + 9] }, B);
-        const pb = rig.project({ x: segs[i + 2], y: segs[i + 3], z: segs[i + 10] }, B);
-        out.set([pa.x, pa.y, pb.x, pb.y, segs[i + 4], segs[i + 5], segs[i + 6], segs[i + 7], segs[i + 8]], k);
-        k += 9;
+      if (ro.showTir && tirPoints.length) {
+        const B = rig.basis();
+        drawTirRings(ctx, tirPoints.map((p) => rig.project(p, B)));
       }
-      const drawn = opts.rays.draw(out, (p) => p, {
-        ghostOpacity: ro.ghostOpacity,
-        exposure: ro.exposure,
-        dpr,
-        width: W,
-        height: H,
-      });
-      count = drawn.count;
-      tir = ro.showTir ? drawn.tirDots : [];
-      ctx.save();
-      ctx.setTransform(1, 0, 0, 1, 0, 0);
-      ctx.globalCompositeOperation = "lighter";
-      ctx.drawImage(opts.rays.canvas, 0, 0);
-      ctx.restore();
-      drawTirRings(ctx, tir);
       drawAxisLabels(ctx, rig, renderer.axisEnds());
       const so = objList.find((o) => o.id === selected);
       if (so) drawSelectionDot(ctx, rig, { x: so.pos[0], y: so.pos[1], z: so.pos[2] });
@@ -392,12 +392,22 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
     }
     ctx.restore();
 
-    opts.status({ count, ms: performance.now() - t0, traceMs });
+    opts.status({ count: renderer ? rayCount : 0, ms: performance.now() - t0, traceMs });
   }
 
   // --- picking -------------------------------------------------------------
-  // Phase 1: the projected centre and a coarse radius decide a hit.
+  // A ray through the render proxies decides first. A thin plate seen edge-on
+  // is hard to hit that way, so the projected centre and a coarse radius (the
+  // wireframe view's rule) is the fallback.
   function pick(cx: number, cy: number): SceneObject | null {
+    if (renderer) {
+      syncRender();
+      const id = renderer.pick(cx, cy, rig);
+      if (id !== null) {
+        const hit = objList.find((o) => o.id === id);
+        if (hit) return hit;
+      }
+    }
     const B = rig.basis();
     let best: SceneObject | null = null, bestD = Infinity;
     for (const o of objList) {
@@ -482,13 +492,30 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
   view.addEventListener("pointerup", endPointer);
   view.addEventListener("pointercancel", endPointer);
 
+  // Hover is resolved at most once per animation frame, and never traces.
+  let hoverAt: V2 | null = null;
+  let hoverFrame = 0;
   function updateHover(cx: number, cy: number) {
-    const id = pick(cx, cy)?.id ?? -1;
-    if (id === hovered) return;
-    hovered = id;
-    view.style.cursor = id >= 0 ? "pointer" : "";
-    invalidate();
+    hoverAt = { x: cx, y: cy };
+    if (hoverFrame) return;
+    hoverFrame = requestAnimationFrame(() => {
+      hoverFrame = 0;
+      if (!hoverAt || mode || !active) return;
+      const id = pick(hoverAt.x, hoverAt.y)?.id ?? -1;
+      if (id === hovered) return;
+      hovered = id;
+      renderer?.setHovered(id);
+      view.style.cursor = id >= 0 ? "pointer" : "";
+      invalidate();
+    });
   }
+  view.addEventListener("pointerleave", () => {
+    hoverAt = null;
+    if (hovered < 0) return;
+    hovered = -1;
+    renderer?.setHovered(-1);
+    invalidate();
+  });
 
   view.addEventListener("wheel", (e) => {
     if (!owns()) return;
@@ -516,7 +543,7 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
     if (selected < 0) return;
     if (scene.deleteObject3D(selected)) {
       cards.close(selected);
-      selected = -1;
+      clearSelection();
       afterEdit();
       opts.detectorRefresh?.();
     }
@@ -543,7 +570,7 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
   window.addEventListener("keydown", (e) => {
     if (!owns() || e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement) return;
     const mod = e.ctrlKey || e.metaKey;
-    if (e.key === "Escape") { cards.closeAll(); selected = -1; invalidate(); return; }
+    if (e.key === "Escape") { cards.closeAll(); clearSelection(); invalidate(); return; }
     if (e.key === "0") { frameScene(); invalidate(); return; }
     if (mod && (e.key === "c" || e.key === "C")) { if (selected >= 0) clipboard = selected; e.preventDefault(); return; }
     if (mod && (e.key === "v" || e.key === "V")) { pasteBody(); e.preventDefault(); return; }
@@ -581,6 +608,7 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
     active = false;
     mode = null;
     hovered = -1;
+    renderer?.setHovered(-1);
     quality.settleNow();
     cards.closeAll();
     canvas.style.display = "none";

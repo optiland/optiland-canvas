@@ -208,11 +208,12 @@ export class SceneRenderCache {
     return out;
   }
 
-  /** Remove a proxy and free its geometries (materials are shared). */
+  /** Remove a proxy and free its geometries (materials are shared). Crease
+   *  lines are this cache's; other children (cues) belong to their owners. */
   private release(e: CachedRenderable) {
     this.root.remove(e.root);
     e.root.geometry.dispose();
-    for (const c of e.root.children) (c as THREE.LineSegments).geometry?.dispose();
+    for (const c of e.root.children) if (c.userData.crease) (c as THREE.LineSegments).geometry.dispose();
   }
 
   dispose() {

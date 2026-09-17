@@ -758,10 +758,8 @@ async function main() {
       owns: () => in3dModel(),
       onSelect: onSelect3d,
       detectorRefresh: refreshReference,
-      rays,
       rayOptions: () => ({
         ghostOpacity: Number(ghostOpacity.value) / 100,
-        exposure: EXPOSURE,
         showTir: tirBox.checked,
       }),
       grid: () => ({ on: gridBox.checked, spacing: Math.max(0.1, Number(gridSpacing.value) || 5) }),

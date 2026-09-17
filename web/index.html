@@ -349,6 +349,11 @@
       <label title="display exposure, in stops">exposure
         <input type="range" id="v3dExposure" min="-2" max="2" step="0.1" value="0" />
         <span id="v3dExposureVal">±0.0 EV</span></label>
+      <label title="whether solid parts hide the rays behind them (glass never does)">rays
+        <select id="v3dRays">
+          <option value="through">through components</option>
+          <option value="occluded">occluded</option>
+        </select></label>
       <label><input type="checkbox" id="v3dGround" checked /> ground</label>
     </div>
 

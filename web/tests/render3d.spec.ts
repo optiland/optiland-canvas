@@ -9,6 +9,11 @@
 
 import { test, expect, type Page } from "@playwright/test";
 
+// In headless CI, SwiftShader compiles every shader on the CPU: opening the
+// view alone takes about 12 s there (2 s on a desktop with SwiftShader forced),
+// so the longest tests here need about a minute. They get three.
+test.describe.configure({ timeout: 180_000 });
+
 type Stats = {
   backend: string;
   quality: string;

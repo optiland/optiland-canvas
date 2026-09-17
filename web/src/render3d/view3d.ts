@@ -20,13 +20,15 @@ import { createScene3Cards, type SceneObject } from "./cards3d";
 import { drawAxisLabels, drawNotice, drawSelectionDot, drawTirRings } from "./overlays";
 import { QualityController } from "./quality";
 import type { OpticalRenderer3D } from "./renderer";
-import type {
-  BackgroundId,
-  EnvironmentId,
-  FrameCost,
-  RayVisibilityMode,
-  RenderBackend,
-  RenderStats,
+import {
+  parseDetectorMaps,
+  type BackgroundId,
+  type DetectorMap,
+  type EnvironmentId,
+  type FrameCost,
+  type RayVisibilityMode,
+  type RenderBackend,
+  type RenderStats,
 } from "./types";
 
 // The projected trace layout (traceProjected3D): 11 floats per segment,
@@ -88,11 +90,74 @@ export type View3dDebug = {
   stats: () => RenderStats;
   /** Render now and count lit pixels of the GPU canvas (tests). */
   litPixels: () => Promise<number>;
+  /** Render now and count clearly red or orange pixels of the GPU canvas only
+   *  (the hit map's warm cells; rays, glass, and the default finishes are not
+   *  warm). */
+  warmPixels: () => Promise<number>;
   project: (p: V3) => V2;
   hovered: () => number;
+  /** The appearance settings in effect (as saved). */
+  prefs: () => View3dPrefs;
 };
 
 export type FrameLogEntry = FrameCost & { meshBuilds: number; raySegments: number; quality: string; dpr: number };
+
+/** The 3D view's appearance, remembered in this browser. Display settings
+ *  only; none of them is part of the scene or its file. */
+export type View3dPrefs = {
+  environment: EnvironmentId;
+  background: BackgroundId;
+  exposureEv: number;
+  ground: boolean;
+  rays: RayVisibilityMode;
+  hitMaps: boolean;
+  rayWidth: number;
+  perspective: boolean;
+};
+
+const PREFS_KEY = "optiland-canvas:view3d";
+
+export const DEFAULT_PREFS: View3dPrefs = {
+  environment: "dark_studio",
+  background: "match",
+  exposureEv: 0,
+  ground: true,
+  rays: "through",
+  hitMaps: true,
+  rayWidth: 1,
+  perspective: false,
+};
+
+/** The saved preferences, each field checked, or the defaults. Storage can be
+ *  missing or refused (private windows); that is not an error. */
+function loadPrefs(): View3dPrefs {
+  const out = { ...DEFAULT_PREFS };
+  let saved: Record<string, unknown> = {};
+  try {
+    saved = JSON.parse(localStorage.getItem(PREFS_KEY) ?? "{}") ?? {};
+  } catch {
+    return out;
+  }
+  const oneOf = <T extends string>(v: unknown, allowed: readonly T[]): v is T => allowed.includes(v as T);
+  const num = (v: unknown, lo: number, hi: number) => typeof v === "number" && Number.isFinite(v) && v >= lo && v <= hi;
+  if (oneOf(saved.environment, ["dark_studio", "light_studio", "optical_bench", "inspection"] as const)) out.environment = saved.environment;
+  if (oneOf(saved.background, ["match", "black", "charcoal", "mid_gray", "light_gray"] as const)) out.background = saved.background;
+  if (num(saved.exposureEv, -2, 2)) out.exposureEv = saved.exposureEv as number;
+  if (typeof saved.ground === "boolean") out.ground = saved.ground;
+  if (oneOf(saved.rays, ["through", "occluded"] as const)) out.rays = saved.rays;
+  if (typeof saved.hitMaps === "boolean") out.hitMaps = saved.hitMaps;
+  if (num(saved.rayWidth, 1, 6)) out.rayWidth = saved.rayWidth as number;
+  if (typeof saved.perspective === "boolean") out.perspective = saved.perspective;
+  return out;
+}
+
+function savePrefs(prefs: View3dPrefs) {
+  try {
+    localStorage.setItem(PREFS_KEY, JSON.stringify(prefs));
+  } catch {
+    // Not saved; the settings still apply to this page.
+  }
+}
 
 export type View3dOptions = {
   scene: Canvas;
@@ -131,14 +196,10 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
 
   const quality = new QualityController(() => invalidate());
 
-  // --- appearance settings (display only; local UI state, not saved) -------
-  const settings = {
-    environment: "dark_studio" as EnvironmentId,
-    background: "match" as BackgroundId,
-    exposureEv: 0,
-    ground: true,
-    rays: "through" as RayVisibilityMode,
-  };
+  // --- appearance settings (display only; remembered in this browser) ------
+  const settings = loadPrefs();
+  rig.setPerspective(settings.perspective);
+  const remember = () => savePrefs({ ...settings, perspective: rig.perspective });
   function applySettings() {
     if (!renderer) return;
     renderer.setEnvironment(settings.environment);
@@ -146,6 +207,8 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
     renderer.setExposure(2 ** settings.exposureEv);
     renderer.setGround(settings.ground);
     renderer.setRayVisibility(settings.rays);
+    renderer.setRayWidth(settings.rayWidth);
+    renderer.setHitMapsEnabled(settings.hitMaps);
   }
   const envSelect = document.getElementById("v3dEnv") as HTMLSelectElement | null;
   const bgSelect = document.getElementById("v3dBg") as HTMLSelectElement | null;
@@ -153,17 +216,57 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
   const exposureLabel = document.getElementById("v3dExposureVal");
   const groundBox = document.getElementById("v3dGround") as HTMLInputElement | null;
   const raysSelect = document.getElementById("v3dRays") as HTMLSelectElement | null;
+  const hitsBox = document.getElementById("v3dHits") as HTMLInputElement | null;
+  const widthInput = document.getElementById("v3dRayWidth") as HTMLInputElement | null;
+  const widthLabel = document.getElementById("v3dRayWidthVal");
+  const showExposure = () => {
+    const v = settings.exposureEv;
+    if (exposureLabel) exposureLabel.textContent = `${v === 0 ? "±" : v > 0 ? "+" : "−"}${Math.abs(v).toFixed(1)} EV`;
+  };
+  const showWidth = () => {
+    if (widthLabel) widthLabel.textContent = `${settings.rayWidth.toFixed(1)} px`;
+  };
+  // The controls start from the saved settings.
+  if (envSelect) envSelect.value = settings.environment;
+  if (bgSelect) bgSelect.value = settings.background;
+  if (exposureInput) exposureInput.value = String(settings.exposureEv);
+  if (groundBox) groundBox.checked = settings.ground;
+  if (raysSelect) raysSelect.value = settings.rays;
+  if (hitsBox) hitsBox.checked = settings.hitMaps;
+  if (widthInput) widthInput.value = String(settings.rayWidth);
+  showExposure();
+  showWidth();
   for (const el of [envSelect, bgSelect, raysSelect]) el?.addEventListener("keydown", (e) => e.stopPropagation());
   raysSelect?.addEventListener("change", () => {
     settings.rays = raysSelect.value as RayVisibilityMode;
+    remember();
     renderer?.setRayVisibility(settings.rays);
     invalidate();
   });
   envSelect?.addEventListener("change", () => {
     settings.environment = envSelect.value as EnvironmentId;
+    remember();
     if (!renderer) return;
     renderer.setEnvironment(settings.environment);
     holdFramesWhile(renderer.prepare(rig));
+  });
+  hitsBox?.addEventListener("change", () => {
+    settings.hitMaps = hitsBox.checked;
+    remember();
+    if (!renderer) return;
+    renderer.setHitMapsEnabled(settings.hitMaps);
+    holdFramesWhile(renderer.prepare(rig));
+  });
+  widthInput?.addEventListener("input", () => {
+    settings.rayWidth = Number(widthInput.value) || 1;
+    showWidth();
+    remember();
+    if (!renderer) return;
+    const kindChanges = (settings.rayWidth > 1) !== (renderer.rayWidth() > 1);
+    renderer.setRayWidth(settings.rayWidth);
+    // Switching between lines and strips needs the other shader.
+    if (kindChanges) holdFramesWhile(renderer.prepare(rig));
+    else invalidate();
   });
 
   /** Keep the last picture on screen until `work` is done, then draw. */
@@ -176,21 +279,21 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
   }
   bgSelect?.addEventListener("change", () => {
     settings.background = bgSelect.value as BackgroundId;
+    remember();
     renderer?.setBackground(settings.background);
     invalidate();
   });
   exposureInput?.addEventListener("input", () => {
     settings.exposureEv = Number(exposureInput.value);
-    if (exposureLabel) {
-      const v = settings.exposureEv;
-      exposureLabel.textContent = `${v === 0 ? "±" : v > 0 ? "+" : "−"}${Math.abs(v).toFixed(1)} EV`;
-    }
+    showExposure();
+    remember();
     renderer?.setExposure(2 ** settings.exposureEv);
     quality.pulse();
     invalidate();
   });
   groundBox?.addEventListener("change", () => {
     settings.ground = groundBox.checked;
+    remember();
     renderer?.setGround(settings.ground);
     invalidate();
   });
@@ -216,6 +319,11 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
   let uploadedSegs: Float32Array<ArrayBufferLike> | null = null;
   let rayCount = 0;
   let tirPoints: V3[] = [];
+  // The detectors' hit maps from the latest exact trace, the revision they
+  // belong to, and whether the renderer has them yet.
+  let maps: DetectorMap[] = [];
+  let mapsRevision = -1;
+  let mapsUploaded = true;
   const cost: FrameCost = { total: 0, trace: 0, sync: 0, upload: 0, render: 0, overlay: 0 };
   let frameLog: FrameLogEntry[] | null = null;
 
@@ -250,6 +358,10 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
       segs = scene.traceProjected3D();
       tracedRevision = scene.sceneRevision();
       shownExact = true;
+      // The same trace left the detector maps behind; no second trace.
+      maps = parseDetectorMaps(scene.lastDetectorMapsF32());
+      mapsRevision = tracedRevision;
+      mapsUploaded = false;
     } else if (!opts.fast) {
       segs = scene.traceProjected3DFast();
       tracedRevision = scene.sceneRevision();
@@ -269,14 +381,15 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
 
   const objectsPanel = document.getElementById("objects3d");
   function refreshObjects() {
-    objList = JSON.parse(scene.sceneObjectsJSON());
+    // This view also draws the light sources, so they are selectable here.
+    objList = [...JSON.parse(scene.sceneObjectsJSON()), ...JSON.parse(scene.sourceObjectsJSON())];
     if (!objectsPanel) return;
     objectsPanel.replaceChildren();
     for (const o of objList) {
       const row = document.createElement("div");
       row.className = "row";
       const [x, y, z] = o.pos.map((v) => v.toFixed(1));
-      const shape = o.kind === "profile" ? `profile · ${o.construction}` : o.kind;
+      const shape = o.kind === "profile" || o.kind === "source" ? `${o.kind} · ${o.construction}` : o.kind;
       const planar = o.is3d ? "" : ` <span class="planar" title="a 2D-only body: not traced in full 3D">⚠ 2D-only</span>`;
       row.innerHTML =
         `<span class="oid">#${o.id}</span>` +
@@ -424,6 +537,17 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
         tirPoints = up.tir;
         uploadMs = up.ms;
       }
+      if (!mapsUploaded) {
+        mapsUploaded = true;
+        // A detector's first map needs its shader; draw once it is ready.
+        if (renderer.setDetectorMaps(maps)) {
+          holdFramesWhile(renderer.prepare(rig));
+          return;
+        }
+      }
+      // A map belongs to the exact trace it came from, and only while the
+      // scene is still the one that trace saw.
+      renderer.setHitMapsShown(shownExact && mapsRevision === tracedRevision && tracedRevision === scene.sceneRevision());
       renderer.setGhostOpacity(ro.ghostOpacity);
       renderer.setGrid(grid.on, grid.spacing);
       renderer.resize(W, H, quality.pixelRatio(dpr));
@@ -731,6 +855,8 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
     syncMs: 0,
     rayUploadMs: 0,
     rayUploads: 0,
+    rayWidth: settings.rayWidth,
+    hitMaps: 0,
     environmentBuilds: 0,
     geometries: 0,
     textures: 0,
@@ -740,12 +866,39 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
     jsHeap: (performance as unknown as { memory?: { usedJSHeapSize: number } }).memory?.usedJSHeapSize ?? null,
   });
 
+  /** Draw a frame now. A frame can stop to compile a new shader (a detector's
+   *  first hit map); then wait for it and draw again. */
+  async function drawSettled() {
+    for (let i = 0; i < 4; i++) {
+      if (compiling) await compiling;
+      drawFrame();
+      if (!compiling) return;
+    }
+  }
+
+  /** Draw a frame and count the pixels `test` accepts, on the GPU canvas and,
+   *  with `overlay`, the 2D annotations over it. */
+  async function countPixels(overlay: boolean, test: (r: number, g: number, b: number) => boolean) {
+    await ensureRenderer();
+    if (!renderer) return 0;
+    await drawSettled();
+    const c = document.createElement("canvas");
+    c.width = canvas.width;
+    c.height = canvas.height;
+    const c2 = c.getContext("2d")!;
+    c2.drawImage(canvas, 0, 0);
+    if (overlay) c2.drawImage(view, 0, 0, c.width, c.height);
+    const { data } = c2.getImageData(0, 0, c.width, c.height);
+    let n = 0;
+    for (let i = 0; i < data.length; i += 4) if (test(data[i], data[i + 1], data[i + 2])) n++;
+    return n;
+  }
+
   const debug: View3dDebug = {
     ready: () => ensureRenderer(),
     renderNow: async () => {
       await ensureRenderer();
-      if (compiling) await compiling;
-      drawFrame();
+      await drawSettled();
       await renderer?.gpuTime();
       return stats();
     },
@@ -762,23 +915,11 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
     },
     camera: () => rig.state(),
     stats,
-    litPixels: async () => {
-      await ensureRenderer();
-      if (!renderer) return 0;
-      drawFrame();
-      const c = document.createElement("canvas");
-      c.width = canvas.width;
-      c.height = canvas.height;
-      const c2 = c.getContext("2d")!;
-      c2.drawImage(canvas, 0, 0);
-      c2.drawImage(view, 0, 0, c.width, c.height);
-      const { data } = c2.getImageData(0, 0, c.width, c.height);
-      let n = 0;
-      for (let i = 0; i < data.length; i += 4) if (data[i] + data[i + 1] + data[i + 2] > 60) n++;
-      return n;
-    },
+    litPixels: () => countPixels(true, (r, g, b) => r + g + b > 60),
+    warmPixels: () => countPixels(false, (r, g, b) => r > 120 && r > g + 30 && r > b + 30),
     project,
     hovered: () => hovered,
+    prefs: () => ({ ...settings, perspective: rig.perspective }),
   };
 
   return {
@@ -791,7 +932,7 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
     focusObject,
     resetView: () => { rig.resetOrientation(); frameScene(); invalidate(); },
     setPreset: (name) => { rig.setPreset(name as CameraPreset); frameScene(); invalidate(); },
-    setPerspective: (on) => { rig.setPerspective(on); invalidate(); },
+    setPerspective: (on) => { rig.setPerspective(on); remember(); invalidate(); },
     isPerspective: () => rig.perspective,
     backendLabel,
     prefetch: () => {

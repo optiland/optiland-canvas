@@ -15,11 +15,14 @@
 //     coating model has nothing a colour could honestly stand for.
 //   - Mirror reflections are environment reflections, not the scene's mirror
 //     reflectivity.
+//   - A source's glow is its light's display colour, not a radiance.
+//   - A detector's hit map is a picture of the f64 readout's cells, painted on
+//     the face they belong to; the numbers stay in the readout.
 //
 // A role comes from the Rust scene (render_view.rs); nothing here writes back.
 
 import * as THREE from "three/webgpu";
-import { abs, dot, float, normalView, positionViewDirection, vec3 } from "three/tsl";
+import { abs, dot, float, mix, normalView, positionLocal, positionViewDirection, texture, uniform, vec2, vec3 } from "three/tsl";
 import { FaceGroup, type MaterialRole, type RenderObjectDescriptor } from "./types";
 import { FACE_GROUP_SLOTS } from "./mesh-adapter";
 
@@ -77,10 +80,26 @@ export class MaterialLibrary {
     });
   }
 
-  private material(role: ShadingRole, nd: number | null): THREE.Material {
+  /** A source's emitting face: lit by its own light's colour. Keyed by colour. */
+  private emitter(emit: [number, number, number] | null): THREE.Material {
+    const [r, g, b] = emit ?? [1, 1, 1];
+    const key = `source_emitter:${r.toFixed(2)},${g.toFixed(2)},${b.toFixed(2)}`;
+    return this.get(key, () => {
+      const light = new THREE.Color(r, g, b);
+      return new THREE.MeshStandardNodeMaterial({
+        color: light.clone().multiplyScalar(0.2),
+        emissive: light,
+        emissiveIntensity: 1.4,
+        metalness: 0,
+        roughness: 0.6,
+      });
+    });
+  }
+
+  private material(role: ShadingRole, d: RenderObjectDescriptor): THREE.Material {
     switch (role) {
       case "optical_glass":
-        return this.glass(nd);
+        return this.glass(d.nd);
       case "glass_edge":
         // The ground rim, drawn as a pale frosted band so the lens outline reads
         // against any background. A display aid, not a modelled surface finish.
@@ -151,6 +170,15 @@ export class MaterialLibrary {
           metalness: 0.4,
           roughness: 0.5,
         }));
+      case "source_emitter":
+        return this.emitter(d.emit);
+      case "source_housing":
+        // Anodized lamp housing: dark, satin, a little metallic.
+        return this.get("source_housing", () => new THREE.MeshStandardNodeMaterial({
+          color: new THREE.Color(0.1, 0.105, 0.12),
+          metalness: 0.5,
+          roughness: 0.45,
+        }));
       case "slab_edge":
         // The edge of a display-only slab (a mirror or plate substrate).
         return this.get("slab_edge", () => new THREE.MeshStandardNodeMaterial({
@@ -178,16 +206,49 @@ export class MaterialLibrary {
         return "detector_active";
       case FaceGroup.DetectorHousing:
         return "detector_body";
+      case FaceGroup.SourceEmitter:
+        return "source_emitter";
+      case FaceGroup.SourceHousing:
+        return "source_housing";
       default:
         return d.role;
     }
   }
 
-  /** Materials for an object, indexed by face group. Shared instances. */
+  /** Materials for an object, indexed by face group. Shared instances. Only
+   *  the groups an object's kind can have are resolved; the rest are unused
+   *  slots and get a shared placeholder. */
   forObject(d: RenderObjectDescriptor): THREE.Material[] {
     const out: THREE.Material[] = [];
-    for (let g = 0; g < FACE_GROUP_SLOTS; g++) out.push(this.material(MaterialLibrary.roleFor(d, g), d.nd));
+    for (let g = 0; g < FACE_GROUP_SLOTS; g++) {
+      const used = d.kind === "source" ? g >= FaceGroup.SourceEmitter : g < FaceGroup.SourceEmitter;
+      out.push(used ? this.material(MaterialLibrary.roleFor(d, g), d) : this.material("error", d));
+    }
     return out;
+  }
+
+  /** A detector face showing a hit map: the detector's own finish, with the
+   *  map's cells lit on top. One per detector (it holds that detector's
+   *  texture); the caller owns and disposes it. `visible` fades the map without
+   *  a new shader. */
+  static hitMap(map: THREE.DataTexture, halfW: number, halfH: number) {
+    const half = uniform(new THREE.Vector2(halfW, halfH));
+    const visible = uniform(1);
+    const m = new THREE.MeshPhysicalNodeMaterial({
+      metalness: 0.6,
+      roughness: 0.38,
+      clearcoat: 0.25,
+      clearcoatRoughness: 0.2,
+    });
+    // The face is the local XY plane, so a fragment's local (x, y) is its
+    // detector (u, v), the coordinates the cells are binned in.
+    const uv = positionLocal.xy.div(half.mul(2)).add(0.5);
+    const cell = texture(map, vec2(uv.x, uv.y));
+    const lit = cell.a.mul(visible);
+    m.colorNode = mix(vec3(0.04, 0.13, 0.16), vec3(0.02, 0.02, 0.025), lit);
+    m.emissiveNode = cell.rgb.mul(lit).mul(1.3);
+    m.name = "detector_hit_map";
+    return { material: m, half, visible };
   }
 
   /** Faint crease lines on clear bodies (lens rims, prism edges), so a glass

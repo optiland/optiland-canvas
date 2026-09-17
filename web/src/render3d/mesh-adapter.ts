@@ -28,7 +28,7 @@ export function readMesh(mesh: RenderMesh): RenderMeshData & { note: string | nu
 }
 
 /** Number of face-group slots; a material array is indexed by group code. */
-export const FACE_GROUP_SLOTS = 7;
+export const FACE_GROUP_SLOTS = 9;
 
 export function buildGeometry(data: RenderMeshData): THREE.BufferGeometry {
   const g = new THREE.BufferGeometry();

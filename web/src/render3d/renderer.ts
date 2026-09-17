@@ -22,12 +22,14 @@ import type { RenderMesh } from "../../pkg/oc_wasm.js";
 import type { Bounds3, CameraRig } from "./camera";
 import { CueLayer } from "./cues";
 import { EnvironmentManager, luminance } from "./environments";
+import { HitMapLayer } from "./hitmaps";
 import { MaterialLibrary } from "./materials";
 import { RayBuffer, type RayUpload, type RayVisibility } from "./rays";
 import { Scaffold, type ScaffoldTheme } from "./scaffold";
 import { SceneRenderCache, type SyncReport } from "./scene-cache";
 import type {
   BackgroundId,
+  DetectorMap,
   EnvironmentId,
   RenderBackend,
   RenderObjectDescriptor,
@@ -59,6 +61,7 @@ export class OpticalRenderer3D {
   private readonly cues = new CueLayer(this.cache);
   private readonly raycaster = new THREE.Raycaster();
   private readonly rays = new RayBuffer();
+  private readonly hitMaps = new HitMapLayer(this.cache);
   private lastRayUploadMs = 0;
   private lastSync: SyncReport | null = null;
   private lastSyncMs = 0;
@@ -82,7 +85,7 @@ export class OpticalRenderer3D {
     this.scene.name = "optiland-canvas-3d";
     this.scene.add(this.scaffold.root);
     this.scene.add(this.cache.root);
-    this.scene.add(this.rays.object);
+    for (const o of this.rays.objects) this.scene.add(o);
     this.scene.add(this.rays.inkOverlay);
     this.cache.onRebuilt = (id) => this.cues.refresh(id);
     this.environments = new EnvironmentManager(renderer, this.scene);
@@ -192,6 +195,32 @@ export class OpticalRenderer3D {
     this.rays.setVisibility(mode);
   }
 
+  /** Ray line width in CSS pixels (1 draws GPU lines, wider draws strips). A
+   *  change of kind re-uploads the last trace, so call `prepare` after it. */
+  setRayWidth(px: number) {
+    this.rays.setWidth(px);
+  }
+
+  rayWidth(): number {
+    return this.rays.getWidth();
+  }
+
+  /** Paint the detectors' hit maps from the latest exact trace. Returns true
+   *  when a new material was made (call `prepare` before the next frame). */
+  setDetectorMaps(maps: DetectorMap[]): boolean {
+    return this.hitMaps.update(maps);
+  }
+
+  /** The user's hit-map toggle. */
+  setHitMapsEnabled(on: boolean) {
+    this.hitMaps.setEnabled(on);
+  }
+
+  /** Hide the maps while the picture on screen is not the exact trace. */
+  setHitMapsShown(shown: boolean) {
+    this.hitMaps.setShown(shown);
+  }
+
   setHovered(id: number) {
     this.cues.setHovered(id);
   }
@@ -274,6 +303,7 @@ export class OpticalRenderer3D {
     }
     cam.updateMatrixWorld();
     (cam as THREE.OrthographicCamera | THREE.PerspectiveCamera).updateProjectionMatrix();
+    this.rays.setCamera(rig.perspective, near);
     return cam;
   }
 
@@ -288,9 +318,9 @@ export class OpticalRenderer3D {
       (this.renderer.info as { frame: number }).frame = internals._nodes.nodeFrame.frameId;
     }
     if (this.rays.inkMode) this.renderInkPass(cam);
-    this.rays.object.visible = !this.rays.inkMode;
+    this.rays.setDrawVisible(!this.rays.inkMode);
     this.renderer.render(this.scene, cam);
-    this.rays.object.visible = true;
+    this.rays.setDrawVisible(true);
     this.frames++;
     this.lastRenderMs = performance.now() - t0;
     if (this.timing) {
@@ -321,7 +351,7 @@ export class OpticalRenderer3D {
     r.setClearColor(0x000000, 0);
     r.setRenderTarget(rays.inkTarget);
     r.setRenderObjectFunction((object, scene, camera, geometry, material, group, lightsNode, clippingContext, passId) => {
-      if (object === rays.object) {
+      if (rays.isRayObject(object)) {
         r.renderObject(object, scene, camera, geometry, material, group, lightsNode, clippingContext, passId);
       } else if (occluded && object.userData.objectId !== undefined && material.depthWrite && !material.transparent) {
         r.renderObject(object, scene, camera, geometry, rays.depthOnly, group, lightsNode, clippingContext, passId);
@@ -359,10 +389,13 @@ export class OpticalRenderer3D {
       raySegments: this.rays.count,
       rayUploads: this.rays.uploads,
       rayUploadMs: this.lastRayUploadMs,
+      rayWidth: this.rays.getWidth(),
+      hitMaps: this.hitMaps.size,
     };
   }
 
   dispose() {
+    this.hitMaps.dispose();
     this.cues.dispose();
     this.rays.dispose();
     this.cache.dispose();

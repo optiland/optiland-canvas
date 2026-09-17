@@ -109,4 +109,26 @@ test.describe("GPU 3D view appearance", () => {
     await refresh3d(page);
     await shot(page, "inspection-grey.png");
   });
+
+  test("wide rays through three lenses, dark and light", async ({ page }) => {
+    await lenses(page, 3);
+    await page.locator("#ghosts").check();
+    await enter3d(page);
+    await page.locator("#v3dRayWidth").fill("3");
+    await refresh3d(page);
+    await shot(page, "wide-rays-dark.png");
+    await environment(page, "light_studio");
+    await shot(page, "wide-rays-light.png");
+  });
+
+  test("a hit map on a detector seen end-on", async ({ page }) => {
+    // A point source 70 mm out: the image lies past the detector, so the
+    // detector sees a spread pattern rather than one focused cell.
+    await page.selectOption("#srcType", "point");
+    await enter3d(page);
+    await page.selectOption("#v3dRays", "occluded");
+    await page.locator("#v3dSide").click();
+    await refresh3d(page);
+    await shot(page, "hit-map-end-on.png");
+  });
 });

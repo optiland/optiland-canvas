@@ -13,6 +13,7 @@ import { initViewport3d, type Viewport3d } from "./viewport3d";
 import { initView3dThree, type FrameReport, type View3dThree } from "./render3d/view3d";
 import { createFastPreview } from "./fastpreview";
 import { initOpenUc2 } from "./features/openuc2/OpenUc2Page";
+import { heatRgb } from "./heat";
 
 const SCALE = 6.5; // px per mm
 type V2 = { x: number; y: number };
@@ -437,22 +438,10 @@ async function main() {
     return { s, ox: (hist.width - s) / 2, oy: (hist.height - s) / 2 };
   }
 
-  // An inferno-like ramp for the flux heatmap: dark → violet → orange → white.
+  // The flux heatmap ramp (heat.ts), shared with the 3D view's detector faces.
   function heatColor(t: number): string {
-    const stops: [number, number, number, number][] = [
-      [0.0, 6, 4, 20], [0.25, 70, 20, 110], [0.5, 170, 45, 90],
-      [0.75, 240, 120, 40], [1.0, 250, 250, 190],
-    ];
-    t = Math.max(0, Math.min(1, t));
-    for (let i = 1; i < stops.length; i++) {
-      if (t <= stops[i][0]) {
-        const [t0, r0, g0, b0] = stops[i - 1];
-        const [t1, r1, g1, b1] = stops[i];
-        const f = (t - t0) / (t1 - t0 || 1);
-        return `rgb(${(r0 + (r1 - r0) * f) | 0},${(g0 + (g1 - g0) * f) | 0},${(b0 + (b1 - b0) * f) | 0})`;
-      }
-    }
-    return "rgb(250,250,190)";
+    const [r, g, b] = heatRgb(t);
+    return `rgb(${r},${g},${b})`;
   }
 
   // 2D binning: paint the nu×nv incident-flux grid as a heatmap. Detector v
@@ -845,6 +834,8 @@ async function main() {
     viewport3d!.setPerspective(on);
     perspBtn.classList.toggle("active", on);
   };
+  // The GPU view restores the last projection used in this browser.
+  perspBtn.classList.toggle("active", viewport3d!.isPerspective());
 
   // Adders: element (round plate, per-face response), aperture (circular stop),
   // prism (dispersing glass triangle). Each spawns at a sensible spot, then opens

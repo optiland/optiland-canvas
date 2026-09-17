@@ -20,8 +20,9 @@ test.describe("3D model view — orbit camera over the same Scene3", () => {
 
     // The authoritative f64 3D bundle renders through the shared RayLayer.
     expect(await litPixels(page)).toBeGreaterThan(200);
-    // The inspector still lists the singlet and the default detector, re-read in 3D.
-    await expect(page.locator("#objects3d .row")).toHaveCount(2);
+    // The inspector lists the singlet and the default detector, re-read in 3D,
+    // plus the light source, which only the 3D view draws.
+    await expect(page.locator("#objects3d .row")).toHaveCount(3);
   });
 
   test("orbiting the camera changes the picture", async ({ page }) => {

@@ -22,6 +22,8 @@ type Stats = {
   geometries: number;
   textures: number;
   cachedObjects: number;
+  rayWidth: number;
+  hitMaps: number;
 };
 type Cam = { yaw: number; pitch: number; scale: number; target: { x: number; y: number; z: number }; perspective: boolean };
 type Obj = { id: number; kind: string; pos: number[] };
@@ -43,6 +45,12 @@ const objects = (page: Page): Promise<Obj[]> =>
   page.evaluate(() => JSON.parse((window as any).__ocDebug.scene.sceneObjectsJSON()));
 const project = (page: Page, p: { x: number; y: number; z: number }) =>
   page.evaluate((p) => (window as any).__ocDebug.render3d.project(p), p);
+const sources = (page: Page): Promise<(Obj & { rotZ: number })[]> =>
+  page.evaluate(() => JSON.parse((window as any).__ocDebug.scene.sourceObjectsJSON()));
+const selected = (page: Page): Promise<number> =>
+  page.evaluate(() => (window as any).__ocDebug.render3d.selected());
+const warmPixels = (page: Page): Promise<number> =>
+  page.evaluate(() => (window as any).__ocDebug.render3d.warmPixels());
 
 /** The optical state a view setting must never change: the saved scene, the
  *  exact trace, and the detector readout. */
@@ -81,7 +89,7 @@ test.describe("GPU 3D view", () => {
     await expect(page.locator("#view3d")).toBeVisible();
     expect(await litPixels(page)).toBeGreaterThan(200);
     const s = await renderNow(page);
-    expect(s.cachedObjects).toBe(2); // the singlet and the detector
+    expect(s.cachedObjects).toBe(3); // the singlet, the detector, and the source
     expect(s.raySegments).toBeGreaterThan(100);
   });
 
@@ -181,7 +189,9 @@ test.describe("GPU 3D view", () => {
 
   test("copy, paste, delete, and nudge act on the 3D selection", async ({ page }) => {
     await open3d(page);
-    await expect(page.locator("#objects3d .row")).toHaveCount(2);
+    // The singlet, the detector, and (in this view) the light source.
+    await expect(page.locator("#objects3d .row")).toHaveCount(3);
+    await expect(page.locator("#objects3d")).toContainText("source · rectangle");
     const lens = (await objects(page)).find((o) => o.kind === "profile")!;
     const at = await project(page, { x: 0, y: 0, z: 0 });
     await page.mouse.click(at.x + 2, at.y + 25);
@@ -192,11 +202,144 @@ test.describe("GPU 3D view", () => {
 
     await page.keyboard.press("Control+c");
     await page.keyboard.press("Control+v");
-    await expect(page.locator("#objects3d .row")).toHaveCount(3);
+    await expect(page.locator("#objects3d .row")).toHaveCount(4);
     await page.keyboard.press("Delete"); // the pasted copy is selected
-    await expect(page.locator("#objects3d .row")).toHaveCount(2);
+    await expect(page.locator("#objects3d .row")).toHaveCount(3);
     const s = await renderNow(page);
-    expect(s.cachedObjects).toBe(2);
+    expect(s.cachedObjects).toBe(3);
+  });
+
+  test("the light source has a glyph at its emitting face that can be picked, moved, and turned", async ({ page }) => {
+    await open3d(page);
+    const src = (await sources(page))[0];
+    const stats = await renderNow(page);
+    expect(stats.cachedObjects).toBe(3);
+    // The housing sits just behind the emitting face.
+    const at = await project(page, { x: src.pos[0] - 2, y: src.pos[1] + 4, z: src.pos[2] });
+    await page.mouse.click(at.x, at.y);
+    await expect.poll(() => selected(page)).toBe(src.id);
+
+    await page.mouse.move(at.x, at.y);
+    await page.mouse.down();
+    await page.mouse.move(at.x - 50, at.y, { steps: 5 });
+    await page.mouse.up();
+    const moved = (await sources(page))[0];
+    expect(Math.hypot(moved.pos[0] - src.pos[0], moved.pos[1] - src.pos[1], moved.pos[2] - src.pos[2])).toBeGreaterThan(1);
+    // The exact rays start on the glyph's emitting face: no ray starts behind it.
+    const firstX = await page.evaluate(() => {
+      const a = (window as any).__ocDebug.exactProjected() as Float32Array;
+      let lo = Infinity;
+      for (let i = 0; i < a.length; i += 11) lo = Math.min(lo, a[i]);
+      return lo;
+    });
+    expect(firstX).toBeCloseTo(moved.pos[0], 3);
+    // A move is a transform: the glyph was not rebuilt.
+    expect((await renderNow(page)).meshBuilds).toBe(stats.meshBuilds);
+
+    // Its card turns it like a body.
+    const there = await project(page, { x: moved.pos[0] - 2, y: moved.pos[1] + 4, z: moved.pos[2] });
+    await page.mouse.dblclick(there.x, there.y);
+    const card = page.locator(".card");
+    await expect(card.locator(".c-title")).toContainText(`#${src.id} · source`);
+    await expect(card.locator(".c3-surface")).toBeHidden();
+    await card.locator('input[data-name="rot"]').fill("10");
+    await expect.poll(async () => (await sources(page))[0].rotZ).toBeCloseTo(10, 6);
+  });
+
+  test("each detector face shows the readout's hit map, only for the exact trace", async ({ page }) => {
+    await open3d(page);
+    expect((await renderNow(page)).hitMaps).toBe(1);
+    // End-on, the detector face fills the view; occluded rays stay behind it.
+    await page.locator("#v3dSide").click();
+    await page.selectOption("#v3dRays", "occluded");
+    await expect.poll(() => warmPixels(page)).toBeGreaterThan(0);
+
+    // A drag shows the interactive preview; the map of the last exact trace
+    // is hidden until the drag ends.
+    const det = (await objects(page)).find((o) => o.kind === "detector")!;
+    const at = await project(page, { x: det.pos[0], y: det.pos[1] - 5, z: det.pos[2] + 5 });
+    await page.mouse.move(at.x, at.y);
+    await page.mouse.down();
+    await page.mouse.move(at.x + 8, at.y, { steps: 2 });
+    expect(await warmPixels(page)).toBe(0);
+    await page.mouse.up();
+    await expect.poll(() => warmPixels(page)).toBeGreaterThan(0);
+
+    // The toggle hides the maps; it changes nothing optical.
+    const before = await opticalState(page);
+    await page.locator("#v3dHits").uncheck();
+    expect(await warmPixels(page)).toBe(0);
+    await page.locator("#v3dHits").check();
+    await expect.poll(() => warmPixels(page)).toBeGreaterThan(0);
+    expect(await opticalState(page)).toEqual(before);
+  });
+
+  test("wide rays keep every segment in one draw and cover more of the picture", async ({ page }) => {
+    await open3d(page);
+    const before = await opticalState(page);
+    // No grid and no ground, so the added pixels are the rays'. The default
+    // beam draws about five distinct lines, each some 600 px long.
+    await page.locator("#gridBox").uncheck();
+    await page.locator("#v3dGround").uncheck();
+    const thin = await renderNow(page);
+    const thinLit = await litPixels(page);
+    await setRange(page, "#v3dRayWidth", "3");
+    await expect(page.locator("#v3dRayWidthVal")).toHaveText("3.0 px");
+    const wide = await renderNow(page);
+    expect(wide.rayWidth).toBe(3);
+    expect(wide.raySegments).toBe(thin.raySegments);
+    expect(wide.drawCalls).toBe(thin.drawCalls);
+    expect(await litPixels(page)).toBeGreaterThan(thinLit + 3000);
+    // The ink pass and occluded rays take the wide picture too.
+    await page.selectOption("#v3dEnv", "light_studio");
+    await page.selectOption("#v3dRays", "occluded");
+    expect((await renderNow(page)).raySegments).toBe(thin.raySegments);
+    await page.selectOption("#v3dEnv", "dark_studio");
+    await page.selectOption("#v3dRays", "through");
+    // Back to 1 px is the line picture again.
+    await setRange(page, "#v3dRayWidth", "1");
+    expect((await renderNow(page)).rayWidth).toBe(1);
+    expect(await litPixels(page)).toBeLessThan(thinLit * 1.05);
+    expect(await opticalState(page)).toEqual(before);
+  });
+
+  test("appearance settings come back after a reload", async ({ page }) => {
+    await open3d(page);
+    await page.selectOption("#v3dEnv", "optical_bench");
+    await page.selectOption("#v3dBg", "charcoal");
+    await setRange(page, "#v3dExposure", "-0.5");
+    await page.selectOption("#v3dRays", "occluded");
+    await setRange(page, "#v3dRayWidth", "2.5");
+    await page.locator("#v3dHits").uncheck();
+    await page.locator("#v3dGround").uncheck();
+    await page.locator("#v3dPersp").click();
+
+    await open3d(page);
+    await expect(page.locator("#v3dEnv")).toHaveValue("optical_bench");
+    await expect(page.locator("#v3dBg")).toHaveValue("charcoal");
+    await expect(page.locator("#v3dExposure")).toHaveValue("-0.5");
+    await expect(page.locator("#v3dExposureVal")).toHaveText("−0.5 EV");
+    await expect(page.locator("#v3dRays")).toHaveValue("occluded");
+    await expect(page.locator("#v3dRayWidth")).toHaveValue("2.5");
+    await expect(page.locator("#v3dHits")).not.toBeChecked();
+    await expect(page.locator("#v3dGround")).not.toBeChecked();
+    await expect(page.locator("#v3dPersp")).toHaveClass(/active/);
+    expect((await camera(page)).perspective).toBe(true);
+    const s = await renderNow(page);
+    expect(s.rayWidth).toBe(2.5);
+
+    // Damaged storage falls back to the defaults, field by field.
+    const prefs = () => page.evaluate(() => (window as any).__ocDebug.render3d.prefs());
+    await page.evaluate(() => localStorage.setItem("optiland-canvas:view3d", "{not json"));
+    await open3d(page);
+    expect((await prefs()).environment).toBe("dark_studio");
+    await expect(page.locator("#v3dPersp")).not.toHaveClass(/active/);
+    await page.evaluate(() =>
+      localStorage.setItem("optiland-canvas:view3d", JSON.stringify({ environment: "disco", rayWidth: 99, rays: "occluded" })),
+    );
+    await open3d(page);
+    const p = await prefs();
+    expect([p.environment, p.rayWidth, p.rays]).toEqual(["dark_studio", 1, "occluded"]);
   });
 
   test("lighting, background, exposure, and ray visibility never touch the optics", async ({ page }) => {

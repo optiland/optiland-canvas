@@ -9,7 +9,8 @@
 //   transform revision-> set position and quaternion only
 //   material revision -> reassign shared materials only
 //   nothing changed   -> nothing
-// Materials are shared (materials.ts) and never disposed here.
+// Materials are shared (materials.ts) and never disposed here. A slot override
+// (a detector's hit map) replaces one face group's material for one object.
 
 import * as THREE from "three/webgpu";
 import type { RenderMesh } from "../../pkg/oc_wasm.js";
@@ -46,6 +47,9 @@ export type SyncReport = {
 export class SceneRenderCache {
   readonly root = new THREE.Group();
   private readonly entries = new Map<number, CachedRenderable>();
+  /** Per-object material replacements for one face-group slot (a detector's
+   *  hit map). Owned by whoever set them; they survive restyles. */
+  private readonly overrides = new Map<number, Map<number, THREE.Material>>();
   /** Geometries built since the cache was created. */
   meshBuilds = 0;
   /** Called after an entry's geometry or material changes (cue caches). */
@@ -106,6 +110,7 @@ export class SceneRenderCache {
       if (live.has(id)) continue;
       this.release(e);
       this.entries.delete(id);
+      this.overrides.delete(id);
       report.removed++;
     }
     this.meshBuilds += report.meshBuilds;
@@ -160,10 +165,35 @@ export class SceneRenderCache {
   }
 
   private style(e: CachedRenderable, d: RenderObjectDescriptor) {
-    e.root.material = e.root instanceof THREE.LineSegments ? this.materials.outline() : this.materials.forObject(d);
+    if (e.root instanceof THREE.LineSegments) {
+      e.root.material = this.materials.outline();
+    } else {
+      const list = this.materials.forObject(d);
+      for (const [slot, m] of this.overrides.get(d.id) ?? []) list[slot] = m;
+      e.root.material = list;
+    }
     e.materialRevision = d.materialRevision;
     e.descriptor = d;
     this.updateCreases(e, d);
+  }
+
+  /** Replace (or, with null, restore) one face-group slot's material for one
+   *  object. Applied now if the object is cached, and on every later restyle. */
+  setSlotOverride(id: number, slot: number, material: THREE.Material | null) {
+    let slots = this.overrides.get(id);
+    if (material) {
+      if (!slots) this.overrides.set(id, (slots = new Map()));
+      if (slots.get(slot) === material) return;
+      slots.set(slot, material);
+    } else {
+      if (!slots?.delete(slot)) return;
+      if (slots.size === 0) this.overrides.delete(id);
+    }
+    const e = this.entries.get(id);
+    if (e && e.root instanceof THREE.Mesh) {
+      this.style(e, e.descriptor);
+      this.onRebuilt(id);
+    }
   }
 
   /** Clear bodies get faint crease lines (see MaterialLibrary.crease). Built

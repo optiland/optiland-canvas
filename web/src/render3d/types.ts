@@ -17,6 +17,8 @@ export type MaterialRole =
   | "absorber"
   | "detector_active"
   | "detector_body"
+  | "source_emitter"
+  | "source_housing"
   | "generic_dielectric"
   | "error";
 
@@ -28,7 +30,8 @@ export type RenderObjectKind =
   | "planar_only" // a 2D-only body: no third dimension exists, drawn as an outline
   | "surface" // a zero-thickness surface object (mirror, plate)
   | "aperture"
-  | "detector";
+  | "detector"
+  | "source"; // a light source's glyph (not an object the tracer hits)
 
 export type RenderObjectDescriptor = {
   id: number;
@@ -55,6 +58,8 @@ export type RenderObjectDescriptor = {
   radius: number;
   /** Why no solid mesh exists (a 2D-only body), or null. */
   error: string | null;
+  /** A source's light colour (linear RGB, brightest channel 1), or null. */
+  emit: [number, number, number] | null;
 };
 
 /** Mesh group codes, as `oc-wasm` numbers them. A group is a run of indices
@@ -74,6 +79,10 @@ export const enum FaceGroup {
   DetectorActive = 5,
   /** A detector's housing (back and edges). */
   DetectorHousing = 6,
+  /** A light source's emitting aperture. */
+  SourceEmitter = 7,
+  /** A light source's display housing. */
+  SourceHousing = 8,
 }
 
 export type MeshTopology = "triangles" | "lines";
@@ -93,6 +102,32 @@ export type RenderMeshData = {
 };
 
 export type RayVisibilityMode = "through" | "occluded";
+
+/** One area detector's incident-flux map, from the exact trace
+ *  (`lastDetectorMapsF32`). Cells are row-major from local (-halfW, -halfH). */
+export type DetectorMap = {
+  id: number;
+  nu: number;
+  nv: number;
+  halfW: number;
+  halfH: number;
+  cells: Float32Array;
+};
+
+/** Split the flat `lastDetectorMapsF32` layout into one map per detector. */
+export function parseDetectorMaps(flat: Float32Array): DetectorMap[] {
+  const out: DetectorMap[] = [];
+  const count = flat.length > 0 ? flat[0] : 0;
+  let k = 1;
+  for (let i = 0; i < count && k + 5 <= flat.length; i++) {
+    const nu = flat[k + 1], nv = flat[k + 2];
+    const n = nu * nv;
+    if (k + 5 + n > flat.length) break;
+    out.push({ id: flat[k], nu, nv, halfW: flat[k + 3], halfH: flat[k + 4], cells: flat.subarray(k + 5, k + 5 + n) });
+    k += 5 + n;
+  }
+  return out;
+}
 
 export type EnvironmentId = "dark_studio" | "light_studio" | "optical_bench" | "inspection";
 
@@ -125,6 +160,10 @@ export type RenderStats = {
   rayUploadMs: number;
   /** Ray buffer uploads since start. */
   rayUploads: number;
+  /** Ray line width, CSS px. */
+  rayWidth: number;
+  /** Detectors showing a hit map. */
+  hitMaps: number;
   environmentBuilds: number;
   geometries: number;
   textures: number;

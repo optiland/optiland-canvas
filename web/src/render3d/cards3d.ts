@@ -39,7 +39,8 @@ export function createScene3Cards(opts: {
     const o = find(id);
     scene.setObjectPosition(id, num("x"), num("y"), o ? o.pos[2] : 0);
     if (o) {
-      if (o.body) scene.setObjectRotationZDeg(id, num("rot"));
+      // A source turns like a body (its aim is its local +X).
+      if (o.body || o.kind === "source") scene.setObjectRotationZDeg(id, num("rot"));
       else scene.setSurfaceTiltZDeg(id, num("rot"));
     }
     if (JSON.parse(scene.singletGeomJSON(id))) {
@@ -47,7 +48,7 @@ export function createScene3Cards(opts: {
     }
     if (JSON.parse(scene.bodyGlassJSON(id))) scene.setBodyGlassAbbe(id, num("nd"), num("vd"));
     if (JSON.parse(scene.apertureOpeningJSON(id))) scene.setApertureOpening(id, num("apMin"), num("apMax"));
-    if (o && !o.body) {
+    if (o && !o.body && o.kind !== "source") {
       const sel = (n: string) => (root.querySelector(`select[data-name="${n}"]`) as HTMLSelectElement | null)?.value;
       const f = sel("front"), b = sel("back");
       if (f && b && JSON.parse(scene.surfaceResponseJSON(id))) scene.setSurfaceResponse(id, f, b);
@@ -90,7 +91,7 @@ export function createScene3Cards(opts: {
       q(".c3-aperture").style.display = ap ? "block" : "none";
       if (ap) { setV("apMin", ap.inner); setV("apMax", ap.outer); }
       const block = q(".c3-surface");
-      const r = o.body ? null : JSON.parse(scene.surfaceResponseJSON(id));
+      const r = o.body || o.kind === "source" ? null : JSON.parse(scene.surfaceResponseJSON(id));
       block.style.display = r ? "block" : "none";
       if (r) {
         for (const [name, value] of [["front", r.front], ["back", r.back]] as const) {

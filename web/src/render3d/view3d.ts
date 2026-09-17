@@ -21,7 +21,7 @@ import { createScene3Cards, type SceneObject } from "./cards3d";
 import { drawAxisLabels, drawNotice, drawSelectionDot, drawTirRings } from "./overlays";
 import { QualityController } from "./quality";
 import type { OpticalRenderer3D } from "./renderer";
-import type { RenderBackend, RenderStats } from "./types";
+import type { BackgroundId, EnvironmentId, RenderBackend, RenderStats } from "./types";
 
 // The projected trace layout (traceProjected3D): 11 floats per segment,
 // [au,av,bu,bv, r,g,b, flux, flags, dist_a, dist_b]. With the default XY view
@@ -102,6 +102,52 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
   let pending = 0;
 
   const quality = new QualityController(() => invalidate());
+
+  // --- appearance settings (display only; local UI state, not saved) -------
+  const settings = {
+    environment: "dark_studio" as EnvironmentId,
+    background: "match" as BackgroundId,
+    exposureEv: 0,
+    ground: true,
+  };
+  function applySettings() {
+    if (!renderer) return;
+    renderer.setEnvironment(settings.environment);
+    renderer.setBackground(settings.background);
+    renderer.setExposure(2 ** settings.exposureEv);
+    renderer.setGround(settings.ground);
+  }
+  const envSelect = document.getElementById("v3dEnv") as HTMLSelectElement | null;
+  const bgSelect = document.getElementById("v3dBg") as HTMLSelectElement | null;
+  const exposureInput = document.getElementById("v3dExposure") as HTMLInputElement | null;
+  const exposureLabel = document.getElementById("v3dExposureVal");
+  const groundBox = document.getElementById("v3dGround") as HTMLInputElement | null;
+  for (const el of [envSelect, bgSelect]) el?.addEventListener("keydown", (e) => e.stopPropagation());
+  envSelect?.addEventListener("change", () => {
+    settings.environment = envSelect.value as EnvironmentId;
+    renderer?.setEnvironment(settings.environment);
+    invalidate();
+  });
+  bgSelect?.addEventListener("change", () => {
+    settings.background = bgSelect.value as BackgroundId;
+    renderer?.setBackground(settings.background);
+    invalidate();
+  });
+  exposureInput?.addEventListener("input", () => {
+    settings.exposureEv = Number(exposureInput.value);
+    if (exposureLabel) {
+      const v = settings.exposureEv;
+      exposureLabel.textContent = `${v === 0 ? "±" : v > 0 ? "+" : "−"}${Math.abs(v).toFixed(1)} EV`;
+    }
+    renderer?.setExposure(2 ** settings.exposureEv);
+    quality.pulse();
+    invalidate();
+  });
+  groundBox?.addEventListener("change", () => {
+    settings.ground = groundBox.checked;
+    renderer?.setGround(settings.ground);
+    invalidate();
+  });
 
   // --- scene data (re-read from Rust; never mirrored) --------------------
   let segs: Float32Array<ArrayBufferLike> = new Float32Array(0);
@@ -256,6 +302,7 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
         const mod = await import("./renderer");
         renderer = await mod.OpticalRenderer3D.create(canvas, { forceWebGL: opts.forceWebGL });
         backend = renderer.backend;
+        applySettings();
         refreshObjects();
         syncRender(true);
       } catch (e) {

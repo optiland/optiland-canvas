@@ -20,10 +20,17 @@
 import * as THREE from "three/webgpu";
 import type { RenderMesh } from "../../pkg/oc_wasm.js";
 import type { Bounds3, CameraRig } from "./camera";
+import { EnvironmentManager, luminance } from "./environments";
 import { MaterialLibrary } from "./materials";
 import { Scaffold, type ScaffoldTheme } from "./scaffold";
 import { SceneRenderCache, type SyncReport } from "./scene-cache";
-import type { RenderBackend, RenderObjectDescriptor, RenderStats } from "./types";
+import type {
+  BackgroundId,
+  EnvironmentId,
+  RenderBackend,
+  RenderObjectDescriptor,
+  RenderStats,
+} from "./types";
 
 export type RendererOptions = {
   /** Use the WebGL2 backend even where WebGPU exists (tests, comparisons). */
@@ -43,6 +50,7 @@ export class OpticalRenderer3D {
   private readonly scaffold = new Scaffold();
   private readonly materials = new MaterialLibrary();
   private readonly cache = new SceneRenderCache(this.materials);
+  private readonly environments: EnvironmentManager;
   private lastSync: SyncReport | null = null;
   private lastSyncMs = 0;
   private cssWidth = 1;
@@ -54,24 +62,17 @@ export class OpticalRenderer3D {
   private gridOn = true;
   private groundOn = true;
   private bounds: Bounds3 | null = null;
-  private theme: ScaffoldTheme = {
-    grid: new THREE.Color(0.47, 0.59, 0.75),
-    gridOpacity: 0.35,
-    ground: null,
-  };
+  private theme: ScaffoldTheme;
 
   private constructor(private readonly renderer: THREE.WebGPURenderer) {
     const backend = (renderer.backend as { isWebGPUBackend?: boolean }).isWebGPUBackend ? "webgpu" : "webgl2";
     this.backend = backend;
     this.scene.name = "optiland-canvas-3d";
-    this.scene.background = new THREE.Color(0x06080d);
     this.scene.add(this.scaffold.root);
     this.scene.add(this.cache.root);
-    // Phase 2 lighting: enough to read the shapes.
-    this.scene.add(new THREE.HemisphereLight(0xdfe8ff, 0x1a1c22, 1.2));
-    const key = new THREE.DirectionalLight(0xffffff, 1.5);
-    key.position.set(-1, 2, 1.5);
-    this.scene.add(key);
+    this.environments = new EnvironmentManager(renderer, this.scene);
+    this.environments.setEnvironment("dark_studio");
+    this.theme = this.environments.scaffoldTheme();
     this.scaffold.layout(null, this.gridSpacing, this.gridOn, this.groundOn, this.theme);
   }
 
@@ -121,6 +122,45 @@ export class OpticalRenderer3D {
     }
     this.lastSyncMs = performance.now() - startedAt;
     return report;
+  }
+
+  /** Lighting preset. Builds its PMREM the first time only. */
+  setEnvironment(id: EnvironmentId) {
+    this.environments.setEnvironment(id);
+    this.retheme();
+  }
+
+  /** Background, independent of the lighting. */
+  setBackground(id: BackgroundId) {
+    this.environments.setBackground(id);
+    this.retheme();
+  }
+
+  /** Is the background shown light enough that bright display lines vanish? */
+  lightBackground(): boolean {
+    return luminance(this.environments.backgroundHex()) > 0.25;
+  }
+
+  private retheme() {
+    this.theme = this.environments.scaffoldTheme();
+    this.materials.setCreaseTone(this.lightBackground());
+    this.relayout();
+  }
+
+  /** The background colour in effect (sRGB hex). */
+  backgroundHex(): number {
+    return this.environments.backgroundHex();
+  }
+
+  /** Display exposure (a multiplier before tone mapping). */
+  setExposure(value: number) {
+    this.renderer.toneMappingExposure = value;
+  }
+
+  setGround(on: boolean) {
+    if (on === this.groundOn) return;
+    this.groundOn = on;
+    this.relayout();
   }
 
   setGrid(on: boolean, spacing: number) {
@@ -204,12 +244,14 @@ export class OpticalRenderer3D {
       meshBuildMs: this.lastSync?.meshBuildMs ?? 0,
       syncMs: this.lastSyncMs,
       cachedObjects: this.cache.size,
+      environmentBuilds: this.environments.builds,
     };
   }
 
   dispose() {
     this.cache.dispose();
     this.materials.dispose();
+    this.environments.dispose();
     this.scaffold.dispose();
     void this.renderer.dispose();
   }

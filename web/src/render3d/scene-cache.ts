@@ -79,7 +79,7 @@ export class SceneRenderCache {
         if (!e) report.added++;
         e = next;
         this.entries.set(d.id, e);
-        // A new proxy needs its placement and materials regardless.
+        // A new or rebuilt proxy needs its placement, materials, and creases.
         this.place(e, d);
         this.style(e, d);
         this.onRebuilt(d.id);
@@ -99,8 +99,7 @@ export class SceneRenderCache {
     }
     for (const [id, e] of this.entries) {
       if (live.has(id)) continue;
-      this.root.remove(e.root);
-      e.root.geometry.dispose();
+      this.release(e);
       this.entries.delete(id);
       report.removed++;
     }
@@ -124,16 +123,16 @@ export class SceneRenderCache {
       old.root.geometry.dispose();
       old.root.geometry = geometry;
       root = old.root;
+      // Geometry changed: the crease lines follow on the next style().
     } else {
-      if (old) {
-        this.root.remove(old.root);
-        old.root.geometry.dispose();
-      }
+      if (old) this.release(old);
       root = lines ? new THREE.LineSegments(geometry) : new THREE.Mesh(geometry);
       root.userData.objectId = d.id;
       root.name = `${d.kind}#${d.id}`;
       this.root.add(root);
     }
+    // The outline stand-in is drawn dashed, which needs distances along it.
+    if (root instanceof THREE.LineSegments) root.computeLineDistances();
     return {
       id: d.id,
       root,
@@ -156,6 +155,34 @@ export class SceneRenderCache {
     e.root.material = e.root instanceof THREE.LineSegments ? this.materials.outline() : this.materials.forObject(d);
     e.materialRevision = d.materialRevision;
     e.descriptor = d;
+    this.updateCreases(e, d);
+  }
+
+  /** Clear bodies get faint crease lines (see MaterialLibrary.crease). Built
+   *  once per geometry revision, and only for bodies that need them. */
+  private updateCreases(e: CachedRenderable, d: RenderObjectDescriptor) {
+    const want = e.root instanceof THREE.Mesh && (d.role === "optical_glass" || d.role === "generic_dielectric") &&
+      (d.kind === "lens" || d.kind === "prism" || d.kind === "solid");
+    const existing = e.root.children.find((c) => c.userData.crease) as THREE.LineSegments | undefined;
+    if (!want) {
+      if (existing) {
+        e.root.remove(existing);
+        existing.geometry.dispose();
+      }
+      return;
+    }
+    if (existing && existing.userData.geometryRevision === e.geometryRevision) return;
+    if (existing) {
+      e.root.remove(existing);
+      existing.geometry.dispose();
+    }
+    // 25 degrees: the rim and prism corners, not the smooth faces.
+    const lines = new THREE.LineSegments(new THREE.EdgesGeometry(e.root.geometry, 25), this.materials.crease());
+    lines.userData.crease = true;
+    lines.userData.geometryRevision = e.geometryRevision;
+    lines.renderOrder = 1;
+    lines.raycast = () => {};
+    e.root.add(lines);
   }
 
   /** World bounds of every visible proxy. */
@@ -181,11 +208,15 @@ export class SceneRenderCache {
     return out;
   }
 
+  /** Remove a proxy and free its geometries (materials are shared). */
+  private release(e: CachedRenderable) {
+    this.root.remove(e.root);
+    e.root.geometry.dispose();
+    for (const c of e.root.children) (c as THREE.LineSegments).geometry?.dispose();
+  }
+
   dispose() {
-    for (const e of this.entries.values()) {
-      this.root.remove(e.root);
-      e.root.geometry.dispose();
-    }
+    for (const e of this.entries.values()) this.release(e);
     this.entries.clear();
   }
 }

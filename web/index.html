@@ -15,7 +15,8 @@
       canvas#view3d { position: fixed; inset: 0; width: 100vw; height: 100vh; display: none; }
       .panel { position: fixed; background: rgba(10,14,22,0.86); border: 1px solid #1e2a3d;
         border-radius: 8px; padding: 10px 12px; backdrop-filter: blur(6px); }
-      #hud { top: 12px; left: 14px; pointer-events: none; }
+      /* Stops short of the centred view toolbar; the status line wraps. */
+      #hud { top: 12px; left: 14px; pointer-events: none; max-width: calc(50vw - 190px); }
       #hud b { color: #7fd6ff; }
       #hud #stat { opacity: 0.7; }
       #controls { top: 12px; right: 14px; width: 250px; }
@@ -109,6 +110,14 @@
       #view3dctl { top: 58px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 5px; }
       #view3dctl .v3d-sep { opacity: 0.4; font-size: 10px; margin: 0 2px 0 6px; }
       #view3dctl .m4btn.active { background: #1d4e6b; color: #e8f6ff; border-color: #3a86b0; }
+      /* 3D view appearance: lighting, background, exposure (shown in 3D only). */
+      #view3dopts { bottom: 12px; left: 50%; transform: translateX(-50%); display: none; flex-wrap: wrap;
+        align-items: center; gap: 6px 12px; max-width: calc(100vw - 600px); }
+      #view3dopts label { display: flex; align-items: center; gap: 5px; white-space: nowrap; }
+      #view3dopts select { background: #0a1220; color: #e8f6ff; border: 1px solid #24344d; border-radius: 4px;
+        padding: 2px 4px; font: inherit; }
+      #view3dopts input[type="range"] { width: 90px; flex: none; }
+      #v3dExposureVal { min-width: 44px; opacity: 0.75; font-variant-numeric: tabular-nums; }
       /* inspector cards — compact pop-ups (positioned in JS, many at once). */
       .card { width: 158px; padding: 7px 8px; }
       .card h3 { margin: 0 0 5px; font-size: 12px; color: #7fd6ff; cursor: move;
@@ -317,6 +326,30 @@
       <button class="m4btn" id="v3dTop" title="looking down the vertical">top</button>
       <button class="m4btn" id="v3dSide" title="end-on down the optical axis">side</button>
       <button class="m4btn" id="v3dPersp" title="toggle perspective / orthographic">persp</button>
+    </div>
+
+    <!-- 3D view appearance. Display settings only: none of these changes the
+         optical scene, the trace, or a displayed number. -->
+    <div class="panel" id="view3dopts">
+      <label title="display lighting for the 3D view (not an optical source)">lighting
+        <select id="v3dEnv">
+          <option value="dark_studio">Dark studio</option>
+          <option value="light_studio">Light studio</option>
+          <option value="optical_bench">Optical bench</option>
+          <option value="inspection">Inspection</option>
+        </select></label>
+      <label>background
+        <select id="v3dBg">
+          <option value="match">match lighting</option>
+          <option value="black">black</option>
+          <option value="charcoal">dark charcoal</option>
+          <option value="mid_gray">medium grey</option>
+          <option value="light_gray">light grey</option>
+        </select></label>
+      <label title="display exposure, in stops">exposure
+        <input type="range" id="v3dExposure" min="-2" max="2" step="0.1" value="0" />
+        <span id="v3dExposureVal">±0.0 EV</span></label>
+      <label><input type="checkbox" id="v3dGround" checked /> ground</label>
     </div>
 
     <!-- M3: inspector-card template — cloned per element (many open at once) -->

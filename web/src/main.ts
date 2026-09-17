@@ -808,6 +808,8 @@ async function main() {
     document.getElementById("drawMirror")?.toggleAttribute("disabled", m === "3d");
     // The 3D view-controls bar is shown only in the 3D model view.
     document.getElementById("view3dctl")!.style.display = m === "3d" ? "flex" : "none";
+    // The GPU view's appearance options belong to it alone.
+    document.getElementById("view3dopts")!.style.display = m === "3d" && threeView() ? "flex" : "none";
     // Hand interaction to the incoming view and stand the other one down (close
     // its stray cards). Refresh the incoming view's cached geometry/trace from
     // Rust so an edit made in the other view is reflected — both are views of the

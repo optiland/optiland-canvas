@@ -8,8 +8,6 @@
 //               over orbiting frames
 //   GPU frame   GPU time of the same frames from timestamp queries, where the
 //               device offers them
-//   legacy      the Canvas 2D wireframe view's frame for the same scene
-//               (`?renderer=legacy`), static camera
 //   exact trace one f64 retrace, and the ray upload that follows it
 // plus a pointer drag (fast path), curvature edits (mesh rebuilds), lighting
 // and projection switches, and a memory stress run.
@@ -95,14 +93,6 @@ async function measureThree(page: Page) {
   };
 }
 
-async function measureLegacy(page: Page) {
-  await page.evaluate(() => (window as any).__ocDebug.setViewMode("3d"));
-  const t: number[] = [];
-  for (let i = 0; i < 5; i++) await dbg(page, "window.__ocDebug.renderView()");
-  for (let i = 0; i < 30; i++) t.push((await dbg(page, "window.__ocDebug.renderView()")) as number);
-  return stat(t);
-}
-
 test("GPU 3D view benchmark", async ({ page, browser }) => {
   const report: any = { browser: browser.version(), date: new Date().toISOString(), scenes: [] };
 
@@ -110,9 +100,7 @@ test("GPU 3D view benchmark", async ({ page, browser }) => {
   for (const s of SCENES) {
     await setup(page, s);
     const three = await measureThree(page);
-    await setup(page, s, "renderer=legacy");
-    const legacy = await measureLegacy(page);
-    report.scenes.push({ scene: s.name, ...three, legacy });
+    report.scenes.push({ scene: s.name, ...three });
   }
   report.backend = report.scenes[0].backend;
 
@@ -259,10 +247,10 @@ test("GPU 3D view benchmark", async ({ page, browser }) => {
   // --- report ----------------------------------------------------------------
   const md: string[] = [];
   md.push(`Browser ${report.browser}, 3D backend ${report.backend}, ${new Date(report.date).toUTCString()}`, "");
-  md.push("| Scene | Segments | Triangles | Draws | CPU frame median / p95 (ms) | GPU frame median / p95 (ms) | Legacy frame median (ms) | Exact trace (ms) | Ray upload (ms) |");
-  md.push("|---|---:|---:|---:|---:|---:|---:|---:|---:|");
+  md.push("| Scene | Segments | Triangles | Draws | CPU frame median / p95 (ms) | GPU frame median / p95 (ms) | Exact trace (ms) | Ray upload (ms) |");
+  md.push("|---|---:|---:|---:|---:|---:|---:|---:|");
   for (const r of report.scenes) {
-    md.push(`| ${r.scene} | ${r.segments} | ${r.triangles} | ${r.drawCalls} | ${f(r.cpu.median)} / ${f(r.cpu.p95)} | ${f(r.gpu.median)} / ${f(r.gpu.p95)} | ${f(r.legacy.median)} | ${f(r.exactTrace)} | ${f(r.upload)} |`);
+    md.push(`| ${r.scene} | ${r.segments} | ${r.triangles} | ${r.drawCalls} | ${f(r.cpu.median)} / ${f(r.cpu.p95)} | ${f(r.gpu.median)} / ${f(r.gpu.p95)} | ${f(r.exactTrace)} | ${f(r.upload)} |`);
   }
   const d = report.drag;
   md.push("", `Drag (3 lenses, ${d.interactiveFrames} interactive frames of ${d.frames}, DPR ${d.dpr}, ${d.segments} segments): total ${f(d.total.median)} / ${f(d.total.p95)} ms, trace ${f(d.trace.median)}, sync ${f(d.sync.median)}, upload ${f(d.upload.median)}, render ${f(d.render.median)}; mesh rebuilds during the drag: ${d.meshBuildsDuringDrag}.`);

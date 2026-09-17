@@ -520,13 +520,4 @@ test.describe("GPU 3D view fallbacks", () => {
     });
     expect(lit).toBeGreaterThan(200);
   });
-
-  test("the legacy wireframe view is still reachable for comparison", async ({ page }) => {
-    await page.goto("/?renderer=legacy");
-    await expect(page.locator("#stat")).toContainText("segs");
-    await page.locator("#view-3d").click();
-    await expect(page.locator("#stat")).toContainText("3D model");
-    await expect(page.locator("#stat")).not.toContainText("render ");
-    await expect(page.locator("#view3dopts")).toBeHidden();
-  });
 });

@@ -2027,45 +2027,6 @@ impl Canvas {
         id as f64
     }
 
-    /// An extruded body's local profile + z-extents, for drawing a prism in 3D:
-    /// `{zMin, zMax, points:[[x,y],...]}` (polygon vertices, local frame), or
-    /// `null` if `id` is not an extruded profile body.
-    #[wasm_bindgen(js_name = bodyExtrudeJSON)]
-    pub fn body_extrude_json(&self, id: f64) -> String {
-        use oc_core::profile2::Curve2;
-        use oc_core::scene3::SolidGeometry3;
-        let Some(scene) = &self.scene3 else {
-            return "null".into();
-        };
-        let Some(b) = scene.bodies.iter().find(|b| b.common.id.0 == id as u64) else {
-            return "null".into();
-        };
-        let SolidGeometry3::Profile(p) = &b.geometry else {
-            return "null".into();
-        };
-        let ProfileConstruction3::ExtrudeLocalZ { z_min_mm, z_max_mm } = p.construction else {
-            return "null".into();
-        };
-        let mut pts: Vec<String> = Vec::new();
-        for e in &p.profile.edges {
-            match &e.curve {
-                Curve2::Line { a, .. } => pts.push(format!("[{},{}]", a.x, a.y)),
-                Curve2::Polyline { points } => {
-                    for q in points {
-                        pts.push(format!("[{},{}]", q.x, q.y));
-                    }
-                }
-                _ => {}
-            }
-        }
-        format!(
-            "{{\"zMin\":{},\"zMax\":{},\"points\":[{}]}}",
-            z_min_mm,
-            z_max_mm,
-            pts.join(",")
-        )
-    }
-
     /// Set a surface object's meridional tilt (its normal's X–Y angle, degrees).
     /// Bumps the revision. `false` for a non-surface id.
     #[wasm_bindgen(js_name = setSurfaceTiltZDeg)]
@@ -3512,11 +3473,9 @@ mod scene3_tests {
         let mut c = Canvas::new();
         c.new_default_scene3();
 
-        // A prism: a body, glass-editable, with a drawable extruded outline.
+        // A prism: a glass-editable extruded body.
         let pid = c.add_prism(-40.0, 0.0, 16.0, 10.0, 1.62, 36.0);
         assert!(pid >= 0.0);
-        let ext = c.body_extrude_json(pid);
-        assert!(ext.contains("\"zMin\":") && ext.contains("\"points\":[["), "{ext}");
         assert!(c.scene_objects_json().contains("\"construction\":\"extruded\""));
         assert!(c.body_glass_json(pid).contains("\"nd\":1.62"));
 

@@ -2,7 +2,7 @@
 
 This report covers the solid 3D renderer that replaces the Canvas 2D wireframe in the 3D model view (branch `3d-solid-renderer`, from `main` at `bf06b13`). It follows §76 of the implementation specification. The numbers come from the benchmark and test suites in this branch, run on the development machine: Windows 11, an NVIDIA RTX 5070, and Chrome 153.
 
-A second round on the same branch added detector hit maps, light-source glyphs, saved view settings, and a ray width setting. [Follow-up](#follow-up-hit-maps-source-glyphs-saved-settings-ray-width) describes them.
+A second round on the same branch added detector hit maps, light-source glyphs, saved view settings, and a ray width setting. [Follow-up](#follow-up-hit-maps-source-glyphs-saved-settings-ray-width) describes them. The last commit removed the old wireframe view, so the "legacy" column below is a historical measurement.
 
 Three.js materials give physically plausible display shading, not optical simulation. Nothing in this renderer computes an optical quantity, and nothing it draws is a measurement. Every displayed number still comes from the f64 reference tracer.
 
@@ -49,7 +49,7 @@ Browser (`web/src/render3d/`):
 
 `web/src/heat.ts` holds the flux colour ramp that the detector dock and the hit maps share.
 
-`main.ts` chooses the view. The GPU view is the default, and `?renderer=legacy` keeps the old wireframe (`viewport3d.ts`) for comparison. `?render3d=webgl` forces the WebGL2 backend, and `?render3d=off` simulates a browser with no usable renderer. The GPU canvas (`#view3d`) sits under `#view`, which becomes a transparent overlay and still receives the pointer, so the page's DOM ids and event wiring are unchanged.
+`main.ts` creates the view. The old wireframe (`viewport3d.ts`, reachable with `?renderer=legacy` while the GPU view was new) has been removed. `?render3d=webgl` forces the WebGL2 backend, and `?render3d=off` simulates a browser with no usable renderer. The GPU canvas (`#view3d`) sits under `#view`, which becomes a transparent overlay and still receives the pointer, so the page's DOM ids and event wiring are unchanged.
 
 ### Rust and wasm changes
 
@@ -281,7 +281,7 @@ For the GPU view:
 
 - **CPU frame:** everything on the main thread (a stale trace, wasm sync, ray upload, render submission, overlay), measured over 60 orbiting frames.
 - **GPU frame:** from timestamp queries, which Chrome quantizes, so values below 0.1 ms are coarse.
-- **Legacy frame:** the wireframe view with a static camera, which includes rasterizing the rays in JavaScript.
+- **Legacy frame:** the removed wireframe view with a static camera, which included rasterizing the rays in JavaScript. The benchmark no longer measures it.
 - **Exact trace:** one f64 retrace of the scene. It is the tracer, not the renderer.
 - **Ray upload:** the upload that follows that retrace.
 
@@ -355,12 +355,12 @@ The three.js WebGPU build does not tree-shake well; almost all of the lazy chunk
   - These suites cover the spec's regression requirement for the f64 trace, detector results, OPL, the energy ledger, `.ocanvas`, and the Rust half of the Optiland round trip, and they pass unchanged. This work changes none of that code.
 - **Python bridge:** the CI job (`pip install '.[test]'`, then `pytest` against a live Optiland) was run locally in a Python 3.12 environment: 38 passed.
 - **Browser, CI project:**
-  - `tests/render3d.spec.ts` (19 tests): opening and backend naming; orbit, pan, zoom and reset; presets, perspective and the `0` key; picking and dragging without a mesh rebuild; the card and the 2D/3D selection hand-off; copy, paste, delete and nudge; lighting, background, exposure and ray visibility leaving the saved scene, the exact trace and the detector readout bit-identical; mesh rebuilds only on geometry edits; the ray buffer (every segment, bounded draws, no re-upload for ghost opacity, depth mode changing depth only); quality states; no idle frames; no resource growth; the forced WebGL2 backend; the no-renderer path with the 2D view still working; and the legacy view.
+  - `tests/render3d.spec.ts` (18 tests): opening and backend naming; orbit, pan, zoom and reset; presets, perspective and the `0` key; picking and dragging without a mesh rebuild; the card and the 2D/3D selection hand-off; copy, paste, delete and nudge; lighting, background, exposure and ray visibility leaving the saved scene, the exact trace and the detector readout bit-identical; mesh rebuilds only on geometry edits; the ray buffer (every segment, bounded draws, no re-upload for ghost opacity, depth mode changing depth only); quality states; no idle frames; no resource growth; the forced WebGL2 backend; and the no-renderer path with the 2D view still working. A test that the legacy view was still reachable went with that view.
   - The follow-up adds four: the source glyph (picked, dragged, rays starting on its face, turned from its card); hit maps (drawn, hidden during a drag, toggled without touching the optics); wide rays (same segments, same draw count, more pixels); and saved settings (restored after a reload, damaged storage ignored field by field).
   - The existing 3D view-controls test now reads the camera and the GPU picture through the `?debug` hooks.
-  - The full suite (60 tests) passes. Headless CI has no WebGPU device, so this suite runs there on the WebGL2 fallback; the same suite passes locally on Playwright's bundled Chromium, which also lands on WebGL2.
+  - The full suite (59 tests) passes. Headless CI has no WebGPU device, so this suite runs there on the WebGL2 fallback; the same suite passes locally on Playwright's bundled Chromium, which also lands on WebGL2.
 - **Browser, opt-in:**
-  - `OC_WEBGPU=1 … --project=webgpu` also runs `render3d.spec.ts` on a real device. With Chrome 153 on the RTX 5070, its 21 tests (these 19 plus the 2 WebGPU preview tests) pass.
+  - `OC_WEBGPU=1 … --project=webgpu` also runs `render3d.spec.ts` on a real device. With Chrome 153 on the RTX 5070, its 20 tests (these 18 plus the 2 WebGPU preview tests) pass.
   - `OC_VISUAL=1 … --project=visual` compares 14 screenshots in 12 tests (default scene dark and light, prism, fold mirror, aperture with a second detector, overlapping glass, three lenses with ghosts, selected and hovered lens, occluded rays on the bench in perspective, inspection on grey, wide rays dark and light, a hit map end-on) at 1% pixel tolerance, with the status line masked. The baselines are for this machine (`*-visual-win32.png`), were re-recorded for the follow-up (every scene now shows its source), and are stable across runs.
 - **Backends seen:** WebGPU (Chrome 153 on the RTX 5070), WebGL2 (forced, and three.js's fallback in Playwright's bundled Chromium), SwiftShader software GL, and "unavailable" (simulated).
 
@@ -386,7 +386,7 @@ The three.js WebGPU build does not tree-shake well; almost all of the lazy chunk
   - The 2D cross-section still draws no source.
 - **2D-only bodies:** outlines, not solids.
 - **Shadows:** none.
-- **Legacy view:** still in the tree behind `?renderer=legacy`. It should be removed once the GPU view has seen use.
+- **No fallback view:** with the wireframe view gone, a browser with neither WebGPU nor WebGL2 gets a notice in the 3D view. The 2D cross-section still works there.
 - **Timing precision:** GPU times below 0.1 ms are quantized by the browser.
 - **CI coverage:** CI exercises only the WebGL2 path (SwiftShader). The WebGPU path is covered by the opt-in project on a machine with a GPU.
 
@@ -419,4 +419,3 @@ The follow-up built strip rays, saved preferences, source glyphs and hit maps. S
 - Optional HDRI environments.
 - Order-independent transparency for glass behind glass.
 - A source glyph in the 2D cross-section.
-- Removing the legacy wireframe view.

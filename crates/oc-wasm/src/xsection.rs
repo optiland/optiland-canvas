@@ -7,8 +7,9 @@
 //! view plane's `(u, v)` coordinates, ready for the renderer's `toScreen`.
 //!
 //! Output is a JSON array of polylines, each `{kind, closed, pts:[u,v,...]}`, so
-//! the renderer can style a body, a mirror, a detector, and an aperture
-//! differently. A profile body is stroked edge by edge (robust against edge
+//! the renderer can style a body, a mirror, a splitter, a dichroic, a detector,
+//! and an aperture differently. A dichroic also carries `tint`, the CSS colour
+//! of what its front face reflects. A profile body is stroked edge by edge (robust against edge
 //! ordering); analytic solids and planar events are emitted as closed or open
 //! curves.
 
@@ -363,16 +364,47 @@ fn surface(s: &SurfaceObject3, plane: &Plane3, out: &mut Vec<String>) {
     let SurfaceGeometry3::Plane { shape } = &s.geometry else {
         return; // a surface of revolution has no simple planar section here
     };
-    let kind = if matches!(s.response_front, SurfaceResponse::Mirror { .. }) {
-        "mirror"
-    } else {
-        "surface"
+    let kind = match crate::surface_object_kind(s) {
+        "mirror" => "mirror",
+        "beamsplitter" => "splitter",
+        "dichroic" => "dichroic",
+        _ => "surface",
+    };
+    let tint = match kind {
+        "dichroic" => coat_css(&s.response_front).or_else(|| coat_css(&s.response_back)),
+        _ => None,
     };
     for seg in plane_line(&s.common.transform, plane, shape_bound(shape), &|uv| {
         shape_contains(shape, uv)
     }) {
-        out.push(poly(kind, false, &seg));
+        let line = poly(kind, false, &seg);
+        out.push(match &tint {
+            // Splice the tint into the object before its closing brace.
+            Some(css) => format!("{},\"tint\":\"{css}\"}}", &line[..line.len() - 1]),
+            None => line,
+        });
     }
+}
+
+/// The reflected colour of a coated face as a CSS `rgb()`, brightest channel
+/// at full scale and gamma-encoded, or `None` for an uncoated face or one that
+/// reflects nothing visible.
+fn coat_css(r: &SurfaceResponse) -> Option<String> {
+    let (rc, _) = crate::render_view::coat_colors(r)?;
+    let peak = rc[0].max(rc[1]).max(rc[2]);
+    if peak.is_nan() || peak <= 1e-6 {
+        return None;
+    }
+    let enc = |v: f32| {
+        let l = (v / peak).clamp(0.0, 1.0);
+        let s = if l <= 0.003_130_8 {
+            12.92 * l
+        } else {
+            1.055 * l.powf(1.0 / 2.4) - 0.055
+        };
+        (s * 255.0).round() as u8
+    };
+    Some(format!("rgb({},{},{})", enc(rc[0]), enc(rc[1]), enc(rc[2])))
 }
 
 fn detector(d: &Detector3, plane: &Plane3, out: &mut Vec<String>) {

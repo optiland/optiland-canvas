@@ -22,7 +22,9 @@ use oc_trace::{trace as ref_trace, TraceConfig};
 use wasm_bindgen::prelude::*;
 
 // --- 3D (Scene3) view surface (PR 3D-09) -----------------------------------
-use oc_core::build3::SingletGeom;
+use oc_core::build3::{
+    response_kind, singlet_face_sag, DichroicSpec, SingletAspheres, SingletGeom,
+};
 use oc_core::migrate_v1::{load_any, LoadReport};
 use oc_core::planar_reduce::{preview_mode, PreviewMode};
 use oc_core::profile2::ProfileConstruction3;
@@ -1924,8 +1926,208 @@ impl Canvas {
         id as f64
     }
 
-    /// Set a surface object's front/back responses (`mirror`/`absorb`/`clear`/
-    /// `refract`). Bumps the revision. `false` for an unknown kind / non-surface.
+    /// Add a beam splitter at `(x,y)`: a round plate of `radius` mm, tilted
+    /// `tilt_deg` in the meridional plane, reflecting `reflectance` and
+    /// transmitting `transmittance` on both faces. Returns the new object id,
+    /// or `-1` (nothing added) for fractions outside `[0, 1]` or summing past 1.
+    /// Bumps the revision.
+    #[wasm_bindgen(js_name = addBeamSplitter)]
+    pub fn add_beam_splitter(
+        &mut self,
+        x: f64,
+        y: f64,
+        radius: f64,
+        tilt_deg: f64,
+        reflectance: f64,
+        transmittance: f64,
+    ) -> f64 {
+        let Some(scene) = self.scene3.as_mut() else {
+            return -1.0;
+        };
+        match scene.add_beam_splitter(
+            Vec3::new(x, y, 0.0),
+            radius.max(0.5),
+            tilt_deg,
+            reflectance,
+            transmittance,
+        ) {
+            Some(id) => {
+                self.revision += 1;
+                id as f64
+            }
+            None => -1.0,
+        }
+    }
+
+    /// Add a dichroic filter at `(x,y)`: a round plate of `radius` mm, tilted
+    /// `tilt_deg`, whose coating reflects one side of `edge_nm` and transmits
+    /// the other (`long_pass` transmits the long side) across a transition
+    /// `width_nm` wide, with the default peak fractions (R 0.98, T 0.95).
+    /// Returns the new object id, or `-1` for a non-finite spec. Bumps the
+    /// revision.
+    #[wasm_bindgen(js_name = addDichroic)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_dichroic(
+        &mut self,
+        x: f64,
+        y: f64,
+        radius: f64,
+        tilt_deg: f64,
+        edge_nm: f64,
+        width_nm: f64,
+        long_pass: bool,
+    ) -> f64 {
+        let Some(scene) = self.scene3.as_mut() else {
+            return -1.0;
+        };
+        let spec = DichroicSpec {
+            edge_nm,
+            width_nm,
+            long_pass,
+            ..DichroicSpec::default()
+        };
+        match scene.add_dichroic(Vec3::new(x, y, 0.0), radius.max(0.5), tilt_deg, spec) {
+            Some(id) => {
+                self.revision += 1;
+                id as f64
+            }
+            None => -1.0,
+        }
+    }
+
+    /// Make both faces of a surface object a beam splitter. Bumps the revision.
+    /// `false` (scene unchanged) for invalid fractions or a non-surface id.
+    #[wasm_bindgen(js_name = setSurfaceSplit)]
+    pub fn set_surface_split(&mut self, id: f64, reflectance: f64, transmittance: f64) -> bool {
+        let Some(scene) = self.scene3.as_mut() else {
+            return false;
+        };
+        if scene.set_surface_split(id as u64, reflectance, transmittance) {
+            self.revision += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Give both faces of a surface object a dichroic coating. Out-of-range
+    /// values are brought into range (see `DichroicSpec::sanitized`). Bumps the
+    /// revision. `false` (scene unchanged) for a non-finite value or a
+    /// non-surface id.
+    #[wasm_bindgen(js_name = setSurfaceDichroic)]
+    pub fn set_surface_dichroic(
+        &mut self,
+        id: f64,
+        edge_nm: f64,
+        width_nm: f64,
+        long_pass: bool,
+        r_max: f64,
+        t_max: f64,
+    ) -> bool {
+        let Some(scene) = self.scene3.as_mut() else {
+            return false;
+        };
+        let spec = DichroicSpec {
+            edge_nm,
+            width_nm,
+            long_pass,
+            r_max,
+            t_max,
+        };
+        if scene.set_surface_dichroic(id as u64, spec) {
+            self.revision += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Each face's coating, for the component view: `{front, back}`, each
+    /// `{kind, r, t, dichroic}` with `kind` as in [`Canvas::surface_response_json`],
+    /// `r`/`t` the constant reflectance and transmittance (a mirror's
+    /// reflectivity as `r`; `null` when tabulated or not defined), and
+    /// `dichroic` the `{edgeNm, widthNm, longPass, rMax, tMax}` a dichroic
+    /// coating was made from (else `null`). `null` if `id` is not a surface.
+    #[wasm_bindgen(js_name = surfaceCoatingJSON)]
+    pub fn surface_coating_json(&self, id: f64) -> String {
+        use oc_core::scene3::{SpectralScalar, SurfaceResponse};
+        let Some((front, back)) = self
+            .scene3
+            .as_ref()
+            .and_then(|s| s.surface_responses(id as u64))
+        else {
+            return "null".into();
+        };
+        let constant = |v: &SpectralScalar| match v {
+            SpectralScalar::Constant(x) => format!("{x}"),
+            SpectralScalar::Tabulated { .. } => "null".into(),
+        };
+        let face = |r: &SurfaceResponse| {
+            let (rr, tt) = match r {
+                SurfaceResponse::Mirror { reflectivity } => (constant(reflectivity), "0".into()),
+                SurfaceResponse::ExplicitRt {
+                    reflectance,
+                    transmittance,
+                } => (constant(reflectance), constant(transmittance)),
+                SurfaceResponse::Absorber => ("0".into(), "0".into()),
+                SurfaceResponse::ThinLens { .. } => ("0".into(), "1".into()),
+                SurfaceResponse::DielectricFresnel { .. } => ("null".into(), "null".into()),
+            };
+            let dichroic = DichroicSpec::from_response(r).map_or("null".into(), |d| {
+                format!(
+                    "{{\"edgeNm\":{},\"widthNm\":{},\"longPass\":{},\"rMax\":{},\"tMax\":{}}}",
+                    d.edge_nm, d.width_nm, d.long_pass, d.r_max, d.t_max
+                )
+            });
+            format!(
+                "{{\"kind\":{},\"r\":{rr},\"t\":{tt},\"dichroic\":{dichroic}}}",
+                json_str(response_kind(r))
+            )
+        };
+        format!("{{\"front\":{},\"back\":{}}}", face(front), face(back))
+    }
+
+    /// A surface face's reflectance and transmittance at each wavelength in
+    /// `nm`, as `[R, T, R, T, ...]`: the tables the tracer samples, so a plot
+    /// of them is the coating the rays see. A mirror reports its reflectivity
+    /// and no transmission; an uncoated dielectric face depends on the angle
+    /// of incidence and reports `NaN`, as does a table asked for a wavelength
+    /// outside its range with no out-of-range value. Empty if `id` is not a
+    /// surface.
+    #[wasm_bindgen(js_name = surfaceRtF64)]
+    pub fn surface_rt_f64(&self, id: f64, back: bool, nm: &[f64]) -> Vec<f64> {
+        use oc_core::scene3::SurfaceResponse;
+        let Some((front, back_r)) = self
+            .scene3
+            .as_ref()
+            .and_then(|s| s.surface_responses(id as u64))
+        else {
+            return Vec::new();
+        };
+        let r = if back { back_r } else { front };
+        let mut out = Vec::with_capacity(nm.len() * 2);
+        for &w in nm {
+            let um = w / 1000.0;
+            let (rr, tt) = match r {
+                SurfaceResponse::Mirror { reflectivity } => (reflectivity.sample(um), Some(0.0)),
+                SurfaceResponse::ExplicitRt {
+                    reflectance,
+                    transmittance,
+                } => (reflectance.sample(um), transmittance.sample(um)),
+                SurfaceResponse::Absorber => (Some(0.0), Some(0.0)),
+                SurfaceResponse::ThinLens { .. } => (Some(0.0), Some(1.0)),
+                SurfaceResponse::DielectricFresnel { .. } => (None, None),
+            };
+            out.push(rr.unwrap_or(f64::NAN));
+            out.push(tt.unwrap_or(f64::NAN));
+        }
+        out
+    }
+
+    /// Set a surface object's front/back responses (`mirror`, `absorb`,
+    /// `clear`, `split` (50:50), `dichroic` (the default long-pass coating), or
+    /// `refract`). Bumps the revision. `false` for an unknown kind or a
+    /// non-surface id.
     #[wasm_bindgen(js_name = setSurfaceResponse)]
     pub fn set_surface_response(&mut self, id: f64, front: &str, back: &str) -> bool {
         let Some(scene) = self.scene3.as_mut() else {
@@ -1939,8 +2141,9 @@ impl Canvas {
         }
     }
 
-    /// A surface object's `{front, back}` response kinds, or `null` if `id` is not
-    /// a surface.
+    /// A surface object's `{front, back}` response kinds (`mirror`, `absorb`,
+    /// `clear`, `split`, `dichroic`, `coated`, `refract`, `thin-lens`), or
+    /// `null` if `id` is not a surface.
     #[wasm_bindgen(js_name = surfaceResponseJSON)]
     pub fn surface_response_json(&self, id: f64) -> String {
         let Some(scene) = &self.scene3 else {
@@ -2467,9 +2670,10 @@ impl Canvas {
         }
     }
 
-    /// Replace a singlet body's geometry. Refuses (returns `false`, scene
-    /// unchanged) if `id` is not a singlet or the geometry is not revolvable — a
-    /// bad card edit never corrupts the scene. Bumps the revision on success.
+    /// Replace a singlet body's geometry, keeping its aspheric terms. Refuses
+    /// (returns `false`, scene unchanged) if `id` is not a singlet or the
+    /// geometry is not revolvable — a bad card edit never corrupts the scene.
+    /// Bumps the revision on success.
     #[wasm_bindgen(js_name = setSingletGeom)]
     #[allow(clippy::too_many_arguments)]
     pub fn set_singlet_geom(
@@ -2494,6 +2698,197 @@ impl Canvas {
             conic2,
         };
         if scene.set_singlet_geom(id as u64, g) {
+            self.revision += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// A singlet's whole shape, for the component view, or `null` if `id` is
+    /// not a singlet:
+    ///
+    /// - the [`Canvas::singlet_geom_json`] fields (a plane's radius is `null`);
+    /// - `asph1`, `asph2`: each face's aspheric terms A4..A18;
+    /// - `nd`, `efl`, `bfl`: the paraxial d-line index, focal length, and back
+    ///   focal distance from the rear vertex (`null` for an afocal lens or a
+    ///   material without an index);
+    /// - `edge`: the thickness at the rim, mm;
+    /// - `faces`: for the front then the back face, `{vertex, pts}` with the
+    ///   vertex X and `samples + 1` points `[x, y, ...]` along the upper half of
+    ///   the face from the axis to the rim, in the lens's local frame (optical
+    ///   axis +X, centred on the body origin).
+    #[wasm_bindgen(js_name = singletShapeJSON)]
+    pub fn singlet_shape_json(&self, id: f64, samples: u32) -> String {
+        let Some(scene) = &self.scene3 else {
+            return "null".into();
+        };
+        let Some((g, a)) = scene.singlet_shape(id as u64) else {
+            return "null".into();
+        };
+        let num = |v: f64| {
+            if v.is_finite() {
+                format!("{v}")
+            } else {
+                "null".into()
+            }
+        };
+        let list = |v: &[f64]| v.iter().map(|x| num(*x)).collect::<Vec<_>>().join(",");
+        let n = samples.clamp(2, 400);
+        let ha = g.semi_aperture_mm;
+        let face = |back: bool| {
+            let vertex = if back {
+                g.thickness_mm / 2.0
+            } else {
+                -g.thickness_mm / 2.0
+            };
+            let mut pts = Vec::with_capacity(2 * n as usize + 2);
+            for i in 0..=n {
+                let y = ha * i as f64 / n as f64;
+                pts.push(vertex + singlet_face_sag(&g, &a, back, y));
+                pts.push(y);
+            }
+            format!("{{\"vertex\":{},\"pts\":[{}]}}", num(vertex), list(&pts))
+        };
+        let edge = g.thickness_mm + singlet_face_sag(&g, &a, true, ha)
+            - singlet_face_sag(&g, &a, false, ha);
+        let par = scene.singlet_paraxial(id as u64);
+        format!(
+            "{{\"r1\":{},\"r2\":{},\"thickness\":{},\"semiAperture\":{},\"conic1\":{},\"conic2\":{},\"asph1\":[{}],\"asph2\":[{}],\"nd\":{},\"efl\":{},\"bfl\":{},\"edge\":{},\"faces\":[{},{}]}}",
+            num(g.r1_mm),
+            num(g.r2_mm),
+            num(g.thickness_mm),
+            num(ha),
+            num(g.conic1),
+            num(g.conic2),
+            list(&a.front),
+            list(&a.back),
+            par.map_or("null".into(), |p| num(p.nd)),
+            par.map_or("null".into(), |p| num(p.efl_mm)),
+            par.map_or("null".into(), |p| num(p.bfl_mm)),
+            num(edge),
+            face(false),
+            face(true),
+        )
+    }
+
+    /// The sag of a singlet face (`back` false for the front) at each of
+    /// `heights`, measured from that face's vertex along the lens axis, or of
+    /// its base conic alone with `conic_only`. `NaN` for a height outside the
+    /// face; empty if `id` is not a singlet.
+    #[wasm_bindgen(js_name = singletFaceSagF64)]
+    pub fn singlet_face_sag_f64(
+        &self,
+        id: f64,
+        back: bool,
+        heights: &[f64],
+        conic_only: bool,
+    ) -> Vec<f64> {
+        let Some((g, mut a)) = self
+            .scene3
+            .as_ref()
+            .and_then(|s| s.singlet_shape(id as u64))
+        else {
+            return Vec::new();
+        };
+        if conic_only {
+            a = SingletAspheres::default();
+        }
+        heights
+            .iter()
+            .map(|&h| {
+                if h.is_finite() && h.abs() <= g.semi_aperture_mm * (1.0 + 1e-12) {
+                    singlet_face_sag(&g, &a, back, h.abs())
+                } else {
+                    f64::NAN
+                }
+            })
+            .collect()
+    }
+
+    /// Replace a singlet's geometry and aspheric terms in one edit. `asph1` and
+    /// `asph2` hold up to eight terms each (A4 first); missing ones are zero.
+    /// Refuses (`false`, scene unchanged) more than eight terms, a non-finite
+    /// value, or a shape whose faces cross. Bumps the revision on success.
+    #[wasm_bindgen(js_name = setSingletShape)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_singlet_shape(
+        &mut self,
+        id: f64,
+        r1: f64,
+        r2: f64,
+        thickness: f64,
+        semi_aperture: f64,
+        conic1: f64,
+        conic2: f64,
+        asph1: &[f64],
+        asph2: &[f64],
+    ) -> bool {
+        let Some(scene) = self.scene3.as_mut() else {
+            return false;
+        };
+        let terms = |v: &[f64]| -> Option<[f64; 8]> {
+            if v.len() > 8 {
+                return None;
+            }
+            let mut out = [0.0; 8];
+            out[..v.len()].copy_from_slice(v);
+            Some(out)
+        };
+        let (Some(front), Some(back)) = (terms(asph1), terms(asph2)) else {
+            return false;
+        };
+        let g = SingletGeom {
+            r1_mm: r1,
+            r2_mm: r2,
+            thickness_mm: thickness,
+            semi_aperture_mm: semi_aperture,
+            conic1,
+            conic2,
+        };
+        if scene.set_singlet_shape(id as u64, g, SingletAspheres { front, back }) {
+            self.revision += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Bend one singlet face (`back` false for the front) so its rim sits
+    /// `rim_sag` mm from its vertex, solving for the curvature and keeping the
+    /// conic constant and aspheric terms (the component view's bend handle).
+    /// Refuses (`false`, scene unchanged) a sag past the conic's reach or a
+    /// shape whose faces cross. Bumps the revision on success.
+    #[wasm_bindgen(js_name = bendSingletFace)]
+    pub fn bend_singlet_face(&mut self, id: f64, back: bool, rim_sag: f64) -> bool {
+        let Some(scene) = self.scene3.as_mut() else {
+            return false;
+        };
+        if scene.bend_singlet_face(id as u64, back, rim_sag) {
+            self.revision += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Reshape one singlet face (`back` false for the front) to pass through
+    /// the points `(heights[i], sags[i])`, sags measured from the face's vertex
+    /// (the component view's control points): its curvature and conic stay,
+    /// and its eight aspheric terms become the least-bending set through the
+    /// points. Refuses (`false`, scene unchanged) mismatched lengths and
+    /// anything [`oc_core::scene3::Scene3::fit_singlet_face`] refuses. Bumps
+    /// the revision on success.
+    #[wasm_bindgen(js_name = fitSingletFace)]
+    pub fn fit_singlet_face(&mut self, id: f64, back: bool, heights: &[f64], sags: &[f64]) -> bool {
+        let Some(scene) = self.scene3.as_mut() else {
+            return false;
+        };
+        if heights.len() != sags.len() {
+            return false;
+        }
+        let pts: Vec<(f64, f64)> = heights.iter().copied().zip(sags.iter().copied()).collect();
+        if scene.fit_singlet_face(id as u64, back, &pts) {
             self.revision += 1;
             true
         } else {
@@ -2934,11 +3329,8 @@ fn aperture_radius_opening(a: &oc_core::scene3::Aperture3) -> (f64, f64) {
 /// A surface object's kind label + a coarse hit-test radius, for the inspector
 /// and pointer picking (mirrors the body helpers).
 fn surface_kind_radius(s: &oc_core::scene3::SurfaceObject3) -> (&'static str, f64) {
-    use oc_core::scene3::{PlanarShape2, SurfaceGeometry3, SurfaceResponse};
-    let kind = match s.response_front {
-        SurfaceResponse::Mirror { .. } => "mirror",
-        _ => "surface",
-    };
+    use oc_core::scene3::{PlanarShape2, SurfaceGeometry3};
+    let kind = surface_object_kind(s);
     let radius = match &s.geometry {
         SurfaceGeometry3::Plane { shape } => match shape {
             PlanarShape2::Rectangle {
@@ -2954,6 +3346,24 @@ fn surface_kind_radius(s: &oc_core::scene3::SurfaceObject3) -> (&'static str, f6
         SurfaceGeometry3::SurfaceOfRevolution { .. } => 5.0,
     };
     (kind, radius.max(1.0))
+}
+
+/// What a surface object is, by its coatings: `mirror` (a reflective front),
+/// `dichroic` or `beamsplitter` (either face so coated), or `surface`.
+pub(crate) fn surface_object_kind(s: &oc_core::scene3::SurfaceObject3) -> &'static str {
+    let (f, b) = (
+        response_kind(&s.response_front),
+        response_kind(&s.response_back),
+    );
+    if f == "mirror" {
+        "mirror"
+    } else if f == "dichroic" || b == "dichroic" || f == "coated" || b == "coated" {
+        "dichroic"
+    } else if f == "split" || b == "split" {
+        "beamsplitter"
+    } else {
+        "surface"
+    }
 }
 
 /// A detector's in-plane half-extents (mm), for scaling a spot diagram into its
@@ -3408,6 +3818,137 @@ mod scene3_tests {
         let v: serde_json::Value = serde_json::from_str(&c.source_objects_json()).unwrap();
         assert_eq!(v[0]["pos"][1].as_f64().unwrap(), 3.0);
         assert!((v[0]["rotZ"].as_f64().unwrap() - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_component_view_reads_and_reshapes_a_singlet() {
+        let mut c = Canvas::new();
+        let lens = c.new_default_scene3();
+        let v: serde_json::Value = serde_json::from_str(&c.singlet_shape_json(lens, 8)).unwrap();
+        assert_eq!(v["r1"].as_f64(), Some(50.0));
+        assert_eq!(v["asph1"].as_array().unwrap().len(), 8);
+        // The default N-BK7 biconvex: f ≈ 49 mm, and its faces as polylines
+        // from the vertex (x = -2 and x = +2) to the rim (y = 12).
+        let efl = v["efl"].as_f64().unwrap();
+        assert!((efl - 49.04).abs() < 0.05, "efl {efl}");
+        let front = v["faces"][0]["pts"].as_array().unwrap();
+        assert_eq!(front.len(), 18);
+        assert_eq!(front[0].as_f64(), Some(-2.0));
+        assert_eq!(front[17].as_f64(), Some(12.0));
+        assert_eq!(v["faces"][1]["vertex"].as_f64(), Some(2.0));
+        let edge = v["edge"].as_f64().unwrap();
+        assert!(edge > 0.0 && edge < 4.0, "edge {edge}");
+
+        // Control points: fit the front face through two dragged points.
+        let base = c.singlet_face_sag_f64(lens, false, &[6.0, 12.0], false);
+        let before = c.trace_projected_3d();
+        let rev = c.scene_revision();
+        assert!(c.fit_singlet_face(lens, false, &[6.0, 12.0], &[base[0] + 0.05, base[1] + 0.3]));
+        assert!(c.scene_revision() > rev);
+        let now = c.singlet_face_sag_f64(lens, false, &[6.0, 12.0], false);
+        assert!((now[0] - base[0] - 0.05).abs() < 1e-9 && (now[1] - base[1] - 0.3).abs() < 1e-9);
+        assert_ne!(c.trace_projected_3d(), before, "the asphere bends the rays");
+        let v: serde_json::Value = serde_json::from_str(&c.singlet_shape_json(lens, 8)).unwrap();
+        assert!(v["asph1"][0].as_f64().unwrap() != 0.0);
+        // The base conic is still the sphere it was.
+        let conic = c.singlet_face_sag_f64(lens, false, &[6.0, 12.0], true);
+        assert!((conic[0] - base[0]).abs() < 1e-12 && (conic[1] - base[1]).abs() < 1e-12);
+        // The bend handle: the rim moves, the aspheric terms stay.
+        assert!(c.bend_singlet_face(lens, false, 1.0));
+        assert!((c.singlet_face_sag_f64(lens, false, &[12.0], false)[0] - 1.0).abs() < 1e-9);
+        assert!(!c.bend_singlet_face(lens, false, 20.0));
+        assert!(c.singlet_face_sag_f64(lens, false, &[13.0], false)[0].is_nan());
+        // Refusals leave the revision alone.
+        let rev = c.scene_revision();
+        assert!(!c.fit_singlet_face(lens, false, &[6.0], &[0.1, 0.2]));
+        assert!(
+            !c.fit_singlet_face(lens, false, &[12.0], &[30.0]),
+            "faces would cross"
+        );
+        assert_eq!(c.scene_revision(), rev);
+
+        // The card's setter keeps the terms; the shape setter replaces them.
+        assert!(c.set_singlet_geom(lens, 45.0, -50.0, 4.0, 12.0, 0.0, 0.0));
+        let v: serde_json::Value = serde_json::from_str(&c.singlet_shape_json(lens, 8)).unwrap();
+        assert!(v["asph1"][0].as_f64().unwrap() != 0.0);
+        assert!(c.set_singlet_shape(lens, 45.0, -50.0, 5.0, 12.0, -0.5, 0.0, &[], &[1e-6]));
+        let v: serde_json::Value = serde_json::from_str(&c.singlet_shape_json(lens, 8)).unwrap();
+        assert_eq!(v["asph1"][0].as_f64(), Some(0.0));
+        assert_eq!(v["asph2"][0].as_f64(), Some(1e-6));
+        assert_eq!(v["conic1"].as_f64(), Some(-0.5));
+        assert!(!c.set_singlet_shape(lens, 45.0, -50.0, 5.0, 12.0, 0.0, 0.0, &[0.0; 9], &[]));
+        // Not a singlet.
+        assert_eq!(c.singlet_shape_json(999.0, 8), "null");
+        assert!(c
+            .singlet_face_sag_f64(999.0, false, &[1.0], false)
+            .is_empty());
+    }
+
+    #[test]
+    fn splitters_and_dichroics_are_added_listed_and_read_back() {
+        let mut c = Canvas::new();
+        c.new_default_scene3();
+        let bs = c.add_beam_splitter(-35.0, 0.0, 15.0, 135.0, 0.5, 0.5);
+        let dc = c.add_dichroic(-50.0, 0.0, 15.0, 135.0, 550.0, 20.0, true);
+        assert!(bs >= 0.0 && dc >= 0.0);
+        assert_eq!(c.add_beam_splitter(0.0, 0.0, 5.0, 0.0, 0.8, 0.8), -1.0);
+
+        let objs: serde_json::Value = serde_json::from_str(&c.scene_objects_json()).unwrap();
+        let kind = |id: f64| {
+            objs.as_array()
+                .unwrap()
+                .iter()
+                .find(|o| o["id"].as_f64() == Some(id))
+                .unwrap()["kind"]
+                .clone()
+        };
+        assert_eq!(kind(bs), "beamsplitter");
+        assert_eq!(kind(dc), "dichroic");
+        assert_eq!(
+            c.surface_response_json(bs),
+            "{\"front\":\"split\",\"back\":\"split\"}"
+        );
+
+        let coat: serde_json::Value = serde_json::from_str(&c.surface_coating_json(dc)).unwrap();
+        assert_eq!(coat["front"]["kind"], "dichroic");
+        assert!(coat["front"]["r"].is_null());
+        assert_eq!(coat["front"]["dichroic"]["edgeNm"].as_f64(), Some(550.0));
+        assert_eq!(coat["back"]["dichroic"]["longPass"], true);
+        let coat: serde_json::Value = serde_json::from_str(&c.surface_coating_json(bs)).unwrap();
+        assert_eq!(
+            (coat["front"]["r"].as_f64(), coat["front"]["t"].as_f64()),
+            (Some(0.5), Some(0.5))
+        );
+        assert!(coat["front"]["dichroic"].is_null());
+        assert_eq!(c.surface_coating_json(-1.0), "null");
+
+        // The curves the tracer samples.
+        let rt = c.surface_rt_f64(dc, false, &[450.0, 550.0, 650.0]);
+        assert_eq!(rt.len(), 6);
+        assert_eq!((rt[0], rt[1]), (0.98, 0.0));
+        assert!((rt[2] - 0.49).abs() < 1e-12);
+        assert_eq!((rt[4], rt[5]), (0.0, 0.95));
+
+        // Edits.
+        assert!(c.set_surface_split(bs, 0.2, 0.8));
+        assert_eq!(c.surface_rt_f64(bs, true, &[500.0]), vec![0.2, 0.8]);
+        assert!(!c.set_surface_split(bs, 0.9, 0.9));
+        assert!(c.set_surface_dichroic(dc, 600.0, 30.0, false, 0.9, 0.8));
+        let coat: serde_json::Value = serde_json::from_str(&c.surface_coating_json(dc)).unwrap();
+        assert_eq!(coat["front"]["dichroic"]["longPass"], false);
+        assert_eq!(coat["front"]["dichroic"]["tMax"].as_f64(), Some(0.8));
+        assert!(!c.set_surface_dichroic(dc, f64::NAN, 30.0, false, 0.9, 0.8));
+
+        // The 2D section names both and tints the dichroic by what it reflects.
+        let xs: serde_json::Value = serde_json::from_str(&c.scene_cross_section_json()).unwrap();
+        let items = xs.as_array().unwrap();
+        assert!(items
+            .iter()
+            .any(|p| p["kind"] == "splitter" && p.get("tint").is_none()));
+        let tinted = items.iter().find(|p| p["kind"] == "dichroic").unwrap();
+        // A short-pass edge at 600 nm reflects the red end.
+        let tint = tinted["tint"].as_str().unwrap();
+        assert!(tint.starts_with("rgb(255,"), "{tint}");
     }
 
     #[test]

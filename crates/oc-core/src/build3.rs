@@ -12,6 +12,12 @@
 //! index, never reused) and produces geometry that satisfies [`Scene3::validate`]
 //! and [`validate_revolvable`]. The optical axis is local **+X** (§4.1); a lens
 //! is a meridional profile mirror-symmetric about `y = 0`, revolved about it.
+//!
+//! Beam splitters and dichroic filters are zero-thickness plates with an
+//! explicit reflectance and transmittance ([`SurfaceResponse::ExplicitRt`]):
+//! constant for a splitter, tabulated over wavelength for a dichroic
+//! ([`DichroicSpec`]). The tracer splits both into a reflected and a
+//! transmitted branch, weighted per wavelength.
 
 use crate::geom3::primitives::even_asphere_sag;
 use crate::geom3::profile::validate_revolvable;
@@ -23,9 +29,10 @@ use crate::profile2::{
 use crate::scene::Spectrum;
 use crate::scene3::{
     AbsorptionModel, AngularDistribution3, Aperture3, ApertureInteraction, ApertureShape3, Body3,
-    Detector3, DetectorGeometry3, DetectorResponse, DetectorTermination, ObjectCommon, PlanarShape2,
-    SamplingSequence, Scene3, SolidGeometry3, Source3, SourceSampling, SpatialDistribution3,
-    SpectralScalar, SurfaceGeometry3, SurfaceObject3, SurfaceProps3, SurfaceResponse,
+    Detector3, DetectorGeometry3, DetectorResponse, DetectorTermination, Interpolation,
+    ObjectCommon, OutOfRangePolicy, PlanarShape2, SamplingSequence, Scene3, SolidGeometry3,
+    Source3, SourceSampling, SpatialDistribution3, SpectralScalar, SurfaceGeometry3,
+    SurfaceObject3, SurfaceProps3, SurfaceResponse,
 };
 use crate::vec::Vec2;
 use crate::vec3::{Isometry3, Plane3, Vec3};
@@ -63,6 +70,192 @@ impl SingletGeom {
     }
 }
 
+/// The even-asphere terms of a singlet's two faces: `sag += Σ coeffs[i]·r^(2i+4)`
+/// on top of each face's conic, so `coeffs[0]` is A4 (mm⁻³), `coeffs[1]` A6,
+/// and so on to A18. A face whose terms are all zero is stored as a plain conic,
+/// which keeps a conic singlet's document and its planar reduction unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct SingletAspheres {
+    pub front: [f64; 8],
+    pub back: [f64; 8],
+}
+
+/// The sag of one singlet face at height `h_mm`, measured from that face's
+/// vertex along +X: the conic plus its aspheric terms, the same function the
+/// geometry traces.
+pub fn singlet_face_sag(g: &SingletGeom, a: &SingletAspheres, back: bool, h_mm: f64) -> f64 {
+    if back {
+        even_asphere_sag(curvature(g.r2_mm), g.conic2, &a.back, h_mm)
+    } else {
+        even_asphere_sag(curvature(g.r1_mm), g.conic1, &a.front, h_mm)
+    }
+}
+
+/// A singlet's paraxial first-order properties at the d line, in the ambient
+/// medium: effective focal length, and the back focal distance measured from
+/// the rear vertex along the lens axis. Thick-lens formulas; the aspheric terms
+/// have no paraxial effect.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SingletParaxial {
+    pub nd: f64,
+    pub efl_mm: f64,
+    pub bfl_mm: f64,
+}
+
+/// A dichroic coating: wavelengths on one side of `edge_nm` reflect, those on
+/// the other side transmit. Long-pass transmits above the edge.
+///
+/// The curves are a raised-cosine transition `width_nm` wide, sampled at
+/// [`DICHROIC_SAMPLES`] wavelengths and held flat beyond them
+/// ([`OutOfRangePolicy::Clamp`]): reflectance falls from `r_max` to 0 while
+/// transmittance rises from 0 to `t_max` (the other way round for short-pass).
+/// Both tables share one grid, so `R + T <= max(r_max, t_max)` at every
+/// wavelength and the remainder is absorbed. A scalar model: no angle of
+/// incidence and no polarization, like every response in the kernel.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DichroicSpec {
+    pub edge_nm: f64,
+    pub width_nm: f64,
+    pub long_pass: bool,
+    pub r_max: f64,
+    pub t_max: f64,
+}
+
+/// Samples in a dichroic's tables.
+pub const DICHROIC_SAMPLES: usize = 9;
+
+impl Default for DichroicSpec {
+    /// A long-pass edge at 550 nm: blue and green reflect, yellow and red pass.
+    fn default() -> Self {
+        Self {
+            edge_nm: 550.0,
+            width_nm: 20.0,
+            long_pass: true,
+            r_max: 0.98,
+            t_max: 0.95,
+        }
+    }
+}
+
+impl DichroicSpec {
+    /// The spec with its values brought into range (a positive edge, a
+    /// transition at least 0.5 nm wide that stays at positive wavelengths,
+    /// fractions in `[0, 1]`), or `None` if a value is not finite.
+    pub fn sanitized(self) -> Option<Self> {
+        let finite = [self.edge_nm, self.width_nm, self.r_max, self.t_max]
+            .iter()
+            .all(|v| v.is_finite());
+        if !finite {
+            return None;
+        }
+        let edge_nm = self.edge_nm.max(1.0);
+        Some(Self {
+            edge_nm,
+            width_nm: self.width_nm.clamp(0.5, 2.0 * edge_nm - 1.0),
+            long_pass: self.long_pass,
+            r_max: self.r_max.clamp(0.0, 1.0),
+            t_max: self.t_max.clamp(0.0, 1.0),
+        })
+    }
+
+    /// The shared wavelength grid (µm) and the reflectance and transmittance
+    /// tables on it.
+    fn tables(&self) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+        let n = DICHROIC_SAMPLES;
+        let lo = self.edge_nm - self.width_nm / 2.0;
+        let mut lambda = Vec::with_capacity(n);
+        let mut r = Vec::with_capacity(n);
+        let mut t = Vec::with_capacity(n);
+        for i in 0..n {
+            let f = i as f64 / (n - 1) as f64;
+            let rise = 0.5 - 0.5 * (std::f64::consts::PI * f).cos();
+            let pass = if self.long_pass { rise } else { 1.0 - rise };
+            lambda.push((lo + self.width_nm * f) / 1000.0);
+            r.push(self.r_max * (1.0 - pass));
+            t.push(self.t_max * pass);
+        }
+        (lambda, r, t)
+    }
+
+    /// The surface response this spec stands for.
+    pub fn response(&self) -> SurfaceResponse {
+        let (lambda_um, r, t) = self.tables();
+        let table = |values: Vec<f64>| SpectralScalar::Tabulated {
+            lambda_um: lambda_um.clone(),
+            values,
+            interpolation: Interpolation::Linear,
+            out_of_range: OutOfRangePolicy::Clamp,
+        };
+        SurfaceResponse::ExplicitRt {
+            reflectance: table(r),
+            transmittance: table(t),
+        }
+    }
+
+    /// The spec a response was made from, if [`DichroicSpec::response`] made
+    /// it. Any other table, however similar, is `None`: its parameters would
+    /// be a guess.
+    pub fn from_response(r: &SurfaceResponse) -> Option<Self> {
+        let SurfaceResponse::ExplicitRt {
+            reflectance:
+                SpectralScalar::Tabulated {
+                    lambda_um: lr,
+                    values: rv,
+                    out_of_range: OutOfRangePolicy::Clamp,
+                    ..
+                },
+            transmittance:
+                SpectralScalar::Tabulated {
+                    lambda_um: lt,
+                    values: tv,
+                    out_of_range: OutOfRangePolicy::Clamp,
+                    ..
+                },
+        } = r
+        else {
+            return None;
+        };
+        let n = DICHROIC_SAMPLES;
+        if lr.len() != n || lr != lt || rv.len() != n || tv.len() != n {
+            return None;
+        }
+        let (lo, hi) = (lr[0] * 1000.0, lr[n - 1] * 1000.0);
+        let max = |v: &[f64]| v.iter().copied().fold(0.0_f64, f64::max);
+        let (r_max, t_max) = (max(rv), max(tv));
+        let long_pass = if t_max > 0.0 {
+            tv[n - 1] > tv[0]
+        } else {
+            rv[0] >= rv[n - 1]
+        };
+        let spec = Self {
+            edge_nm: (lo + hi) / 2.0,
+            width_nm: hi - lo,
+            long_pass,
+            r_max,
+            t_max,
+        };
+        let (l2, r2, t2) = spec.tables();
+        let close = |a: &[f64], b: &[f64]| {
+            a.iter()
+                .zip(b)
+                .all(|(x, y)| (x - y).abs() <= 1e-9 * (1.0 + x.abs()))
+        };
+        (close(lr, &l2) && close(rv, &r2) && close(tv, &t2)).then_some(spec)
+    }
+}
+
+/// A constant reflectance/transmittance pair, if it is a valid one.
+fn split_response(reflectance: f64, transmittance: f64) -> Option<SurfaceResponse> {
+    let ok = |v: f64| v.is_finite() && (0.0..=1.0).contains(&v);
+    if !ok(reflectance) || !ok(transmittance) || reflectance + transmittance > 1.0 + 1e-12 {
+        return None;
+    }
+    Some(SurfaceResponse::ExplicitRt {
+        reflectance: SpectralScalar::Constant(reflectance),
+        transmittance: SpectralScalar::Constant(transmittance),
+    })
+}
+
 /// A white beam: nine equal-weight lines across the visible band, so a full
 /// spectrum sums to white and chromatic dispersion shows as coloured fringes
 /// (the v1 default beam's behaviour). Wavelengths in µm.
@@ -82,38 +275,39 @@ fn curvature(r_mm: f64) -> f64 {
     }
 }
 
-/// The four meridional edges of a singlet, in closed-loop order: front conic,
-/// top rim line, back conic, bottom rim line. Mirror-symmetric about `y = 0`.
+/// The four meridional edges of a singlet, in closed-loop order: front face,
+/// top rim line, back face, bottom rim line. Mirror-symmetric about `y = 0`.
 ///
 /// The rim X of each face is its sag at the semi-aperture, computed with the same
 /// [`even_asphere_sag`] the geometry and [`validate_revolvable`] use, so the two
-/// rim lines meet the conics exactly and the loop closes.
-fn singlet_curves(g: SingletGeom) -> [Curve2; 4] {
+/// rim lines meet the faces exactly and the loop closes.
+fn singlet_curves(g: SingletGeom, a: SingletAspheres) -> [Curve2; 4] {
     let ha = g.semi_aperture_mm;
     let (zf, zr) = (-g.thickness_mm / 2.0, g.thickness_mm / 2.0);
     let (c1, c2) = (curvature(g.r1_mm), curvature(g.r2_mm));
-    let z8 = [0.0f64; 8];
-    let ftip = zf + even_asphere_sag(c1, g.conic1, &z8, ha);
-    let rtip = zr + even_asphere_sag(c2, g.conic2, &z8, ha);
-    [
-        Curve2::Conic(ConicParams2 {
-            vertex: Vec2::new(zf, 0.0),
+    let ftip = zf + even_asphere_sag(c1, g.conic1, &a.front, ha);
+    let rtip = zr + even_asphere_sag(c2, g.conic2, &a.back, ha);
+    let face = |x: f64, c: f64, k: f64, coeffs: [f64; 8]| {
+        let base = ConicParams2 {
+            vertex: Vec2::new(x, 0.0),
             axis: Vec2::X,
-            c: c1,
-            k: g.conic1,
+            c,
+            k,
             half_ap: ha,
-        }),
+        };
+        if coeffs.iter().all(|v| *v == 0.0) {
+            Curve2::Conic(base)
+        } else {
+            Curve2::EvenAsphere { base, coeffs }
+        }
+    };
+    [
+        face(zf, c1, g.conic1, a.front),
         Curve2::Line {
             a: Vec2::new(ftip, ha),
             b: Vec2::new(rtip, ha),
         },
-        Curve2::Conic(ConicParams2 {
-            vertex: Vec2::new(zr, 0.0),
-            axis: Vec2::X,
-            c: c2,
-            k: g.conic2,
-            half_ap: ha,
-        }),
+        face(zr, c2, g.conic2, a.back),
         Curve2::Line {
             a: Vec2::new(rtip, -ha),
             b: Vec2::new(ftip, -ha),
@@ -121,32 +315,82 @@ fn singlet_curves(g: SingletGeom) -> [Curve2; 4] {
     ]
 }
 
-/// Read a singlet body's geometry back out of its profile (for the inspector).
-fn geom_from_profile(profile: &ClosedProfile2) -> Option<SingletGeom> {
+/// Read a singlet body's geometry and aspheric terms back out of its profile
+/// (for the inspector).
+fn shape_from_profile(profile: &ClosedProfile2) -> Option<(SingletGeom, SingletAspheres)> {
     let edges = &profile.edges;
     if edges.len() != 4 {
         return None;
     }
-    let (front, back) = match (&edges[0].curve, &edges[2].curve) {
-        (Curve2::Conic(a), Curve2::Conic(b)) => (a, b),
-        _ => return None,
+    let face = |c: &Curve2| match c {
+        Curve2::Conic(p) => Some((*p, [0.0; 8])),
+        Curve2::EvenAsphere { base, coeffs } => Some((*base, *coeffs)),
+        _ => None,
     };
-    let radius = |c: f64| if c.abs() > 1e-12 { 1.0 / c } else { f64::INFINITY };
-    Some(SingletGeom {
-        r1_mm: radius(front.c),
-        r2_mm: radius(back.c),
-        thickness_mm: back.vertex.x - front.vertex.x,
-        semi_aperture_mm: front.half_ap,
-        conic1: front.k,
-        conic2: back.k,
-    })
+    let (front, a1) = face(&edges[0].curve)?;
+    let (back, a2) = face(&edges[2].curve)?;
+    let radius = |c: f64| {
+        if c.abs() > 1e-12 {
+            1.0 / c
+        } else {
+            f64::INFINITY
+        }
+    };
+    Some((
+        SingletGeom {
+            r1_mm: radius(front.c),
+            r2_mm: radius(back.c),
+            thickness_mm: back.vertex.x - front.vertex.x,
+            semi_aperture_mm: front.half_ap,
+            conic1: front.k,
+            conic2: back.k,
+        },
+        SingletAspheres {
+            front: a1,
+            back: a2,
+        },
+    ))
+}
+
+/// Solve `A x = b` by Gaussian elimination with partial pivoting. `None` when
+/// a pivot vanishes against the matrix's largest entry.
+fn solve_dense(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Option<Vec<f64>> {
+    let n = b.len();
+    let scale = a
+        .iter()
+        .flatten()
+        .fold(0.0_f64, |m, v| m.max(v.abs()))
+        .max(f64::MIN_POSITIVE);
+    for col in 0..n {
+        let pivot = (col..n).max_by(|&i, &j| a[i][col].abs().total_cmp(&a[j][col].abs()))?;
+        if a[pivot][col].abs() < 1e-15 * scale {
+            return None;
+        }
+        a.swap(col, pivot);
+        b.swap(col, pivot);
+        let (upper, lower) = a.split_at_mut(col + 1);
+        let top = &upper[col];
+        for (r, row) in lower.iter_mut().enumerate() {
+            let f = row[col] / top[col];
+            for (x, t) in row[col..n].iter_mut().zip(&top[col..n]) {
+                *x -= f * t;
+            }
+            b[col + 1 + r] -= f * b[col];
+        }
+    }
+    let mut x = vec![0.0; n];
+    for row in (0..n).rev() {
+        let s: f64 = (row + 1..n).map(|k| a[row][k] * x[k]).sum();
+        x[row] = (b[row] - s) / a[row][row];
+    }
+    x.iter().all(|v| v.is_finite()).then_some(x)
 }
 
 impl Scene3 {
     /// Add a rotationally-symmetric singlet on the optical axis, its body centred
     /// at `center`, with glass `(nd, vd)`. Returns the new body id.
     pub fn add_singlet(&mut self, center: Vec3, g: SingletGeom, nd: f64, vd: f64) -> BodyId {
-        let curves = singlet_curves(g);
+        let curves = singlet_curves(g, SingletAspheres::default());
         let edges = curves
             .into_iter()
             .map(|curve| ProfileEdge2 {
@@ -314,6 +558,76 @@ impl Scene3 {
             reflectivity: SpectralScalar::Constant(reflectivity.clamp(0.0, 1.0)),
         };
         Some(self.planar_surface((a + b) * 0.5, normal, len * 0.5, m.clone(), m))
+    }
+
+    /// Add a beam splitter: a round plate at `pos`, tilted `tilt_deg` in the
+    /// meridional plane, that reflects `reflectance` and transmits
+    /// `transmittance` of the light on either face (the rest is absorbed).
+    /// `None`, and nothing added, for fractions outside `[0, 1]` or summing past 1.
+    pub fn add_beam_splitter(
+        &mut self,
+        pos: Vec3,
+        radius_mm: f64,
+        tilt_deg: f64,
+        reflectance: f64,
+        transmittance: f64,
+    ) -> Option<u64> {
+        let r = split_response(reflectance, transmittance)?;
+        Some(self.add_planar_element(pos, radius_mm, tilt_deg, r.clone(), r))
+    }
+
+    /// Add a dichroic filter: a round plate at `pos`, tilted `tilt_deg`, with the
+    /// coating `spec` on both faces. `None` for a non-finite spec.
+    pub fn add_dichroic(
+        &mut self,
+        pos: Vec3,
+        radius_mm: f64,
+        tilt_deg: f64,
+        spec: DichroicSpec,
+    ) -> Option<u64> {
+        let r = spec.sanitized()?.response();
+        Some(self.add_planar_element(pos, radius_mm, tilt_deg, r.clone(), r))
+    }
+
+    /// Make both faces of a surface object a beam splitter with these fractions.
+    /// False (scene unchanged) for invalid fractions or a non-surface id.
+    pub fn set_surface_split(&mut self, id: u64, reflectance: f64, transmittance: f64) -> bool {
+        let Some(r) = split_response(reflectance, transmittance) else {
+            return false;
+        };
+        self.set_surface_responses(id, r.clone(), r)
+    }
+
+    /// Give both faces of a surface object the dichroic coating `spec`. False
+    /// (scene unchanged) for a non-finite spec or a non-surface id.
+    pub fn set_surface_dichroic(&mut self, id: u64, spec: DichroicSpec) -> bool {
+        let Some(spec) = spec.sanitized() else {
+            return false;
+        };
+        let r = spec.response();
+        self.set_surface_responses(id, r.clone(), r)
+    }
+
+    fn set_surface_responses(
+        &mut self,
+        id: u64,
+        front: SurfaceResponse,
+        back: SurfaceResponse,
+    ) -> bool {
+        match self.surfaces.iter_mut().find(|s| s.common.id.0 == id) {
+            Some(s) => {
+                s.response_front = front;
+                s.response_back = back;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// A surface object's `(front, back)` responses, if `id` is one.
+    pub fn surface_responses(&self, id: u64) -> Option<(&SurfaceResponse, &SurfaceResponse)> {
+        let s = self.surfaces.iter().find(|s| s.common.id.0 == id)?;
+        Some((&s.response_front, &s.response_back))
     }
 
     /// Add a round optical element (a flat plate) at `pos`, tilted `tilt_deg` in
@@ -610,11 +924,181 @@ impl Scene3 {
         true
     }
 
-    /// Replace a singlet body's geometry. Rejects the edit (returns false, scene
-    /// unchanged) if the id is not a 4-edge revolved profile or the new geometry
-    /// is not revolvable — a bad card edit never corrupts the scene.
+    /// Replace a singlet body's geometry, keeping its aspheric terms. Rejects
+    /// the edit (returns false, scene unchanged) if the id is not a singlet or
+    /// the new geometry is not revolvable — a bad card edit never corrupts the
+    /// scene.
     pub fn set_singlet_geom(&mut self, id: u64, g: SingletGeom) -> bool {
-        let curves = singlet_curves(g);
+        match self.singlet_shape(id) {
+            Some((_, a)) => self.set_singlet_shape(id, g, a),
+            None => false,
+        }
+    }
+
+    /// Replace a singlet body's aspheric terms, keeping its geometry. Same
+    /// refusal rules as [`Scene3::set_singlet_shape`].
+    pub fn set_singlet_aspheres(&mut self, id: u64, a: SingletAspheres) -> bool {
+        match self.singlet_shape(id) {
+            Some((g, _)) => self.set_singlet_shape(id, g, a),
+            None => false,
+        }
+    }
+
+    /// Reshape one face of a singlet so it passes through the given points,
+    /// each `(height_mm, sag_mm)` with the sag measured from that face's vertex
+    /// along +X. The face keeps its curvature and conic constant. Its eight
+    /// aspheric terms (A4 to A18) become the set that passes through every
+    /// point and bends least doing so: the departure `d(u)` from the conic,
+    /// with `u` the height over the semi-aperture, minimises `∫₀¹ d''(u)² du`.
+    /// Interpolating with only as many terms as points would also pass
+    /// through them, but it swings between them by several times the edit.
+    ///
+    /// False (scene unchanged) for no points or more than eight, a height
+    /// outside `(0, semi-aperture]`, two points at one height, a base conic
+    /// that is undefined out to a point's height, a solve that misses a point
+    /// by more than 1e-9 of its sag, or a shape the singlet setters refuse.
+    pub fn fit_singlet_face(&mut self, id: u64, back: bool, points: &[(f64, f64)]) -> bool {
+        let Some((g, mut a)) = self.singlet_shape(id) else {
+            return false;
+        };
+        let n = points.len();
+        let ha = g.semi_aperture_mm;
+        if n == 0 || n > 8 || ha.is_nan() || ha <= 0.0 {
+            return false;
+        }
+        let (r, k) = if back {
+            (g.r2_mm, g.conic2)
+        } else {
+            (g.r1_mm, g.conic1)
+        };
+        let c = curvature(r);
+        // Heights scaled by the semi-aperture keep the system well
+        // conditioned; each coefficient is scaled back at the end.
+        let mut us = Vec::with_capacity(n);
+        let mut rhs = Vec::with_capacity(n);
+        for &(h, sag) in points {
+            if !h.is_finite() || !sag.is_finite() || h <= 0.0 || h > ha * (1.0 + 1e-12) {
+                return false;
+            }
+            if (1.0 + k) * c * c * h * h >= 1.0 {
+                return false;
+            }
+            let u = h / ha;
+            if us.iter().any(|v: &f64| (v - u).abs() < 1e-9) {
+                return false;
+            }
+            us.push(u);
+            rhs.push(sag - even_asphere_sag(c, k, &[0.0; 8], h));
+        }
+        // Term j is u^p with p = 2j + 4.
+        const TERMS: usize = 8;
+        let power = |j: usize| 2 * j as i32 + 4;
+        let row = |u: f64| (0..TERMS).map(|j| u.powi(power(j))).collect::<Vec<f64>>();
+        // Minimise aᵀHa subject to A a = d, as one linear system:
+        //   [H Aᵀ] [a]   [0]
+        //   [A 0 ] [λ] = [d]
+        // with H[i][j] = ∫₀¹ (u^pi)''(u^pj)'' du = pi(pi-1)pj(pj-1)/(pi+pj-3).
+        let size = TERMS + n;
+        let mut kkt = vec![vec![0.0; size]; size];
+        for (i, row) in kkt.iter_mut().enumerate().take(TERMS) {
+            for (j, cell) in row.iter_mut().enumerate().take(TERMS) {
+                let (pi, pj) = (power(i) as f64, power(j) as f64);
+                *cell = pi * (pi - 1.0) * pj * (pj - 1.0) / (pi + pj - 3.0);
+            }
+        }
+        for (m, &u) in us.iter().enumerate() {
+            for (j, v) in row(u).into_iter().enumerate() {
+                kkt[TERMS + m][j] = v;
+                kkt[j][TERMS + m] = v;
+            }
+        }
+        let mut b = vec![0.0; TERMS];
+        b.extend_from_slice(&rhs);
+        let Some(x) = solve_dense(kkt, b) else {
+            return false;
+        };
+        let scaled = &x[..TERMS];
+        for (&u, d) in us.iter().zip(&rhs) {
+            let got: f64 = row(u).iter().zip(scaled).map(|(p, a)| p * a).sum();
+            if (got - d).abs() > 1e-9 * (1.0 + d.abs()) {
+                return false;
+            }
+        }
+        let mut coeffs = [0.0; 8];
+        for (j, v) in scaled.iter().enumerate() {
+            coeffs[j] = v / ha.powi(power(j));
+        }
+        if back {
+            a.back = coeffs;
+        } else {
+            a.front = coeffs;
+        }
+        self.set_singlet_shape(id, g, a)
+    }
+
+    /// Bend one face of a singlet so its rim sits `rim_sag_mm` from its vertex
+    /// (along +X): the curvature is solved for, and the conic constant and the
+    /// aspheric terms stay. A rim sag equal to the aspheric part alone makes
+    /// the base a plane.
+    ///
+    /// False (scene unchanged) for a non-finite sag, a sag no curvature
+    /// reaches on the conic's principal branch (past a hemisphere, for a
+    /// sphere), or a shape the singlet setters refuse.
+    pub fn bend_singlet_face(&mut self, id: u64, back: bool, rim_sag_mm: f64) -> bool {
+        let Some((mut g, a)) = self.singlet_shape(id) else {
+            return false;
+        };
+        let ha = g.semi_aperture_mm;
+        if !rim_sag_mm.is_finite() || ha.is_nan() || ha <= 0.0 {
+            return false;
+        }
+        let (k, coeffs) = if back {
+            (g.conic2, &a.back)
+        } else {
+            (g.conic1, &a.front)
+        };
+        // The conic's share of the rim sag: the target less the aspheric terms.
+        let s = rim_sag_mm - even_asphere_sag(0.0, k, coeffs, ha);
+        let r = if s.abs() < 1e-12 {
+            f64::INFINITY
+        } else {
+            // s = c h² / (1 + √(1 − (1+k) c² h²)) inverts to
+            // c = 2 s / (h² + (1+k) s²) while (1+k) s² <= h².
+            if (1.0 + k) * s * s > ha * ha {
+                return false;
+            }
+            (ha * ha + (1.0 + k) * s * s) / (2.0 * s)
+        };
+        if back {
+            g.r2_mm = r;
+        } else {
+            g.r1_mm = r;
+        }
+        self.set_singlet_shape(id, g, a)
+    }
+
+    /// Replace a singlet body's geometry and aspheric terms together. Rejects
+    /// the edit (returns false, scene unchanged) if the id is not a 4-edge
+    /// revolved profile, the centre thickness or semi-aperture is not a
+    /// positive number, a radius is NaN (an infinite radius is a plane), any
+    /// other value is not finite, or the new shape is not revolvable (its
+    /// faces cross).
+    ///
+    /// A thickness of zero or less is refused on its own: with the faces
+    /// swapped the outline still closes without crossing, so the profile
+    /// check alone would accept a lens turned inside out.
+    pub fn set_singlet_shape(&mut self, id: u64, g: SingletGeom, a: SingletAspheres) -> bool {
+        let positive = |v: f64| v.is_finite() && v > 0.0;
+        if !positive(g.thickness_mm) || !positive(g.semi_aperture_mm) {
+            return false;
+        }
+        if g.r1_mm.is_nan() || g.r2_mm.is_nan() || !g.conic1.is_finite() || !g.conic2.is_finite() {
+            return false;
+        }
+        if a.front.iter().chain(&a.back).any(|v| !v.is_finite()) {
+            return false;
+        }
+        let curves = singlet_curves(g, a);
         let Some(body) = self.bodies.iter_mut().find(|b| b.common.id.0 == id) else {
             return false;
         };
@@ -640,7 +1124,7 @@ impl Scene3 {
                 })
                 .collect(),
         };
-        if validate_revolvable(&rebuilt).is_err() {
+        if !rebuilt.is_finite() || validate_revolvable(&rebuilt).is_err() {
             return false;
         }
         solid.profile = rebuilt;
@@ -649,13 +1133,45 @@ impl Scene3 {
 
     /// Read a singlet body's geometry, if `id` is one.
     pub fn singlet_geom(&self, id: u64) -> Option<SingletGeom> {
+        self.singlet_shape(id).map(|(g, _)| g)
+    }
+
+    /// Read a singlet body's geometry and aspheric terms, if `id` is one.
+    pub fn singlet_shape(&self, id: u64) -> Option<(SingletGeom, SingletAspheres)> {
         let body = self.bodies.iter().find(|b| b.common.id.0 == id)?;
         match &body.geometry {
             SolidGeometry3::Profile(p) if p.construction == ProfileConstruction3::RevolveLocalX => {
-                geom_from_profile(&p.profile)
+                shape_from_profile(&p.profile)
             }
             _ => None,
         }
+    }
+
+    /// A singlet's paraxial focal lengths at the d line, if `id` is a singlet
+    /// with a d-line index. `None` for an afocal lens as well.
+    pub fn singlet_paraxial(&self, id: u64) -> Option<SingletParaxial> {
+        let (g, _) = self.singlet_shape(id)?;
+        let body = self.bodies.iter().find(|b| b.common.id.0 == id)?;
+        let nd = match body.material.abbe(&self.catalog) {
+            Some((nd, _)) => nd,
+            None => body
+                .material
+                .index_at(crate::material::LAMBDA_D, &self.catalog)?,
+        };
+        let n0 = self.env.ambient_index;
+        let t = g.thickness_mm;
+        let p1 = (nd - n0) * curvature(g.r1_mm);
+        let p2 = (n0 - nd) * curvature(g.r2_mm);
+        let power = p1 + p2 - p1 * p2 * t / nd;
+        if !power.is_finite() || power.abs() < 1e-12 {
+            return None;
+        }
+        let efl_mm = n0 / power;
+        Some(SingletParaxial {
+            nd,
+            efl_mm,
+            bfl_mm: efl_mm * (1.0 - p1 * t / nd),
+        })
     }
 
     /// A body's bulk glass as an Abbe point `(nd, vd)`, if it has one (an
@@ -771,6 +1287,8 @@ fn response_from_kind(kind: &str) -> Option<SurfaceResponse> {
             reflectance: SpectralScalar::Constant(0.0),
             transmittance: SpectralScalar::Constant(1.0),
         },
+        "split" => split_response(0.5, 0.5)?,
+        "dichroic" => DichroicSpec::default().response(),
         "refract" => SurfaceResponse::DielectricFresnel {
             ar_residual: SpectralScalar::Constant(1.0),
         },
@@ -778,12 +1296,31 @@ fn response_from_kind(kind: &str) -> Option<SurfaceResponse> {
     })
 }
 
-/// The short kind string for a surface response.
-fn response_kind(r: &SurfaceResponse) -> &'static str {
+/// The short kind string for a surface response: `mirror`, `absorb`, `clear`
+/// (full transmission), `split` (constant reflectance and transmittance),
+/// `dichroic` (a [`DichroicSpec`] coating), `coated` (any other tabulated
+/// reflectance/transmittance), `refract`, or `thin-lens`.
+pub fn response_kind(r: &SurfaceResponse) -> &'static str {
     match r {
         SurfaceResponse::Mirror { .. } => "mirror",
         SurfaceResponse::Absorber => "absorb",
-        SurfaceResponse::ExplicitRt { .. } => "clear",
+        SurfaceResponse::ExplicitRt {
+            reflectance: SpectralScalar::Constant(rr),
+            transmittance: SpectralScalar::Constant(tt),
+        } => {
+            if *rr == 0.0 && *tt == 1.0 {
+                "clear"
+            } else {
+                "split"
+            }
+        }
+        SurfaceResponse::ExplicitRt { .. } => {
+            if DichroicSpec::from_response(r).is_some() {
+                "dichroic"
+            } else {
+                "coated"
+            }
+        }
         SurfaceResponse::DielectricFresnel { .. } => "refract",
         SurfaceResponse::ThinLens { .. } => "thin-lens",
     }
@@ -860,6 +1397,47 @@ mod tests {
         assert_eq!(patches, after, "patch ids are stable across an edit");
         assert!((s.singlet_geom(id).unwrap().r1_mm - 30.0).abs() < 1e-9);
         s.validate().expect("edited scene validates");
+    }
+
+    #[test]
+    fn a_lens_turned_inside_out_is_refused() {
+        let mut s = Scene3::default_scene();
+        let id = s.bodies[0].common.id.0;
+        let json = s.to_json();
+        let g = s.singlet_geom(id).unwrap();
+        for bad in [
+            SingletGeom {
+                thickness_mm: -4.0,
+                ..g
+            },
+            SingletGeom {
+                thickness_mm: 0.0,
+                ..g
+            },
+            SingletGeom {
+                semi_aperture_mm: 0.0,
+                ..g
+            },
+            SingletGeom {
+                r1_mm: f64::NAN,
+                ..g
+            },
+            SingletGeom {
+                conic2: f64::INFINITY,
+                ..g
+            },
+        ] {
+            assert!(!s.set_singlet_geom(id, bad), "{bad:?}");
+        }
+        assert_eq!(s.to_json(), json);
+        // A flat face is an infinite radius, and stays allowed.
+        assert!(s.set_singlet_geom(
+            id,
+            SingletGeom {
+                r2_mm: f64::INFINITY,
+                ..g
+            }
+        ));
     }
 
     #[test]
@@ -984,5 +1562,363 @@ mod tests {
         assert!(s.set_object_rotation_z_deg(id, 10.0));
         s.validate().expect("moved/rotated scene validates");
         assert!(!s.set_object_position(999, Vec3::ZERO));
+    }
+
+    fn front_curve(s: &Scene3, id: u64) -> Curve2 {
+        match &s
+            .bodies
+            .iter()
+            .find(|b| b.common.id.0 == id)
+            .unwrap()
+            .geometry
+        {
+            SolidGeometry3::Profile(p) => p.profile.edges[0].curve.clone(),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn aspheric_terms_round_trip_and_survive_geometry_edits() {
+        let mut s = Scene3::default_scene();
+        let id = s.bodies[0].common.id.0;
+        // A conic singlet stays a conic: no asphere variant appears unasked.
+        assert!(matches!(front_curve(&s, id), Curve2::Conic(_)));
+        assert_eq!(s.singlet_shape(id).unwrap().1, SingletAspheres::default());
+
+        let mut a = SingletAspheres::default();
+        a.front[0] = 2e-5;
+        a.front[1] = -3e-8;
+        assert!(s.set_singlet_aspheres(id, a));
+        s.validate().expect("aspheric singlet validates");
+        assert!(matches!(front_curve(&s, id), Curve2::EvenAsphere { .. }));
+        assert_eq!(s.singlet_shape(id).unwrap().1, a);
+
+        // A geometry edit keeps the aspheric terms and the patch ids.
+        let patches = |s: &Scene3| match &s.bodies[0].geometry {
+            SolidGeometry3::Profile(p) => p
+                .profile
+                .edges
+                .iter()
+                .map(|e| e.patch.0)
+                .collect::<Vec<_>>(),
+            _ => unreachable!(),
+        };
+        let before = patches(&s);
+        let mut g = s.singlet_geom(id).unwrap();
+        g.r1_mm = 40.0;
+        assert!(s.set_singlet_geom(id, g));
+        assert_eq!(s.singlet_shape(id).unwrap().1, a);
+        assert_eq!(patches(&s), before);
+
+        // Clearing the terms turns the face back into a plain conic.
+        assert!(s.set_singlet_aspheres(id, SingletAspheres::default()));
+        assert!(matches!(front_curve(&s, id), Curve2::Conic(_)));
+        s.validate().expect("still valid");
+    }
+
+    #[test]
+    fn a_fitted_face_passes_through_its_points() {
+        let mut s = Scene3::default_scene();
+        let id = s.bodies[0].common.id.0;
+        let (g, _) = s.singlet_shape(id).unwrap();
+        let c = 1.0 / g.r1_mm;
+        let base = |h: f64| even_asphere_sag(c, g.conic1, &[0.0; 8], h);
+        let pts: Vec<(f64, f64)> = [3.0, 6.0, 9.0, 12.0]
+            .iter()
+            .zip([0.01, -0.02, 0.05, 0.12])
+            .map(|(&h, d)| (h, base(h) + d))
+            .collect();
+        assert!(s.fit_singlet_face(id, false, &pts));
+        s.validate().expect("fitted singlet validates");
+        let (g2, a) = s.singlet_shape(id).unwrap();
+        assert_eq!(g2, g, "the base surface is kept");
+        for &(h, sag) in &pts {
+            let got = even_asphere_sag(c, g.conic1, &a.front, h);
+            assert!((got - sag).abs() < 1e-9, "at {h}: {got} vs {sag}");
+        }
+        assert_eq!(a.back, [0.0; 8], "the other face is untouched");
+        // Between and beyond the points the departure stays within the
+        // points' own range: no swing of several times the edit.
+        let departure = |h: f64| even_asphere_sag(c, g.conic1, &a.front, h) - base(h);
+        for i in 0..=120 {
+            let d = departure(12.0 * i as f64 / 120.0);
+            assert!(
+                (-0.03..=0.125).contains(&d),
+                "departure {d} at {}",
+                12.0 * i as f64 / 120.0
+            );
+        }
+
+        // The back face is measured from its own vertex, and fits the same way.
+        assert!(s.fit_singlet_face(id, true, &[(12.0, -1.0)]));
+        let (g3, a3) = s.singlet_shape(id).unwrap();
+        let rim = even_asphere_sag(1.0 / g3.r2_mm, g3.conic2, &a3.back, 12.0);
+        assert!((rim + 1.0).abs() < 1e-9);
+
+        // Refusals leave the scene as it was.
+        let json = s.to_json();
+        assert!(
+            !s.fit_singlet_face(id, false, &[(6.0, 0.4), (6.0, 0.5)]),
+            "one height twice"
+        );
+        assert!(
+            !s.fit_singlet_face(id, false, &[(12.5, 0.4)]),
+            "beyond the semi-aperture"
+        );
+        assert!(!s.fit_singlet_face(id, false, &[(0.0, 0.0)]), "on the axis");
+        assert!(!s.fit_singlet_face(id, false, &[]), "no points");
+        assert!(!s.fit_singlet_face(id, false, &[(f64::NAN, 0.0)]));
+        assert_eq!(s.to_json(), json);
+    }
+
+    #[test]
+    fn bending_a_face_puts_its_rim_where_asked() {
+        let mut s = Scene3::default_scene();
+        let id = s.bodies[0].common.id.0;
+        let rim = |s: &Scene3, back: bool| {
+            let (g, a) = s.singlet_shape(id).unwrap();
+            singlet_face_sag(&g, &a, back, g.semi_aperture_mm)
+        };
+        // Flatter, then steeper, then a conic face with an aspheric term.
+        for (back, target) in [(true, -0.5), (false, 0.8), (false, 2.0)] {
+            assert!(s.bend_singlet_face(id, back, target));
+            assert!((rim(&s, back) - target).abs() < 1e-9, "{back} {target}");
+        }
+        let (mut g, mut a) = s.singlet_shape(id).unwrap();
+        g.conic1 = -0.6;
+        a.front[0] = 1e-5;
+        assert!(s.set_singlet_shape(id, g, a));
+        assert!(s.bend_singlet_face(id, false, 1.2));
+        assert!((rim(&s, false) - 1.2).abs() < 1e-9);
+        let (g2, a2) = s.singlet_shape(id).unwrap();
+        assert_eq!(
+            (g2.conic1, a2.front),
+            (-0.6, a.front),
+            "conic and terms stay"
+        );
+
+        // The aspheric part alone: the base becomes a plane.
+        let poly = even_asphere_sag(0.0, -0.6, &a.front, 12.0);
+        assert!(s.bend_singlet_face(id, false, poly));
+        assert!(s.singlet_geom(id).unwrap().r1_mm.is_infinite());
+
+        // Past a hemisphere (12 mm rim on a sphere) and NaN are refused.
+        let json = s.to_json();
+        assert!(!s.bend_singlet_face(id, true, -13.0));
+        assert!(!s.bend_singlet_face(id, true, f64::NAN));
+        assert_eq!(s.to_json(), json);
+    }
+
+    #[test]
+    fn an_asphere_that_crosses_the_other_face_is_refused() {
+        let mut s = Scene3::default_scene();
+        let id = s.bodies[0].common.id.0;
+        let json = s.to_json();
+        // Front rim pushed 20 mm towards +X: far past the back face.
+        assert!(!s.fit_singlet_face(id, false, &[(12.0, 20.0)]));
+        let mut a = SingletAspheres::default();
+        a.back[0] = f64::INFINITY;
+        assert!(!s.set_singlet_aspheres(id, a), "a non-finite term");
+        assert_eq!(s.to_json(), json);
+    }
+
+    #[test]
+    fn paraxial_focal_lengths_match_a_ray_transfer_matrix() {
+        let mut s = Scene3::new();
+        let g = SingletGeom {
+            r1_mm: 40.0,
+            r2_mm: -90.0,
+            thickness_mm: 6.0,
+            semi_aperture_mm: 10.0,
+            conic1: 0.0,
+            conic2: 0.0,
+        };
+        let id = s.add_singlet(Vec3::ZERO, g, 1.6, 40.0).0;
+        let p = s.singlet_paraxial(id).expect("a focusing lens");
+        // Refraction, translation, refraction on (height, n·angle).
+        let n = 1.6;
+        let refr = |r: f64, n1: f64, n2: f64| [[1.0, 0.0], [-(n2 - n1) / r, 1.0]];
+        let tran = |t: f64, n: f64| [[1.0, t / n], [0.0, 1.0]];
+        let mul = |a: [[f64; 2]; 2], b: [[f64; 2]; 2]| {
+            [
+                [
+                    a[0][0] * b[0][0] + a[0][1] * b[1][0],
+                    a[0][0] * b[0][1] + a[0][1] * b[1][1],
+                ],
+                [
+                    a[1][0] * b[0][0] + a[1][1] * b[1][0],
+                    a[1][0] * b[0][1] + a[1][1] * b[1][1],
+                ],
+            ]
+        };
+        let m = mul(refr(-90.0, n, 1.0), mul(tran(6.0, n), refr(40.0, 1.0, n)));
+        let efl = -1.0 / m[1][0];
+        let bfl = -m[0][0] / m[1][0];
+        assert!((p.efl_mm - efl).abs() < 1e-9, "{} vs {efl}", p.efl_mm);
+        assert!((p.bfl_mm - bfl).abs() < 1e-9, "{} vs {bfl}", p.bfl_mm);
+        assert_eq!(p.nd, 1.6);
+
+        // A flat plate has no power.
+        let flat = SingletGeom {
+            r1_mm: f64::INFINITY,
+            r2_mm: f64::INFINITY,
+            ..g
+        };
+        let plate = s.add_singlet(Vec3::new(30.0, 0.0, 0.0), flat, 1.5, 60.0).0;
+        assert!(s.singlet_paraxial(plate).is_none());
+        assert!(s.singlet_paraxial(999).is_none());
+    }
+
+    #[test]
+    fn beam_splitters_and_dichroics_are_valid_surfaces() {
+        let mut s = Scene3::default_scene();
+        let bs = s
+            .add_beam_splitter(Vec3::new(-35.0, 0.0, 0.0), 15.0, 135.0, 0.5, 0.5)
+            .expect("a valid split");
+        let dc = s
+            .add_dichroic(
+                Vec3::new(-50.0, 0.0, 0.0),
+                15.0,
+                135.0,
+                DichroicSpec::default(),
+            )
+            .expect("a valid coating");
+        s.validate().expect("the scene validates");
+        assert_eq!(s.surface_response(bs), Some(("split", "split")));
+        assert_eq!(s.surface_response(dc), Some(("dichroic", "dichroic")));
+        assert!((s.surface_tilt_z_deg(bs).unwrap() - 135.0).abs() < 1e-9);
+
+        let (front, _) = s.surface_responses(dc).unwrap();
+        assert_eq!(
+            DichroicSpec::from_response(front),
+            Some(DichroicSpec::default())
+        );
+
+        // Refused splits add or change nothing.
+        let json = s.to_json();
+        assert!(s
+            .add_beam_splitter(Vec3::ZERO, 5.0, 0.0, 0.7, 0.4)
+            .is_none());
+        assert!(s
+            .add_beam_splitter(Vec3::ZERO, 5.0, 0.0, -0.1, 0.4)
+            .is_none());
+        assert!(!s.set_surface_split(bs, f64::NAN, 0.5));
+        assert!(
+            !s.set_surface_split(s.bodies[0].common.id.0, 0.5, 0.5),
+            "not a surface"
+        );
+        let bad = DichroicSpec {
+            edge_nm: f64::NAN,
+            ..DichroicSpec::default()
+        };
+        assert!(!s.set_surface_dichroic(dc, bad));
+        assert_eq!(s.to_json(), json);
+
+        // Edits: a 30:70 split, a short-pass edge at 600 nm.
+        assert!(s.set_surface_split(bs, 0.3, 0.7));
+        assert_eq!(s.surface_response(bs), Some(("split", "split")));
+        let sp = DichroicSpec {
+            edge_nm: 600.0,
+            width_nm: 40.0,
+            long_pass: false,
+            r_max: 0.9,
+            t_max: 0.8,
+        };
+        assert!(s.set_surface_dichroic(dc, sp));
+        let (front, back) = s.surface_responses(dc).unwrap();
+        assert_eq!(DichroicSpec::from_response(front), Some(sp));
+        assert_eq!(DichroicSpec::from_response(back), Some(sp));
+        s.validate().expect("still valid");
+
+        // The card's kind strings reach the new responses too.
+        assert!(s.set_surface_response(bs, "dichroic", "split"));
+        assert_eq!(s.surface_response(bs), Some(("dichroic", "split")));
+    }
+
+    #[test]
+    fn a_dichroic_reflects_one_side_of_its_edge_and_passes_the_other() {
+        let sample = |r: &SurfaceResponse, nm: f64| match r {
+            SurfaceResponse::ExplicitRt {
+                reflectance,
+                transmittance,
+            } => (
+                reflectance.sample(nm / 1000.0).unwrap(),
+                transmittance.sample(nm / 1000.0).unwrap(),
+            ),
+            _ => unreachable!(),
+        };
+        let lp = DichroicSpec::default().response();
+        assert_eq!(sample(&lp, 420.0), (0.98, 0.0));
+        assert_eq!(sample(&lp, 700.0), (0.0, 0.95));
+        let (r, t) = sample(&lp, 550.0);
+        assert!(
+            (r - 0.49).abs() < 1e-12 && (t - 0.475).abs() < 1e-12,
+            "{r} {t}"
+        );
+        let sp = DichroicSpec {
+            long_pass: false,
+            ..DichroicSpec::default()
+        }
+        .response();
+        assert_eq!(sample(&sp, 420.0), (0.0, 0.95));
+        assert_eq!(sample(&sp, 700.0), (0.98, 0.0));
+        // Never more out than in, across the transition.
+        for i in 0..=200 {
+            let nm = 530.0 + 40.0 * i as f64 / 200.0;
+            for resp in [&lp, &sp] {
+                let (r, t) = sample(resp, nm);
+                assert!(r + t <= 1.0 + 1e-12, "{nm}: {r} + {t}");
+            }
+        }
+        // A table this spec did not make has no spec.
+        let SurfaceResponse::ExplicitRt {
+            reflectance,
+            transmittance:
+                SpectralScalar::Tabulated {
+                    lambda_um, values, ..
+                },
+        } = lp
+        else {
+            unreachable!()
+        };
+        let mut nudged = values.clone();
+        nudged[4] += 0.01;
+        let other = SurfaceResponse::ExplicitRt {
+            reflectance,
+            transmittance: SpectralScalar::Tabulated {
+                lambda_um,
+                values: nudged,
+                interpolation: Interpolation::Linear,
+                out_of_range: OutOfRangePolicy::Clamp,
+            },
+        };
+        assert_eq!(DichroicSpec::from_response(&other), None);
+        assert_eq!(response_kind(&other), "coated");
+    }
+
+    #[test]
+    fn a_dichroic_spec_is_brought_into_range() {
+        let s = DichroicSpec {
+            edge_nm: 3.0,
+            width_nm: 50.0,
+            long_pass: true,
+            r_max: 1.5,
+            t_max: -0.2,
+        }
+        .sanitized()
+        .unwrap();
+        assert_eq!(
+            (s.edge_nm, s.width_nm, s.r_max, s.t_max),
+            (3.0, 5.0, 1.0, 0.0)
+        );
+        let tiny = DichroicSpec {
+            width_nm: 0.0,
+            ..DichroicSpec::default()
+        };
+        assert_eq!(tiny.sanitized().unwrap().width_nm, 0.5);
+        // Every sanitized spec makes a table the scene accepts.
+        let mut scene = Scene3::default_scene();
+        scene.add_dichroic(Vec3::ZERO, 5.0, 0.0, s).unwrap();
+        scene.validate().expect("a sanitized coating validates");
     }
 }

@@ -10,18 +10,19 @@
 //! It traces the objects the compiler admits: the analytic bodies (sphere, box,
 //! cylinder), extruded line profiles (prisms), revolved profiles (conic and
 //! even-asphere surfaces of revolution, plus their frustum rims), zero-thickness
-//! surfaces (mirror, absorber, scalar dielectric, explicit R/T), finite aperture
-//! masks, and area detectors. The conic of revolution is an exact quadratic and
-//! the asphere a safeguarded Newton with an analytic derivative (§7.3–7.4). What
-//! the compiler still cannot trace exactly it rejects by name — an off-axis arc,
-//! a curved-edge extrusion, a tabulated response — rather than guessing.
+//! surfaces (mirror, absorber, scalar dielectric, explicit R/T, thin lens, with
+//! constant or tabulated response scalars), finite aperture masks, and area
+//! detectors. The conic of revolution is an exact quadratic and the asphere a
+//! safeguarded Newton with an analytic derivative (§7.3–7.4). What the compiler
+//! still cannot trace exactly it rejects by name — an off-axis arc, a
+//! curved-edge extrusion, tabulated volume absorption — rather than guessing.
 
 use glam::{DVec3, Vec2, Vec3};
 
 use crate::scene3::{
     even_asphere_dsag, even_asphere_sag, GpuAperture3, GpuBody3, GpuDetector3, GpuExtrude,
-    GpuResponse, GpuRevolve, GpuScene3, GpuSurface3, RevFace, OBJ_BOX, OBJ_CYLINDER, OBJ_EXTRUDE,
-    OBJ_REVOLVE, OBJ_SPHERE, SURF_ABSORBER,
+    GpuResponse, GpuRevolve, GpuScene3, GpuSurface3, RevFace, Spectral32, OBJ_BOX, OBJ_CYLINDER,
+    OBJ_EXTRUDE, OBJ_REVOLVE, OBJ_SPHERE, SURF_ABSORBER,
 };
 
 /// Segment flag bits (shared meaning with the 2D path).
@@ -180,7 +181,7 @@ fn trace_one(
                 scene, &mut stack, &w, body, point, normal, flux_end, lambda, max_depth, min_flux,
             ),
             EvKind::Surface { surf, normal } => interact_surface(
-                scene, &mut stack, &w, surf, point, normal, flux_end, max_depth, min_flux,
+                scene, &mut stack, &w, surf, point, normal, flux_end, lambda, max_depth, min_flux,
             ),
             EvKind::Aperture => { /* blocked: the branch ends here */ }
             EvKind::Detector { det, uv } => {
@@ -299,13 +300,14 @@ fn interact_surface(
     point: Vec3,
     normal: Vec3,
     flux_end: f32,
+    lambda: f32,
     max_depth: u32,
     min_flux: f32,
 ) {
     let s: &GpuSurface3 = &scene.surfaces[surf];
     // Front is the local +Z side; incident on the front when running against it.
     let from_front = w.d.dot(normal) < 0.0;
-    let resp = if from_front { s.front } else { s.back };
+    let resp = if from_front { &s.front } else { &s.back };
     let n_oppose = if from_front { normal } else { -normal };
 
     // A zero-thickness surface has the same medium on both sides (§6.6): no
@@ -355,12 +357,18 @@ fn interact_surface(
     match resp {
         GpuResponse::Absorber => { /* terminate */ }
         GpuResponse::Mirror { r } => {
+            // A table with no value at this wavelength ends the branch (tracer3
+            // names it as unsupported physics).
+            let Some(r) = r.sample(lambda) else {
+                return;
+            };
             reflect_branch(stack, flux_end * r.clamp(0.0, 1.0), false);
         }
         GpuResponse::Dielectric { ar } => {
             // Same medium both sides: Fresnel at n1 = n2 is ~0, so the transmitted
             // ray is the whole beam undeviated; the AR-scaled sliver reflects.
             let cos_i = (-n_oppose.dot(w.d)).clamp(0.0, 1.0);
+            let ar = ar_at(ar, lambda);
             let r = (reflectance(cos_i, w.medium_n, w.medium_n) * ar).clamp(0.0, 1.0);
             transmit(stack, flux_end * (1.0 - r));
             if scene.ghosts && w.gdepth < scene.max_ghost && r > 0.0 {
@@ -368,16 +376,27 @@ fn interact_surface(
             }
         }
         GpuResponse::ExplicitRt { r, t } => {
+            // A beam splitter or dichroic: both branches are primary paths, as in
+            // tracer3. Each keeps the parent's ghost state and ghost depth and
+            // is followed whether or not ghosts are on. Either scalar missing at
+            // this wavelength ends the branch.
+            let (Some(r), Some(t)) = (r.sample(lambda), t.sample(lambda)) else {
+                return;
+            };
             let (r, t) = (r.clamp(0.0, 1.0), t.clamp(0.0, 1.0));
-            transmit(stack, flux_end * t);
-            if scene.ghosts && w.gdepth < scene.max_ghost && r > 0.0 {
-                reflect_branch(stack, flux_end * r, true);
+            // Reflected first, like tracer3, so both pop in the same order.
+            if r > 0.0 {
+                reflect_branch(stack, flux_end * r, false);
+            }
+            if t > 0.0 {
+                transmit(stack, flux_end * t);
             }
         }
         GpuResponse::ThinLens { f } => {
             // Ideal-lens slope law u' = u − h/f in the surface's local frame
             // (direction-aware; mirrors tracer3's f64 branch). Full
             // transmission, no reflection, no absorption.
+            let f = *f;
             let rt = s.rot.transpose();
             let pl = rt * (point - s.pos);
             let dl = rt * w.d;
@@ -409,6 +428,12 @@ fn interact_surface(
             );
         }
     }
+}
+
+/// The AR residual at `lambda`, clamped to `[0, 1]`. A table with no value there
+/// leaves the Fresnel reflection unscaled (`1`), as tracer3 does.
+fn ar_at(ar: &Spectral32, lambda: f32) -> f32 {
+    ar.sample(lambda).unwrap_or(1.0).clamp(0.0, 1.0)
 }
 
 fn record_detector(out: &mut DetReadout3, d: &GpuDetector3, uv: Vec2, flux: f32) {
@@ -1173,5 +1198,26 @@ fn beer_lambert(alpha_per_mm: f32, len_mm: f64) -> f32 {
         1.0
     } else {
         (-alpha_per_mm as f64 * len_mm).exp() as f32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oc_core::scene3::OutOfRangePolicy;
+
+    #[test]
+    fn a_missing_ar_residual_leaves_fresnel_unscaled() {
+        // tracer3: `sample(ar_residual).unwrap_or(1.0).clamp(0.0, 1.0)`.
+        let table = |policy| Spectral32::Table {
+            lambda: vec![0.5, 0.6],
+            values: vec![0.2, 0.4],
+            policy,
+        };
+        assert_eq!(ar_at(&table(OutOfRangePolicy::Error), 0.7), 1.0);
+        assert_eq!(ar_at(&table(OutOfRangePolicy::Zero), 0.7), 0.0);
+        assert_eq!(ar_at(&table(OutOfRangePolicy::Clamp), 0.7), 0.4);
+        assert!((ar_at(&table(OutOfRangePolicy::Error), 0.55) - 0.3).abs() < 1e-6);
+        assert_eq!(ar_at(&Spectral32::Const(1.5), 0.55), 1.0);
     }
 }

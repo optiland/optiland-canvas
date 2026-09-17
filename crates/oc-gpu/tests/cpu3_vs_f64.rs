@@ -9,9 +9,10 @@
 //!
 //! Covers the objects the compiler admits: sphere, box, cylinder, extruded line
 //! profiles, and revolved profiles (a spherical singlet and an even-asphere);
-//! mirror surfaces; and aperture-plus-detector clipping. What is still out of
-//! reach — a curved-edge extrusion — must show up in `rejected` rather than as a
-//! chord, which the rejection test pins.
+//! mirror surfaces; beam splitters and dichroics (explicit R/T, constant and
+//! tabulated, with every out-of-range policy); and aperture-plus-detector
+//! clipping. What is still out of reach — a curved-edge extrusion — must show up
+//! in `rejected` rather than as a chord, which the rejection test pins.
 #![cfg(feature = "gpu3")]
 
 use oc_core::id::{LayerId, ObjectId, SourceId};
@@ -21,8 +22,9 @@ use oc_core::profile2::{
 };
 use oc_core::scene3::{
     Aperture3, ApertureInteraction, ApertureShape3, Body3, Detector3, DetectorGeometry3,
-    DetectorResponse, DetectorTermination, ObjectCommon, PlanarShape2, Scene3, SolidGeometry3,
-    SpectralScalar, SurfaceGeometry3, SurfaceObject3, SurfaceProps3, SurfaceResponse,
+    DetectorResponse, DetectorTermination, Interpolation, ObjectCommon, OutOfRangePolicy,
+    PlanarShape2, Scene3, SolidGeometry3, SpectralScalar, SurfaceGeometry3, SurfaceObject3,
+    SurfaceProps3, SurfaceResponse,
 };
 use oc_core::source3::EmittedRay3;
 use oc_core::vec::Vec2;
@@ -38,12 +40,23 @@ fn facing(pos: Vec3, normal: Vec3) -> Isometry3 {
 }
 
 fn add_mirror(scene: &mut Scene3, pos: Vec3, normal: Vec3, half: f64) -> ObjectId {
-    let id = scene.alloc_object_id();
-    let mut common = ObjectCommon::new(id, LayerId(0));
-    common.transform = facing(pos, normal);
     let resp = SurfaceResponse::Mirror {
         reflectivity: SpectralScalar::Constant(1.0),
     };
+    add_surface(scene, pos, normal, half, resp)
+}
+
+/// A square zero-thickness surface with the same response on both faces.
+fn add_surface(
+    scene: &mut Scene3,
+    pos: Vec3,
+    normal: Vec3,
+    half: f64,
+    resp: SurfaceResponse,
+) -> ObjectId {
+    let id = scene.alloc_object_id();
+    let mut common = ObjectCommon::new(id, LayerId(0));
+    common.transform = facing(pos, normal);
     scene.surfaces.push(SurfaceObject3 {
         common,
         geometry: SurfaceGeometry3::Plane {
@@ -56,6 +69,16 @@ fn add_mirror(scene: &mut Scene3, pos: Vec3, normal: Vec3, half: f64) -> ObjectI
         response_back: resp,
     });
     id
+}
+
+/// A linear wavelength table.
+fn table(lambda_um: &[f64], values: &[f64], out_of_range: OutOfRangePolicy) -> SpectralScalar {
+    SpectralScalar::Tabulated {
+        lambda_um: lambda_um.to_vec(),
+        values: values.to_vec(),
+        interpolation: Interpolation::Linear,
+        out_of_range,
+    }
 }
 
 fn add_circular_aperture(
@@ -130,19 +153,28 @@ fn glass(nd: f64) -> Material {
 
 /// The same rays as both a v2 launch set (f32 path) and f64 launch rays.
 fn rays(origins_dirs: &[(Vec3, Vec3)]) -> (Vec<EmittedRay3>, Vec<LaunchRay3>) {
+    let at_d: Vec<_> = origins_dirs
+        .iter()
+        .map(|&(o, d)| (o, d, LAMBDA_D))
+        .collect();
+    rays_at(&at_d)
+}
+
+/// [`rays`] with a wavelength per ray: `(origin, dir, lambda_um)`.
+fn rays_at(rays: &[(Vec3, Vec3, f64)]) -> (Vec<EmittedRay3>, Vec<LaunchRay3>) {
     let mut emitted = Vec::new();
     let mut launch = Vec::new();
-    for (o, d) in origins_dirs {
-        let ray = Ray3::new(*o, *d).unwrap();
+    for &(o, d, lambda_um) in rays {
+        let ray = Ray3::new(o, d).unwrap();
         emitted.push(EmittedRay3 {
             ray,
-            lambda_um: LAMBDA_D,
+            lambda_um,
             flux: 1.0,
             source: SourceId(0),
         });
         launch.push(LaunchRay3 {
             ray,
-            lambda_um: LAMBDA_D,
+            lambda_um,
             flux: 1.0,
             source: None,
         });
@@ -744,4 +776,379 @@ fn a_thin_lens_matches_f64_for_skew_rays() {
         (Vec3::new(30.0, 6.0, -2.0), Vec3::NEG_X),
     ];
     assert_landing_matches(&scene, &rays);
+}
+
+// ---------------------------------------------------------------------------
+// Beam splitters and dichroics: explicit R/T, constant and tabulated
+// ---------------------------------------------------------------------------
+
+/// Build options matching [`cfg`], with the ghost switch set.
+fn opts(ghosts: bool) -> BuildOpts {
+    BuildOpts {
+        ghosts,
+        flux_eps: 1e-9,
+        max_ghost: if ghosts { 8 } else { 0 },
+    }
+}
+
+/// Relative agreement to 1e-5 (so absolute 1e-7 for fluxes below 1e-2).
+fn flux_close(a: f64, b: f32) -> bool {
+    let b = b as f64;
+    (a - b).abs() <= 1e-5 * a.abs().max(b.abs()).max(1e-2)
+}
+
+/// Trace one ray through both engines and compare the whole branch tree.
+///
+/// Both engines keep a LIFO branch stack and push a split's children in the
+/// same order, so one ray's segment lists line up one to one: same count, same
+/// ghost and TIR flags, endpoints within the landing tolerance (an escape by
+/// direction only), flux within [`flux_close`]. Returns the f32 segments.
+fn assert_tree_matches(scene: &Scene3, ray: (Vec3, Vec3, f64), ghosts: bool) -> Vec<SegOut3> {
+    let (emitted, launch) = rays_at(&[ray]);
+    let f64_res = trace3(scene, &launch, &TraceConfig3 { ghosts, ..cfg() });
+    let gpu = GpuScene3::build_with_rays(scene, &emitted, opts(ghosts));
+    assert!(
+        gpu.rejected.is_empty(),
+        "unexpected rejects: {:?}",
+        gpu.rejected
+    );
+    let tol = pos_tol(gpu.norm.scale);
+    let f32_segs = cpu3::trace_segments(&gpu, 32).swap_remove(0);
+    let f64_segs = &f64_res.segments;
+
+    assert_eq!(
+        f64_segs.len(),
+        f32_segs.len(),
+        "segment count for {ray:?}, ghosts {ghosts}:\nf64 {f64_segs:?}\nf32 {f32_segs:?}"
+    );
+    const ESCAPE: f64 = 1e3;
+    for (i, (a, b)) in f64_segs.iter().zip(&f32_segs).enumerate() {
+        let at = format!("seg {i} of {ray:?}, ghosts {ghosts}");
+        assert_eq!(a.flags.ghost, b.is_ghost(), "{at}: ghost flag");
+        assert_eq!(a.flags.tir, b.is_tir(), "{at}: TIR flag");
+        let d0 = (a.a - b.a).length();
+        assert!(d0 <= tol, "{at}: |Δstart| = {d0} mm > {tol}");
+        let escapes = (a.b - a.a).length() > ESCAPE;
+        assert_eq!(escapes, (b.b - b.a).length() > ESCAPE, "{at}: escape");
+        if escapes {
+            let ang = ((a.b - a.a).normalize() - (b.b - b.a).normalize()).length();
+            assert!(ang < 1e-3, "{at}: escape direction |Δ| = {ang}");
+        } else {
+            let d1 = (a.b - b.b).length();
+            assert!(d1 <= tol, "{at}: |Δend| = {d1} mm > {tol}");
+        }
+        assert!(
+            flux_close(a.flux_end, b.flux),
+            "{at}: flux f64 {} vs f32 {}",
+            a.flux_end,
+            b.flux
+        );
+    }
+    f32_segs
+}
+
+/// Every listed detector's readout, f64 against f32, for one launch set: equal
+/// hit counts, total and per-cell flux within [`flux_close`].
+fn assert_detectors_match(
+    scene: &Scene3,
+    dets: &[ObjectId],
+    rays: &[(Vec3, Vec3, f64)],
+    ghosts: bool,
+) {
+    let (emitted, launch) = rays_at(rays);
+    let f64_res = trace3(scene, &launch, &TraceConfig3 { ghosts, ..cfg() });
+    let gpu = GpuScene3::build_with_rays(scene, &emitted, opts(ghosts));
+    assert!(
+        gpu.rejected.is_empty(),
+        "unexpected rejects: {:?}",
+        gpu.rejected
+    );
+    let f32_res = cpu3::trace(&gpu, 32);
+    for det in dets {
+        let a = f64_res
+            .detectors
+            .iter()
+            .find(|d| d.detector.0 == det.0)
+            .expect("f64 detector");
+        let b = f32_res.detector(det.0).expect("f32 detector");
+        assert_eq!(a.hits, b.hits, "detector {}: hit count", det.0);
+        assert!(
+            flux_close(a.total_incident, b.total),
+            "detector {}: total f64 {} vs f32 {}",
+            det.0,
+            a.total_incident,
+            b.total
+        );
+        assert_eq!(a.incident_flux.len(), b.incident.len(), "cell count");
+        for (i, (x, y)) in a.incident_flux.iter().zip(&b.incident).enumerate() {
+            assert!(
+                flux_close(*x, *y),
+                "detector {} cell {i}: f64 {x} vs f32 {y}",
+                det.0
+            );
+        }
+    }
+}
+
+/// A 45° fold at the origin (a +X beam reflects toward +Y) with a terminating
+/// detector on each arm. Returns `(through, folded)`.
+fn fold_with_two_arms(scene: &mut Scene3, resp: SurfaceResponse) -> (ObjectId, ObjectId) {
+    let normal = Vec3::new(-1.0, 1.0, 0.0).normalize();
+    add_surface(scene, Vec3::ZERO, normal, 10.0, resp);
+    // Three bins a side keep every test ray's hit clear of a cell edge.
+    let through = add_rect_detector(scene, Vec3::new(20.0, 0.0, 0.0), -Vec3::X, 8.0, 8.0, [3, 3]);
+    let folded = add_rect_detector(scene, Vec3::new(0.0, 20.0, 0.0), -Vec3::Y, 8.0, 8.0, [3, 3]);
+    (through, folded)
+}
+
+/// Parallel +X rays meeting the fold at a spread of heights, at one wavelength.
+fn fold_rays(lambda_um: f64) -> Vec<(Vec3, Vec3, f64)> {
+    [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (-1.5, 1.0)]
+        .iter()
+        .map(|&(y, z)| (Vec3::new(-15.0, y, z), Vec3::X, lambda_um))
+        .collect()
+}
+
+fn splitter_50_50() -> SurfaceResponse {
+    SurfaceResponse::ExplicitRt {
+        reflectance: SpectralScalar::Constant(0.5),
+        transmittance: SpectralScalar::Constant(0.5),
+    }
+}
+
+#[test]
+fn a_beam_splitter_keeps_its_reflected_arm_with_ghosts_off() {
+    // A splitter's reflection is a primary path in tracer3, not a Fresnel ghost:
+    // with ghosts off it must still be traced, and with ghosts on it must not be
+    // flagged as one.
+    let mut scene = Scene3::new();
+    let (through, folded) = fold_with_two_arms(&mut scene, splitter_50_50());
+    scene.validate().unwrap();
+
+    let rays = fold_rays(LAMBDA_D);
+    for ghosts in [false, true] {
+        for &ray in &rays {
+            // In, then through, then folded: the reflection is pushed first.
+            let segs = assert_tree_matches(&scene, ray, ghosts);
+            assert_eq!(segs.len(), 3, "{ray:?}");
+            assert!(segs.iter().all(|s| !s.is_ghost()), "{ray:?}");
+            assert!(
+                segs[1].b.x > 19.0 && segs[2].b.y > 19.0,
+                "{ray:?}: {segs:?}"
+            );
+        }
+        assert_detectors_match(&scene, &[through, folded], &rays, ghosts);
+    }
+
+    // Each arm receives half of every ray.
+    let (emitted, _) = rays_at(&rays);
+    let gpu = GpuScene3::build_with_rays(&scene, &emitted, opts(false));
+    let res = cpu3::trace(&gpu, 32);
+    for det in [through, folded] {
+        let d = res.detector(det.0).unwrap();
+        assert_eq!(d.hits, rays.len() as u64);
+        assert!((d.total - 0.5 * rays.len() as f32).abs() < 1e-6);
+    }
+}
+
+#[test]
+fn a_ghost_that_meets_a_splitter_stays_a_ghost_on_both_arms() {
+    // A glass plate ahead of the splitter, ghosts on. The plate's double-bounce
+    // ghosts travel forward into the splitter, whose children keep the parent's
+    // ghost state and ghost depth (tracer3 spawns them with `w.ghost`).
+    let mut scene = Scene3::new();
+    push_body(
+        &mut scene,
+        SolidGeometry3::Box {
+            half_extents_mm: Vec3::new(1.0, 8.0, 8.0),
+        },
+        glass(1.5),
+    );
+    scene.bodies[0].common.transform = Isometry3::from_pos(Vec3::new(-8.0, 0.0, 0.0));
+    let (through, folded) = fold_with_two_arms(&mut scene, splitter_50_50());
+    scene.validate().unwrap();
+
+    let ray = (Vec3::new(-20.0, 0.5, 0.25), Vec3::X, LAMBDA_D);
+    let segs = assert_tree_matches(&scene, ray, true);
+    let ghost_on = |through_arm: bool| {
+        segs.iter().any(|s| {
+            s.is_ghost()
+                && if through_arm {
+                    s.b.x > 19.0
+                } else {
+                    s.b.y > 19.0
+                }
+        })
+    };
+    assert!(ghost_on(true), "no ghost on the through arm: {segs:?}");
+    assert!(ghost_on(false), "no ghost on the folded arm: {segs:?}");
+    assert_detectors_match(&scene, &[through, folded], &[ray], true);
+}
+
+#[test]
+fn a_dichroic_splits_by_wavelength_like_f64() {
+    // A long-pass dichroic: reflects below 0.53 µm, transmits above 0.57 µm,
+    // a linear edge between, the end values held outside the table. R + T = 1.
+    let edge = [0.40, 0.53, 0.57, 0.80];
+    let dichroic = SurfaceResponse::ExplicitRt {
+        reflectance: table(&edge, &[1.0, 1.0, 0.0, 0.0], OutOfRangePolicy::Clamp),
+        transmittance: table(&edge, &[0.0, 0.0, 1.0, 1.0], OutOfRangePolicy::Clamp),
+    };
+    let mut scene = Scene3::new();
+    let (through, folded) = fold_with_two_arms(&mut scene, dichroic);
+    scene.validate().unwrap();
+
+    // (wavelength, segments per ray): one arm off the edge, past either end of
+    // the table included; both arms on the edge.
+    let cases = [
+        (0.35, 2),
+        (0.45, 2),
+        (0.52, 2),
+        (0.545, 3),
+        (0.55, 3),
+        (0.56, 3),
+        (0.65, 2),
+        (0.95, 2),
+    ];
+    let mut all = Vec::new();
+    for (lambda_um, n_segs) in cases {
+        let rays = fold_rays(lambda_um);
+        for &ray in &rays {
+            let segs = assert_tree_matches(&scene, ray, false);
+            assert_eq!(segs.len(), n_segs, "{ray:?}");
+            if n_segs == 2 {
+                let folded_arm = segs[1].b.y > 19.0;
+                assert_eq!(folded_arm, lambda_um < 0.53, "{ray:?}: {segs:?}");
+            }
+        }
+        assert_detectors_match(&scene, &[through, folded], &rays, false);
+        all.extend(rays);
+    }
+    assert_detectors_match(&scene, &[through, folded], &all, false);
+}
+
+#[test]
+fn out_of_range_splitter_policies_shape_the_branches_like_f64() {
+    // Reflectance tabulated over 0.45..0.65 µm only, transmittance constant.
+    // Outside the band tracer3 ends the branch under Error (no value), keeps
+    // only the transmitted arm under Zero, and holds the end value under Clamp.
+    let band = [0.45, 0.65];
+    for (policy, outside) in [
+        (OutOfRangePolicy::Error, 1),
+        (OutOfRangePolicy::Zero, 2),
+        (OutOfRangePolicy::Clamp, 3),
+    ] {
+        let resp = SurfaceResponse::ExplicitRt {
+            reflectance: table(&band, &[0.3, 0.35], policy),
+            transmittance: SpectralScalar::Constant(0.6),
+        };
+        let mut scene = Scene3::new();
+        let (through, folded) = fold_with_two_arms(&mut scene, resp);
+        scene.validate().unwrap();
+
+        let mut all = Vec::new();
+        for lambda_um in [0.4, 0.55, 0.8] {
+            let inside = (band[0]..=band[1]).contains(&lambda_um);
+            let rays = fold_rays(lambda_um);
+            for &ray in &rays {
+                let segs = assert_tree_matches(&scene, ray, false);
+                let want = if inside { 3 } else { outside };
+                assert_eq!(segs.len(), want, "{policy:?}, {ray:?}");
+            }
+            all.extend(rays);
+        }
+        assert_detectors_match(&scene, &[through, folded], &all, false);
+    }
+}
+
+#[test]
+fn out_of_range_mirror_and_window_tables_match_f64() {
+    let band = [0.45, 0.65];
+    // Mirror: no value (Error) ends the branch; Zero reflects nothing, and the
+    // flux threshold drops that child, as tracer3's spawn does.
+    for policy in [OutOfRangePolicy::Error, OutOfRangePolicy::Zero] {
+        let mirror = SurfaceResponse::Mirror {
+            reflectivity: table(&band, &[0.9, 0.95], policy),
+        };
+        let mut scene = Scene3::new();
+        let (_, folded) = fold_with_two_arms(&mut scene, mirror);
+        scene.validate().unwrap();
+
+        let mut all = Vec::new();
+        for lambda_um in [0.4, 0.55, 0.8] {
+            let inside = (band[0]..=band[1]).contains(&lambda_um);
+            let rays = fold_rays(lambda_um);
+            for &ray in &rays {
+                let segs = assert_tree_matches(&scene, ray, false);
+                assert_eq!(segs.len(), if inside { 2 } else { 1 }, "{policy:?}");
+            }
+            all.extend(rays);
+        }
+        assert_detectors_match(&scene, &[folded], &all, false);
+    }
+
+    // Window (scalar dielectric): with no AR value tracer3 scales the Fresnel
+    // reflection by 1 rather than dropping the branch. Both faces of a
+    // zero-thickness surface see one index, so the beam passes whole either
+    // way; the tree and the flux must still agree, ghosts on and off. (The
+    // fallback itself is unit-tested in cpu3.)
+    let window = SurfaceResponse::DielectricFresnel {
+        ar_residual: table(&band, &[0.01, 0.02], OutOfRangePolicy::Error),
+    };
+    let mut scene = Scene3::new();
+    add_surface(&mut scene, Vec3::ZERO, -Vec3::X, 10.0, window);
+    let det = add_rect_detector(
+        &mut scene,
+        Vec3::new(20.0, 0.0, 0.0),
+        -Vec3::X,
+        8.0,
+        8.0,
+        [3, 3],
+    );
+    scene.validate().unwrap();
+    for ghosts in [false, true] {
+        let mut all = Vec::new();
+        for lambda_um in [0.4, 0.55, 0.8] {
+            let rays = fold_rays(lambda_um);
+            for &ray in &rays {
+                let segs = assert_tree_matches(&scene, ray, ghosts);
+                assert_eq!(segs.len(), 2, "{ray:?}");
+                assert!((segs[1].flux - 1.0).abs() < 1e-6, "{ray:?}: {segs:?}");
+            }
+            all.extend(rays);
+        }
+        assert_detectors_match(&scene, &[det], &all, ghosts);
+    }
+}
+
+#[test]
+fn a_tabulated_mirror_matches_f64() {
+    // A metal-like reflectivity curve, weaker in the blue, held at its ends.
+    let reflectivity = table(
+        &[0.40, 0.50, 0.60, 0.75],
+        &[0.80, 0.93, 0.96, 0.975],
+        OutOfRangePolicy::Clamp,
+    );
+    let mut scene = Scene3::new();
+    let (_, folded) = fold_with_two_arms(&mut scene, SurfaceResponse::Mirror { reflectivity });
+    scene.validate().unwrap();
+
+    let mut all = Vec::new();
+    for lambda_um in [0.38, 0.45, 0.5, LAMBDA_D, 0.7, 0.9] {
+        let rays = fold_rays(lambda_um);
+        for &ray in &rays {
+            let segs = assert_tree_matches(&scene, ray, false);
+            assert_eq!(segs.len(), 2, "{ray:?}");
+        }
+        all.extend(rays);
+    }
+    assert_detectors_match(&scene, &[folded], &all, false);
+
+    // The curve itself: at 0.45 µm the mirror returns the interpolated 0.865.
+    let rays = fold_rays(0.45);
+    let (emitted, _) = rays_at(&rays);
+    let gpu = GpuScene3::build_with_rays(&scene, &emitted, opts(false));
+    let total = cpu3::trace(&gpu, 32).detector(folded.0).unwrap().total;
+    let want = 0.865 * rays.len() as f32;
+    assert!((total - want).abs() < 1e-5, "{total} vs {want}");
 }

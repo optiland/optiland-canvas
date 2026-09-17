@@ -16,17 +16,21 @@
 //! asphere its base conic (§12.3). Supported: the analytic bodies (sphere, box,
 //! cylinder), extruded line profiles (prisms), revolved profiles (conic and
 //! even-asphere surfaces of revolution with their frustum rims), zero-thickness
-//! surfaces (mirror, absorber, scalar dielectric, explicit R/T), finite aperture
-//! masks, and area detectors. Rejected, each with a named issue: an off-axis arc
-//! revolve, a curved-edge extrusion, and tabulated responses.
+//! surfaces (mirror, absorber, scalar dielectric, explicit R/T, thin lens),
+//! finite aperture masks, and area detectors. A zero-thickness surface's
+//! response scalars may be constant or tabulated in wavelength ([`Spectral32`],
+//! sampled exactly as the f64 kernel samples them), which is what beam
+//! splitters and dichroic filters need. Rejected, each with a named issue: an
+//! off-axis arc revolve, a curved-edge extrusion, tabulated volume absorption,
+//! and any body surface other than a symmetric dielectric or absorber.
 
 use glam::{DQuat, DVec3, Mat3, Vec2, Vec3};
 use oc_core::material::{Cauchy, Material};
 use oc_core::profile2::{ClosedProfile2, ProfileConstruction3};
 use oc_core::scene3::{
     AbsorptionModel, Aperture3, Body3, Detector3, DetectorGeometry3, DetectorTermination,
-    PlanarShape2, Scene3, SolidGeometry3, SpectralScalar, SurfaceGeometry3, SurfaceObject3,
-    SurfaceResponse, TwoSidedSurfaceResponse,
+    Interpolation, OutOfRangePolicy, PlanarShape2, Scene3, SolidGeometry3, SpectralScalar,
+    SurfaceGeometry3, SurfaceObject3, SurfaceResponse, TwoSidedSurfaceResponse,
 };
 use oc_core::source3::EmittedRay3;
 use oc_core::vec3::Isometry3;
@@ -857,26 +861,119 @@ fn point_in_polygon(verts: &[Vec2], p: Vec2) -> bool {
     inside
 }
 
-/// A constant surface response the preview supports. A tabulated one is rejected.
-#[derive(Debug, Clone, Copy)]
+/// A dimensionless response scalar in f32: a constant, or a wavelength table.
+/// The f32 twin of [`SpectralScalar`], sampled by the same rule.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Spectral32 {
+    Const(f32),
+    /// `(lambda[i], values[i])` samples, wavelengths in µm and increasing, at
+    /// least two of them (the compiler checks).
+    Table {
+        lambda: Vec<f32>,
+        values: Vec<f32>,
+        policy: OutOfRangePolicy,
+    },
+}
+
+impl Spectral32 {
+    /// The value at `lambda_um`, or `None` outside the table under
+    /// [`OutOfRangePolicy::Error`]. Mirrors [`SpectralScalar::sample`] step for
+    /// step: piecewise linear, the interval found by `partition_point`, the
+    /// endpoint held (`Clamp`) or zero (`Zero`) outside the range.
+    pub fn sample(&self, lambda_um: f32) -> Option<f32> {
+        let (xs, ys, policy) = match self {
+            Spectral32::Const(v) => return Some(*v),
+            Spectral32::Table {
+                lambda,
+                values,
+                policy,
+            } => (lambda, values, *policy),
+        };
+        let n = xs.len();
+        let x = lambda_um;
+        if x < xs[0] {
+            return match policy {
+                OutOfRangePolicy::Error => None,
+                OutOfRangePolicy::Clamp => Some(ys[0]),
+                OutOfRangePolicy::Zero => Some(0.0),
+            };
+        }
+        if x > xs[n - 1] {
+            return match policy {
+                OutOfRangePolicy::Error => None,
+                OutOfRangePolicy::Clamp => Some(ys[n - 1]),
+                OutOfRangePolicy::Zero => Some(0.0),
+            };
+        }
+        let i = xs.partition_point(|&v| v <= x).saturating_sub(1).min(n - 2);
+        let (x0, x1) = (xs[i], xs[i + 1]);
+        // Two samples closer than one f32 step round to the same value; the
+        // f64 guard against a zero-width interval covers that case too.
+        let f = if x1 > x0 { (x - x0) / (x1 - x0) } else { 0.0 };
+        Some(ys[i] + f * (ys[i + 1] - ys[i]))
+    }
+}
+
+/// A surface response the preview supports. Its scalars are sampled at the
+/// ray's wavelength when the ray arrives.
+#[derive(Debug, Clone, PartialEq)]
 pub enum GpuResponse {
     Absorber,
-    Mirror { r: f32 },
-    Dielectric { ar: f32 },
-    ExplicitRt { r: f32, t: f32 },
+    Mirror {
+        r: Spectral32,
+    },
+    Dielectric {
+        ar: Spectral32,
+    },
+    ExplicitRt {
+        r: Spectral32,
+        t: Spectral32,
+    },
     /// Ideal thin lens; `f` is the focal length in NORMALIZED units
     /// (`focal_length_mm / norm.scale`), so the slope law `u' = u − h/f`
     /// works directly on normalized hit heights.
-    ThinLens { f: f32 },
+    ThinLens {
+        f: f32,
+    },
 }
 
-fn constant(s: &SpectralScalar) -> Result<f32, String> {
-    match s {
-        SpectralScalar::Constant(v) => Ok(*v as f32),
-        SpectralScalar::Tabulated { .. } => {
-            Err("tabulated surface response (not yet in the f32 preview)".into())
-        }
+/// A response scalar in f32, or the reason it cannot be previewed. A table
+/// must satisfy the load-time contract (`Scene3::validate`): matched lengths,
+/// at least two samples, finite, strictly increasing in wavelength. A scene
+/// that skipped validation gets a named reject here, not a guess.
+fn spectral(s: &SpectralScalar) -> Result<Spectral32, String> {
+    let (lambda_um, values, interpolation, policy) = match s {
+        SpectralScalar::Constant(v) => return Ok(Spectral32::Const(*v as f32)),
+        SpectralScalar::Tabulated {
+            lambda_um,
+            values,
+            interpolation,
+            out_of_range,
+        } => (lambda_um, values, *interpolation, *out_of_range),
+    };
+    // Linear is the only rule today. A new one must be mirrored in
+    // `Spectral32::sample` and the shader before it can be previewed.
+    match interpolation {
+        Interpolation::Linear => {}
     }
+    let bad = || "tabulated surface response with an invalid table (not previewed)".to_string();
+    if lambda_um.len() != values.len()
+        || lambda_um.len() < 2
+        || lambda_um.windows(2).any(|w| w[1] <= w[0])
+    {
+        return Err(bad());
+    }
+    let lambda: Vec<f32> = lambda_um.iter().map(|&v| v as f32).collect();
+    let values: Vec<f32> = values.iter().map(|&v| v as f32).collect();
+    // Checked after the cast: a finite f64 past f32::MAX is not finite here.
+    if lambda.iter().chain(&values).any(|v| !v.is_finite()) {
+        return Err(bad());
+    }
+    Ok(Spectral32::Table {
+        lambda,
+        values,
+        policy,
+    })
 }
 
 fn compile_response(r: &SurfaceResponse, scale: f64) -> Result<GpuResponse, String> {
@@ -886,17 +983,17 @@ fn compile_response(r: &SurfaceResponse, scale: f64) -> Result<GpuResponse, Stri
             f: (focal_length_mm / scale) as f32,
         },
         SurfaceResponse::Mirror { reflectivity } => GpuResponse::Mirror {
-            r: constant(reflectivity)?,
+            r: spectral(reflectivity)?,
         },
         SurfaceResponse::DielectricFresnel { ar_residual } => GpuResponse::Dielectric {
-            ar: constant(ar_residual)?,
+            ar: spectral(ar_residual)?,
         },
         SurfaceResponse::ExplicitRt {
             reflectance,
             transmittance,
         } => GpuResponse::ExplicitRt {
-            r: constant(reflectance)?,
-            t: constant(transmittance)?,
+            r: spectral(reflectance)?,
+            t: spectral(transmittance)?,
         },
     })
 }
@@ -1172,6 +1269,134 @@ mod tests {
         assert_eq!(gpu.rejected.len(), 1);
         assert_eq!(gpu.rejected[0].object, id.0);
         assert!(gpu.rejected[0].kind.contains("curved edge"));
+    }
+
+    fn plane_surface(scene: &mut Scene3, front: SurfaceResponse, back: SurfaceResponse) -> u64 {
+        let id = scene.alloc_object_id();
+        scene.surfaces.push(SurfaceObject3 {
+            common: ObjectCommon::new(id, oc_core::id::LayerId(0)),
+            geometry: SurfaceGeometry3::Plane {
+                shape: PlanarShape2::Disc { radius_mm: 5.0 },
+            },
+            response_front: front,
+            response_back: back,
+        });
+        id.0
+    }
+
+    fn table(lambda_um: &[f64], values: &[f64], out_of_range: OutOfRangePolicy) -> SpectralScalar {
+        SpectralScalar::Tabulated {
+            lambda_um: lambda_um.to_vec(),
+            values: values.to_vec(),
+            interpolation: Interpolation::Linear,
+            out_of_range,
+        }
+    }
+
+    #[test]
+    fn splitters_dichroics_and_tabulated_responses_are_previewed() {
+        // These used to be rejected, which dropped the object from the drag
+        // preview. Every response scalar may now be a table.
+        use OutOfRangePolicy::{Clamp, Error, Zero};
+        let mut scene = Scene3::new();
+        let splitter = SurfaceResponse::ExplicitRt {
+            reflectance: SpectralScalar::Constant(0.5),
+            transmittance: SpectralScalar::Constant(0.5),
+        };
+        plane_surface(&mut scene, splitter.clone(), splitter);
+        let edge = [0.40, 0.53, 0.57, 0.80];
+        let dichroic = SurfaceResponse::ExplicitRt {
+            reflectance: table(&edge, &[1.0, 1.0, 0.0, 0.0], Clamp),
+            transmittance: table(&edge, &[0.0, 0.0, 1.0, 1.0], Clamp),
+        };
+        plane_surface(&mut scene, dichroic.clone(), dichroic);
+        let mirror = SurfaceResponse::Mirror {
+            reflectivity: table(&[0.4, 0.7], &[0.9, 0.96], Error),
+        };
+        plane_surface(&mut scene, mirror, SurfaceResponse::Absorber);
+        let window = SurfaceResponse::DielectricFresnel {
+            ar_residual: table(&[0.4, 0.7], &[0.01, 0.03], Zero),
+        };
+        plane_surface(&mut scene, window.clone(), window);
+        scene.validate().unwrap();
+
+        let gpu = GpuScene3::build(&scene, BuildOpts::default());
+        assert!(gpu.rejected.is_empty(), "{:?}", gpu.rejected);
+        assert_eq!(gpu.surfaces.len(), 4);
+
+        let GpuResponse::ExplicitRt { r, t } = &gpu.surfaces[0].back else {
+            panic!("splitter: {:?}", gpu.surfaces[0].back);
+        };
+        assert_eq!((r.sample(0.55), t.sample(0.55)), (Some(0.5), Some(0.5)));
+
+        let GpuResponse::ExplicitRt { r, t } = &gpu.surfaces[1].front else {
+            panic!("dichroic: {:?}", gpu.surfaces[1].front);
+        };
+        assert_eq!((r.sample(0.45), t.sample(0.45)), (Some(1.0), Some(0.0)));
+        assert_eq!((r.sample(0.95), t.sample(0.95)), (Some(0.0), Some(1.0)));
+        let (r55, t55) = (r.sample(0.55).unwrap(), t.sample(0.55).unwrap());
+        assert!((r55 - 0.5).abs() < 1e-6 && (t55 - 0.5).abs() < 1e-6);
+
+        let GpuResponse::Mirror { r } = &gpu.surfaces[2].front else {
+            panic!("mirror: {:?}", gpu.surfaces[2].front);
+        };
+        assert_eq!(r.sample(0.8), None);
+        assert!(matches!(gpu.surfaces[2].back, GpuResponse::Absorber));
+
+        let GpuResponse::Dielectric { ar } = &gpu.surfaces[3].front else {
+            panic!("window: {:?}", gpu.surfaces[3].front);
+        };
+        assert_eq!(ar.sample(0.8), Some(0.0));
+    }
+
+    #[test]
+    fn a_spectral_table_samples_like_the_f64_kernel() {
+        let xs = [0.42, 0.5, 0.55, 0.61, 0.9];
+        let ys = [0.1, 0.7, 0.2, 0.95, 0.3];
+        for policy in [
+            OutOfRangePolicy::Error,
+            OutOfRangePolicy::Clamp,
+            OutOfRangePolicy::Zero,
+        ] {
+            let s64 = table(&xs, &ys, policy);
+            let s32 = spectral(&s64).unwrap();
+            // A sweep across and beyond the table, plus every sample point.
+            let sweep = (0..=280).map(|i| 0.3 + 0.7 * i as f64 / 280.0);
+            for lam in sweep.chain(xs) {
+                match (s64.sample(lam), s32.sample(lam as f32)) {
+                    (None, None) => {}
+                    (Some(a), Some(b)) => assert!(
+                        (a as f32 - b).abs() < 1e-5,
+                        "{policy:?} at {lam}: f64 {a} vs f32 {b}"
+                    ),
+                    (a, b) => panic!("{policy:?} at {lam}: f64 {a:?} vs f32 {b:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_invalid_response_table_is_rejected_by_name() {
+        // `Scene3::validate` refuses these; a scene built without it must get a
+        // named reject, not a panic or a made-up curve.
+        let cases = [
+            (vec![0.5], vec![0.3]),
+            (vec![0.5, 0.6], vec![0.3]),
+            (vec![0.6, 0.5], vec![0.3, 0.4]),
+            (vec![0.5, f64::NAN], vec![0.3, 0.4]),
+        ];
+        for (lambda_um, values) in cases {
+            let mut scene = Scene3::new();
+            let bad = SurfaceResponse::Mirror {
+                reflectivity: table(&lambda_um, &values, OutOfRangePolicy::Clamp),
+            };
+            let id = plane_surface(&mut scene, SurfaceResponse::Absorber, bad);
+            let gpu = GpuScene3::build(&scene, BuildOpts::default());
+            assert!(gpu.surfaces.is_empty(), "{lambda_um:?}");
+            assert_eq!(gpu.rejected.len(), 1, "{lambda_um:?}");
+            assert_eq!(gpu.rejected[0].object, id);
+            assert!(gpu.rejected[0].kind.contains("invalid table"));
+        }
     }
 
     #[test]

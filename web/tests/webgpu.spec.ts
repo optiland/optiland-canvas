@@ -99,6 +99,37 @@ test.describe("WebGPU preview", () => {
     await expect(page.locator("#stat")).toContainText(/light scene; GPU.* ready/);
   });
 
+  // A splitter and a dichroic fold parts of the beam up. The fold is a primary
+  // path, so it must be in the picture with ghosts off, and the dichroic's
+  // tables are sampled per wavelength on both sides of and inside its edge.
+  test("the GPU picture matches the CPU mirror through a splitter and a dichroic", async ({ page }) => {
+    await page.goto("/?debug");
+    await expect(page.locator("#stat")).toContainText("segs");
+    await page.evaluate(() => {
+      const s = (window as unknown as { __ocDebug: any }).__ocDebug.scene;
+      s.setGhosts(false);
+      s.setSourceWavelengths(new Float64Array([450, 546, 553, 650]), new Float64Array(0));
+      s.addBeamSplitter(-50, 0, 15, 135, 0.4, 0.6);
+      s.addDichroic(-35, 0, 15, 135, 550, 20, true);
+      s.addAreaDetector(-50, 40, 20, 90);
+      s.addAreaDetector(-35, 40, 20, 90);
+    });
+    const r = await compare(page, 5);
+    console.log(`splitter + dichroic: ${r.cpuLen / 11} segs (${r.label})`);
+    expectParity(r);
+    const folds = await page.evaluate(async () => {
+      const d = (window as unknown as { __ocDebug: any }).__ocDebug;
+      const g = (await d.gpuProjected()) as Float32Array;
+      const at = new Set<number>();
+      for (let i = 0; i + 11 <= g.length; i += 11) {
+        // A segment rising straight up from one of the plates.
+        if (g[i + 3] - g[i + 1] > 5 && Math.abs(g[i + 2] - g[i]) < 0.01) at.add(Math.round(g[i] + 50 - g[i + 1]) === 0 ? -50 : -35);
+      }
+      return [...at].sort((a, b) => a - b);
+    });
+    expect(folds).toEqual([-50, -35]);
+  });
+
   // Lenses one to seven with ghosts on (the case that motivated the GPU path),
   // then seven lenses ghost-free at the densest source. Parity at every step; the
   // timings are logged, not asserted, because they belong to this machine.

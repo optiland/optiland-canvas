@@ -11,6 +11,8 @@ import { RayLayer } from "./rays";
 import { initSlice3d, type Slice3d } from "./slice3d";
 import { initView3dThree, type FrameReport, type View3dThree } from "./render3d/view3d";
 import { createFastPreview } from "./fastpreview";
+import { initInset } from "./inset/inset";
+import { createComponentView, type ComponentView } from "./inset/component-view";
 import { initOpenUc2 } from "./features/openuc2/OpenUc2Page";
 import { heatRgb } from "./heat";
 
@@ -79,6 +81,8 @@ async function main() {
   // simulates a browser with no usable 3D renderer.
   let slice3d: Slice3d | null = null;
   let viewport3d: View3dThree | null = null;
+  // The component view of the selection, in an inset window (web/src/inset).
+  let componentView: ComponentView | null = null;
   const params = new URLSearchParams(location.search);
   type ViewMode = "2d" | "3d";
   let viewMode: ViewMode = "2d";
@@ -235,6 +239,9 @@ async function main() {
   // The status line. In the 3D view it also names the presentation backend,
   // which is a different subsystem from the ray-preview backend before it.
   function writeStatus({ count, ms, traceMs }: FrameReport) {
+    // Both views report every drawn frame here, so the component view catches
+    // up with any edit or selection change once per frame.
+    componentView?.sync();
     const three = in3dModel() ? viewport3d : null;
     const view = in3dModel() ? " · 3D model" : "";
     const render = three ? ` · ${three.backendLabel()}` : "";
@@ -728,6 +735,35 @@ async function main() {
     timing: params.has("debug"),
   });
 
+  // The component view: a tab in the top bar opens it as an inset window, in
+  // place or wherever the tab is dropped. Its handles edit the selection; the
+  // view that owns the canvas draws the fast picture while a handle is held
+  // and settles on the exact trace when it is let go.
+  const inset = initInset({
+    tab: document.getElementById("insetTab")!,
+    bar: document.getElementById("tools")!,
+    frame: document.getElementById("componentInset")!,
+    ghost: document.getElementById("insetGhost")!,
+  });
+  componentView = createComponentView({
+    scene,
+    body: inset.body,
+    setSubtitle: inset.setSubtitle,
+    selected: () => selectedBody3d(),
+    edited: (settled) => {
+      if (in3dModel()) {
+        if (settled) { viewport3d!.refresh(); refreshReference(); }
+        else viewport3d!.previewEdit();
+        return;
+      }
+      if (settled) slice3d!.refresh();
+      else slice3d!.previewEdit();
+      renderView();
+      if (settled) refreshReference();
+    },
+  });
+  inset.attach(componentView);
+
   // Always-3D: the app boots straight into the canonical 3D scene — a singlet
   // traced by the f64 3D engine in the Y–Z plane (§4.1), shown as the meridional
   // cross-section. The v1 freeform layer stays initialized but hidden (its
@@ -762,6 +798,13 @@ async function main() {
       setViewMode: (m: "2d" | "3d") => setViewMode(m),
       // The selection the active view (and the material picker) targets.
       selectedBody3d: () => selectedBody3d(),
+      // The component view's inset window.
+      inset: {
+        open: () => inset.open(),
+        close: () => inset.close(),
+        isOpen: () => inset.isOpen(),
+        view: () => componentView?.debug() ?? null,
+      },
     };
   }
 
@@ -820,6 +863,10 @@ async function main() {
   document.getElementById("addAperture")!.onclick = () => addAndFocus(scene.addAperture(-20, 0, 5, 0));
   document.getElementById("addPrism")!.onclick = () => addAndFocus(scene.addPrism(-40, 0, 16, 0, 1.62, 36));
   document.getElementById("addDetector")!.onclick = () => addAndFocus(scene.addAreaDetector(40, 0, 8, 0));
+  // Splitter and dichroic plates at 135°: the default beam meets their front
+  // face and the reflected arm goes up (+Y).
+  document.getElementById("addSplitter")!.onclick = () => addAndFocus(scene.addBeamSplitter(-35, 0, 15, 135, 0.5, 0.5));
+  document.getElementById("addDichroic")!.onclick = () => addAndFocus(scene.addDichroic(-35, 0, 15, 135, 550, 20, true));
 
   // --- save .ocanvas — the Optiland handoff (§6) --------------------------
   // Save downloads the canonical 3D scene (the one the user actually edits) as a

@@ -69,6 +69,21 @@ test.describe("GPU 3D view appearance", () => {
     await shot(page, "overlapping-glass.png");
   });
 
+  test("a beam splitter and a dichroic folding the beam", async ({ page }) => {
+    // The splitter passes 60 % toward the dichroic, which folds blue up and
+    // passes red to the lens.
+    await page.evaluate(() => {
+      const s = (window as any).__ocDebug.scene;
+      s.setSourceWavelengths(new Float64Array([450, 520, 620]), new Float64Array(0));
+      s.addBeamSplitter(-55, 0, 15, 135, 0.4, 0.6);
+      s.addDichroic(-30, 0, 15, 135, 560, 20, true);
+    });
+    await enter3d(page);
+    await page.keyboard.press("Escape");
+    await refresh3d(page);
+    await shot(page, "splitter-dichroic.png");
+  });
+
   test("three lenses with ghosts", async ({ page }) => {
     await lenses(page, 3);
     await page.locator("#ghosts").check();

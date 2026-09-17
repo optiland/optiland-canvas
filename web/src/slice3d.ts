@@ -40,6 +40,10 @@ export type Slice3d = {
   setSelected: (id: number) => void;
   /** Select an object and open its inspector card (after adding an element). */
   focusObject: (id: number) => void;
+  /** Re-read after an edit made elsewhere while it is still in progress (the
+   *  component view's handle drags): the fast picture, no exact trace. The
+   *  caller repaints. */
+  previewEdit: () => void;
 };
 
 // The flat layout of `traceProjected3D`: 11 floats per segment
@@ -92,7 +96,7 @@ export function initSlice3d(opts: {
   let objList: Obj[] = [];
   // The elements' cross-section with the view plane, as polylines to draw. Kept
   // in step with the geometry (load, drag).
-  type XLine = { kind: string; closed: boolean; pts: number[] };
+  type XLine = { kind: string; closed: boolean; pts: number[]; tint?: string };
   let xsec: XLine[] = [];
   // The body being dragged, and the grab offset (view-plane u,v) so it does not
   // jump to the cursor. `origZ` keeps the out-of-plane coordinate fixed — an
@@ -405,9 +409,12 @@ export function initSlice3d(opts: {
   // Stroke (and lightly fill) the element cross-sections. Each kind reads
   // differently: a glass body, a mirror, a plain surface, a detector, an
   // aperture mask.
-  const STYLE: Record<string, { stroke: string; width: number; fill?: string }> = {
+  const STYLE: Record<string, { stroke: string; width: number; fill?: string; dash?: number[] }> = {
     body: { stroke: "rgba(150,185,225,0.9)", width: 1.5, fill: "rgba(120,155,205,0.10)" },
     mirror: { stroke: "rgba(190,205,235,0.95)", width: 2.5 },
+    // A splitter half-silvered (dashed); a dichroic in the colour it reflects.
+    splitter: { stroke: "rgba(215,225,240,0.95)", width: 2.5, dash: [5, 3] },
+    dichroic: { stroke: "rgba(160,200,255,0.95)", width: 3 },
     surface: { stroke: "rgba(150,160,175,0.7)", width: 1.5 },
     detector: { stroke: "rgba(127,214,255,0.85)", width: 2 },
     aperture: { stroke: "rgba(210,165,120,0.85)", width: 2.5 },
@@ -445,9 +452,11 @@ export function initSlice3d(opts: {
         ctx.fillStyle = st.fill;
         ctx.fill();
       }
-      ctx.strokeStyle = st.stroke;
+      ctx.strokeStyle = el.tint ?? st.stroke;
       ctx.lineWidth = st.width;
+      ctx.setLineDash(st.dash ?? []);
       ctx.stroke();
+      ctx.setLineDash([]);
     }
   }
 
@@ -692,6 +701,12 @@ export function initSlice3d(opts: {
     standDown,
     setSelected,
     focusObject,
+    previewEdit: () => {
+      retrace(true);
+      refreshGeometry();
+      refreshInspector();
+      cardMgr.renderAll();
+    },
     raySegments,
     refresh,
     selectedBody: () => selected,

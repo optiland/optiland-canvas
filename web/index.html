@@ -16,7 +16,7 @@
       .panel { position: fixed; background: rgba(10,14,22,0.86); border: 1px solid #1e2a3d;
         border-radius: 8px; padding: 10px 12px; backdrop-filter: blur(6px); }
       /* Stops short of the centred view toolbar; the status line wraps. */
-      #hud { top: 12px; left: 14px; pointer-events: none; max-width: calc(50vw - 190px); }
+      #hud { top: 12px; left: 14px; pointer-events: none; max-width: calc(50vw - 226px); }
       #hud b { color: #7fd6ff; }
       #hud #stat { opacity: 0.7; }
       #controls { top: 12px; right: 14px; width: 250px; }
@@ -140,6 +140,40 @@
       button.pin { background: none; border: none; cursor: pointer; padding: 0; opacity: 0.45; font-size: 11px; }
       button.pin.pinned { opacity: 1; }
       .sub { opacity: 0.7; margin-top: 2px; min-height: 14px; font-size: 11px; }
+      /* The component view: a tab in the top bar that opens, or is dragged out
+         into, an inset window over the canvas. */
+      #tools .tools-sep { width: 1px; align-self: stretch; background: #24344d; margin: 0 2px; }
+      #tools button.inset-tab { cursor: grab; touch-action: none; }
+      #tools button.inset-tab.dock-target { outline: 2px dashed #7fd6ff; outline-offset: 2px; }
+      .inset { display: flex; flex-direction: column; padding: 0; z-index: 30; box-sizing: border-box; }
+      .inset[hidden], #insetGhost[hidden] { display: none; }
+      .inset-head { display: flex; align-items: center; gap: 6px; padding: 5px 8px; border-bottom: 1px solid #1e2a3d;
+        cursor: move; user-select: none; touch-action: none; }
+      .inset-grip { opacity: 0.45; }
+      .inset-title { color: #7fd6ff; white-space: nowrap; }
+      .inset-sub { opacity: 0.7; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .inset-close { background: none; border: none; color: #8aa1b8; cursor: pointer; font-size: 14px; line-height: 1; padding: 0 2px; }
+      .inset-close:hover { color: #e8f6ff; }
+      .inset-body { flex: 1; display: flex; flex-direction: column; min-height: 0; padding: 6px 8px 10px; gap: 5px; }
+      .inset-resize { position: absolute; right: 0; bottom: 0; width: 14px; height: 14px; cursor: nwse-resize; touch-action: none;
+        background: linear-gradient(135deg, transparent 55%, #3a86b0 55%); border-bottom-right-radius: 8px; }
+      #insetGhost { position: fixed; border: 2px dashed #7fd6ff; border-radius: 8px; background: rgba(127,214,255,0.07);
+        pointer-events: none; z-index: 60; box-sizing: border-box; }
+      .cv-canvas { flex: 1; min-height: 110px; width: 100%; border-radius: 5px; background: #04060a; touch-action: none; display: block; }
+      .cv-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+      .cv-bar .m4btn { padding: 1px 7px; }
+      .cv-bar .cv-label { opacity: 0.6; margin-left: 4px; }
+      .cv-fields { display: grid; grid-template-columns: repeat(auto-fill, minmax(118px, 1fr)); gap: 2px 8px; }
+      .cv-field { display: flex; align-items: center; gap: 4px; font-size: 11px; }
+      .cv-field > span:first-child { min-width: 36px; opacity: 0.7; white-space: nowrap; }
+      .cv-field input, .cv-field select { flex: 1; min-width: 0; width: 50px; background: #0a1220; color: #e8f6ff;
+        border: 1px solid #24344d; border-radius: 4px; padding: 1px 4px; font: inherit; }
+      .cv-field .u { opacity: 0.45; min-width: 14px; }
+      /* Fixed heights: a longer message must not resize the drawing above. */
+      .cv-read { font-size: 11px; opacity: 0.85; line-height: 1.45; height: 46px; overflow-y: auto; flex: none; }
+      .cv-read b { color: #7fd6ff; font-weight: normal; }
+      .cv-note { font-size: 11px; opacity: 0.6; height: 30px; overflow: hidden; line-height: 1.35; flex: none; }
+      .cv-note.warn { color: #ffb38a; opacity: 1; }
       #fitpanel { bottom: 12px; left: 50%; transform: translateX(-50%); width: 268px; text-align: center; }
       #fitpanel h3 { margin: 0 0 6px; font-size: 12px; color: #7fd6ff; }
       #fitpanel button { background: #12203a; color: #cdd6e4; border: 1px solid #24344d; border-radius: 6px;
@@ -214,7 +248,7 @@
 
     <div class="panel" id="hud">
       <div><b>Optiland Canvas</b> — always 3D</div>
-      <div>drag &amp; double-click the lens to edit · hover the Abbe map for glass · toggle 2D ⇄ 3D above</div>
+      <div>drag &amp; double-click to edit · hover the Abbe map for glass · views and the component tab above</div>
       <div id="stat"></div>
     </div>
 
@@ -294,6 +328,10 @@
           <button class="m4btn" id="addPrism" title="add a dispersing glass prism">＋ prism</button>
         </div>
         <div class="m4row">
+          <button class="m4btn" id="addSplitter" title="add a 50:50 beam splitter plate at 45°">＋ splitter</button>
+          <button class="m4btn" id="addDichroic" title="add a long-pass dichroic plate at 45° (reflects below 550 nm)">＋ dichroic</button>
+        </div>
+        <div class="m4row">
           <button class="m4btn" id="addDetector" title="add an area detector (movable/tiltable; add as many as you like)">＋ detector</button>
         </div>
         <div id="objects3d" class="obj3d"></div>
@@ -314,6 +352,8 @@
     <div class="panel" id="tools">
       <button id="view-2d" class="active" title="the meridional Y–Z cross-section, editable like v1">◧ 2D cross-section</button>
       <button id="view-3d" title="an orbitable 3D model of the same system">◳ 3D model</button>
+      <span class="tools-sep"></span>
+      <button id="insetTab" class="inset-tab" title="component view of the selection: click to open, or drag it onto the canvas">⬚ component</button>
       <span id="viewHint" class="sub"></span>
     </div>
 
@@ -412,13 +452,30 @@
         <div class="c3-surface" style="display:none">
           <div class="field"><span>front</span><select data-name="front" class="c3-resp">
             <option value="mirror">mirror</option><option value="absorb">absorb</option>
-            <option value="clear">clear</option><option value="refract">refract</option></select></div>
+            <option value="clear">clear</option><option value="refract">refract</option>
+            <option value="split">split 50:50</option><option value="dichroic">dichroic</option>
+            <option value="coated" disabled>coated</option></select></div>
           <div class="field"><span>back</span><select data-name="back" class="c3-resp">
             <option value="mirror">mirror</option><option value="absorb">absorb</option>
-            <option value="clear">clear</option><option value="refract">refract</option></select></div>
+            <option value="clear">clear</option><option value="refract">refract</option>
+            <option value="split">split 50:50</option><option value="dichroic">dichroic</option>
+            <option value="coated" disabled>coated</option></select></div>
         </div>
       </div>
     </template>
+
+    <!-- The component view (web/src/inset): opened from #insetTab. -->
+    <div class="panel inset" id="componentInset" hidden>
+      <div class="inset-head">
+        <span class="inset-grip" aria-hidden="true">⠿</span>
+        <span class="inset-title">component</span>
+        <span class="inset-sub"></span>
+        <button class="inset-close" title="close (or drag the header back onto the tab)">✕</button>
+      </div>
+      <div class="inset-body"></div>
+      <div class="inset-resize" title="resize"></div>
+    </div>
+    <div id="insetGhost" hidden></div>
 
     <script type="module" src="/src/main.ts"></script>
 

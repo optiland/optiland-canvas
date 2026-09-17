@@ -20,7 +20,13 @@ export type MaterialRole =
   | "source_emitter"
   | "source_housing"
   | "generic_dielectric"
+  | "beamsplitter"
+  | "dichroic"
   | "error";
+
+/** A coated face's display colours (linear RGB): its reflectance and its
+ *  transmittance weighted across the visible band. */
+export type CoatColors = { r: [number, number, number]; t: [number, number, number] };
 
 /** What kind of display object a descriptor stands for. */
 export type RenderObjectKind =
@@ -60,6 +66,8 @@ export type RenderObjectDescriptor = {
   error: string | null;
   /** A source's light colour (linear RGB, brightest channel 1), or null. */
   emit: [number, number, number] | null;
+  /** A surface object's coating colours per face, or null for other kinds. */
+  coat: { front: CoatColors | null; back: CoatColors | null } | null;
 };
 
 /** Mesh group codes, as `oc-wasm` numbers them. A group is a run of indices

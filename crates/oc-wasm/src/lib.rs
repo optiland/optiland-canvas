@@ -39,6 +39,9 @@ pub mod gpu_preview;
 /// optical elements in the 2D layout.
 mod xsection;
 
+/// Render descriptors and display meshes for the GPU 3D view.
+pub mod render_view;
+
 /// State kept for an element drawn freehand: its fitted ladder (§5.3) so the
 /// complexity slider can re-swap the front surface with no refit, plus the
 /// extrusion depth used to close the body.
@@ -143,6 +146,8 @@ pub struct Canvas {
     /// Bumped on every mutation of `scene3`, so an async f64 result carrying an
     /// older revision is discarded rather than shown (§3.3, §13).
     revision: u64,
+    /// Per-object geometry/transform/material revisions for the GPU 3D view.
+    render_tracker: render_view::RenderTracker,
 }
 
 #[wasm_bindgen]
@@ -166,6 +171,7 @@ impl Canvas {
             view_plane: Plane3::XY,
             slice_thickness: 0.0,
             revision: 0,
+            render_tracker: render_view::RenderTracker::default(),
         }
     }
 
@@ -2221,6 +2227,25 @@ impl Canvas {
             Some(scene) => xsection::cross_section_json(scene, &self.view_plane),
             None => "[]".into(),
         }
+    }
+
+    /// What the GPU 3D view draws: one descriptor per body, surface, aperture,
+    /// and detector, with independent geometry, transform, and material
+    /// revisions (`render_view`). JSON array; `[]` if no scene is loaded. Call it
+    /// when the scene revision moves, not per frame.
+    #[wasm_bindgen(js_name = renderObjectsJSON)]
+    pub fn render_objects_json(&mut self) -> String {
+        match &self.scene3 {
+            Some(scene) => render_view::render_objects_json(scene, &mut self.render_tracker),
+            None => "[]".into(),
+        }
+    }
+
+    /// The display mesh of object `id` in its local frame, or `undefined`. A
+    /// picture of the analytic geometry, never traced (`oc_core::display_mesh`).
+    #[wasm_bindgen(js_name = renderMesh)]
+    pub fn render_mesh(&self, id: f64) -> Option<render_view::RenderMesh> {
+        render_view::render_mesh(self.scene3.as_ref()?, id as u64)
     }
 
     /// The 3D objects for the inspector: each body's id, geometry kind, 3D

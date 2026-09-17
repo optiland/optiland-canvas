@@ -26,6 +26,8 @@
 #[cfg(feature = "scene3")]
 pub mod build3;
 pub mod coordinates;
+#[cfg(feature = "scene3")]
+pub mod display_mesh;
 pub mod fragment;
 pub mod geom;
 #[cfg(feature = "scene3")]

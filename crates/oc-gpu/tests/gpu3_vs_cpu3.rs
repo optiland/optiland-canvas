@@ -14,9 +14,11 @@
 //!   `buffers3` cover Rust; a divergent field offset would make the trace diverge,
 //!   which the landing checks below catch.
 //!
-//! Part 1 covers the analytic bodies (sphere, box, cylinder), a tilted mirror, and
-//! an aperture-plus-detector. Extruded and revolved bodies join as their shader
-//! parts land. The suite skips cleanly when no wgpu adapter is present.
+//! It covers the analytic bodies (sphere, box, cylinder), extruded and revolved
+//! bodies, a tilted mirror, an aperture-plus-detector, beam splitters (ghosts off
+//! and on), and dichroics and other tabulated responses. The struct layout
+//! itself is checked without a device in `shader3_layout`. The suite skips
+//! cleanly when no wgpu adapter is present.
 #![cfg(feature = "gpu3")]
 
 use oc_core::id::{LayerId, ObjectId};
@@ -26,8 +28,9 @@ use oc_core::profile2::{
 };
 use oc_core::scene3::{
     Aperture3, ApertureInteraction, ApertureShape3, Body3, Detector3, DetectorGeometry3,
-    DetectorResponse, DetectorTermination, ObjectCommon, PlanarShape2, Scene3, SolidGeometry3,
-    SpectralScalar, SurfaceGeometry3, SurfaceObject3, SurfaceProps3, SurfaceResponse,
+    DetectorResponse, DetectorTermination, Interpolation, ObjectCommon, OutOfRangePolicy,
+    PlanarShape2, Scene3, SolidGeometry3, SpectralScalar, SurfaceGeometry3, SurfaceObject3,
+    SurfaceProps3, SurfaceResponse,
 };
 use oc_core::source3::EmittedRay3;
 use oc_core::vec::Vec2;
@@ -132,14 +135,25 @@ fn add_rect_detector(
 }
 
 fn emitted(origins_dirs: &[(Vec3, Vec3)]) -> Vec<EmittedRay3> {
-    origins_dirs
-        .iter()
-        .map(|(o, d)| EmittedRay3 {
-            ray: Ray3::new(*o, *d).unwrap(),
-            lambda_um: LAMBDA_D,
+    emitted_at(&at_d(origins_dirs))
+}
+
+/// [`emitted`] with a wavelength per ray: `(origin, dir, lambda_um)`.
+fn emitted_at(rays: &[(Vec3, Vec3, f64)]) -> Vec<EmittedRay3> {
+    rays.iter()
+        .map(|&(o, d, lambda_um)| EmittedRay3 {
+            ray: Ray3::new(o, d).unwrap(),
+            lambda_um,
             flux: 1.0,
             source: oc_core::id::SourceId(0),
         })
+        .collect()
+}
+
+fn at_d(origins_dirs: &[(Vec3, Vec3)]) -> Vec<(Vec3, Vec3, f64)> {
+    origins_dirs
+        .iter()
+        .map(|&(o, d)| (o, d, LAMBDA_D))
         .collect()
 }
 
@@ -150,8 +164,20 @@ fn tol(scale: f64) -> f64 {
 
 /// Compare the shader's per-ray segments to the CPU oracle's, within §15.5.
 fn assert_gpu_matches_cpu(tracer: &Gpu3Tracer, scene: &Scene3, origins_dirs: &[(Vec3, Vec3)]) {
-    let launch = emitted(origins_dirs);
-    let gpu_scene = GpuScene3::build_with_rays(scene, &launch, opts());
+    assert_gpu_matches_cpu_at(tracer, scene, &at_d(origins_dirs), opts());
+}
+
+/// [`assert_gpu_matches_cpu`] with a wavelength per ray and explicit build
+/// options. The segment budget grows to hold the CPU mirror's longest tree (a
+/// ghost tree can outgrow [`MAX_SEGS`]), and the shader must fit it.
+fn assert_gpu_matches_cpu_at(
+    tracer: &Gpu3Tracer,
+    scene: &Scene3,
+    rays: &[(Vec3, Vec3, f64)],
+    build: BuildOpts,
+) {
+    let launch = emitted_at(rays);
+    let gpu_scene = GpuScene3::build_with_rays(scene, &launch, build);
     assert!(
         gpu_scene.rejected.is_empty(),
         "unexpected rejects: {:?}",
@@ -160,26 +186,32 @@ fn assert_gpu_matches_cpu(tracer: &Gpu3Tracer, scene: &Scene3, origins_dirs: &[(
     let pos_tol = tol(gpu_scene.norm.scale);
 
     let cpu = cpu3::trace_segments(&gpu_scene, MAX_DEPTH);
-    let gpu = tracer.trace(&gpu_scene, MAX_DEPTH, MAX_SEGS);
+    let longest = cpu.iter().map(Vec::len).max().unwrap_or(0) as u32;
+    let budget = longest.next_power_of_two().max(MAX_SEGS);
+    let full = tracer.trace_checked(&gpu_scene, MAX_DEPTH, budget);
+    assert!(
+        full.is_complete(),
+        "budget {budget}: {} rays over budget, {} lost a branch to the stack",
+        full.budget_truncated,
+        full.stack_truncated
+    );
+    let gpu = full.segments;
 
     assert_eq!(cpu.len(), gpu.len(), "ray count");
     for (ri, (csegs, gsegs)) in cpu.iter().zip(&gpu).enumerate() {
-        assert!(
-            csegs.len() as u32 <= MAX_SEGS,
-            "ray {ri}: CPU produced {} segments, over the GPU budget",
-            csegs.len()
-        );
+        let od = (rays[ri].0, rays[ri].1);
         assert_eq!(
             csegs.len(),
             gsegs.len(),
             "ray {ri} ({:?}): segment count CPU {} vs GPU {}",
-            origins_dirs[ri],
+            rays[ri],
             csegs.len(),
             gsegs.len()
         );
         for (i, (c, g)) in csegs.iter().zip(gsegs).enumerate() {
             assert_eq!(c.flags, g.flags, "ray {ri} seg {i}: flags");
-            assert_seg(c, g, pos_tol, ri, i, origins_dirs[ri]);
+            assert_eq!(c.lambda_um, g.lambda_um, "ray {ri} seg {i}: wavelength");
+            assert_seg(c, g, pos_tol, ri, i, od);
         }
     }
 }
@@ -643,4 +675,198 @@ fn an_aperture_and_detector_match_cpu() {
         }
     }
     assert_gpu_matches_cpu(&tracer, &scene, &rays);
+}
+
+// ---------------------------------------------------------------------------
+// Beam splitters, dichroics, tabulated responses
+// ---------------------------------------------------------------------------
+
+fn ghost_opts(ghosts: bool) -> BuildOpts {
+    BuildOpts {
+        ghosts,
+        flux_eps: 1e-9,
+        max_ghost: if ghosts { 8 } else { 0 },
+    }
+}
+
+/// A square zero-thickness surface with the same response on both faces.
+fn add_surface(scene: &mut Scene3, pos: Vec3, normal: Vec3, half: f64, resp: SurfaceResponse) {
+    let id = scene.alloc_object_id();
+    let mut common = ObjectCommon::new(id, LayerId(0));
+    common.transform = facing(pos, normal);
+    scene.surfaces.push(SurfaceObject3 {
+        common,
+        geometry: SurfaceGeometry3::Plane {
+            shape: PlanarShape2::Rectangle {
+                half_width_mm: half,
+                half_height_mm: half,
+            },
+        },
+        response_front: resp.clone(),
+        response_back: resp,
+    });
+}
+
+fn table(lambda_um: &[f64], values: &[f64], out_of_range: OutOfRangePolicy) -> SpectralScalar {
+    SpectralScalar::Tabulated {
+        lambda_um: lambda_um.to_vec(),
+        values: values.to_vec(),
+        interpolation: Interpolation::Linear,
+        out_of_range,
+    }
+}
+
+/// A 45° fold at the origin (+X reflects toward +Y) with a terminating detector
+/// on each arm, as in `cpu3_vs_f64`. An off-path polygon absorber is added
+/// first, so the fold's response tables do not start at `verts[0]`.
+fn fold_with_two_arms(scene: &mut Scene3, resp: SurfaceResponse) {
+    let id = scene.alloc_object_id();
+    let mut common = ObjectCommon::new(id, LayerId(0));
+    common.transform = facing(Vec3::new(0.0, -40.0, 0.0), Vec3::Y);
+    scene.surfaces.push(SurfaceObject3 {
+        common,
+        geometry: SurfaceGeometry3::Plane {
+            shape: PlanarShape2::Polygon {
+                vertices: vec![
+                    Vec2::new(-3.0, -3.0),
+                    Vec2::new(3.0, -3.0),
+                    Vec2::new(0.0, 3.0),
+                ],
+            },
+        },
+        response_front: SurfaceResponse::Absorber,
+        response_back: SurfaceResponse::Absorber,
+    });
+    add_surface(
+        scene,
+        Vec3::ZERO,
+        Vec3::new(-1.0, 1.0, 0.0).normalize(),
+        10.0,
+        resp,
+    );
+    add_rect_detector(scene, Vec3::new(20.0, 0.0, 0.0), -Vec3::X, 8.0, 8.0, [3, 3]);
+    add_rect_detector(scene, Vec3::new(0.0, 20.0, 0.0), -Vec3::Y, 8.0, 8.0, [3, 3]);
+}
+
+/// Parallel +X rays meeting the fold at a spread of heights, at each wavelength.
+fn fold_rays(lambdas: &[f64]) -> Vec<(Vec3, Vec3, f64)> {
+    let heights = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (-1.5, 1.0)];
+    lambdas
+        .iter()
+        .flat_map(|&l| {
+            heights
+                .iter()
+                .map(move |&(y, z)| (Vec3::new(-15.0, y, z), Vec3::X, l))
+        })
+        .collect()
+}
+
+fn splitter_50_50() -> SurfaceResponse {
+    SurfaceResponse::ExplicitRt {
+        reflectance: SpectralScalar::Constant(0.5),
+        transmittance: SpectralScalar::Constant(0.5),
+    }
+}
+
+#[test]
+fn a_beam_splitter_matches_cpu() {
+    let Some(tracer) = tracer_or_skip() else {
+        return;
+    };
+    // Both arms are primary paths: traced with ghosts off, unflagged with
+    // ghosts on.
+    let mut scene = Scene3::new();
+    fold_with_two_arms(&mut scene, splitter_50_50());
+    scene.validate().unwrap();
+    for ghosts in [false, true] {
+        assert_gpu_matches_cpu_at(&tracer, &scene, &fold_rays(&[LAMBDA_D]), ghost_opts(ghosts));
+    }
+
+    // A glass plate ahead of the splitter, ghosts on: the plate's forward
+    // ghosts must stay ghosts on both arms.
+    let mut scene = Scene3::new();
+    push_body(
+        &mut scene,
+        SolidGeometry3::Box {
+            half_extents_mm: Vec3::new(1.0, 8.0, 8.0),
+        },
+        glass(1.5),
+    );
+    scene.bodies[0].common.transform = Isometry3::from_pos(Vec3::new(-8.0, 0.0, 0.0));
+    fold_with_two_arms(&mut scene, splitter_50_50());
+    scene.validate().unwrap();
+    let rays = [(Vec3::new(-20.0, 0.5, 0.25), Vec3::X, LAMBDA_D)];
+    assert_gpu_matches_cpu_at(&tracer, &scene, &rays, ghost_opts(true));
+}
+
+#[test]
+fn dichroics_and_tabulated_responses_match_cpu() {
+    let Some(tracer) = tracer_or_skip() else {
+        return;
+    };
+    let lambdas = [0.35, 0.45, 0.52, 0.545, 0.55, 0.56, 0.65, 0.95];
+
+    // A long-pass dichroic with a linear edge, end values held.
+    let edge = [0.40, 0.53, 0.57, 0.80];
+    let dichroic = SurfaceResponse::ExplicitRt {
+        reflectance: table(&edge, &[1.0, 1.0, 0.0, 0.0], OutOfRangePolicy::Clamp),
+        transmittance: table(&edge, &[0.0, 0.0, 1.0, 1.0], OutOfRangePolicy::Clamp),
+    };
+    let mut scene = Scene3::new();
+    fold_with_two_arms(&mut scene, dichroic);
+    scene.validate().unwrap();
+    assert_gpu_matches_cpu_at(&tracer, &scene, &fold_rays(&lambdas), opts());
+
+    // Every out-of-range policy on a splitter's reflectance table.
+    for policy in [
+        OutOfRangePolicy::Error,
+        OutOfRangePolicy::Zero,
+        OutOfRangePolicy::Clamp,
+    ] {
+        let resp = SurfaceResponse::ExplicitRt {
+            reflectance: table(&[0.45, 0.65], &[0.3, 0.35], policy),
+            transmittance: SpectralScalar::Constant(0.6),
+        };
+        let mut scene = Scene3::new();
+        fold_with_two_arms(&mut scene, resp);
+        scene.validate().unwrap();
+        assert_gpu_matches_cpu_at(&tracer, &scene, &fold_rays(&lambdas), opts());
+    }
+
+    // Tabulated mirrors: no value outside the band (Error), and a held curve.
+    for (xs, ys, policy) in [
+        (vec![0.45, 0.65], vec![0.9, 0.95], OutOfRangePolicy::Error),
+        (
+            vec![0.40, 0.50, 0.60, 0.75],
+            vec![0.80, 0.93, 0.96, 0.975],
+            OutOfRangePolicy::Clamp,
+        ),
+    ] {
+        let mirror = SurfaceResponse::Mirror {
+            reflectivity: table(&xs, &ys, policy),
+        };
+        let mut scene = Scene3::new();
+        fold_with_two_arms(&mut scene, mirror);
+        scene.validate().unwrap();
+        assert_gpu_matches_cpu_at(&tracer, &scene, &fold_rays(&lambdas), opts());
+    }
+
+    // A window whose AR table has no value outside its band, ghosts on and off.
+    let window = SurfaceResponse::DielectricFresnel {
+        ar_residual: table(&[0.45, 0.65], &[0.01, 0.02], OutOfRangePolicy::Error),
+    };
+    let mut scene = Scene3::new();
+    add_surface(&mut scene, Vec3::ZERO, -Vec3::X, 10.0, window);
+    add_rect_detector(
+        &mut scene,
+        Vec3::new(20.0, 0.0, 0.0),
+        -Vec3::X,
+        8.0,
+        8.0,
+        [3, 3],
+    );
+    scene.validate().unwrap();
+    for ghosts in [false, true] {
+        assert_gpu_matches_cpu_at(&tracer, &scene, &fold_rays(&lambdas), ghost_opts(ghosts));
+    }
 }

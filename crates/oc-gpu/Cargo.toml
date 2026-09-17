@@ -39,6 +39,10 @@ pollster = { version = "0.3", optional = true }
 # test still uses the default 2D tracer.
 oc-trace = { workspace = true, features = ["trace3"] }
 serde_json.workspace = true
+# The WGSL front end wgpu 22 itself uses (same version), so `shader3_layout`
+# can parse and validate the 3D shader, and check its struct layout against
+# `buffers3`, on a machine with no usable GPU.
+naga = { version = "22.1", features = ["wgsl-in"] }
 
 [[example]]
 name = "gpu_probe"

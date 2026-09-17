@@ -615,6 +615,7 @@ version = "0.0.1"
 dependencies = [
  "bytemuck",
  "glam",
+ "naga",
  "oc-core",
  "oc-trace",
  "pollster",

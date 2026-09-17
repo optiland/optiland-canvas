@@ -11,8 +11,11 @@
 //     the clamped value is never shown as a number.
 //   - No display dispersion (`MeshPhysicalMaterial.dispersion` stays 0): the
 //     only colour separation on screen is the tracer's, in the rays.
-//   - No coating colours: clear glass stays neutral, because the scene's scalar
-//     coating model has nothing a colour could honestly stand for.
+//   - Coating colours only where the scene has a coating: a beam splitter or a
+//     dichroic plate shows what its reflectance and transmittance tables pass
+//     across the visible band (render_view.rs weighs them). Clear glass stays
+//     neutral, because a scalar Fresnel face has nothing a colour could
+//     honestly stand for.
 //   - Mirror reflections are environment reflections, not the scene's mirror
 //     reflectivity.
 //   - A source's glow is its light's display colour, not a radiance.
@@ -23,7 +26,7 @@
 
 import * as THREE from "three/webgpu";
 import { abs, dot, float, mix, normalView, positionLocal, positionViewDirection, texture, uniform, vec2, vec3 } from "three/tsl";
-import { FaceGroup, type MaterialRole, type RenderObjectDescriptor } from "./types";
+import { FaceGroup, type CoatColors, type MaterialRole, type RenderObjectDescriptor } from "./types";
 import { FACE_GROUP_SLOTS } from "./mesh-adapter";
 
 /** Internal shading roles on top of the scene-facing vocabulary. */
@@ -96,7 +99,55 @@ export class MaterialLibrary {
     });
   }
 
-  private material(role: ShadingRole, d: RenderObjectDescriptor): THREE.Material {
+  /** A coated plate: a splitter reads as a half-silvered window, a dichroic
+   *  as clear glass tinted by what it passes, glowing faintly in what it
+   *  reflects. Keyed by its colours, quantized so a dragged edge reuses
+   *  materials; the colours are uniforms, so every coated plate of a role
+   *  shares one shader. */
+  private coated(role: "beamsplitter" | "dichroic", coat: CoatColors | null): THREE.Material {
+    const quant = (c: number[] | undefined) => (c ?? [0.5, 0.5, 0.5]).map((v) => Math.round(Math.min(1, Math.max(0, v)) * 50) / 50);
+    const r = quant(coat?.r);
+    const t = quant(coat?.t);
+    return this.get(`${role}:${r.join(",")}|${t.join(",")}`, () => {
+      const mean = (c: number[]) => (c[0] + c[1] + c[2]) / 3;
+      const peak = (c: number[]) => {
+        const p = Math.max(c[0], c[1], c[2], 1e-6);
+        return new THREE.Color(c[0] / p, c[1] / p, c[2] / p);
+      };
+      let m: THREE.MeshPhysicalNodeMaterial;
+      if (role === "beamsplitter") {
+        m = new THREE.MeshPhysicalNodeMaterial({
+          color: 0xffffff,
+          // The reflected share shows as metal, the rest stays see-through.
+          metalness: Math.min(0.85, mean(r)),
+          roughness: 0.12,
+          transmission: 1,
+          ior: 1.5,
+          thickness: 0.5,
+        });
+        m.emissiveNode = fresnelEdge(0.2);
+      } else {
+        const reflect = peak(r);
+        m = new THREE.MeshPhysicalNodeMaterial({
+          color: mean(t) > 0.02 ? peak(t) : new THREE.Color(0.2, 0.2, 0.22),
+          metalness: 0,
+          roughness: 0.05,
+          transmission: 1,
+          ior: 1.5,
+          thickness: 0.5,
+          specularIntensity: 1,
+          specularColor: reflect,
+        });
+        const glow = uniform(reflect.clone().multiplyScalar(Math.min(1, mean(r) * 1.5)));
+        const grazing = float(1).sub(abs(dot(normalView, positionViewDirection))).pow(2);
+        m.emissiveNode = glow.mul(grazing.mul(0.5).add(0.12));
+      }
+      m.depthWrite = false;
+      return m;
+    });
+  }
+
+  private material(role: ShadingRole, d: RenderObjectDescriptor, group: FaceGroup): THREE.Material {
     switch (role) {
       case "optical_glass":
         return this.glass(d.nd);
@@ -179,6 +230,9 @@ export class MaterialLibrary {
           metalness: 0.5,
           roughness: 0.45,
         }));
+      case "beamsplitter":
+      case "dichroic":
+        return this.coated(role, group === FaceGroup.Back ? d.coat?.back ?? null : d.coat?.front ?? null);
       case "slab_edge":
         // The edge of a display-only slab (a mirror or plate substrate).
         return this.get("slab_edge", () => new THREE.MeshStandardNodeMaterial({
@@ -222,7 +276,7 @@ export class MaterialLibrary {
     const out: THREE.Material[] = [];
     for (let g = 0; g < FACE_GROUP_SLOTS; g++) {
       const used = d.kind === "source" ? g >= FaceGroup.SourceEmitter : g < FaceGroup.SourceEmitter;
-      out.push(used ? this.material(MaterialLibrary.roleFor(d, g), d) : this.material("error", d));
+      out.push(used ? this.material(MaterialLibrary.roleFor(d, g), d, g) : this.material("error", d, g));
     }
     return out;
   }

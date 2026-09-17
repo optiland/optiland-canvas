@@ -54,6 +54,9 @@ export type View3dThree = {
   activate: (selectId: number) => void;
   standDown: () => void;
   focusObject: (id: number) => void;
+  /** Re-read after an edit still in progress elsewhere (the component view's
+   *  handle drags): the fast picture, no exact trace. */
+  previewEdit: () => void;
   resetView: () => void;
   setPreset: (name: string) => void;
   setPerspective: (on: boolean) => void;
@@ -930,6 +933,13 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
     activate,
     standDown,
     focusObject,
+    previewEdit: () => {
+      retrace(true);
+      refreshObjects();
+      cards.renderAll();
+      quality.pulse();
+      invalidate();
+    },
     resetView: () => { rig.resetOrientation(); frameScene(); invalidate(); },
     setPreset: (name) => { rig.setPreset(name as CameraPreset); frameScene(); invalidate(); },
     setPerspective: (on) => { rig.setPerspective(on); remember(); invalidate(); },

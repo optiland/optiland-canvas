@@ -93,12 +93,61 @@ impl RenderTracker {
 
 /// A display role for one side of a zero-thickness surface.
 fn response_role(r: &SurfaceResponse) -> &'static str {
-    match r {
-        SurfaceResponse::Mirror { .. } => "mirror",
-        SurfaceResponse::Absorber => "absorber",
-        SurfaceResponse::ExplicitRt { .. }
-        | SurfaceResponse::DielectricFresnel { .. }
-        | SurfaceResponse::ThinLens { .. } => "generic_dielectric",
+    match oc_core::build3::response_kind(r) {
+        "mirror" => "mirror",
+        "absorb" => "absorber",
+        "split" => "beamsplitter",
+        "dichroic" | "coated" => "dichroic",
+        _ => "generic_dielectric",
+    }
+}
+
+/// The display colours of a coated face, linear RGB: its reflectance and its
+/// transmittance weighted across the visible band with the rays' wavelength
+/// colours, each channel divided by the same weighting of a perfect reflector.
+/// A 50:50 splitter is mid grey in both; a long-pass dichroic reflects blue and
+/// transmits yellow. `None` for a face with no explicit coating.
+pub(crate) fn coat_colors(r: &SurfaceResponse) -> Option<([f32; 3], [f32; 3])> {
+    let SurfaceResponse::ExplicitRt {
+        reflectance,
+        transmittance,
+    } = r
+    else {
+        return None;
+    };
+    let (mut white, mut rc, mut tc) = ([0.0f64; 3], [0.0f64; 3], [0.0f64; 3]);
+    // 5 nm steps at the band's interior midpoints.
+    for i in 0..80 {
+        let um = 0.3825 + 0.005 * i as f64;
+        let c = wavelength_um_to_linear(um as f32);
+        let rv = reflectance.sample(um).unwrap_or(0.0);
+        let tv = transmittance.sample(um).unwrap_or(0.0);
+        for k in 0..3 {
+            white[k] += c[k] as f64;
+            rc[k] += rv * c[k] as f64;
+            tc[k] += tv * c[k] as f64;
+        }
+    }
+    let norm = |v: [f64; 3]| -> [f32; 3] {
+        std::array::from_fn(|k| {
+            if white[k] > 0.0 {
+                (v[k] / white[k]) as f32
+            } else {
+                0.0
+            }
+        })
+    };
+    Some((norm(rc), norm(tc)))
+}
+
+/// A face's `{r, t}` display colours as JSON, or `null`.
+fn coat_json(r: &SurfaceResponse) -> String {
+    match coat_colors(r) {
+        Some((rc, tc)) => format!(
+            "{{\"r\":[{},{},{}],\"t\":[{},{},{}]}}",
+            rc[0], rc[1], rc[2], tc[0], tc[1], tc[2]
+        ),
+        None => "null".to_string(),
     }
 }
 
@@ -146,12 +195,14 @@ fn descriptor(
     radius: f64,
     error: Option<&str>,
     emit: Option<[f32; 3]>,
+    coat: Option<String>,
 ) -> String {
     let p = t.pos;
     let q = t.rot_xyzw;
     let emit = emit.map_or("null".to_string(), |[r, g, b]| format!("[{r},{g},{b}]"));
+    let coat = coat.unwrap_or_else(|| "null".to_string());
     format!(
-        "{{\"id\":{id},\"kind\":\"{kind}\",\"geometryRevision\":{},\"transformRevision\":{},\"materialRevision\":{},\"visible\":{visible},\"pos\":[{},{},{}],\"rot\":[{},{},{},{}],\"role\":\"{role}\",\"front\":{},\"back\":{},\"nd\":{},\"radius\":{},\"error\":{},\"emit\":{emit}}}",
+        "{{\"id\":{id},\"kind\":\"{kind}\",\"geometryRevision\":{},\"transformRevision\":{},\"materialRevision\":{},\"visible\":{visible},\"pos\":[{},{},{}],\"rot\":[{},{},{},{}],\"role\":\"{role}\",\"front\":{},\"back\":{},\"nd\":{},\"radius\":{},\"error\":{},\"emit\":{emit},\"coat\":{coat}}}",
         e.geometry.rev,
         e.transform.rev,
         e.material.rev,
@@ -225,6 +276,7 @@ pub fn render_objects_json(scene: &Scene3, tracker: &mut RenderTracker) -> Strin
             crate::body_radius(b),
             error,
             None,
+            None,
         ));
     }
 
@@ -254,6 +306,11 @@ pub fn render_objects_json(scene: &Scene3, tracker: &mut RenderTracker) -> Strin
             crate::surface_kind_radius(s).1,
             None,
             None,
+            Some(format!(
+                "{{\"front\":{},\"back\":{}}}",
+                coat_json(&s.response_front),
+                coat_json(&s.response_back)
+            )),
         ));
     }
 
@@ -277,6 +334,7 @@ pub fn render_objects_json(scene: &Scene3, tracker: &mut RenderTracker) -> Strin
             None,
             None,
             crate::aperture_radius_opening(a).0,
+            None,
             None,
             None,
         ));
@@ -305,6 +363,7 @@ pub fn render_objects_json(scene: &Scene3, tracker: &mut RenderTracker) -> Strin
             hw.hypot(hh),
             None,
             None,
+            None,
         ));
     }
 
@@ -331,6 +390,7 @@ pub fn render_objects_json(scene: &Scene3, tracker: &mut RenderTracker) -> Strin
             crate::source_radius(s),
             None,
             Some(emission_color(s)),
+            None,
         ));
     }
 
@@ -541,6 +601,95 @@ mod tests {
                 assert!(emit.is_null());
             }
         }
+    }
+
+    #[test]
+    fn splitters_and_dichroics_carry_their_coating_colours() {
+        use oc_core::build3::DichroicSpec;
+        let mut scene = Scene3::default_scene();
+        let bs = scene
+            .add_beam_splitter(Vec3::new(-35.0, 0.0, 0.0), 15.0, 135.0, 0.5, 0.5)
+            .unwrap();
+        let dc = scene
+            .add_dichroic(
+                Vec3::new(-50.0, 0.0, 0.0),
+                15.0,
+                135.0,
+                DichroicSpec::default(),
+            )
+            .unwrap();
+        let mut t = RenderTracker::default();
+        let json = render_objects_json(&scene, &mut t);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let find = |id: u64| {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .find(|o| o["id"].as_u64() == Some(id))
+                .unwrap()
+                .clone()
+        };
+        let rgb = |x: &serde_json::Value| -> Vec<f64> {
+            x.as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c.as_f64().unwrap())
+                .collect()
+        };
+
+        let o = find(bs);
+        assert_eq!(
+            (o["front"].as_str(), o["back"].as_str()),
+            (Some("beamsplitter"), Some("beamsplitter"))
+        );
+        for c in rgb(&o["coat"]["front"]["r"])
+            .into_iter()
+            .chain(rgb(&o["coat"]["back"]["t"]))
+        {
+            assert!(
+                (c - 0.5).abs() < 1e-6,
+                "a 50:50 splitter is neutral grey: {c}"
+            );
+        }
+
+        let o = find(dc);
+        assert_eq!(o["front"].as_str(), Some("dichroic"));
+        let (r, tr) = (rgb(&o["coat"]["front"]["r"]), rgb(&o["coat"]["front"]["t"]));
+        assert!(r[2] > r[0] + 0.3, "a long-pass edge reflects blue: {r:?}");
+        assert!(tr[0] > tr[2] + 0.3, "and transmits red: {tr:?}");
+
+        // Bodies, detectors, and plain mirrors have no coating colours.
+        let body = find(scene.bodies[0].common.id.0);
+        assert!(body["coat"].is_null());
+        let mirror = scene.add_planar_element(
+            Vec3::ZERO,
+            5.0,
+            0.0,
+            SurfaceResponse::Mirror {
+                reflectivity: oc_core::scene3::SpectralScalar::Constant(0.9),
+            },
+            SurfaceResponse::Absorber,
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&render_objects_json(&scene, &mut t)).unwrap();
+        let m = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["id"].as_u64() == Some(mirror))
+            .unwrap();
+        assert!(m["coat"]["front"].is_null() && m["coat"]["back"].is_null());
+
+        // A new edge is a material change.
+        let before = revs(&render_objects_json(&scene, &mut t), dc);
+        let spec = DichroicSpec {
+            edge_nm: 620.0,
+            ..DichroicSpec::default()
+        };
+        assert!(scene.set_surface_dichroic(dc, spec));
+        let after = revs(&render_objects_json(&scene, &mut t), dc);
+        assert_eq!((after.0, after.1), (before.0, before.1));
+        assert_ne!(after.2, before.2);
     }
 
     #[test]

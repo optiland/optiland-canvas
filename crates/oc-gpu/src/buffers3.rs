@@ -8,21 +8,25 @@
 //! travels as its three columns in three `[f32; 4]`; the shader rebuilds the
 //! `mat3x3` from them.
 //!
-//! Variable-length geometry (extruded polygons, revolved faces and contours, and
-//! polygon face-shapes) lives in flat **arenas** — `verts` and `faces` — with each
-//! object holding a `(start, count)` range into them. That is the one shape that
-//! survives a GPU storage buffer: nested `Vec`s do not.
+//! Variable-length data (extruded polygons, revolved faces and contours, polygon
+//! face-shapes, and tabulated response curves) lives in flat **arenas** — `verts`
+//! and `faces` — with each object holding a `(start, count)` range into them.
+//! That is the one shape that survives a GPU storage buffer: nested `Vec`s do
+//! not. A response table is stored in `verts` as one `(lambda_um, value)` pair
+//! per sample.
 //!
 //! `bytemuck::Pod`, so a `&[T]` uploads with `cast_slice`. Sizes are asserted at
-//! compile time here and re-checked against the WGSL struct sizes at runtime in
-//! `gpu3_vs_cpu3` — the two must never drift.
+//! compile time here, and the `shader3_layout` test parses the WGSL with naga
+//! and checks every struct's size and field offsets against these, so the two
+//! cannot drift.
 
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat3, Vec3};
+use oc_core::scene3::OutOfRangePolicy;
 
 use crate::scene3::{
     DetShape, GpuAperture3, GpuBody3, GpuDetector3, GpuResponse, GpuScene3, GpuShape2, GpuSurface3,
-    RevFace,
+    RevFace, Spectral32,
 };
 
 // Face-shape kinds (the finite region of a plane). Shared by surfaces, apertures,
@@ -38,6 +42,11 @@ pub const RESP_MIRROR: u32 = 1;
 pub const RESP_DIELECTRIC: u32 = 2;
 pub const RESP_EXPLICIT_RT: u32 = 3;
 pub const RESP_THIN_LENS: u32 = 4;
+
+// Out-of-range policies of a tabulated response scalar.
+pub const POLICY_ERROR: u32 = 0;
+pub const POLICY_CLAMP: u32 = 1;
+pub const POLICY_ZERO: u32 = 2;
 
 // Revolved-face kinds (Part 3).
 pub const FACE_SAG: u32 = 0;
@@ -143,8 +152,39 @@ pub struct Face3Buf {
     pub coeffs: [f32; 8],
 }
 
+/// A response scalar: the constant `value` when `tab_count == 0`, else
+/// `tab_count` `(lambda_um, value)` samples at `verts[tab_start..]`, read with
+/// the out-of-range `policy` (`POLICY_*`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable, PartialEq)]
+pub struct Spectral3Buf {
+    pub value: f32,
+    pub tab_start: u32,
+    pub tab_count: u32,
+    pub policy: u32,
+}
+
+/// One side of a zero-thickness surface. `r` is the mirror reflectivity or the
+/// explicit reflectance (a thin lens carries its normalized focal length there,
+/// always constant), `t` the explicit transmittance, `ar` the dielectric AR
+/// residual. Scalars a kind does not use are zero constants.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable, PartialEq)]
+pub struct Response3Buf {
+    pub kind: u32,
+    pub _pad: [u32; 3],
+    pub r: Spectral3Buf,
+    pub t: Spectral3Buf,
+    pub ar: Spectral3Buf,
+}
+
 /// A zero-thickness surface: local `z=0` plane, a face shape, and a response per
 /// side.
+///
+/// Byte offsets: `rot0..pos` 0-63, `shape_kind` 64, `shape_a` 68, `shape_b` 72,
+/// `poly_start` 76, `poly_count` 80, pad 84-95, `front` 96-159, `back` 160-223.
+/// Within a side: `kind` +0, pad +4, `r` +16, `t` +32, `ar` +48, each scalar
+/// `value` +0, `tab_start` +4, `tab_count` +8, `policy` +12.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct Surface3Buf {
@@ -157,15 +197,9 @@ pub struct Surface3Buf {
     pub shape_b: f32,
     pub poly_start: u32,
     pub poly_count: u32,
-    pub front_kind: u32,
-    pub front_r: f32,
-    pub front_t: f32,
-    pub front_ar: f32,
-    pub back_kind: u32,
-    pub back_r: f32,
-    pub back_t: f32,
-    pub back_ar: f32,
-    pub _pad: [f32; 3],
+    pub _pad: [u32; 3],
+    pub front: Response3Buf,
+    pub back: Response3Buf,
 }
 
 /// A finite aperture: an opening (`clear`) in an opaque mask (`outer`, optional),
@@ -218,7 +252,9 @@ const _: () = {
     assert!(std::mem::size_of::<Seg3Buf>() == 48);
     assert!(std::mem::size_of::<Body3Buf>() == 176);
     assert!(std::mem::size_of::<Face3Buf>() == 80);
-    assert!(std::mem::size_of::<Surface3Buf>() == 128);
+    assert!(std::mem::size_of::<Spectral3Buf>() == 16);
+    assert!(std::mem::size_of::<Response3Buf>() == 64);
+    assert!(std::mem::size_of::<Surface3Buf>() == 224);
     assert!(std::mem::size_of::<Aperture3Buf>() == 112);
     assert!(std::mem::size_of::<Detector3Buf>() == 80);
     assert!(std::mem::size_of::<Vert3Buf>() == 8);
@@ -275,15 +311,60 @@ fn encode_det_shape(shape: &DetShape) -> (u32, f32, f32) {
     }
 }
 
-/// Encode a surface response as `(kind, r, t, ar)`. A thin lens carries its
-/// normalized focal length in the `r` slot.
-fn encode_response(r: &GpuResponse) -> (u32, f32, f32, f32) {
-    match r {
-        GpuResponse::Absorber => (RESP_ABSORBER, 0.0, 0.0, 0.0),
-        GpuResponse::Mirror { r } => (RESP_MIRROR, *r, 0.0, 0.0),
-        GpuResponse::Dielectric { ar } => (RESP_DIELECTRIC, 0.0, 0.0, *ar),
-        GpuResponse::ExplicitRt { r, t } => (RESP_EXPLICIT_RT, *r, *t, 0.0),
-        GpuResponse::ThinLens { f } => (RESP_THIN_LENS, *f, 0.0, 0.0),
+fn constant(value: f32) -> Spectral3Buf {
+    Spectral3Buf {
+        value,
+        tab_start: 0,
+        tab_count: 0,
+        policy: POLICY_ERROR,
+    }
+}
+
+/// Encode a response scalar, appending a table's samples to the arena.
+fn encode_spectral(s: &Spectral32, verts: &mut Vec<Vert3Buf>) -> Spectral3Buf {
+    match s {
+        Spectral32::Const(v) => constant(*v),
+        Spectral32::Table {
+            lambda,
+            values,
+            policy,
+        } => {
+            let tab_start = verts.len() as u32;
+            verts.extend(lambda.iter().zip(values).map(|(l, v)| [*l, *v]));
+            Spectral3Buf {
+                value: 0.0,
+                tab_start,
+                tab_count: lambda.len() as u32,
+                policy: match policy {
+                    OutOfRangePolicy::Error => POLICY_ERROR,
+                    OutOfRangePolicy::Clamp => POLICY_CLAMP,
+                    OutOfRangePolicy::Zero => POLICY_ZERO,
+                },
+            }
+        }
+    }
+}
+
+/// Encode one side's response. A thin lens carries its normalized focal length
+/// in the `r` slot.
+fn encode_response(resp: &GpuResponse, verts: &mut Vec<Vert3Buf>) -> Response3Buf {
+    let zero = constant(0.0);
+    let (kind, r, t, ar) = match resp {
+        GpuResponse::Absorber => (RESP_ABSORBER, zero, zero, zero),
+        GpuResponse::Mirror { r } => (RESP_MIRROR, encode_spectral(r, verts), zero, zero),
+        GpuResponse::Dielectric { ar } => (RESP_DIELECTRIC, zero, zero, encode_spectral(ar, verts)),
+        GpuResponse::ExplicitRt { r, t } => {
+            let r = encode_spectral(r, verts);
+            (RESP_EXPLICIT_RT, r, encode_spectral(t, verts), zero)
+        }
+        GpuResponse::ThinLens { f } => (RESP_THIN_LENS, constant(*f), zero, zero),
+    };
+    Response3Buf {
+        kind,
+        _pad: [0; 3],
+        r,
+        t,
+        ar,
     }
 }
 
@@ -383,8 +464,8 @@ fn pack_face(f: &RevFace) -> Face3Buf {
 fn pack_surface(s: &GpuSurface3, verts: &mut Vec<Vert3Buf>) -> Surface3Buf {
     let (rot0, rot1, rot2) = cols(&s.rot);
     let (shape_kind, shape_a, shape_b, poly_start, poly_count) = encode_shape(&s.shape, verts);
-    let (front_kind, front_r, front_t, front_ar) = encode_response(&s.front);
-    let (back_kind, back_r, back_t, back_ar) = encode_response(&s.back);
+    let front = encode_response(&s.front, verts);
+    let back = encode_response(&s.back, verts);
     Surface3Buf {
         rot0,
         rot1,
@@ -395,15 +476,9 @@ fn pack_surface(s: &GpuSurface3, verts: &mut Vec<Vert3Buf>) -> Surface3Buf {
         shape_b,
         poly_start,
         poly_count,
-        front_kind,
-        front_r,
-        front_t,
-        front_ar,
-        back_kind,
-        back_r,
-        back_t,
-        back_ar,
-        _pad: [0.0; 3],
+        _pad: [0; 3],
+        front,
+        back,
     }
 }
 
@@ -512,5 +587,85 @@ impl Gpu3Buffers {
             verts,
             faces,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use glam::Vec2;
+
+    #[test]
+    fn response_tables_land_in_the_verts_arena() {
+        let surface = GpuSurface3 {
+            rot: Mat3::IDENTITY,
+            pos: Vec3::ZERO,
+            shape: GpuShape2::Polygon {
+                verts: vec![Vec2::ZERO, Vec2::X, Vec2::Y],
+            },
+            front: GpuResponse::ExplicitRt {
+                r: Spectral32::Table {
+                    lambda: vec![0.4, 0.55, 0.7],
+                    values: vec![1.0, 0.5, 0.0],
+                    policy: OutOfRangePolicy::Clamp,
+                },
+                t: Spectral32::Const(0.25),
+            },
+            back: GpuResponse::Mirror {
+                r: Spectral32::Table {
+                    lambda: vec![0.5, 0.6],
+                    values: vec![0.9, 0.8],
+                    policy: OutOfRangePolicy::Zero,
+                },
+            },
+            object: 7,
+        };
+        // Something is already in the arena: ranges are absolute.
+        let mut verts: Vec<Vert3Buf> = vec![[9.0, 9.0]];
+        let b = pack_surface(&surface, &mut verts);
+
+        assert_eq!((b.poly_start, b.poly_count), (1, 3));
+        assert_eq!(b.front.kind, RESP_EXPLICIT_RT);
+        let front_r = Spectral3Buf {
+            value: 0.0,
+            tab_start: 4,
+            tab_count: 3,
+            policy: POLICY_CLAMP,
+        };
+        assert_eq!(b.front.r, front_r);
+        assert_eq!(b.front.t, constant(0.25));
+        assert_eq!(b.front.ar, constant(0.0));
+        assert_eq!(b.back.kind, RESP_MIRROR);
+        let back_r = Spectral3Buf {
+            value: 0.0,
+            tab_start: 7,
+            tab_count: 2,
+            policy: POLICY_ZERO,
+        };
+        assert_eq!(b.back.r, back_r);
+        assert_eq!(
+            verts[4..],
+            [[0.4, 1.0], [0.55, 0.5], [0.7, 0.0], [0.5, 0.9], [0.6, 0.8]]
+        );
+
+        // The documented byte offsets.
+        let bytes = bytemuck::bytes_of(&b);
+        let u = |at: usize| u32::from_ne_bytes(bytes[at..at + 4].try_into().unwrap());
+        let f = |at: usize| f32::from_ne_bytes(bytes[at..at + 4].try_into().unwrap());
+        assert_eq!(u(80), 3); // poly_count
+        assert_eq!(u(96), RESP_EXPLICIT_RT); // front.kind
+        assert_eq!((u(116), u(120), u(124)), (4, 3, POLICY_CLAMP)); // front.r
+        assert_eq!(f(128), 0.25); // front.t.value
+        assert_eq!(u(160), RESP_MIRROR); // back.kind
+        assert_eq!((u(180), u(184), u(188)), (7, 2, POLICY_ZERO)); // back.r
+    }
+
+    #[test]
+    fn a_thin_lens_keeps_its_focal_length_in_the_r_slot() {
+        let mut verts = Vec::new();
+        let b = encode_response(&GpuResponse::ThinLens { f: -0.75 }, &mut verts);
+        assert_eq!(b.kind, RESP_THIN_LENS);
+        assert_eq!(b.r, constant(-0.75));
+        assert!(verts.is_empty());
     }
 }

@@ -56,6 +56,27 @@ struct Body {
     _pad: array<f32, 2>,
 };
 
+// A response scalar: the constant `value` when `tab_count == 0`, else
+// `tab_count` `(lambda_um, value)` samples at `verts[tab_start..]`, read with the
+// out-of-range `policy` (POLICY_*).
+struct Spectral {
+    value: f32,
+    tab_start: u32,
+    tab_count: u32,
+    policy: u32,
+};
+
+// One side of a zero-thickness surface. `r` is the mirror reflectivity or the
+// explicit reflectance (a thin lens keeps its normalized focal length there),
+// `t` the explicit transmittance, `ar` the dielectric AR residual.
+struct Response {
+    kind: u32,
+    _pad: array<u32, 3>,
+    r: Spectral,
+    t: Spectral,
+    ar: Spectral,
+};
+
 struct Surface {
     rot0: vec4<f32>,
     rot1: vec4<f32>,
@@ -66,15 +87,9 @@ struct Surface {
     shape_b: f32,
     poly_start: u32,
     poly_count: u32,
-    front_kind: u32,
-    front_r: f32,
-    front_t: f32,
-    front_ar: f32,
-    back_kind: u32,
-    back_r: f32,
-    back_t: f32,
-    back_ar: f32,
-    _pad: array<f32, 3>,
+    _pad: array<u32, 3>,
+    front: Response,
+    back: Response,
 };
 
 struct Aperture {
@@ -158,6 +173,11 @@ const RESP_MIRROR: u32 = 1u;
 const RESP_DIELECTRIC: u32 = 2u;
 const RESP_EXPLICIT_RT: u32 = 3u;
 const RESP_THIN_LENS: u32 = 4u;
+
+// Out-of-range policies of a tabulated response scalar.
+const POLICY_ERROR: u32 = 0u;
+const POLICY_CLAMP: u32 = 1u;
+const POLICY_ZERO: u32 = 2u;
 
 // Body geometry kinds.
 const OBJ_SPHERE: u32 = 0u;
@@ -813,6 +833,40 @@ fn beer_lambert(alpha_per_mm: f32, t_norm: f32) -> f32 {
     return exp(-alpha_per_mm * t_norm * params.scale);
 }
 
+// A response scalar at `lambda`. `.x` is the value; `.y` is 1 when there is
+// one and 0 when a table under the Error policy has none there. Mirrors
+// scene3::Spectral32::sample: piecewise linear over the interval that
+// `partition_point(x <= lambda) - 1` picks, clamped to the last interval. The
+// tables are short, so the interval is found by a linear scan.
+fn sample_spectral(s: Spectral, lambda: f32) -> vec2<f32> {
+    if (s.tab_count == 0u) { return vec2<f32>(s.value, 1.0); }
+    let n = s.tab_count;
+    let first = verts[s.tab_start];
+    let last = verts[s.tab_start + n - 1u];
+    if (lambda < first.x || lambda > last.x) {
+        if (s.policy == POLICY_CLAMP) {
+            return vec2<f32>(select(last.y, first.y, lambda < first.x), 1.0);
+        } else if (s.policy == POLICY_ZERO) {
+            return vec2<f32>(0.0, 1.0);
+        }
+        return vec2<f32>(0.0, 0.0);
+    }
+    // The first sample past `lambda` (n if none); the wavelengths increase.
+    var pp = n;
+    for (var k = 0u; k < n; k = k + 1u) {
+        if (verts[s.tab_start + k].x > lambda) {
+            pp = k;
+            break;
+        }
+    }
+    let i = min(max(pp, 1u) - 1u, n - 2u);
+    let a = verts[s.tab_start + i];
+    let b = verts[s.tab_start + i + 1u];
+    var f = 0.0;
+    if (b.x > a.x) { f = (lambda - a.x) / (b.x - a.x); }
+    return vec2<f32>(a.y + f * (b.y - a.y), 1.0);
+}
+
 // ---------------------------------------------------------------------------
 // Per-thread branch stack
 // ---------------------------------------------------------------------------
@@ -954,7 +1008,7 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (ev.kind == 0u) {
             interact_body(w, ev, point, flux_end, lambda, min_flux);
         } else if (ev.kind == 1u) {
-            interact_surface(w, ev, point, flux_end, min_flux);
+            interact_surface(w, ev, point, flux_end, lambda, min_flux);
         } else if (ev.kind == 2u) {
             // Aperture: the branch ends here (blocked).
         } else {
@@ -1003,19 +1057,12 @@ fn interact_body(w: Work, ev: Event, point: vec3<f32>, flux_end: f32, lambda: f3
     }
 }
 
-fn interact_surface(w: Work, ev: Event, point: vec3<f32>, flux_end: f32, min_flux: f32) {
+fn interact_surface(w: Work, ev: Event, point: vec3<f32>, flux_end: f32, lambda: f32, min_flux: f32) {
     let s = surfaces[ev.idx];
     let from_front = dot(w.d, ev.n) < 0.0;
-    var kind = s.back_kind;
-    var rr = s.back_r;
-    var tt = s.back_t;
-    var ar = s.back_ar;
-    if (from_front) {
-        kind = s.front_kind;
-        rr = s.front_r;
-        tt = s.front_t;
-        ar = s.front_ar;
-    }
+    var resp = s.back;
+    if (from_front) { resp = s.front; }
+    let kind = resp.kind;
     var n_oppose = -ev.n;
     if (from_front) { n_oppose = ev.n; }
 
@@ -1023,19 +1070,27 @@ fn interact_surface(w: Work, ev: Event, point: vec3<f32>, flux_end: f32, min_flu
         return;
     } else if (kind == RESP_THIN_LENS) {
         // Ideal-lens slope law u' = u - h/f in the surface's local frame
-        // (rr carries the normalized focal length). Full transmission.
+        // (`r` carries the normalized focal length). Full transmission.
+        let fl = resp.r.value;
         let srot = surface_rot(s);
         let pl = transpose(srot) * (point - s.pos.xyz);
         let dl = transpose(srot) * w.d;
         var dir = w.d;
-        if (abs(dl.z) > 1e-6 && rr != 0.0) {
-            dir = srot * normalize(vec3<f32>(dl.x - abs(dl.z) * pl.x / rr, dl.y - abs(dl.z) * pl.y / rr, dl.z));
+        if (abs(dl.z) > 1e-6 && fl != 0.0) {
+            dir = srot * normalize(vec3<f32>(dl.x - abs(dl.z) * pl.x / fl, dl.y - abs(dl.z) * pl.y / fl, dl.z));
         }
         push(Work(point + dir * EPS, dir, flux_end, w.depth + 1u, w.gdepth, w.medium_n, w.medium_alpha, w.flags & ~SEG_TIR), min_flux);
     } else if (kind == RESP_MIRROR) {
+        // A table with no value at `lambda` ends the branch.
+        let rs = sample_spectral(resp.r, lambda);
+        if (rs.y < 0.5) { return; }
         let dir = reflect3(w.d, n_oppose);
-        push(Work(point + dir * EPS, dir, flux_end * clamp(rr, 0.0, 1.0), w.depth + 1u, w.gdepth, w.medium_n, w.medium_alpha, w.flags & ~SEG_TIR), min_flux);
+        push(Work(point + dir * EPS, dir, flux_end * clamp(rs.x, 0.0, 1.0), w.depth + 1u, w.gdepth, w.medium_n, w.medium_alpha, w.flags & ~SEG_TIR), min_flux);
     } else if (kind == RESP_DIELECTRIC) {
+        // A table with no value at `lambda` leaves the Fresnel reflection
+        // unscaled (ar = 1).
+        let ars = sample_spectral(resp.ar, lambda);
+        let ar = clamp(select(1.0, ars.x, ars.y > 0.5), 0.0, 1.0);
         let cos_i = clamp(-dot(n_oppose, w.d), 0.0, 1.0);
         let r = clamp(reflectance(cos_i, w.medium_n, w.medium_n) * ar, 0.0, 1.0);
         push(Work(point + w.d * EPS, w.d, flux_end * (1.0 - r), w.depth + 1u, w.gdepth, w.medium_n, w.medium_alpha, w.flags & ~SEG_TIR), min_flux);
@@ -1044,13 +1099,22 @@ fn interact_surface(w: Work, ev: Event, point: vec3<f32>, flux_end: f32, min_flu
             push(Work(point + dir * EPS, dir, flux_end * r, w.depth + 1u, w.gdepth + 1u, w.medium_n, w.medium_alpha, (w.flags & ~SEG_TIR) | SEG_GHOST), min_flux);
         }
     } else {
-        // Explicit R/T.
-        let r = clamp(rr, 0.0, 1.0);
-        let t = clamp(tt, 0.0, 1.0);
-        push(Work(point + w.d * EPS, w.d, flux_end * t, w.depth + 1u, w.gdepth, w.medium_n, w.medium_alpha, w.flags & ~SEG_TIR), min_flux);
-        if (params.ghosts == 1u && w.gdepth < params.max_ghost && r > 0.0) {
+        // Explicit R/T (a beam splitter or dichroic). Both branches are primary
+        // paths: each keeps the parent's ghost flag and ghost depth, and is not
+        // gated by the ghost switch. Either scalar missing at `lambda` ends the
+        // branch. Reflected first, as in cpu3 and tracer3, so both pop in the
+        // same order.
+        let rs = sample_spectral(resp.r, lambda);
+        let ts = sample_spectral(resp.t, lambda);
+        if (rs.y < 0.5 || ts.y < 0.5) { return; }
+        let r = clamp(rs.x, 0.0, 1.0);
+        let t = clamp(ts.x, 0.0, 1.0);
+        if (r > 0.0) {
             let dir = reflect3(w.d, n_oppose);
-            push(Work(point + dir * EPS, dir, flux_end * r, w.depth + 1u, w.gdepth + 1u, w.medium_n, w.medium_alpha, (w.flags & ~SEG_TIR) | SEG_GHOST), min_flux);
+            push(Work(point + dir * EPS, dir, flux_end * r, w.depth + 1u, w.gdepth, w.medium_n, w.medium_alpha, w.flags & ~SEG_TIR), min_flux);
+        }
+        if (t > 0.0) {
+            push(Work(point + w.d * EPS, w.d, flux_end * t, w.depth + 1u, w.gdepth, w.medium_n, w.medium_alpha, w.flags & ~SEG_TIR), min_flux);
         }
     }
 }

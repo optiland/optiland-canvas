@@ -22,6 +22,7 @@ use oc_core::display_mesh::{object_mesh, DisplayMesh, Tessellation, Topology};
 use oc_core::profile2::ProfileConstruction3;
 use oc_core::scene3::{Scene3, SolidGeometry3, SurfaceResponse};
 use oc_core::Material;
+use oc_gpu::color::wavelength_um_to_linear;
 use wasm_bindgen::prelude::*;
 
 /// FNV-1a over the `Debug` text of `parts`. `Debug` prints an `f64` in its
@@ -112,6 +113,25 @@ fn opt_num(v: Option<f64>) -> String {
     }
 }
 
+/// The display colour of a source's light: its spectral lines' colours summed
+/// by weight, the brightest channel scaled to 1. The same wavelength colours as
+/// the rays, so a white source looks white and a laser line its own colour.
+fn emission_color(s: &oc_core::scene3::Source3) -> [f32; 3] {
+    let mut c = [0.0f32; 3];
+    for (um, w) in s.spectrum.samples() {
+        let rgb = wavelength_um_to_linear(um as f32);
+        for k in 0..3 {
+            c[k] += rgb[k] * w as f32;
+        }
+    }
+    let peak = c[0].max(c[1]).max(c[2]);
+    if peak > 0.0 && peak.is_finite() {
+        c.map(|v| v / peak)
+    } else {
+        [1.0, 1.0, 1.0]
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // one descriptor's fields, written once
 fn descriptor(
     id: u64,
@@ -125,11 +145,13 @@ fn descriptor(
     nd: Option<f64>,
     radius: f64,
     error: Option<&str>,
+    emit: Option<[f32; 3]>,
 ) -> String {
     let p = t.pos;
     let q = t.rot_xyzw;
+    let emit = emit.map_or("null".to_string(), |[r, g, b]| format!("[{r},{g},{b}]"));
     format!(
-        "{{\"id\":{id},\"kind\":\"{kind}\",\"geometryRevision\":{},\"transformRevision\":{},\"materialRevision\":{},\"visible\":{visible},\"pos\":[{},{},{}],\"rot\":[{},{},{},{}],\"role\":\"{role}\",\"front\":{},\"back\":{},\"nd\":{},\"radius\":{},\"error\":{}}}",
+        "{{\"id\":{id},\"kind\":\"{kind}\",\"geometryRevision\":{},\"transformRevision\":{},\"materialRevision\":{},\"visible\":{visible},\"pos\":[{},{},{}],\"rot\":[{},{},{},{}],\"role\":\"{role}\",\"front\":{},\"back\":{},\"nd\":{},\"radius\":{},\"error\":{},\"emit\":{emit}}}",
         e.geometry.rev,
         e.transform.rev,
         e.material.rev,
@@ -202,6 +224,7 @@ pub fn render_objects_json(scene: &Scene3, tracker: &mut RenderTracker) -> Strin
             nd,
             crate::body_radius(b),
             error,
+            None,
         ));
     }
 
@@ -230,6 +253,7 @@ pub fn render_objects_json(scene: &Scene3, tracker: &mut RenderTracker) -> Strin
             None,
             crate::surface_kind_radius(s).1,
             None,
+            None,
         ));
     }
 
@@ -253,6 +277,7 @@ pub fn render_objects_json(scene: &Scene3, tracker: &mut RenderTracker) -> Strin
             None,
             None,
             crate::aperture_radius_opening(a).0,
+            None,
             None,
         ));
     }
@@ -279,6 +304,33 @@ pub fn render_objects_json(scene: &Scene3, tracker: &mut RenderTracker) -> Strin
             None,
             hw.hypot(hh),
             None,
+            None,
+        ));
+    }
+
+    // Sources: a glyph at the emitting aperture (display_mesh::source_mesh).
+    for s in &scene.sources {
+        let id = s.id.0;
+        live.push(id);
+        let e = tracker.track(
+            id,
+            fingerprint(&[&"source", &s.spatial, &s.angular]),
+            fingerprint(&[&s.transform]),
+            fingerprint(&[&s.spectrum]),
+        );
+        out.push(descriptor(
+            id,
+            "source",
+            e,
+            true,
+            &s.transform,
+            "source_emitter",
+            None,
+            None,
+            None,
+            crate::source_radius(s),
+            None,
+            Some(emission_color(s)),
         ));
     }
 
@@ -449,12 +501,14 @@ mod tests {
             .collect();
         let body = scene.bodies[0].common.id.0;
         let det = scene.detectors[0].common.id.0;
+        let src = scene.sources[0].id.0;
         for (id, kind, role) in [
             (body, "lens", "optical_glass"),
             (prism, "prism", "optical_glass"),
             (ap, "aperture", "aperture"),
             (mirror, "surface", "mirror"),
             (det, "detector", "detector_active"),
+            (src, "source", "source_emitter"),
         ] {
             assert!(
                 kinds.contains(&(id, kind.to_string(), role.to_string())),
@@ -469,5 +523,63 @@ mod tests {
         let nd = v[0]["nd"].as_f64().unwrap();
         assert!((nd - 1.5168).abs() < 1e-12);
         assert!(render_mesh(&scene, 999_999).is_none());
+        // Only a source carries a light colour; the default white beam's is white.
+        for o in v.as_array().unwrap() {
+            let emit = &o["emit"];
+            if o["kind"] == "source" {
+                let c: Vec<f64> = emit
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|x| x.as_f64().unwrap())
+                    .collect();
+                assert!(
+                    c.iter().all(|x| *x > 0.8 && *x <= 1.0),
+                    "white source drawn as {c:?}"
+                );
+            } else {
+                assert!(emit.is_null());
+            }
+        }
+    }
+
+    #[test]
+    fn a_source_change_moves_only_its_own_revision() {
+        let mut scene = Scene3::default_scene();
+        let src = scene.sources[0].id.0;
+        let mut t = RenderTracker::default();
+        let r0 = revs(&render_objects_json(&scene, &mut t), src);
+        // A new wavelength is a material change: the glyph takes the line's colour.
+        assert!(scene.set_first_source_spectrum(&[(0.6328, 1.0)]));
+        let json = render_objects_json(&scene, &mut t);
+        let r1 = revs(&json, src);
+        assert_eq!((r1.0, r1.1), (r0.0, r0.1));
+        assert_ne!(r1.2, r0.2);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let o = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["id"].as_u64() == Some(src))
+            .unwrap();
+        let c: Vec<f64> = o["emit"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_f64().unwrap())
+            .collect();
+        assert!(
+            c[0] == 1.0 && c[2] < 0.2,
+            "a HeNe line should draw red, got {c:?}"
+        );
+        // A move is a transform change; a new aperture is a geometry change.
+        assert!(scene.set_object_position(src, Vec3::new(-50.0, 2.0, 0.0)));
+        let r2 = revs(&render_objects_json(&scene, &mut t), src);
+        assert_eq!((r2.0, r2.2), (r1.0, r1.2));
+        assert_ne!(r2.1, r1.1);
+        scene.sources[0].spatial = oc_core::scene3::SpatialDistribution3::Disc { radius_mm: 3.0 };
+        let r3 = revs(&render_objects_json(&scene, &mut t), src);
+        assert_eq!((r3.1, r3.2), (r2.1, r2.2));
+        assert_ne!(r3.0, r2.0);
     }
 }

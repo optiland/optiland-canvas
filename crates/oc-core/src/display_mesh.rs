@@ -37,6 +37,13 @@
 //! come from how the mesh was built, not from comparing face normals, so a
 //! renderer can outline a body without analysing its triangles.
 //!
+//! # Light sources
+//!
+//! A source is not an object the tracer can hit, but it has a place, an
+//! emitting aperture, and a direction. Its mesh is a glyph: the aperture as a
+//! thin plate whose front face is the emission plane, and a housing behind it.
+//! The housing is a display choice with no size in the scene.
+//!
 //! # What cannot be drawn
 //!
 //! A 2D-only body (a v1 migration whose third dimension was never authored) has
@@ -50,8 +57,9 @@ use crate::geom3::primitives::{even_asphere_dsag, even_asphere_sag};
 use crate::geom3::profile::{profile_contains_2d, validate_extrudable, validate_revolvable};
 use crate::profile2::{ClosedProfile2, ConicParams2, Curve2, ProfileConstruction3};
 use crate::scene3::{
-    Aperture3, Body3, Detector3, DetectorGeometry3, PlanarShape2, RadialAperture, SagModel, Scene3,
-    SolidGeometry3, SurfaceGeometry3, SurfaceObject3,
+    AngularDistribution3, Aperture3, Body3, Detector3, DetectorGeometry3, PlanarShape2,
+    RadialAperture, SagModel, Scene3, SolidGeometry3, Source3, SpatialDistribution3,
+    SurfaceGeometry3, SurfaceObject3,
 };
 use crate::vec::{perp, Vec2};
 use crate::vec3::{Plane3, Vec3};
@@ -106,6 +114,10 @@ pub enum FaceGroup {
     DetectorActive = 5,
     /// A detector's edge band.
     DetectorHousing = 6,
+    /// A light source's emitting aperture.
+    SourceEmitter = 7,
+    /// A light source's display housing.
+    SourceHousing = 8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,7 +172,7 @@ impl DisplayMesh {
 // ---------------------------------------------------------------------------
 
 /// The display mesh of the object with `id`, whatever kind it is, or `None` if
-/// no body, surface, aperture, or detector has that id.
+/// no body, surface, aperture, detector, or source has that id.
 pub fn object_mesh(scene: &Scene3, id: u64, tess: &Tessellation) -> Option<DisplayMesh> {
     if let Some(b) = scene.bodies.iter().find(|b| b.common.id.0 == id) {
         return Some(body_mesh(b, tess));
@@ -173,6 +185,9 @@ pub fn object_mesh(scene: &Scene3, id: u64, tess: &Tessellation) -> Option<Displ
     }
     if let Some(d) = scene.detectors.iter().find(|d| d.common.id.0 == id) {
         return Some(detector_mesh(d, tess));
+    }
+    if let Some(s) = scene.sources.iter().find(|s| s.id.0 == id) {
+        return Some(source_mesh(s, tess));
     }
     None
 }
@@ -332,6 +347,88 @@ pub fn detector_mesh(d: &Detector3, tess: &Tessellation) -> DisplayMesh {
             edge: FaceGroup::DetectorHousing,
         },
     );
+    m.finish(None)
+}
+
+/// A light source's glyph (see the module doc). The emitting aperture lies in
+/// the local YZ plane and light leaves along local `+X`, or `-X` for a
+/// collimated source aimed backwards; the plate's front face is the emission
+/// plane and the housing sits behind it. A point source is a small ball on a
+/// short stem. A legacy line source has no area and is drawn as its line.
+pub fn source_mesh(s: &Source3, tess: &Tessellation) -> DisplayMesh {
+    let forward = match s.angular {
+        AngularDistribution3::Direction { local_dir } if local_dir.x < 0.0 => -1.0,
+        _ => 1.0,
+    };
+    let axis = Vec3::X * forward;
+    let aperture = match s.spatial {
+        SpatialDistribution3::Rectangle {
+            half_width_mm,
+            half_height_mm,
+        } => Some(PlanarShape2::Rectangle {
+            half_width_mm,
+            half_height_mm,
+        }),
+        SpatialDistribution3::Disc { radius_mm } => Some(PlanarShape2::Disc { radius_mm }),
+        SpatialDistribution3::Point => None,
+        SpatialDistribution3::LineLegacy { half_width_mm } => {
+            let mut m = Builder::new(Topology::Lines);
+            let a = m.vertex(Vec3::new(0.0, -half_width_mm, 0.0), Vec3::ZERO);
+            let b = m.vertex(Vec3::new(0.0, half_width_mm, 0.0), Vec3::ZERO);
+            m.group(FaceGroup::SourceEmitter);
+            m.line(a, b);
+            return m.finish(Some(
+                "legacy line source: it has no area, so it is drawn as a line".to_string(),
+            ));
+        }
+    };
+    let mut m = Builder::new(Topology::Triangles);
+    let Some(shape) = aperture else {
+        // A point: the ball is the emitter, the stem behind it the housing.
+        let r = 1.0;
+        m.group(FaceGroup::SourceEmitter);
+        ball_into(&mut m, Vec3::ZERO, r, tess);
+        m.group(FaceGroup::SourceHousing);
+        let stem = 3.0;
+        cylinder_into(&mut m, -axis * (0.5 * r + stem), 0.6 * r, stem, axis, tess);
+        return m.finish(None);
+    };
+    let r = shape_radius(&shape);
+    let half = slab_half_thickness(r);
+    // The plate spans `-2·half ..= 0` along the axis, so its front face is the
+    // emission plane and no drawn ray starts inside it.
+    let frame = PlaneFrame {
+        origin: -axis * half,
+        u: Vec3::Y,
+        v: Vec3::Z,
+        n: axis,
+    };
+    let groups = SlabGroups {
+        front: FaceGroup::SourceEmitter,
+        back: FaceGroup::SourceHousing,
+        edge: FaceGroup::SourceHousing,
+    };
+    planar_slab(&mut m, &shape, half, &frame, tess, groups);
+    // The housing: a bezel a little wider than the aperture, reaching back.
+    let margin = (0.12 * r).clamp(0.5, 2.0);
+    let depth = (0.6 * r).clamp(3.0, 12.0);
+    m.group(FaceGroup::SourceHousing);
+    match shape {
+        PlanarShape2::Rectangle {
+            half_width_mm,
+            half_height_mm,
+        } => {
+            let (x0, x1) = (-2.0 * half - depth, -2.0 * half);
+            let (x0, x1) = if forward > 0.0 { (x0, x1) } else { (-x1, -x0) };
+            let hy = half_width_mm + margin;
+            let hz = half_height_mm + margin;
+            box_into(&mut m, Vec3::new(x0, -hy, -hz), Vec3::new(x1, hy, hz));
+        }
+        _ => {
+            let centre = -axis * (2.0 * half + 0.5 * depth);
+            cylinder_into(&mut m, centre, r + margin, 0.5 * depth, axis, tess);
+        }
+    }
     m.finish(None)
 }
 
@@ -953,6 +1050,26 @@ fn point_in_triangle(p: Vec2, a: Vec2, b: Vec2, c: Vec2) -> bool {
 fn sphere(r: f64, tess: &Tessellation) -> DisplayMesh {
     let mut m = Builder::new(Topology::Triangles);
     m.group(FaceGroup::Optical);
+    ball_into(&mut m, Vec3::ZERO, r, tess);
+    m.finish(None)
+}
+
+fn cuboid(h: Vec3) -> DisplayMesh {
+    let mut m = Builder::new(Topology::Triangles);
+    m.group(FaceGroup::Optical);
+    box_into(&mut m, -h, h);
+    m.finish(None)
+}
+
+fn cylinder(r: f64, half_len: f64, axis_local: Vec3, tess: &Tessellation) -> DisplayMesh {
+    let mut m = Builder::new(Topology::Triangles);
+    m.group(FaceGroup::Optical);
+    cylinder_into(&mut m, Vec3::ZERO, r, half_len, axis_local, tess);
+    m.finish(None)
+}
+
+/// A sphere of radius `r` about `centre`, in the builder's open group.
+fn ball_into(m: &mut Builder, centre: Vec3, r: f64, tess: &Tessellation) {
     let segs = circle_segments(r, tess);
     let rows = segs / 2;
     let mut grid = Vec::with_capacity(rows + 1);
@@ -962,7 +1079,7 @@ fn sphere(r: f64, tess: &Tessellation) -> DisplayMesh {
             .map(|j| {
                 let th = TAU * j as f64 / segs as f64;
                 let n = Vec3::new(phi.cos(), phi.sin() * th.cos(), phi.sin() * th.sin());
-                m.vertex(n * r, n)
+                m.vertex(centre + n * r, n)
             })
             .collect();
         grid.push(row);
@@ -973,22 +1090,21 @@ fn sphere(r: f64, tess: &Tessellation) -> DisplayMesh {
             m.quad(w[0][j], w[0][j1], w[1][j1], w[1][j]);
         }
     }
-    m.finish(None)
 }
 
-fn cuboid(h: Vec3) -> DisplayMesh {
-    let mut m = Builder::new(Topology::Triangles);
-    m.group(FaceGroup::Optical);
+/// The axis-aligned box `lo..hi`, with its twelve edges as creases.
+fn box_into(m: &mut Builder, lo: Vec3, hi: Vec3) {
     for axis in 0..3 {
         for sign in [-1.0, 1.0] {
             let mut n = Vec3::ZERO;
             n[axis] = sign;
             let (u, v) = ((axis + 1) % 3, (axis + 2) % 3);
+            let pick = |s: f64, k: usize| if s < 0.0 { lo[k] } else { hi[k] };
             let corner = |su: f64, sv: f64| {
                 let mut p = Vec3::ZERO;
-                p[axis] = sign * h[axis];
-                p[u] = su * h[u];
-                p[v] = sv * h[v];
+                p[axis] = pick(sign, axis);
+                p[u] = pick(su, u);
+                p[v] = pick(sv, v);
                 p
             };
             let ids = [
@@ -1001,17 +1117,23 @@ fn cuboid(h: Vec3) -> DisplayMesh {
             m.edge_loop(&ids);
         }
     }
-    m.finish(None)
 }
 
-fn cylinder(r: f64, half_len: f64, axis_local: Vec3, tess: &Tessellation) -> DisplayMesh {
+/// A capped cylinder about `centre` along `axis_local`, with its rims as
+/// creases.
+fn cylinder_into(
+    m: &mut Builder,
+    centre: Vec3,
+    r: f64,
+    half_len: f64,
+    axis_local: Vec3,
+    tess: &Tessellation,
+) {
     let w = axis_local.normalize_or_zero();
     let w = if w.length_squared() < 0.5 { Vec3::X } else { w };
     let u = w.any_orthonormal_vector();
     let v = w.cross(u);
     let segs = circle_segments(r, tess);
-    let mut m = Builder::new(Topology::Triangles);
-    m.group(FaceGroup::Optical);
     let rim = |j: usize| {
         let th = TAU * j as f64 / segs as f64;
         u * th.cos() + v * th.sin()
@@ -1020,8 +1142,8 @@ fn cylinder(r: f64, half_len: f64, axis_local: Vec3, tess: &Tessellation) -> Dis
         .map(|j| {
             let d = rim(j);
             (
-                m.vertex(d * r - w * half_len, d),
-                m.vertex(d * r + w * half_len, d),
+                m.vertex(centre + d * r - w * half_len, d),
+                m.vertex(centre + d * r + w * half_len, d),
             )
         })
         .collect();
@@ -1031,16 +1153,15 @@ fn cylinder(r: f64, half_len: f64, axis_local: Vec3, tess: &Tessellation) -> Dis
     }
     for sign in [-1.0, 1.0] {
         let n = w * sign;
-        let c = m.vertex(n * half_len, n);
+        let c = m.vertex(centre + n * half_len, n);
         let ring: Vec<u32> = (0..segs)
-            .map(|j| m.vertex(rim(j) * r + n * half_len, n))
+            .map(|j| m.vertex(centre + rim(j) * r + n * half_len, n))
             .collect();
         for j in 0..segs {
             m.tri(c, ring[j], ring[(j + 1) % segs]);
         }
         m.edge_loop(&ring);
     }
-    m.finish(None)
 }
 
 /// A profile drawn as line segments in the plane `z = plane_z`, with a note:
@@ -2100,6 +2221,77 @@ mod tests {
             let (ka, kb) = (k(a), k(b));
             assert!(seen.insert(if ka <= kb { (ka, kb) } else { (kb, ka) }));
         }
+    }
+
+    #[test]
+    fn a_source_is_a_glyph_behind_its_emission_plane() {
+        let t = tess();
+        let mut s = Scene3::default_scene();
+        let id = s.sources[0].id.0;
+        let shapes = [
+            SpatialDistribution3::Rectangle {
+                half_width_mm: 10.0,
+                half_height_mm: 0.25,
+            },
+            SpatialDistribution3::Disc { radius_mm: 4.0 },
+        ];
+        for spatial in shapes {
+            for dir in [Vec3::X, -Vec3::X] {
+                s.sources[0].spatial = spatial;
+                s.sources[0].angular = AngularDistribution3::Direction { local_dir: dir };
+                let m = object_mesh(&s, id, &t).unwrap();
+                assert_watertight(&m);
+                assert_faces_outward(&m);
+                assert!(signed_volume(&m) > 0.0);
+                assert_bounds(&m);
+                // Nothing is drawn on the side the light leaves toward.
+                let ahead = (0..m.vertex_count()).map(|i| vertex(&m, i).dot(dir));
+                assert!(ahead.fold(f64::NEG_INFINITY, f64::max).abs() < 1e-6);
+                // The emitting face lies in the emission plane and faces the light.
+                let front: Vec<usize> = group_vertices(&m, FaceGroup::SourceEmitter);
+                assert!(!front.is_empty());
+                for i in front {
+                    assert!(vertex(&m, i).x.abs() < 1e-6);
+                    assert!((normal(&m, i) - dir).length() < 1e-6);
+                }
+                let groups: Vec<FaceGroup> = m.groups.iter().map(|g| g.group).collect();
+                assert!(groups.contains(&FaceGroup::SourceHousing));
+                assert!(!m.edges.is_empty());
+            }
+        }
+        // The aperture is drawn at its size: a 20 mm wide slit spans local Y.
+        s.sources[0].spatial = shapes[0];
+        s.sources[0].angular = AngularDistribution3::Direction { local_dir: Vec3::X };
+        let m = object_mesh(&s, id, &t).unwrap();
+        let emit = group_vertices(&m, FaceGroup::SourceEmitter);
+        let top = emit
+            .iter()
+            .map(|&i| vertex(&m, i).y)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let deep = emit
+            .iter()
+            .map(|&i| vertex(&m, i).z)
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!((top - 10.0).abs() < 1e-6 && (deep - 0.25).abs() < 1e-6);
+
+        // A point source: a closed ball and stem, the ball centred on the point.
+        s.sources[0].spatial = SpatialDistribution3::Point;
+        s.sources[0].angular = AngularDistribution3::UniformConeSolidAngle {
+            half_angle_rad: 0.2,
+        };
+        let m = object_mesh(&s, id, &t).unwrap();
+        assert_watertight(&m);
+        assert_faces_outward(&m);
+        let ball = group_vertices(&m, FaceGroup::SourceEmitter);
+        assert!(ball
+            .iter()
+            .all(|&i| (vertex(&m, i).length() - 1.0).abs() < 1e-6));
+
+        // A legacy line source has no area: a line and a note.
+        s.sources[0].spatial = SpatialDistribution3::LineLegacy { half_width_mm: 5.0 };
+        let m = object_mesh(&s, id, &t).unwrap();
+        assert_eq!(m.topology, Topology::Lines);
+        assert!(m.note.as_deref().unwrap().contains("legacy line source"));
     }
 
     #[test]

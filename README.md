@@ -31,7 +31,8 @@ Optiland Canvas is a tool for the *ideation* phase of optical design, the part b
 - In the 3D model, each detector face shows its flux map from the exact trace, and the light source has a glyph you can pick and move. Ray width is adjustable, and the view settings are remembered in the browser.
 - Every parameter has an on-canvas handle and a numeric twin. Drag the handle or scrub the number, and the light follows. No Apply button, no modal dialogs.
 - Pop-up inspector cards (several at once, one per element), an adjustable grid with snapping, copy/paste/delete, per-parameter and whole-element pinning, plus zoom & pan.
-- Add a round element or a fold mirror from the scene dock, and choose the source (collimated, point cone, Lambertian disc) and how densely it samples.
+- The component view: the `⬚ component` tab in the top bar opens the selected element on its own, in a window you can drop anywhere over the canvas. On a singlet, drag handles to bend a face, change the thickness or the clear aperture, or reshape a face through four control points that set its aspheric terms. On a plate, drag the reflectance and transmittance curves: a splitter's ratio, a dichroic's edge and width.
+- Add a round element, a fold mirror, a beam splitter or a dichroic filter from the scene dock, and choose the source (collimated, point cone, Lambertian disc) and how densely it samples. Splitters and dichroics divide each ray into a reflected and a transmitted branch, weighted per wavelength, in both tracers.
 
 **Workflow**
 
@@ -58,7 +59,7 @@ npm install
 npm run dev          # builds the wasm, starts Vite; open the printed URL
 ```
 
-The app opens on a biconvex singlet lit by a collimated white beam, with a detector downstream. Double-click an element to inspect it, drag it to move, use the handle to tilt it, and scroll to zoom. `◳ 3D model` swaps the cross-section for an orbit view of the same scene, drawn on the GPU; its lighting, background, exposure and ray visibility sit in a bar at the bottom. Add a fold mirror or a round element from the scene dock. Every number comes from the f64 reference tracer. The picture comes from the f32 tracer, on the CPU for light scenes and on WebGPU for heavy ones when the browser has a device; the status line says which, and in the 3D view it also names the backend that draws the solids.
+The app opens on a biconvex singlet lit by a collimated white beam, with a detector downstream. Double-click an element to inspect it, drag it to move, use the handle to tilt it, and scroll to zoom. `◳ 3D model` swaps the cross-section for an orbit view of the same scene, drawn on the GPU; its lighting, background, exposure and ray visibility sit in a bar at the bottom. `⬚ component` opens the selected element in its own window: click it, or drag it onto the canvas. Add a fold mirror or a round element from the scene dock. Every number comes from the f64 reference tracer. The picture comes from the f32 tracer, on the CPU for light scenes and on WebGPU for heavy ones when the browser has a device; the status line says which, and in the 3D view it also names the backend that draws the solids.
 
 Prefer the engine without the UI?
 

@@ -2,7 +2,7 @@
 
 This report covers the solid 3D renderer that replaces the Canvas 2D wireframe in the 3D model view (branch `3d-solid-renderer`, from `main` at `bf06b13`). It follows §76 of the implementation specification. The numbers come from the benchmark and test suites in this branch, run on the development machine: Windows 11, an NVIDIA RTX 5070, and Chrome 153.
 
-A second round on the same branch added detector hit maps, light-source glyphs, saved view settings, and a ray width setting. [Follow-up](#follow-up-hit-maps-source-glyphs-saved-settings-ray-width) describes them. The last commit removed the old wireframe view, so the "legacy" column below is a historical measurement.
+A second round on the same branch added detector hit maps, light-source glyphs, saved view settings, and a ray width setting. [Follow-up](#follow-up-hit-maps-source-glyphs-saved-settings-ray-width) describes them. The last commit removed the old wireframe view, so the "legacy" column below is a historical measurement. The component view, beam splitters, and dichroic filters, which add two display roles to this renderer, are in [component-view.md](component-view.md).
 
 Three.js materials give physically plausible display shading, not optical simulation. Nothing in this renderer computes an optical quantity, and nothing it draws is a measurement. Every displayed number still comes from the f64 reference tracer.
 

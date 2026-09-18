@@ -104,29 +104,55 @@ The search window is held to ±40% of `λ₀`, because a quarter-wave stack also
 reflects at `λ₀/3`, `λ₀/5` and so on, and those harmonics are just as strong: a
 wider window finds one as the peak and rescales the design onto it.
 
-## Plates have two surfaces
+## A plate is a piece of glass
 
-A dichroic is a coating on a glass plate, not a coating floating in air. The
-light that gets through the stack still has to get out of the substrate, which
-costs about 4% unless that face is anti-reflected.
+A dichroic is a coating on a glass plate, not a coating floating in air, and for
+a while this modelled it as a plane. That got the energy right and the geometry
+wrong in four ways at once: the reflection left the mid-plane rather than the
+front face, the transmitted beam carried on undisplaced, the glass added nothing
+to the optical path, and the far face returned no beam at all. For a 3 mm plate
+at 45 degrees the first two are about 2 mm and 1 mm, which is not a rounding
+error on a 15 mm part.
 
-So a `Plate` backing carries its substrate and its far face, combined
-**incoherently**: millimetres of glass are far beyond any coherence length here,
-so intensities add and the multiple bounces between the two faces sum as a
-geometric series. Dropping that series would lose the second pass of a highly
-reflective coating entirely.
+So a dichroic is a **body**: a disc of N-BK7 with the stack on the face an axial
+beam meets first and plain glass on the other. None of the four corrections is
+special-cased. The exact tracer already resolved per-face responses and
+refracted through solids, so pointing the geometry at reality was enough:
 
-The plate stays zero-thickness geometrically. The transmitted ray continues
-undeviated with no lateral offset, which is the same approximation the splitter
-has always made.
+```
+       coated face            far face
+            |                    |
+   ---------+                    |
+             \  refracted        |
+              \  path            |
+   ------------+-----------------+--------->   parallel, displaced
+                                                                     `-- and its own reflection back inside
+```
+
+The displacement is `t·sin(θ − θ′)/cos θ′`, measured perpendicular to the beam.
+`a_thick_plate_walks_the_transmitted_beam_sideways` checks the traced geometry
+against that closed form rather than against yesterday's behaviour: 3 mm of
+N-BK7 at 45 degrees moves the beam 1.0014 mm, and the formula says 1.0015.
+
+Because the tracer now crosses the glass itself, the coating on that face is
+backed by the **scene's** glass (`CoatingBacking::Medium`) rather than folding a
+substrate into its own numbers. Folding one in as well would count the far face
+twice.
+
+`CoatingBacking::Plate` remains for the zero-thickness idealisation, where the
+far face is combined **incoherently** (millimetres of glass are far beyond any
+coherence length here, so intensities add and the bounces between the faces sum
+as a geometric series). Documents written before plates had thickness carry that
+shape, and it is what `coating_rt` returns.
 
 ## The two tracers
 
 | | Exact (`oc-trace`) | Preview (`oc-gpu`) |
 |---|---|---|
 | Coating | the transfer matrix, per hit | a baked grid, read bilinearly |
-| Angle | the ray's own `cos_i` | interpolated in `sin²θ` |
+| Angle | the ray's own `cos_i` | interpolated in the ambient-medium `sin²θ` |
 | Wavelength | exact | exact at the baked columns |
+| Per-face | yes, always | revolved bodies only |
 
 Running a multilayer matrix per ray in a shader is not on, so the stack is baked
 onto a grid when the scene compiles. Two things keep that honest.
@@ -144,7 +170,17 @@ scene's own wavelengths dropped the worst drift from 1.0e-2 to 7.6e-4 of a ray's
 flux, and made the bake 40 times cheaper.
 
 The angle axis is uniform in `sin²θ` rather than in θ, because that is very
-nearly what the band shift is linear in.
+nearly what the band shift is linear in. It is measured **in the ambient
+medium**, not in whatever medium the ray is in: a coated face of a plate is
+crossed from both sides, and what both crossings share is `n sin θ`, which Snell
+conserves. Indexing on it lets one grid serve a ray arriving through air and the
+same ray coming back out through the glass.
+
+Two things about that grid were wrong before plates had thickness, in ways only
+a body exposes. It was baked with air behind the coating, which is right for a
+plate in air and badly wrong for a film on glass, so it now bakes against the
+body's own index at each wavelength; and the angle axis was the local one.
+Together those cost 3.9e-2 of a ray's flux, now under 2e-3.
 
 `cpu3_vs_f64` holds the coating's branch *structure* exactly and its flux to
 2e-3, stated in the test rather than borrowed from the general flux tolerance.
@@ -152,9 +188,9 @@ The numbers the UI shows never come from this path.
 
 ## In the app
 
-`＋ dichroic` builds a real stack, solved for the 45 degrees the plate is hung
-at. The angle comes from the placement: a plate's normal runs along
-`(cos φ, sin φ, 0)`, so an axial beam meets it at `arccos|cos φ|`.
+`＋ dichroic` builds a 3 mm coated glass plate, its stack solved for the 45
+degrees it is hung at. The angle comes from the placement: a plate's normal runs
+along `(cos φ, sin φ, 0)`, so an axial beam meets it at `arccos|cos φ|`.
 
 That formula is worth stating because the wrong one is invisible at exactly 135
 degrees, where two plausible formulas agree, and only a test at 180 degrees
@@ -176,9 +212,14 @@ drags, changing the thickness of the layer to its left.
 - **Polarization.** s and p are computed and the component view could show them,
   but the tracer carries no polarization state, so it consumes their mean. A
   polarizing beam splitter cannot be represented.
-- **Coatings on lens faces.** The response exists for a body surface and the
-  exact tracer handles it, but the preview refuses one by name rather than
-  guessing. Lens faces still use the scalar `ar_residual`.
+- **Coatings on lens faces.** The machinery is all there now (a coated plate is
+  a revolved body with a film on one face, which is exactly what an AR-coated
+  lens would be), but nothing authors one. Lens faces still use the scalar
+  `ar_residual`.
+- **Wedged plates.** Both faces are parallel. A wedge, which is how real
+  beamsplitters push their ghost out of the way, is not authorable.
+- **Scatter at the rim.** A ray that leaves through the edge of the glass is
+  traced as glass, not as the ground edge it would really meet.
 - **Dispersive films.** Layer indices are `SpectralScalar`, so a measured `n(λ)`
   serializes and traces, but the presets are constants. Real films disperse by a
   percent or two.

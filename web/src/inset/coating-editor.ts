@@ -178,10 +178,13 @@ export function createCoatingEditor(ctx: EditorContext): Editor {
   }
 
   function reread() {
-    const c = JSON.parse(scene.surfaceCoatingJSON(id));
+    // The film first: a coated plate is a glass body, so it has no surface
+    // response to read and would otherwise look like nothing at all.
+    film = JSON.parse(scene.surfaceFilmJSON(id));
+    const blank = { kind: "film", r: null, t: null, dichroic: null };
+    const c = JSON.parse(scene.surfaceCoatingJSON(id)) ?? (film ? { front: { ...blank }, back: { ...blank } } : null);
     if (!c) return;
     coat = c;
-    film = JSON.parse(scene.surfaceFilmJSON(id));
     if (film) coat.front.kind = "film";
     rebuildFields();
     const aoi = film?.aoiDeg ?? 0;

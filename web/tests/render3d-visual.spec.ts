@@ -85,13 +85,15 @@ test.describe("GPU 3D view appearance", () => {
   });
 
   test("a film dichroic folding the beam", async ({ page }) => {
-    // The same fold, with a real thin-film stack solved for the 45° it hangs
-    // at. Its tint comes from what the stack reflects AT THAT ANGLE, so this
-    // shot is also a check that the display colour moved with the physics.
+    // A real coated glass plate: 3 mm of N-BK7 with the stack on the face the
+    // light meets first, solved for the 45° it hangs at. Two things to look for
+    // beyond the fold itself: the transmitted beam steps sideways where it
+    // crosses the glass, and the plate's tint comes from what the stack
+    // reflects AT THAT ANGLE.
     await page.evaluate(() => {
       const s = (window as any).__ocDebug.scene;
       s.setSourceWavelengths(new Float64Array([450, 520, 620]), new Float64Array(0));
-      s.addFilmDichroic(-30, 0, 0, 15, 135, 560, true);
+      s.addPlateDichroic(-30, 0, 0, 15, 3, 135, 560, true);
     });
     await enter3d(page);
     await page.keyboard.press("Escape");

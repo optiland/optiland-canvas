@@ -866,6 +866,115 @@ impl Scene3 {
         Some(dir.dot(normal).abs().clamp(0.0, 1.0).acos().to_degrees())
     }
 
+    /// The media either side of an object's coated face at `lambda_um`:
+    /// `(incident, behind)`.
+    ///
+    /// For a coated solid the film sits on that solid's own glass, and what a
+    /// stack reflects depends on what it is sitting on, so a plot of one has to
+    /// be told. For a zero-thickness plate both sides are the ambient medium and
+    /// the coating carries its own substrate.
+    pub fn coated_face_media(&self, id: u64, lambda_um: f64) -> (f64, f64) {
+        let ambient = self.env.ambient_index;
+        let behind = self
+            .bodies
+            .iter()
+            .find(|b| b.common.id.0 == id)
+            .and_then(|b| match &b.material {
+                Material::AbbePoint { nd, vd } => {
+                    Some(crate::material::Cauchy::from_abbe(*nd, *vd).index(lambda_um))
+                }
+                Material::Catalog(gid) => {
+                    self.catalog.get(*gid).map(|g| g.sell.index(lambda_um))
+                }
+                _ => None,
+            })
+            .unwrap_or(ambient);
+        (ambient, behind)
+    }
+
+    /// The coating on an object, whether it is a zero-thickness plate or a
+    /// coated face of a solid.
+    ///
+    /// The editor should not have to know which, and after plates grew
+    /// thickness most of them are solids.
+    pub fn coating_for_object(&self, id: u64) -> Option<&Coating> {
+        self.surface_coating(id).or_else(|| self.body_coating(id))
+    }
+
+    /// The angle the scene's light meets an object's coated face at, degrees.
+    ///
+    /// A coating is a function of wavelength *and* angle, so a plot of one means
+    /// nothing until you say which angle. This is the angle worth plotting at,
+    /// because it is the one the part is being used at. `None` for an object
+    /// with no coating, or a scene with no light in it.
+    pub fn object_axial_aoi_deg(&self, id: u64) -> Option<f64> {
+        let normal = if let Some(s) = self.surfaces.iter().find(|s| s.common.id.0 == id) {
+            s.common.transform.quat() * Vec3::Z
+        } else {
+            // A coated plate is built with its local −X carried onto the plate
+            // normal, so that is where its coated face looks.
+            let b = self.bodies.iter().find(|b| b.common.id.0 == id)?;
+            b.common.transform.quat() * -Vec3::X
+        };
+        let dir = self.sources.first()?.emit().first()?.ray.dir;
+        Some(dir.dot(normal).abs().clamp(0.0, 1.0).acos().to_degrees())
+    }
+
+    /// Rebuild the coating on an object from a design, whichever kind it is.
+    pub fn set_object_coating_design(&mut self, id: u64, design: CoatingDesign) -> bool {
+        let Some(design) = design.sanitized() else {
+            return false;
+        };
+        if self.surfaces.iter().any(|s| s.common.id.0 == id) {
+            return self.set_surface_coating_design(id, design);
+        }
+        let ambient = self.env.ambient_index;
+        let Some(b) = self.bodies.iter_mut().find(|b| b.common.id.0 == id) else {
+            return false;
+        };
+        let coating = film_coating(design, ambient, PLATE_ND);
+        let mut touched = false;
+        for o in &mut b.surface.overrides {
+            if matches!(o.response.from_outside, SurfaceResponse::Coating { .. }) {
+                let film = SurfaceResponse::Coating {
+                    coating: coating.clone(),
+                };
+                o.response.from_outside = film.clone();
+                o.response.from_inside = film;
+                touched = true;
+            }
+        }
+        touched
+    }
+
+    /// Set one film layer's thickness on an object, whichever kind it is.
+    pub fn set_object_layer_thickness(&mut self, id: u64, index: usize, nm: f64) -> bool {
+        if !nm.is_finite() || nm < 0.0 {
+            return false;
+        }
+        if self.surfaces.iter().any(|s| s.common.id.0 == id) {
+            return self.set_coating_layer_thickness(id, index, nm);
+        }
+        let Some(b) = self.bodies.iter_mut().find(|b| b.common.id.0 == id) else {
+            return false;
+        };
+        let mut touched = false;
+        for o in &mut b.surface.overrides {
+            for side in [&mut o.response.from_outside, &mut o.response.from_inside] {
+                if let SurfaceResponse::Coating { coating } = side {
+                    match coating.layers.get_mut(index) {
+                        Some(l) => {
+                            l.thickness_nm = nm;
+                            touched = true;
+                        }
+                        None => return false,
+                    }
+                }
+            }
+        }
+        touched
+    }
+
     /// The coating on a surface's front face, if it carries one.
     pub fn surface_coating(&self, id: u64) -> Option<&Coating> {
         let s = self.surfaces.iter().find(|s| s.common.id.0 == id)?;

@@ -2590,6 +2590,100 @@ impl Canvas {
         }
     }
 
+    /// Coat one face of a lens (or any revolved body) with a real stack, or
+    /// strip it back to bare glass with `kind` = `none`.
+    ///
+    /// `face` is `front` (the one an axial beam reaches first) or `back`.
+    /// `kind` is `ar-1`, `ar-3`, `mirror`, `long-pass`, `short-pass` or
+    /// `none`. The stack is solved against the body's own glass, so the same
+    /// three layers on crown and on flint are not the same coating.
+    ///
+    /// This is what puts a coating where there was none. `setSurfaceCoatingDesign`
+    /// rewrites one that is already there, which is right for editing a
+    /// dichroic and no use at all for coating a bare lens.
+    #[wasm_bindgen(js_name = setLensFaceCoating)]
+    pub fn set_lens_face_coating(
+        &mut self,
+        id: f64,
+        face: &str,
+        kind: &str,
+        lambda_nm: f64,
+    ) -> bool {
+        use oc_core::build3::BodyFace;
+        use oc_core::thinfilm::{CoatingDesign, DesignKind};
+        let face = match face {
+            "front" => BodyFace::Front,
+            "back" => BodyFace::Back,
+            _ => return false,
+        };
+        let design = match kind {
+            "none" => None,
+            _ => {
+                let kind = match kind {
+                    "ar-1" => DesignKind::SingleLayerAr,
+                    "ar-3" => DesignKind::BroadbandAr,
+                    "mirror" => DesignKind::QuarterWaveStack,
+                    "long-pass" => DesignKind::LongPass,
+                    "short-pass" => DesignKind::ShortPass,
+                    _ => return false,
+                };
+                Some(CoatingDesign {
+                    kind,
+                    lambda_nm,
+                    // A lens face is used on axis, which is what an AR coating
+                    // for one is designed at. A face used at 45 degrees is a
+                    // different part.
+                    aoi_deg: 0.0,
+                    periods: 4,
+                    n_high: 2.35,
+                    n_low: 1.38,
+                })
+            }
+        };
+        let Some(scene) = self.scene3.as_mut() else {
+            return false;
+        };
+        if scene.set_body_face_coating(id as u64, face, design) {
+            self.revision += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// What each face of a body carries: `{front, back}`, each the design kind
+    /// as a string, `"film"` for a stack with no recorded recipe, or null for
+    /// bare glass. `null` for anything that is not a body with two faces.
+    #[wasm_bindgen(js_name = lensFaceCoatingsJSON)]
+    pub fn lens_face_coatings_json(&self, id: f64) -> String {
+        use oc_core::build3::BodyFace;
+        use oc_core::thinfilm::DesignKind;
+        let Some(scene) = self.scene3.as_ref() else {
+            return "null".into();
+        };
+        let name = |face: BodyFace| -> String {
+            match scene.body_face_coating(id as u64, face) {
+                None => "null".into(),
+                Some(c) => format!(
+                    "\"{}\"",
+                    match c.design.map(|d| d.kind) {
+                        Some(DesignKind::SingleLayerAr) => "ar-1",
+                        Some(DesignKind::BroadbandAr) => "ar-3",
+                        Some(DesignKind::QuarterWaveStack) => "mirror",
+                        Some(DesignKind::LongPass) => "long-pass",
+                        Some(DesignKind::ShortPass) => "short-pass",
+                        None => "film",
+                    }
+                ),
+            }
+        };
+        format!(
+            "{{\"front\":{},\"back\":{}}}",
+            name(BodyFace::Front),
+            name(BodyFace::Back)
+        )
+    }
+
     /// Set one film layer's physical thickness, in nanometres. Bumps the
     /// revision. `false` for a bad index, a non-finite thickness, or a surface
     /// with no film on it.
@@ -3989,6 +4083,21 @@ pub(crate) fn source_radius(s: &oc_core::scene3::Source3) -> f64 {
 }
 
 /// A body's geometry kind and 3D construction, for the inspector.
+/// Are both optical faces of a four-edge revolved profile flat? That is what
+/// tells a plate from a lens, and a coated one of each apart.
+fn flat_faces(p: &oc_core::profile2::ProfileSolid3) -> bool {
+    use oc_core::profile2::Curve2;
+    let flat = |c: &Curve2| match c {
+        Curve2::Conic(p) => p.c.abs() < 1e-12,
+        Curve2::EvenAsphere { base, coeffs } => {
+            base.c.abs() < 1e-12 && coeffs.iter().all(|v| v.abs() < 1e-18)
+        }
+        _ => false,
+    };
+    let e = &p.profile.edges;
+    e.len() == 4 && flat(&e[0].curve) && flat(&e[2].curve)
+}
+
 fn body_kind_construction(b: &oc_core::scene3::Body3) -> (&'static str, &'static str) {
     use oc_core::scene3::SolidGeometry3;
     match &b.geometry {
@@ -3997,13 +4106,18 @@ fn body_kind_construction(b: &oc_core::scene3::Body3) -> (&'static str, &'static
         SolidGeometry3::Cylinder { .. } => ("cylinder", "analytic"),
         // A coated plate is a revolved solid like any lens, and calling it one
         // tells you nothing about what it is for. Its film is the component.
-        SolidGeometry3::Profile(_)
-            if b.surface.overrides.iter().any(|o| {
-                matches!(
-                    o.response.from_outside,
-                    oc_core::scene3::SurfaceResponse::Coating { .. }
-                )
-            }) =>
+        //
+        // A coated *lens* is not that. Both faces flat is what makes a plate a
+        // plate, so a body with any curvature stays a lens however it is
+        // coated, and the object list keeps calling it one.
+        SolidGeometry3::Profile(p)
+            if flat_faces(p)
+                && b.surface.overrides.iter().any(|o| {
+                    matches!(
+                        o.response.from_outside,
+                        oc_core::scene3::SurfaceResponse::Coating { .. }
+                    )
+                }) =>
         {
             ("dichroic", "coated plate")
         }

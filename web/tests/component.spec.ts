@@ -322,6 +322,52 @@ test.describe("component view", () => {
 // The component view on a polarizing element
 // ---------------------------------------------------------------------------
 
+test.describe("component view — coating a lens", () => {
+  test("the default singlet can be given an AR coating, a face at a time", async ({ page }) => {
+    await freshApp(page);
+    await openInset(page);
+    // The default singlet is what the inset opens on.
+    const view = await insetView(page);
+    expect(view.kind).toBe("lens");
+    const id = view.id;
+
+    const faces = () =>
+      page.evaluate(
+        (i) => JSON.parse((window as unknown as { __ocDebug: any }).__ocDebug.scene.lensFaceCoatingsJSON(i)),
+        id,
+      );
+    const flux = () =>
+      page.evaluate(() => {
+        const d = (window as unknown as { __ocDebug: any }).__ocDebug;
+        const dets = JSON.parse(d.scene.sceneObjectsJSON()).filter((o: any) => o.kind === "detector");
+        return JSON.parse(d.scene.detectorResultJSON(dets[0].id)).totalIncident as number;
+      });
+
+    expect(await faces()).toEqual({ front: null, back: null });
+    await expect(page.locator("#componentInset .cv-read")).toContainText("bare / bare");
+    const bare = await flux();
+
+    // The control follows whichever face is selected, so coating twice needs
+    // the face buttons in between, the same way R and k do.
+    await page.locator('#componentInset button[data-value="ar-3"]').click();
+    expect((await faces()).front).toBe("ar-3");
+    expect((await faces()).back).toBeNull();
+    await expect(page.locator("#componentInset .cv-read")).toContainText("AR ×3 / bare");
+
+    const oneFace = await flux();
+    expect(oneFace).toBeGreaterThan(bare);
+
+    // And the lens keeps its own editor once it is coated, rather than being
+    // taken for a coated plate.
+    expect((await insetView(page)).kind).toBe("lens");
+
+    // Strip it again and the light goes back where it was.
+    await page.locator('#componentInset button[data-value="none"]').click();
+    expect((await faces()).front).toBeNull();
+    expect(await flux()).toBeCloseTo(bare, 9);
+  });
+});
+
 test.describe("component view — polarizing elements", () => {
   /** Add an element through its own button and select it. */
   async function addAndSelect(page: Page, button: string): Promise<number> {

@@ -252,3 +252,113 @@ fn a_thick_plate_has_a_second_surface() {
     assert!(second_surface, "the far face must return a beam of its own");
     assert!(res.ledger.residual() < 1e-12, "ledger {:?}", res.ledger);
 }
+
+
+// ---------------------------------------------------------------------------
+// A coating on a lens, which is what a coating is mostly for
+// ---------------------------------------------------------------------------
+
+/// An AR coating on a lens face does what an AR coating does: a face that
+/// reflected four percent reflects about one, and the light goes through
+/// instead of bouncing around inside the instrument.
+///
+/// The oracle is the single-layer quarter-wave formula, `((n0·ns − nf²) /
+/// (n0·ns + nf²))²`, which for magnesium fluoride on this crown is 1.3% where
+/// bare glass is 4.2%. Two faces, so the transmission goes from about 0.92 to
+/// about 0.97.
+#[test]
+fn an_ar_coating_on_a_lens_face_passes_more_light() {
+    use oc_core::build3::BodyFace;
+    use oc_core::thinfilm::DesignKind;
+
+    let n_glass = 1.5168f64;
+    let n_film = 1.38f64;
+    let bare_r = ((1.0 - n_glass) / (1.0 + n_glass)).powi(2);
+    let ar_r = ((n_glass - n_film * n_film) / (n_glass + n_film * n_film)).powi(2);
+    assert!(bare_r > 0.041 && bare_r < 0.043, "bare face: {bare_r}");
+    assert!(ar_r > 0.012 && ar_r < 0.014, "coated face: {ar_r}");
+
+    let ar = CoatingDesign {
+        kind: DesignKind::SingleLayerAr,
+        lambda_nm: 550.0,
+        aoi_deg: 0.0,
+        periods: 1,
+        n_high: 2.35,
+        n_low: n_film,
+    };
+
+    let measure = |coat: bool| -> f64 {
+        let mut s = Scene3::default_scene();
+        let lens = s
+            .bodies
+            .first()
+            .map(|b| b.common.id.0)
+            .expect("the default scene has a singlet");
+        if coat {
+            assert!(
+                s.set_body_face_coating(lens, BodyFace::Front, Some(ar)),
+                "front face coats"
+            );
+            assert!(
+                s.set_body_face_coating(lens, BodyFace::Back, Some(ar)),
+                "back face coats"
+            );
+        }
+        let det = s.detectors[0].common.id;
+        s.validate().expect("valid");
+        let res = trace_scene3(&s, &TraceConfig3::default());
+        detector_named(&res, det).total_incident
+    };
+
+    let bare = measure(false);
+    let coated = measure(true);
+    assert!(coated > bare, "coating a lens helps: {coated} vs {bare}");
+    // Both faces, so roughly (1 - ar_r)² / (1 - bare_r)² more light. The beam
+    // is not collimated and the faces are curved, so the rays meet them at a
+    // spread of angles and the ratio is near that rather than on it.
+    let want = ((1.0 - ar_r) / (1.0 - bare_r)).powi(2);
+    let got = coated / bare;
+    assert!(
+        (got - want).abs() < 0.01,
+        "and by about the right amount: {got} vs {want}"
+    );
+}
+
+/// Coating a face is a thing you can undo, and it lands on the face you named.
+#[test]
+fn a_lens_face_can_be_coated_and_stripped_one_side_at_a_time() {
+    use oc_core::build3::BodyFace;
+    use oc_core::thinfilm::DesignKind;
+
+    let ar = CoatingDesign {
+        kind: DesignKind::SingleLayerAr,
+        lambda_nm: 550.0,
+        aoi_deg: 0.0,
+        periods: 1,
+        n_high: 2.35,
+        n_low: 1.38,
+    };
+    let mut s = Scene3::default_scene();
+    let lens = s.bodies.first().map(|b| b.common.id.0).expect("a singlet");
+
+    assert!(s.body_face_coating(lens, BodyFace::Front).is_none());
+    assert!(s.set_body_face_coating(lens, BodyFace::Front, Some(ar)));
+    assert!(s.body_face_coating(lens, BodyFace::Front).is_some());
+    // And only that face: the back is still bare glass.
+    assert!(s.body_face_coating(lens, BodyFace::Back).is_none());
+    s.validate().expect("a coated lens is a valid scene");
+
+    assert!(s.set_body_face_coating(lens, BodyFace::Back, Some(ar)));
+    assert!(s.body_face_coating(lens, BodyFace::Back).is_some());
+    assert!(s.set_body_face_coating(lens, BodyFace::Front, None));
+    assert!(s.body_face_coating(lens, BodyFace::Front).is_none());
+    assert!(
+        s.body_face_coating(lens, BodyFace::Back).is_some(),
+        "stripping one face leaves the other alone"
+    );
+
+    // A detector is not a body with faces, and neither is a nonexistent id.
+    let det = s.detectors[0].common.id.0;
+    assert!(!s.set_body_face_coating(det, BodyFace::Front, Some(ar)));
+    assert!(!s.set_body_face_coating(9_999_999, BodyFace::Front, Some(ar)));
+}

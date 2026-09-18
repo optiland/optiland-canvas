@@ -41,6 +41,29 @@ use crate::scene3::{
 use crate::vec::Vec2;
 use crate::vec3::{Isometry3, Plane3, Vec3};
 
+/// Which face of a revolved body a coating goes on.
+///
+/// The profile `singlet_curves` builds runs [front face, rim, back face, rim],
+/// with the front at local `-X`, and every transform that places one of these
+/// carries local `-X` onto the direction an axial beam arrives from. So "front"
+/// is the face the light reaches first, for a lens and for a plate alike.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyFace {
+    /// The face an axial beam reaches first.
+    Front,
+    /// The one it leaves by.
+    Back,
+}
+
+impl BodyFace {
+    fn edge(self) -> usize {
+        match self {
+            Self::Front => 0,
+            Self::Back => 2,
+        }
+    }
+}
+
 /// The rotationally-symmetric geometry of a singlet lens, in its local frame
 /// (optical axis local +X, centred on its own body origin). Material is separate.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1051,6 +1074,73 @@ impl Scene3 {
         let normal = s.common.transform.quat() * Vec3::Z;
         let dir = self.sources.first()?.emit().first()?.ray.dir;
         Some(dir.dot(normal).abs().clamp(0.0, 1.0).acos().to_degrees())
+    }
+
+    /// Coat one face of a lens, a plate, or anything else built on the
+    /// four-edge revolved profile, or strip it back to bare glass with `None`.
+    ///
+    /// [`Scene3::set_object_coating_design`] rewrites films that are already
+    /// on a body, which is what editing a dichroic needs. This puts one where
+    /// there was none, which is what coating a bare lens needs, and it says
+    /// which face.
+    ///
+    /// The stack is solved against the body's **own glass**, because what a
+    /// coating reflects depends on what it is sitting on: the same three
+    /// layers on crown and on flint are not the same coating. False for an
+    /// unknown id, a body that is not a four-edge profile, or a design that
+    /// does not sanitize.
+    pub fn set_body_face_coating(
+        &mut self,
+        id: u64,
+        face: BodyFace,
+        design: Option<CoatingDesign>,
+    ) -> bool {
+        let (ambient, glass) = self.coated_face_media(id, crate::material::LAMBDA_D);
+        let film = match design {
+            None => None,
+            Some(d) => match d.sanitized() {
+                None => return false,
+                Some(d) => Some(SurfaceResponse::Coating {
+                    coating: film_coating(d, ambient, glass),
+                }),
+            },
+        };
+        let Some(b) = self.bodies.iter_mut().find(|b| b.common.id.0 == id) else {
+            return false;
+        };
+        let patch = {
+            let SolidGeometry3::Profile(solid) = &b.geometry else {
+                return false;
+            };
+            if solid.profile.edges.len() != 4 {
+                return false;
+            }
+            solid.profile.edges[face.edge()].patch
+        };
+        b.surface.overrides.retain(|o| o.patch != patch);
+        if let Some(f) = film {
+            b.surface.overrides.push(PatchResponseOverride {
+                patch,
+                response: TwoSidedSurfaceResponse {
+                    from_outside: f.clone(),
+                    from_inside: f,
+                },
+            });
+        }
+        true
+    }
+
+    /// The coating on one named face of a body, if that face carries one.
+    pub fn body_face_coating(&self, id: u64, face: BodyFace) -> Option<&Coating> {
+        let b = self.bodies.iter().find(|b| b.common.id.0 == id)?;
+        let SolidGeometry3::Profile(solid) = &b.geometry else {
+            return None;
+        };
+        let patch = solid.profile.edges.get(face.edge())?.patch;
+        b.surface.overrides.iter().find_map(|o| match &o.response.from_outside {
+            SurfaceResponse::Coating { coating } if o.patch == patch => Some(coating),
+            _ => None,
+        })
     }
 
     /// The media either side of an object's coated face at `lambda_um`:

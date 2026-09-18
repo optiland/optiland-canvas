@@ -93,10 +93,15 @@ export function createComponentView(opts: {
     // its R and T would be, so it has to be asked about first or it would open
     // the coating editor and show two empty curves.
     if (JSON.parse(scene.surfacePolarizationJSON(id))) return "polarizing";
-    // A coated plate is a glass body, so it would read as a lens by its shape.
-    // Its film is the thing you came to edit, so it wins.
+    // A coated plate is a glass body, so it would read as a lens by its shape,
+    // and its film is the thing you came to edit. But a coated *lens* is still
+    // a lens: what tells them apart is curvature, since a plate is flat on both
+    // faces. Asking by shape first is what lets a lens keep its own editor once
+    // somebody puts an AR coating on it.
+    const lens = JSON.parse(scene.singletShapeJSON(id, 2));
+    if (lens && (lens.r1 != null || lens.r2 != null)) return "lens";
     if (JSON.parse(scene.surfaceFilmJSON(id))) return "coating";
-    if (JSON.parse(scene.singletShapeJSON(id, 2))) return "lens";
+    if (lens) return "lens";
     if (o.kind === "aperture") return "aperture";
     if (o.kind === "detector") return "detector";
     if (o.kind === "source") return "source";

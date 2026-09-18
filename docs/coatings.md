@@ -212,6 +212,41 @@ Under the plot the stack is drawn as its layers, left to right from the incident
 medium inward, each as wide as it is thick and shaded by index. Every boundary
 drags, changing the thickness of the layer to its left.
 
+## Coating a lens
+
+Select a lens in the component view and each face takes one of two
+antireflection coatings, following whichever face is selected the same way `R`
+and `k` do. A real lens is coated a face at a time and the two are often
+different.
+
+Both are solved against **that lens's own glass**: the same three layers on
+crown and on flint are not the same coating, because what a stack reflects
+depends on what it is sitting on. They are designed at 550 nm on axis, which is
+where a general-purpose AR is centred and how a lens face is used. A face meant
+for 45 degrees is a different part.
+
+What it is worth, for the default singlet:
+
+| face | reflects at 550 nm |
+|---|---|
+| bare crown | 4.2% |
+| single quarter wave of MgF₂ | 1.3% |
+| quarter-half-quarter | lower again, and flatter across the visible |
+
+Two faces, so an AR-coated singlet passes about 0.97 of the light where a bare
+one passes about 0.92, and the five percent that stops bouncing around inside
+the instrument is the reason coatings exist.
+
+A coated lens is still a lens. What separates a plate from a lens is curvature,
+not the film, so the object list and the component view keep calling it one and
+it keeps the lens editor. That was not free: the view used to ask "does this
+body carry a film" before "is this body a lens", which was right while only
+plates carried films.
+
+`ar_residual`, the single number that used to be the only way to say a lens was
+coated, is still on every uncoated face. It is not a coating model and its own
+doc comment says so.
+
 ## What is still missing
 
 - **Polarization** is no longer missing. It has its own page,
@@ -236,10 +271,10 @@ drags, changing the thickness of the layer to its left.
 
   A **polarizing beam splitter** as a part is still missing, and so is any
   source that emits polarized light without a polarizer in front of it.
-- **Coatings on lens faces.** The machinery is all there now (a coated plate is
-  a revolved body with a film on one face, which is exactly what an AR-coated
-  lens would be), but nothing authors one. Lens faces still use the scalar
-  `ar_residual`.
+- **Anything but an AR on a lens, from the app.** The core will put any design
+  on either face of any revolved body, and the lens editor offers the two ARs,
+  which is what a lens is coated with. A mirror or an edge filter on a lens
+  face needs `setLensFaceCoating` from script.
 - **Wedged plates.** Both faces are parallel. A wedge, which is how real
   beamsplitters push their ghost out of the way, is not authorable.
 - **Scatter at the rim.** A ray that leaves through the edge of the glass is

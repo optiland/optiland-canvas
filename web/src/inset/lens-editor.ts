@@ -57,6 +57,10 @@ const SAMPLES = 64;
 /** Control point heights, as fractions of the semi-aperture. */
 const CTRL = [0.25, 0.5, 0.75, 1];
 const FACE_COLOR = ["#7fd6ff", "#ffb46b"];
+
+/** The wavelength a lens coating here is designed at: the middle of the
+ *  visible, which is where a general-purpose AR coating is centred. */
+const AR_LAMBDA_NM = 550;
 const FACE_NAME = ["front", "back"];
 
 type Mode = "sphere" | "asphere";
@@ -163,6 +167,44 @@ export function createLensEditor(ctx: EditorContext, objectOf: () => SceneObject
     commit: (v) => commitShape({ semiAperture: v }),
   });
 
+  // The coating follows whichever face is selected, the same way R and k do.
+  // A real lens is coated a face at a time, and the two are often different.
+  label(ctx.fields, "coat");
+  const coatPick = segmented(
+    ctx.fields,
+    [
+      { value: "none", text: "bare", title: "plain glass: about 4% of the light reflected at this face" },
+      {
+        value: "ar-1",
+        text: "AR ×1",
+        title: "a single quarter wave of magnesium fluoride, the classic single-layer AR: about 1.3% here, over a wide band",
+      },
+      {
+        value: "ar-3",
+        text: "AR ×3",
+        title: "quarter-half-quarter, the broadband three-layer AR: lower again and flatter across the visible",
+      },
+    ],
+    (v) => setCoating(v),
+  );
+
+  /** Coat, or strip, the face that is currently selected. */
+  function setCoating(kind: string) {
+    if (!scene.setLensFaceCoating(id, active === 0 ? "front" : "back", kind, AR_LAMBDA_NM)) {
+      ctx.note("this face will not take a coating", true);
+      return;
+    }
+    ctx.note("");
+    ctx.edited(true);
+    reread();
+    ctx.redraw();
+  }
+
+  /** What each face carries, as the JSON reports it. */
+  function coatings(): { front: string | null; back: string | null } {
+    return JSON.parse(scene.lensFaceCoatingsJSON(id)) ?? { front: null, back: null };
+  }
+
   function refreshFields() {
     const f = active;
     fR.set(f === 0 ? shape.r1 ?? Infinity : shape.r2 ?? Infinity);
@@ -173,10 +215,19 @@ export function createLensEditor(ctx: EditorContext, objectOf: () => SceneObject
     fCa.set(shape.semiAperture);
     for (const field of [fR, fK, ...fA]) field.input.style.borderColor = FACE_COLOR[f];
     const edgeWarn = shape.edge < 0.3 ? " (thin)" : "";
+    const c = coatings();
+    // Anything the segments do not offer (a dichroic's stack, say) selects
+    // nothing rather than pretending to be "bare".
+    const on = f === 0 ? c.front : c.back;
+    coatPick.set(on === "ar-1" || on === "ar-3" ? on : on ? null : "none");
+    const coatName = (v: string | null) =>
+      v === "ar-1" ? "AR ×1" : v === "ar-3" ? "AR ×3" : v ? v : "bare";
     ctx.read.innerHTML =
       `n<sub>d</sub> <b>${fmt(shape.nd, 4)}</b> · EFL <b>${fmt(shape.efl, 2)}</b> mm · ` +
       `BFL <b>${fmt(shape.bfl, 2)}</b> mm · edge <b>${fmt(shape.edge, 2)}</b> mm${edgeWarn}` +
-      `<br><span style="opacity:0.6">paraxial, d line, in the scene's ambient medium</span>`;
+      ` · faces <b>${coatName(c.front)}</b> / <b>${coatName(c.back)}</b>` +
+      `<br><span style="opacity:0.6">paraxial, d line, in the scene's ambient medium;` +
+      ` a coating is solved against this lens's own glass at ${AR_LAMBDA_NM} nm on axis</span>`;
   }
 
   /** Write the whole shape with `patch` applied. False if Rust refused it. */

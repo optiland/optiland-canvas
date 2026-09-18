@@ -185,7 +185,7 @@ The `oc-gpu` work turned up differences between the f32 preview and the f64 trac
 - **One window:** the component window shows one element, the selection. There is no undo for edits to the 3D scene, here or anywhere else in the app.
 - **Control points:** there are four per face, at fixed fractions of the semi-aperture.
 - **Paraxial numbers:** they are for the lens alone, on its own axis, at the d line.
-- **Coatings:** scalar, zero-thickness, and applied to both faces by the kind buttons. A mirror's reflectivity is shown but not editable in the window.
+- **Coatings:** the `film` kind is a real thin-film stack and depends on the angle of incidence; every other kind is scalar and does not. All are zero-thickness and applied to both faces by the kind buttons. A mirror's reflectivity is shown but not editable in the window. See [coatings](coatings.md).
 - **Detector view:** it is a picture of the last exact trace.
 - **Source view:** it shows spectral lines only for the first source, the one the source panel edits.
 - **Other bodies:** prisms and analytic solids get a summary, not an editor.

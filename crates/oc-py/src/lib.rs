@@ -96,6 +96,59 @@ fn scene3_sequence_for_intent(
     .map_err(to_py_err)
 }
 
+/// Evaluate a thin-film stack, for cross-checking against `optiland.thin_film`.
+///
+/// `stack_json` is a serialized `oc_core::thinfilm::Coating`. Returns JSON
+/// `{"rs": [...], "rp": [...], "ts": [...], "tp": [...]}`, one entry per
+/// `(wavelength, angle)` pair, both flattened row-major over wavelengths then
+/// angles. Raises `ValueError` if the stack does not parse or a layer's optical
+/// constants have no value at one of the wavelengths.
+///
+/// This exists for the parity suite. The canvas evaluates coatings in Rust and
+/// Optiland evaluates them in Python, and the only way "they agree" means
+/// anything is if something runs both and subtracts.
+#[pyfunction]
+fn thinfilm_rt(
+    stack_json: &str,
+    lambda_um: Vec<f64>,
+    aoi_deg: Vec<f64>,
+    n_incident: f64,
+) -> PyResult<String> {
+    let coating: oc_core::thinfilm::Coating =
+        serde_json::from_str(stack_json).map_err(to_py_err)?;
+    let mut cols: [Vec<f64>; 4] = Default::default();
+    for &nm in &lambda_um {
+        for &deg in &aoi_deg {
+            let rt = oc_core::thinfilm::coating_rt(
+                &coating,
+                n_incident,
+                nm,
+                deg.to_radians().cos(),
+            )
+            .ok_or_else(|| {
+                PyValueError::new_err(format!("no optical constants at {nm} um"))
+            })?;
+            cols[0].push(rt.r_s);
+            cols[1].push(rt.r_p);
+            cols[2].push(rt.t_s);
+            cols[3].push(rt.t_p);
+        }
+    }
+    let arr = |v: &Vec<f64>| {
+        v.iter()
+            .map(|x| x.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    Ok(format!(
+        "{{\"rs\":[{}],\"rp\":[{}],\"ts\":[{}],\"tp\":[{}]}}",
+        arr(&cols[0]),
+        arr(&cols[1]),
+        arr(&cols[2]),
+        arr(&cols[3])
+    ))
+}
+
 /// The `.ocanvas` schema version this build writes.
 #[pyfunction]
 fn format_version() -> u32 {
@@ -132,6 +185,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(seq_to_scene, m)?)?;
     m.add_function(wrap_pyfunction!(scene3_sequence, m)?)?;
     m.add_function(wrap_pyfunction!(scene3_sequence_for_intent, m)?)?;
+    m.add_function(wrap_pyfunction!(thinfilm_rt, m)?)?;
     m.add_function(wrap_pyfunction!(normalize, m)?)?;
     m.add_function(wrap_pyfunction!(validate, m)?)?;
     m.add_function(wrap_pyfunction!(format_version, m)?)?;

@@ -149,6 +149,64 @@ fn thinfilm_rt(
     ))
 }
 
+/// Evaluate a thin-film stack as **complex amplitudes**, for cross-checking the
+/// polarization conventions against `optiland.thin_film`.
+///
+/// Returns JSON with eight arrays: `rs_re`, `rs_im`, `rp_re`, `rp_im` and the
+/// same for `ts`/`tp`, flattened the same way as [`thinfilm_rt`], plus `scale`,
+/// the factor turning `|t|²` into a transmittance.
+///
+/// These are in the **kernel's ray frame** (see `oc_core::polarization`), not
+/// Macleod's: `r_p` carries the opposite sign, `t_p` is the whole field rather
+/// than its tangential part, and every amplitude is conjugated into the
+/// `exp(-iωt)` convention. The parity test reconciles those three steps
+/// explicitly rather than comparing numbers that happen to be close.
+#[pyfunction]
+fn thinfilm_amplitudes(
+    stack_json: &str,
+    lambda_um: Vec<f64>,
+    aoi_deg: Vec<f64>,
+    n_incident: f64,
+    n_exit: f64,
+) -> PyResult<String> {
+    let coating: oc_core::thinfilm::Coating =
+        serde_json::from_str(stack_json).map_err(to_py_err)?;
+    let mut cols: [Vec<f64>; 9] = Default::default();
+    for &nm in &lambda_um {
+        for &deg in &aoi_deg {
+            let a = oc_core::thinfilm::coating_amp_at(
+                &coating,
+                n_incident,
+                n_exit,
+                nm,
+                deg.to_radians().cos(),
+            )
+            .ok_or_else(|| PyValueError::new_err(format!("no amplitudes at {nm} um, {deg} deg")))?;
+            for (i, z) in [a.r_s, a.r_p, a.t_s, a.t_p].into_iter().enumerate() {
+                cols[2 * i].push(z.re);
+                cols[2 * i + 1].push(z.im);
+            }
+            cols[8].push(a.t_power_scale);
+        }
+    }
+    let arr = |v: &Vec<f64>| {
+        v.iter()
+            .map(|x| x.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let names = [
+        "rs_re", "rs_im", "rp_re", "rp_im", "ts_re", "ts_im", "tp_re", "tp_im", "scale",
+    ];
+    let body = names
+        .iter()
+        .zip(cols.iter())
+        .map(|(n, v)| format!("\"{n}\":[{}]", arr(v)))
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(format!("{{{body}}}"))
+}
+
 /// The `.ocanvas` schema version this build writes.
 #[pyfunction]
 fn format_version() -> u32 {
@@ -186,6 +244,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(scene3_sequence, m)?)?;
     m.add_function(wrap_pyfunction!(scene3_sequence_for_intent, m)?)?;
     m.add_function(wrap_pyfunction!(thinfilm_rt, m)?)?;
+    m.add_function(wrap_pyfunction!(thinfilm_amplitudes, m)?)?;
     m.add_function(wrap_pyfunction!(normalize, m)?)?;
     m.add_function(wrap_pyfunction!(validate, m)?)?;
     m.add_function(wrap_pyfunction!(format_version, m)?)?;

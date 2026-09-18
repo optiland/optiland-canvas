@@ -39,6 +39,8 @@ pub mod migrate_v1;
 #[cfg(feature = "scene3")]
 pub mod planar_reduce;
 #[cfg(feature = "scene3")]
+pub mod polarization;
+#[cfg(feature = "scene3")]
 pub mod profile2;
 pub mod scene;
 #[cfg(feature = "scene3")]

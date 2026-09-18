@@ -901,13 +901,30 @@ fn interact_surface(
             n2: n_here,
             children,
         };
-        // The element's axis: its local +X, projected into the plane the ray's
-        // field lives in. For a ray down the axis that is the axis itself; for
-        // an oblique one it is the projection, which is the usual idealisation
-        // and departs from a real polarizer at large obliquity.
-        let local_x = s.common.transform.rotate(Vec3::X);
+        // The axis is a direction in the element's own plane: its local `+X`
+        // turned by `axis_deg` towards its local `+Y`, the plane its normal
+        // (local `+Z`) stands on. What acts on the ray is that direction
+        // projected into the plane the field lives in, which is the usual
+        // idealisation and departs from a real polarizer at large obliquity.
+        //
+        // Building the axis first and projecting second is not the same as
+        // projecting `+X` and turning the result inside the ray's transverse
+        // plane. The two agree at normal incidence and diverge as the square of
+        // the obliquity, and the difference is the whole of an ideal element's
+        // angle dependence: turning inside the transverse plane preserves the
+        // angle between any two elements exactly, so a crossed pair would
+        // extinguish perfectly seen from every direction. Real crossed
+        // polarizers leak off axis, which is why a display has a viewing angle.
+        let axis_deg = match response {
+            SurfaceResponse::Polarizer { axis_deg, .. }
+            | SurfaceResponse::Retarder { axis_deg, .. } => *axis_deg,
+            _ => unreachable!("matched above"),
+        };
+        let (sin_a, cos_a) = axis_deg.to_radians().sin_cos();
+        let t = &s.common.transform;
+        let axis = t.rotate(Vec3::X) * cos_a + t.rotate(Vec3::Y) * sin_a;
         let dir = w.ray.dir;
-        let projected = local_x - dir * dir.dot(local_x);
+        let projected = axis - dir * dir.dot(axis);
         if projected.length() < 1e-9 {
             // The ray runs along the element's own axis: there is no projection
             // and no meaningful transmission axis to apply.
@@ -921,26 +938,20 @@ fn interact_surface(
         }
         let frame_x = projected.normalize();
 
+        // `frame_x` is already the axis, so both elements are diagonal in it
+        // and neither needs turning.
         let (m, feature) = match response {
-            SurfaceResponse::Polarizer {
-                axis_deg,
-                extinction,
-            } => (
+            SurfaceResponse::Polarizer { extinction, .. } => (
                 // Amplitude on the blocked axis is the square root of the power
                 // that leaks: extinction is quoted as a power ratio.
                 Mueller::from_diagonal_jones(
                     oc_core::thinfilm::Cx::real(1.0),
                     oc_core::thinfilm::Cx::real(extinction.clamp(0.0, 1.0).sqrt()),
-                )
-                .rotated(axis_deg.to_radians()),
+                ),
                 PhysicsFeature::Polarizer,
             ),
-            SurfaceResponse::Retarder {
-                axis_deg,
-                retardance_deg,
-            } => (
-                Mueller::linear_retarder(retardance_deg.to_radians())
-                    .rotated(axis_deg.to_radians()),
+            SurfaceResponse::Retarder { retardance_deg, .. } => (
+                Mueller::linear_retarder(retardance_deg.to_radians()),
                 PhysicsFeature::Retarder,
             ),
             _ => unreachable!("matched above"),

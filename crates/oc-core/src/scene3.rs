@@ -425,11 +425,16 @@ pub enum SurfaceResponse {
     /// An ideal absorbing linear polarizer: it passes the field component along
     /// its transmission axis and absorbs the perpendicular one.
     ///
-    /// Zero thickness, no reflection, no dispersion, no angular dependence. It
-    /// models the polarization action of a polarizer and not a sheet of
-    /// anything: a real one reflects, has a contrast that varies with
-    /// wavelength, and degrades as it is tilted. Unpolarized light loses half
-    /// its flux here, which is a physical fact and not an assumption.
+    /// Zero thickness, no reflection, no dispersion. It models the polarization
+    /// action of a polarizer and not a sheet of anything: a real one reflects,
+    /// has a contrast that varies with wavelength, and degrades as it is
+    /// tilted. Unpolarized light loses half its flux here, which is a physical
+    /// fact and not an assumption.
+    ///
+    /// Angle enters only through the geometry: the axis is a direction in the
+    /// element, and a skew ray sees its projection. That is enough for a
+    /// crossed pair to leak off axis and not enough for anything a datasheet
+    /// calls an acceptance angle.
     ///
     /// `extinction` is the **power** fraction of the blocked component that
     /// still gets through, so 0 is perfect and 1e-4 is an ordinary sheet
@@ -450,6 +455,10 @@ pub enum SurfaceResponse {
     /// rays, no optical path through a crystal, and the retardance is the
     /// number given rather than one that follows from a thickness and a
     /// birefringence at each wavelength.
+    ///
+    /// The retardance is the same at every angle of incidence. A real plate's
+    /// moves as the square of the obliquity, which a zero-order plate barely
+    /// notices and a multi-order one does not survive.
     ///
     /// Only meaningful on a standalone planar surface, whose local `+X` the
     /// fast axis is measured from.

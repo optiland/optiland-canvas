@@ -65,8 +65,27 @@ scene with a mirror in it would not be worth reading.
 
 A polarizer's transmission axis and a waveplate's fast axis are directions in
 the element. They do not turn with whatever ray happens to arrive, so unlike a
-coating these do not work in the plane of incidence: they use the surface's own
-local `+X`, projected into the plane the ray's field lives in.
+coating these do not work in the plane of incidence. The axis is the surface's
+local `+X` turned by its angle in the surface's own plane, and what acts on a
+ray is that direction projected into the plane the field lives in.
+
+Projecting the axis out of the element is not the same as projecting local `+X`
+and turning the result inside the ray's transverse plane. The two agree at
+normal incidence and diverge as the square of the obliquity, and the difference
+is the whole of an ideal element's angle dependence. Turning inside the
+transverse plane keeps the angle between any two elements exactly what it was,
+so a crossed pair would extinguish perfectly seen from every direction. Real
+crossed polarizers leak off axis, which is why a display has a viewing angle:
+
+| ray off axis | fraction of unpolarized flux passed by a crossed pair |
+|---|---|
+| 10 degrees | 1.2e-4 |
+| 20 degrees | 1.9e-3 |
+| 30 degrees | 1.0e-2 |
+
+Those are the worst case over the azimuth, which lies at 45 degrees to both
+axes. A ray leaning along either axis leaks nothing, because that axis is left
+alone and the other is shortened without being turned.
 
 That makes them standalone-surface responses. A body patch carrying one is
 refused rather than given an axis nobody chose, because a curved patch of a
@@ -177,5 +196,17 @@ before.
   wavelength. Real waveplates are not.
 - **Depolarization.** Nothing here depolarizes. Scatter and roughness would, and
   neither is modelled.
+- **Everything angle does to a polarizer beyond the projection.** A real one
+  has two faces that reflect, and more so as it is tilted. A wire grid loses
+  contrast off axis. A thin-film polarizer or a MacNeille cube is built around a
+  Brewster match at one angle and stops working a couple of degrees away from
+  it, which is the whole of its datasheet. A Glan-Taylor has a hard acceptance
+  cone. None of that is here: extinction is one number at every angle.
+- **Retardance with angle.** A waveplate's retardance moves as the square of
+  the obliquity, up or down depending on which axis it is tilted about. For
+  quartz it is about 0.6% at 10 degrees and 2.4% at 20. A zero-order plate
+  barely notices; a tenth-order quarter wave is 23 degrees out at 10 degrees of
+  tilt, which is both why multi-order plates are angle-sensitive and why tilt
+  tuning works. The retardance here is one number at every angle.
 - **Coating phase in the preview.** The baked grid carries powers only. Adding
   amplitudes to it is possible and has not been measured to be worth it.

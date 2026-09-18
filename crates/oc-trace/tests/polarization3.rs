@@ -544,6 +544,51 @@ fn scalar_bench(build: impl FnOnce(&mut Scene3)) -> f64 {
     detector_named(&trace3(&s, &launch, &scalar_cfg()), det).total_incident
 }
 
+/// The elements' own plane written in world coordinates. A plate that faces
+/// `+X` carries its local `+X` along world `-Z` and its local `+Y` along world
+/// `+Y`, which is the fact the bench above records.
+fn plate_x() -> Vec3 {
+    -Vec3::Z
+}
+
+fn plate_y() -> Vec3 {
+    Vec3::Y
+}
+
+/// A direction `tilt_deg` off the bench axis, leaning towards `azimuth_deg`
+/// measured in the elements' own plane from their local `+X`.
+fn skew_dir(tilt_deg: f64, azimuth_deg: f64) -> Vec3 {
+    let (st, ct) = tilt_deg.to_radians().sin_cos();
+    let (sa, ca) = azimuth_deg.to_radians().sin_cos();
+    (Vec3::X * ct + (plate_x() * ca + plate_y() * sa) * st).normalize()
+}
+
+/// An element's axis as a ray travelling along `dir` sees it: the direction in
+/// the element, projected into the plane the field lives in.
+fn seen_axis(axis_deg: f64, dir: Vec3) -> Vec3 {
+    let (sa, ca) = axis_deg.to_radians().sin_cos();
+    let axis = plate_x() * ca + plate_y() * sa;
+    (axis - dir * dir.dot(axis)).normalize()
+}
+
+/// The bench again, with the ray arriving off axis. Every element on it still
+/// faces `+X`; the ray does not. Returns the arriving fraction and the
+/// direction it arrived along, which is what the oracle needs.
+fn skew_bench(
+    tilt_deg: f64,
+    azimuth_deg: f64,
+    build: impl FnOnce(&mut Scene3),
+) -> (f64, Vec3) {
+    let dir = skew_dir(tilt_deg, azimuth_deg);
+    let mut s = Scene3::new();
+    build(&mut s);
+    let det = add_rect_detector(&mut s, dir * 60.0, -dir, 20.0, 20.0, [4, 4]);
+    s.validate().expect("valid");
+    let launch = vec![launch(Ray3::new(dir * -60.0, dir).unwrap(), 0.55, 1.0)];
+    let res = trace3(&s, &launch, &cfg());
+    (detector_named(&res, det).total_incident, dir)
+}
+
 fn add_pol(s: &mut Scene3, x: f64, axis_deg: f64, extinction: f64) {
     s.add_polarizer(Vec3::new(x, 0.0, 0.0), 15.0, 0.0, axis_deg, extinction)
         .expect("polarizer");
@@ -744,4 +789,71 @@ fn a_polarizer_on_a_solid_is_refused() {
         !res.capability_report.rejected.is_empty(),
         "a polarizing element on a solid must be reported, not guessed at"
     );
+}
+
+/// Crossed polarizers leak off axis, which is why a display has a viewing
+/// angle.
+///
+/// Two ideal plates crossed in their own plane are not crossed in the
+/// transverse plane of a ray that arrives skew: projecting two perpendicular
+/// directions onto a tilted plane does not keep them perpendicular. What leaks
+/// is Malus against whatever is left of the right angle, and by thirty degrees
+/// off axis that is a percent of the light.
+///
+/// A model that turned the axis inside the ray's own transverse plane instead
+/// of projecting it out of the element would keep the pair exactly crossed from
+/// every direction and report a hard zero here.
+#[test]
+fn crossed_polarizers_leak_off_axis() {
+    for tilt in [10.0f64, 20.0, 30.0] {
+        let (got, dir) = skew_bench(tilt, 45.0, |s| {
+            add_pol(s, -8.0, 0.0, 0.0);
+            add_pol(s, 8.0, 90.0, 0.0);
+        });
+        // Half the unpolarized light survives the first plate, and the second
+        // passes the cosine squared of the angle between the axes this ray
+        // sees.
+        let want = 0.5 * seen_axis(0.0, dir).dot(seen_axis(90.0, dir)).powi(2);
+        assert!(
+            (got - want).abs() < 1e-12,
+            "{tilt} degrees off axis: {got} vs {want}"
+        );
+        assert!(got > 1e-5, "and it is a leak, not a rounding: {got}");
+    }
+}
+
+/// The leak comes from the geometry rather than from a fudge factor: it
+/// vanishes when the ray leans along either axis and peaks between them.
+///
+/// Leaning along an axis leaves that axis alone and shortens the other without
+/// turning it, so the two stay perpendicular and the pair stays dark.
+#[test]
+fn the_off_axis_leak_follows_the_azimuth() {
+    let crossed = |az: f64| {
+        skew_bench(30.0, az, |s| {
+            add_pol(s, -8.0, 0.0, 0.0);
+            add_pol(s, 8.0, 90.0, 0.0);
+        })
+        .0
+    };
+    for az in [0.0f64, 90.0, 180.0, 270.0] {
+        let got = crossed(az);
+        assert!(got < 1e-15, "leaning along an axis at {az} leaks {got}");
+    }
+    let between = crossed(45.0);
+    assert!(between > 5e-3, "and leaning between them leaks: {between}");
+}
+
+/// A polarizer whose axis leans out of the ray's transverse plane still passes
+/// half of unpolarized light, because an ideal one passes all of whatever lies
+/// along the axis it can see and none of the rest whatever the angle.
+#[test]
+fn one_polarizer_off_axis_still_halves_unpolarized_light() {
+    for tilt in [0.0f64, 15.0, 30.0, 45.0] {
+        let (got, _) = skew_bench(tilt, 45.0, |s| add_pol(s, 0.0, 30.0, 0.0));
+        assert!(
+            (got - 0.5).abs() < 1e-12,
+            "at {tilt} degrees off axis: {got}"
+        );
+    }
 }

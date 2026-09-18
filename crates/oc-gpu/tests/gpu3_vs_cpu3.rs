@@ -870,3 +870,31 @@ fn dichroics_and_tabulated_responses_match_cpu() {
         assert_gpu_matches_cpu_at(&tracer, &scene, &fold_rays(&lambdas), ghost_opts(ghosts));
     }
 }
+
+/// A real thin-film coating on the GPU against the CPU mirror.
+///
+/// This is the only test that runs the shader's coating branch at all. Both
+/// sides read the same baked grid, so unlike every other physics comparison
+/// here this one is a check on the *indexing*: the shader walks a wavelength
+/// axis and a `sin²θ` row by hand, and an off-by-one in either would read a
+/// neighbouring column and quietly route light the wrong way.
+#[test]
+fn a_thin_film_coating_matches_cpu() {
+    let Some(tracer) = tracer_or_skip() else {
+        return;
+    };
+    let design = oc_core::thinfilm::CoatingDesign::long_pass(550.0, 45.0);
+    let coating = oc_core::thinfilm::plate_coating(
+        design,
+        oc_core::thinfilm::materials::bk7(),
+        oc_core::thinfilm::ExitFace::Bare,
+        1.0,
+    );
+    let mut scene = Scene3::new();
+    fold_with_two_arms(&mut scene, SurfaceResponse::Coating { coating });
+    scene.validate().unwrap();
+    // Across the edge, where the grid's two axes both matter, and out either
+    // side of it where they do not.
+    let lambdas = [0.42, 0.50, 0.53, 0.55, 0.57, 0.62, 0.70];
+    assert_gpu_matches_cpu_at(&tracer, &scene, &fold_rays(&lambdas), opts());
+}

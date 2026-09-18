@@ -173,6 +173,17 @@ const RESP_MIRROR: u32 = 1u;
 const RESP_DIELECTRIC: u32 = 2u;
 const RESP_EXPLICIT_RT: u32 = 3u;
 const RESP_THIN_LENS: u32 = 4u;
+const RESP_COATING: u32 = 5u;
+
+// A baked thin-film coating. `resp.t` holds the wavelength axis (tab_count
+// entries at tab_start, x = lambda) and `resp.r` the grid itself: COAT_ANGLES
+// rows, uniform in sin2(theta), of one (R, T) pair per wavelength. Must match
+// scene3::COAT_ANGLES; `the_coating_grid_constants_agree` pins that.
+
+// A baked thin-film coating grid: `COAT_ANGLES` rows of `COAT_LAMBDAS` (R, T)
+// pairs, uniform in wavelength and in sin²θ. Must match scene3::COAT_* exactly;
+// `the_coating_grid_constants_agree` pins that.
+const COAT_ANGLES: u32 = 64u;
 
 // Out-of-range policies of a tabulated response scalar.
 const POLICY_ERROR: u32 = 0u;
@@ -1097,6 +1108,47 @@ fn interact_surface(w: Work, ev: Event, point: vec3<f32>, flux_end: f32, lambda:
         if (params.ghosts == 1u && w.gdepth < params.max_ghost && r > 0.0) {
             let dir = reflect3(w.d, n_oppose);
             push(Work(point + dir * EPS, dir, flux_end * r, w.depth + 1u, w.gdepth + 1u, w.medium_n, w.medium_alpha, (w.flags & ~SEG_TIR) | SEG_GHOST), min_flux);
+        }
+    } else if (kind == RESP_COATING) {
+        // A real thin-film stack, read off the grid baked from the transfer
+        // matrix when the scene compiled. Bilinear in wavelength and in
+        // sin2(theta), and identical to what cpu3 computes on the same numbers.
+        // A ray's wavelength is normally one of the baked columns exactly, so
+        // the wavelength weight comes out 0 or 1 and only the angle actually
+        // interpolates. Both branches are primary paths, like explicit R/T.
+        let n_l = resp.t.tab_count;
+        if (n_l == 0u) { return; }
+        var l0 = 0u;
+        loop {
+            if (l0 + 2u >= n_l) { break; }
+            if (verts[resp.t.tab_start + l0 + 1u].x >= lambda) { break; }
+            l0 = l0 + 1u;
+        }
+        let l1 = min(l0 + 1u, n_l - 1u);
+        let lam_a = verts[resp.t.tab_start + l0].x;
+        let lam_b = verts[resp.t.tab_start + l1].x;
+        var tl = 0.0;
+        if (lam_b > lam_a) { tl = clamp((lambda - lam_a) / (lam_b - lam_a), 0.0, 1.0); }
+
+        let cos_i = clamp(-dot(n_oppose, w.d), 0.0, 1.0);
+        let sin2 = clamp(1.0 - cos_i * cos_i, 0.0, 1.0);
+        let fa = clamp(sin2 / 0.999, 0.0, 1.0) * f32(COAT_ANGLES - 1u);
+        let a0 = u32(floor(fa));
+        let a1 = min(a0 + 1u, COAT_ANGLES - 1u);
+        let ta = fa - floor(fa);
+
+        let base = resp.r.tab_start;
+        let lo = mix(verts[base + a0 * n_l + l0], verts[base + a0 * n_l + l1], tl);
+        let hi = mix(verts[base + a1 * n_l + l0], verts[base + a1 * n_l + l1], tl);
+        let rt = mix(lo, hi, ta);
+        let r = clamp(rt.x, 0.0, 1.0);
+        let t = clamp(rt.y, 0.0, 1.0);
+        if (r > 0.0) {
+            let dir = reflect3(w.d, n_oppose);
+            push(Work(point + dir * EPS, dir, flux_end * r, w.depth + 1u, w.gdepth, w.medium_n, w.medium_alpha, w.flags & ~SEG_TIR), min_flux);
+        }
+        if (t > 0.0) {
+            push(Work(point + w.d * EPS, w.d, flux_end * t, w.depth + 1u, w.gdepth, w.medium_n, w.medium_alpha, w.flags & ~SEG_TIR), min_flux);
         }
     } else {
         // Explicit R/T (a beam splitter or dichroic). Both branches are primary

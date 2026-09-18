@@ -203,6 +203,8 @@ impl GpuScene3 {
     /// use so the f32 and f64 paths see identical rays.
     pub fn build_with_rays(scene: &Scene3, launch: &[EmittedRay3], opts: BuildOpts) -> Self {
         let norm = scene_norm(scene);
+        // Coatings bake at the wavelengths this launch set actually carries.
+        let coat_lambdas = launch_lambdas(launch);
         let mut bodies = Vec::new();
         let mut surfaces = Vec::new();
         let mut apertures = Vec::new();
@@ -220,7 +222,7 @@ impl GpuScene3 {
             }
         }
         for s in &scene.surfaces {
-            match compile_surface(s, &norm) {
+            match compile_surface(s, &norm, scene.env.ambient_index, &coat_lambdas) {
                 Ok(gs) => surfaces.push(gs),
                 Err(kind) => reject(s.common.id.0, kind),
             }
@@ -762,6 +764,9 @@ fn classify_surface(r: &TwoSidedSurfaceResponse) -> Result<u32, String> {
         SurfaceResponse::ThinLens { .. } => {
             Err("thin lens on a body patch (only standalone surfaces carry it)".into())
         }
+        SurfaceResponse::Coating { .. } => {
+            Err("thin-film coating on a body patch (not yet in the f32 preview)".into())
+        }
     }
 }
 
@@ -935,6 +940,55 @@ pub enum GpuResponse {
     ThinLens {
         f: f32,
     },
+    /// A thin-film stack evaluated onto a grid: `COAT_ANGLES` rows, uniform in
+    /// `sin2 theta`, of one `(R, T)` pair per entry in `lambdas`.
+    CoatingGrid {
+        lambdas: Vec<f32>,
+        rt: Vec<[f32; 2]>,
+    },
+}
+
+/// Bilinear lookup into a baked coating grid. The CPU mirror and the shader do
+/// exactly this, on exactly these numbers.
+///
+/// A ray's wavelength is normally one of the baked columns exactly, so the
+/// wavelength weight comes out 0 or 1 and only the angle actually interpolates.
+pub fn sample_coating_grid(
+    lambdas: &[f32],
+    rt: &[[f32; 2]],
+    lambda_um: f32,
+    cos_i: f32,
+) -> (f32, f32) {
+    let n_l = lambdas.len();
+    if n_l == 0 || rt.len() < n_l * COAT_ANGLES {
+        return (0.0, 0.0);
+    }
+    // The interval containing `lambda_um`, held at either end.
+    let mut l0 = 0usize;
+    while l0 + 2 < n_l && lambdas[l0 + 1] < lambda_um {
+        l0 += 1;
+    }
+    let l1 = (l0 + 1).min(n_l - 1);
+    let span = lambdas[l1] - lambdas[l0];
+    let tl = if span > 0.0 {
+        ((lambda_um - lambdas[l0]) / span).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+
+    let sin2 = (1.0 - cos_i * cos_i).clamp(0.0, 1.0);
+    let fa = (sin2 / 0.999).clamp(0.0, 1.0) * (COAT_ANGLES as f32 - 1.0);
+    let a0 = fa.floor() as usize;
+    let a1 = (a0 + 1).min(COAT_ANGLES - 1);
+    let ta = fa - a0 as f32;
+
+    let at = |a: usize, l: usize| rt[a * n_l + l];
+    let mix =
+        |x: [f32; 2], y: [f32; 2], t: f32| [x[0] + (y[0] - x[0]) * t, x[1] + (y[1] - x[1]) * t];
+    let lo = mix(at(a0, l0), at(a0, l1), tl);
+    let hi = mix(at(a1, l0), at(a1, l1), tl);
+    let v = mix(lo, hi, ta);
+    (v[0].clamp(0.0, 1.0), v[1].clamp(0.0, 1.0))
 }
 
 /// A response scalar in f32, or the reason it cannot be previewed. A table
@@ -976,7 +1030,12 @@ fn spectral(s: &SpectralScalar) -> Result<Spectral32, String> {
     })
 }
 
-fn compile_response(r: &SurfaceResponse, scale: f64) -> Result<GpuResponse, String> {
+fn compile_response(
+    r: &SurfaceResponse,
+    scale: f64,
+    ambient: f64,
+    coat_lambdas: &[f32],
+) -> Result<GpuResponse, String> {
     Ok(match r {
         SurfaceResponse::Absorber => GpuResponse::Absorber,
         SurfaceResponse::ThinLens { focal_length_mm } => GpuResponse::ThinLens {
@@ -995,7 +1054,76 @@ fn compile_response(r: &SurfaceResponse, scale: f64) -> Result<GpuResponse, Stri
             r: spectral(reflectance)?,
             t: spectral(transmittance)?,
         },
+        SurfaceResponse::Coating { coating } => bake_coating(coating, ambient, coat_lambdas)?,
     })
+}
+
+/// Angle samples in a baked coating grid, uniform in `sin2 theta` from 0 (on
+/// axis) to 1 (grazing).
+pub const COAT_ANGLES: usize = 64;
+/// The most wavelengths a coating grid is baked at. Scenes carry a handful of
+/// spectral lines; this only bounds a pathological one.
+pub const COAT_MAX_LAMBDAS: usize = 64;
+
+/// Evaluate a thin-film stack onto a grid: the wavelengths actually in flight,
+/// crossed with `COAT_ANGLES` samples uniform in `sin2 theta`.
+///
+/// The transfer matrix is too much to run per ray in a shader, and baking is not
+/// a compromise: the grid is the *same* table for the CPU mirror and for the
+/// GPU, so those two stay bit-identical, which is the invariant the parity suite
+/// rests on. The exact tracer never reads it, it runs the matrix per hit, so the
+/// grid only ever has to be good enough to draw.
+///
+/// Baking at the scene's own wavelengths rather than over a fixed spectral range
+/// is what makes this affordable: the preview recompiles the scene on every
+/// frame of a drag, and a source emits a few lines, not a spectrum. A three-line
+/// scene bakes 192 points instead of tens of thousands, and every ray then lands
+/// exactly on a sample in wavelength, leaving angle as the only axis that
+/// interpolates at all.
+///
+/// That axis is uniform in `sin2 theta` rather than in theta because that is
+/// very nearly what the band shift is linear in: the edge of a quarter-wave
+/// stack moves as `sqrt(1 - sin2 theta / n_eff^2)`.
+fn bake_coating(
+    c: &oc_core::thinfilm::Coating,
+    ambient: f64,
+    lambdas: &[f32],
+) -> Result<GpuResponse, String> {
+    if lambdas.is_empty() {
+        return Err("a coating in a scene that emits no light".to_string());
+    }
+    let mut rt = Vec::with_capacity(lambdas.len() * COAT_ANGLES);
+    for a in 0..COAT_ANGLES {
+        let sin2 = a as f64 / (COAT_ANGLES - 1) as f64;
+        // Stop just short of grazing: at exactly 90 degrees the admittances
+        // degenerate and every coating reflects everything, which is true but
+        // useless to interpolate toward.
+        let cos_i = (1.0 - sin2 * 0.999).max(0.0).sqrt();
+        for &lam in lambdas {
+            let v = oc_core::thinfilm::coating_rt_at(c, ambient, ambient, lam as f64, cos_i)
+                .ok_or_else(|| {
+                    "coating whose optical constants are tabulated away from this scene's wavelengths"
+                        .to_string()
+                })?;
+            rt.push([v.r() as f32, v.t() as f32]);
+        }
+    }
+    Ok(GpuResponse::CoatingGrid {
+        lambdas: lambdas.to_vec(),
+        rt,
+    })
+}
+
+/// The distinct wavelengths a launch set carries, sorted, for baking coatings.
+///
+/// Deduplicated at 1e-9 um, far below any real line spacing and far above f32
+/// noise, so two rays of "the same" wavelength share one column.
+pub fn launch_lambdas(launch: &[oc_core::source3::EmittedRay3]) -> Vec<f32> {
+    let mut v: Vec<f64> = launch.iter().map(|r| r.lambda_um).collect();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    v.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+    v.truncate(COAT_MAX_LAMBDAS);
+    v.into_iter().map(|x| x as f32).collect()
 }
 
 /// The rigid placement of an object in the normalized frame.
@@ -1016,7 +1144,12 @@ pub struct GpuSurface3 {
     pub object: u64,
 }
 
-fn compile_surface(s: &SurfaceObject3, norm: &Norm) -> Result<GpuSurface3, String> {
+fn compile_surface(
+    s: &SurfaceObject3,
+    norm: &Norm,
+    ambient: f64,
+    coat_lambdas: &[f32],
+) -> Result<GpuSurface3, String> {
     let shape = match &s.geometry {
         SurfaceGeometry3::Plane { shape } => GpuShape2::from_planar(shape, norm.scale),
         SurfaceGeometry3::SurfaceOfRevolution { .. } => {
@@ -1028,8 +1161,8 @@ fn compile_surface(s: &SurfaceObject3, norm: &Norm) -> Result<GpuSurface3, Strin
         rot,
         pos,
         shape,
-        front: compile_response(&s.response_front, norm.scale)?,
-        back: compile_response(&s.response_back, norm.scale)?,
+        front: compile_response(&s.response_front, norm.scale, ambient, coat_lambdas)?,
+        back: compile_response(&s.response_back, norm.scale, ambient, coat_lambdas)?,
         object: s.common.id.0,
     })
 }

@@ -392,6 +392,20 @@ fn interact_surface(
                 transmit(stack, flux_end * t);
             }
         }
+        GpuResponse::CoatingGrid { lambdas, rt } => {
+            // A real thin-film stack, read off the grid that was baked from the
+            // transfer matrix when the scene compiled. Both branches are primary
+            // paths, exactly as for `ExplicitRt`; the only difference is that
+            // `R` and `T` now depend on the angle the ray arrived at.
+            let cos_i = (-n_oppose.dot(w.d)).clamp(0.0, 1.0);
+            let (r, t) = crate::scene3::sample_coating_grid(lambdas, rt, lambda, cos_i);
+            if r > 0.0 {
+                reflect_branch(stack, flux_end * r, false);
+            }
+            if t > 0.0 {
+                transmit(stack, flux_end * t);
+            }
+        }
         GpuResponse::ThinLens { f } => {
             // Ideal-lens slope law u' = u − h/f in the surface's local frame
             // (direction-aware; mirrors tracer3's f64 branch). Full

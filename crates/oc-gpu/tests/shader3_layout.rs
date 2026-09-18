@@ -257,3 +257,19 @@ fn shader3_structs_match_buffers3() {
         std::mem::size_of::<Ray3Buf>()
     );
 }
+
+/// The baked coating grid is addressed by arithmetic, not by a search: the host
+/// writes `COAT_ANGLES` rows and the shader indexes straight into them. If the
+/// two sides disagree about the shape of that grid, every coated surface reads
+/// someone else's numbers and the trace is quietly wrong rather than loudly
+/// broken. So the row count is pinned here, by value, on both sides.
+#[test]
+fn the_coating_grid_constants_agree() {
+    let at = SRC
+        .find("const COAT_ANGLES:")
+        .expect("COAT_ANGLES is missing from the shader");
+    let line = &SRC[at..SRC[at..].find('\n').map(|e| at + e).unwrap_or(SRC.len())];
+    let rhs = line.split('=').nth(1).expect("a value").trim().trim_end_matches(';');
+    assert_eq!(rhs.trim(), format!("{}u", oc_gpu::scene3::COAT_ANGLES));
+    assert_eq!(oc_gpu::buffers3::RESP_COATING, 5);
+}

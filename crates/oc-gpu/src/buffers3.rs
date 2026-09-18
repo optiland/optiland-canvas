@@ -42,6 +42,9 @@ pub const RESP_MIRROR: u32 = 1;
 pub const RESP_DIELECTRIC: u32 = 2;
 pub const RESP_EXPLICIT_RT: u32 = 3;
 pub const RESP_THIN_LENS: u32 = 4;
+/// A baked thin-film coating: `r.tab_start` points at
+/// `COAT_ANGLES × COAT_LAMBDAS` `(R, T)` pairs in `verts`, row-major by angle.
+pub const RESP_COATING: u32 = 5;
 
 // Out-of-range policies of a tabulated response scalar.
 pub const POLICY_ERROR: u32 = 0;
@@ -358,6 +361,28 @@ fn encode_response(resp: &GpuResponse, verts: &mut Vec<Vert3Buf>) -> Response3Bu
             (RESP_EXPLICIT_RT, r, encode_spectral(t, verts), zero)
         }
         GpuResponse::ThinLens { f } => (RESP_THIN_LENS, constant(*f), zero, zero),
+        GpuResponse::CoatingGrid { lambdas, rt } => {
+            // Both halves live in `verts`, which is already a list of pairs:
+            // the wavelength axis in the `t` slot, the grid itself in `r`. The
+            // grid is `COAT_ANGLES` rows of `t.tab_count` (R, T) pairs.
+            let lam_start = verts.len() as u32;
+            verts.extend(lambdas.iter().map(|l| [*l, 0.0]));
+            let axis = Spectral3Buf {
+                value: 0.0,
+                tab_start: lam_start,
+                tab_count: lambdas.len() as u32,
+                policy: POLICY_CLAMP,
+            };
+            let grid_start = verts.len() as u32;
+            verts.extend(rt.iter().copied());
+            let grid = Spectral3Buf {
+                value: 0.0,
+                tab_start: grid_start,
+                tab_count: rt.len() as u32,
+                policy: POLICY_CLAMP,
+            };
+            (RESP_COATING, grid, axis, zero)
+        }
     };
     Response3Buf {
         kind,

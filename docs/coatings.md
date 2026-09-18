@@ -213,9 +213,39 @@ drags, changing the thickness of the layer to its left.
 
 ## What is still missing
 
-- **Polarization.** s and p are computed and the component view could show them,
-  but the tracer carries no polarization state, so it consumes their mean. A
-  polarizing beam splitter cannot be represented.
+- **Polarization.** This is the largest gap, and it is worth being precise about
+  what it costs.
+
+  The coating calculation *is* polarization-resolved: `FilmRt` carries `r_s`,
+  `r_p`, `t_s` and `t_p` separately all the way through. What is missing is
+  transport. A ray has no polarization state, so the tracer takes the mean and
+  the outgoing beam is unpolarized again.
+
+  For a **single** element lit by unpolarized light, the mean is exactly right
+  for flux, so nothing is wrong yet. The error appears at the **second**
+  polarization-sensitive element, which in reality no longer sees unpolarized
+  light.
+
+  How far from unpolarized? The dichroic `＋ dichroic` builds, at 45 degrees,
+  reflecting:
+
+  | λ (nm) | R_s | R_p | mean used | degree of polarization |
+  |---|---|---|---|---|
+  | 460 | 0.9997 | 0.9937 | 0.9967 | 0.3% |
+  | 520 | 0.9961 | 0.8668 | 0.9315 | 6.9% |
+  | 540 | 0.9773 | 0.3493 | 0.6633 | 47% |
+  | 560 | 0.7782 | 0.0203 | 0.3993 | **95%** |
+  | 620 | 0.0969 | 0.0173 | 0.0571 | 70% |
+
+  Deep in the band both polarizations saturate and the mean is harmless. At the
+  edge, which is exactly where a dichroic is used, the reflected beam is 95%
+  polarized: the part is very nearly a polarizer and the model calls its output
+  unpolarized. Put a second tilted dichroic after it and the answer is wrong by
+  whatever those two polarizations would have done to each other.
+
+  A polarizing beam splitter cannot be represented at all, and neither can a
+  waveplate, a polarizer, or the phase shift on total internal reflection that
+  makes a Fresnel rhomb work.
 - **Coatings on lens faces.** The machinery is all there now (a coated plate is
   a revolved body with a film on one face, which is exactly what an AR-coated
   lens would be), but nothing authors one. Lens faces still use the scalar

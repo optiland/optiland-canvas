@@ -48,6 +48,8 @@ pub mod seq;
 pub mod seq3;
 #[cfg(feature = "scene3")]
 pub mod source3;
+#[cfg(feature = "scene3")]
+pub mod thinfilm;
 pub mod vec;
 pub mod vec3;
 

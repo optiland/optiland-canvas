@@ -177,6 +177,7 @@ fn rays_at(rays: &[(Vec3, Vec3, f64)]) -> (Vec<EmittedRay3>, Vec<LaunchRay3>) {
             lambda_um,
             flux: 1.0,
             source: None,
+            pol: None,
         });
     }
     (emitted, launch)
@@ -187,6 +188,18 @@ fn cfg() -> TraceConfig3 {
         ghosts: false,
         flux_eps: 1e-9,
         max_depth: 32,
+        // The preview carries no polarization state: it averages s and p at
+        // each surface and hands on unpolarized light. So the reference runs
+        // the same model here. Comparing a polarization-aware f64 trace against
+        // an unpolarized f32 one would measure the difference between two
+        // physical models and call it a precision drift.
+        //
+        // The difference is not small where it applies: a coated plate, whose
+        // front face polarizes the beam before its back face transmits it,
+        // moves by 2e-2 of a ray's flux between the two models, which is ten
+        // times the grid tolerance this suite is checking.
+        // `oc-trace/tests/polarization3.rs` measures the gap deliberately.
+        polarization: false,
         ..TraceConfig3::default()
     }
 }

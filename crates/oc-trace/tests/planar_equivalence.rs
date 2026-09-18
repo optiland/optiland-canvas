@@ -70,6 +70,16 @@ fn cfg3() -> TraceConfig3 {
         ghosts: false,
         flux_eps: 1e-12,
         max_depth: 64,
+        // The v1 planar tracer has no polarization: every surface takes the mean
+        // of the s and p powers and hands on unpolarized light. So the 3D
+        // tracer runs the same model here, or this would be comparing two
+        // different physics and calling the difference a reduction error.
+        //
+        // The difference is real and is not small enough to ignore: two glass
+        // faces in a row transmit about 7e-5 more of a beam once the first
+        // one's p enrichment is carried into the second.
+        // `two_glass_faces_transmit_more_than_the_mean_of_means` measures it.
+        polarization: false,
         ..TraceConfig3::default()
     }
 }
@@ -92,6 +102,7 @@ fn launch_rays(s2: &Scene2) -> Vec<LaunchRay3> {
             lambda_um: er.lambda_um,
             flux: er.flux,
             source: None,
+            pol: None,
         })
         .collect()
 }

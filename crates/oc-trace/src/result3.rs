@@ -27,6 +27,13 @@ pub struct LaunchRay3 {
     pub flux: f64,
     /// The source this ray came from, for diagnostics. Not required for transport.
     pub source: Option<SourceId>,
+    /// The polarization state the ray starts in, on its own transverse frame.
+    ///
+    /// `None` is unpolarized, and is not the same as "unset": an unpolarized
+    /// state looks identical in every frame, so a source that declares nothing
+    /// needs no frame chosen for it. Where one is given, `flux` still governs
+    /// the total: the state is rescaled to it, so the two cannot disagree.
+    pub pol: Option<oc_core::polarization::PolRay>,
 }
 
 /// Flags on a traced segment, for rendering and diagnostics.
@@ -72,6 +79,13 @@ pub struct DetectorHit3 {
     pub parent_path_id: Option<PathId>,
     pub depth: u32,
     pub ghost_depth: u32,
+    /// The arriving polarization state, written on this ray's own frame.
+    /// `s0` is `incident_flux`.
+    pub stokes: oc_core::polarization::Stokes,
+    /// That frame's transverse axis, in world coordinates. Without it the
+    /// `s1`/`s2` above name nothing: they are components on an axis, and a
+    /// reader that does not know which axis cannot use them.
+    pub frame_x: Vec3,
 }
 
 /// The role a spawned child branch plays at an interaction.
@@ -169,6 +183,21 @@ pub struct DetectorResult3 {
     pub flux_opl: f64,
     /// Bounded per-hit records, if requested.
     pub records: Vec<DetectorHit3>,
+    /// Every hit's state, summed in **the detector's own frame**: each ray's
+    /// state is rotated onto the projection of the detector's local `+X` axis
+    /// before being added.
+    ///
+    /// `s0` equals `total_incident` and is always meaningful. The other three
+    /// are only as meaningful as that common frame is, which is why
+    /// [`DetectorResult3::max_tilt_rad`] sits next to them: rays arriving from
+    /// very different directions have genuinely different transverse planes,
+    /// and adding their `s1` is then an operation on numbers rather than on
+    /// light. Read the sum when the cone is narrow; read an analyzer response
+    /// when it is not.
+    pub stokes_local: oc_core::polarization::Stokes,
+    /// The largest angle between an arriving ray and the detector's normal,
+    /// radians. The caveat on `stokes_local`, as a number.
+    pub max_tilt_rad: f64,
 }
 
 impl DetectorResult3 {
@@ -180,6 +209,8 @@ impl DetectorResult3 {
             cell_area_mm2,
             incident_flux: vec![0.0; cells],
             detected_signal: vec![0.0; cells],
+            stokes_local: oc_core::polarization::Stokes::ZERO,
+            max_tilt_rad: 0.0,
             hits: 0,
             total_incident: 0.0,
             total_signal: 0.0,
@@ -219,6 +250,10 @@ impl DetectorResult3 {
         self.flux_uv += other.flux_uv;
         self.flux_opl += other.flux_opl;
         self.records.extend_from_slice(&other.records);
+        // Both sides already rotated into the same detector frame, so this is a
+        // sum of comparable numbers rather than of different bases.
+        self.stokes_local = self.stokes_local.plus(&other.stokes_local);
+        self.max_tilt_rad = self.max_tilt_rad.max(other.max_tilt_rad);
     }
 }
 
@@ -442,6 +477,25 @@ impl CapabilityReport {
     pub(crate) fn note_exact(&mut self, f: PhysicsFeature) {
         if !self.exact.contains(&f) {
             self.exact.push(f);
+        }
+        if !self.supported.contains(&f) {
+            self.supported.push(f);
+        }
+    }
+
+    /// Record that a feature ran under a stated model assumption rather than
+    /// exactly. Deduplicated on the pair, so a scene with a thousand mirrors
+    /// says it once.
+    pub(crate) fn note_approx(&mut self, f: PhysicsFeature, detail: &str) {
+        if !self
+            .approximated
+            .iter()
+            .any(|a| a.feature == f && a.detail == detail)
+        {
+            self.approximated.push(Approximation {
+                feature: f,
+                detail: detail.to_string(),
+            });
         }
         if !self.supported.contains(&f) {
             self.supported.push(f);

@@ -31,6 +31,7 @@ pub fn launch(ray: Ray3, lambda_um: f64, flux: f64) -> LaunchRay3 {
         lambda_um,
         flux,
         source: None,
+        pol: None,
     }
 }
 
@@ -119,6 +120,26 @@ pub fn add_glass_slab(scene: &mut Scene3, x0: f64, x1: f64, nd: f64) -> f64 {
         },
         material,
         Isometry3::from_pos(Vec3::new((x0 + x1) / 2.0, 0.0, 0.0)),
+    );
+    n
+}
+
+/// A glass slab of thickness `t_mm`, its front face carrying `normal`, centred
+/// on `pos`. The plate a beam meets off axis, for the tests that care what an
+/// interface does to polarization rather than where it sends the ray.
+pub fn add_tilted_slab(scene: &mut Scene3, pos: Vec3, normal: Vec3, t_mm: f64, nd: f64) -> f64 {
+    let material = Material::AbbePoint { nd, vd: 64.0 };
+    let n = material.index_at(LAMBDA_D, &scene.catalog).unwrap();
+    // Local +Z is the slab's thickness axis, so the box is thin in z and the
+    // rotation carries that axis onto the normal.
+    let q = glam::DQuat::from_rotation_arc(Vec3::Z, normal.normalize());
+    push_body(
+        scene,
+        SolidGeometry3::Box {
+            half_extents_mm: Vec3::new(30.0, 30.0, t_mm / 2.0),
+        },
+        material,
+        Isometry3::new(pos, [q.x, q.y, q.z, q.w]).unwrap(),
     );
     n
 }

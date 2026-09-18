@@ -493,6 +493,30 @@ pub fn frame_angle(dir: Vec3, from: Vec3, to: Vec3) -> f64 {
     to.dot(y).atan2(to.dot(from))
 }
 
+/// Carry a transverse frame across a change of direction, by the shortest
+/// rotation that takes one direction onto the other.
+///
+/// Reflection and refraction need none of this: both outgoing rays lie in the
+/// plane of incidence, so the `ŝ` axis already serves them. This is for a bend
+/// with no plane of incidence to work in, which in this kernel means the ideal
+/// thin lens. Rotating by the smallest angle adds no twist the element does not
+/// physically apply.
+pub fn transport_frame(x: Vec3, from: Vec3, to: Vec3) -> Vec3 {
+    let (a, b) = (from.normalize(), to.normalize());
+    let axis = a.cross(b);
+    let len = axis.length();
+    if len < 1e-12 {
+        // Unchanged direction, or exactly reversed, where no rotation is
+        // preferred over any other and the frame may as well stay put.
+        return x;
+    }
+    let axis = axis * (1.0 / len);
+    let angle = a.dot(b).clamp(-1.0, 1.0).acos();
+    let (s, c) = angle.sin_cos();
+    // Rodrigues.
+    (x * c + axis.cross(x) * s + axis * (axis.dot(x) * (1.0 - c))).normalize()
+}
+
 /// The `ŝ` axis of the plane of incidence: perpendicular to both the ray and
 /// the surface normal.
 ///

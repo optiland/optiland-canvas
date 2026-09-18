@@ -709,6 +709,22 @@ pub fn coating_amp_at(
     Some(stack_amp(&layers, n0, n_far, lambda_um, q))
 }
 
+/// The complex amplitudes of a **bare** dielectric interface, in the ray frame.
+///
+/// A stack with no layers, which is what a bare interface is, so it comes out
+/// of the same matrix and needs no second implementation to keep in step. Past
+/// the critical angle it returns the reflection with its phase, which is the
+/// only thing an interface does there, and the transmitted amplitudes go to
+/// zero along with the scale.
+pub fn interface_amp(n1: f64, n2: f64, cos_i: f64) -> FilmAmp {
+    let n0 = Cx::real(n1.max(1e-9));
+    let ns = Cx::real(n2.max(1e-9));
+    let cos_i = cos_i.clamp(-1.0, 1.0).abs();
+    let sin_i = (1.0 - cos_i * cos_i).max(0.0).sqrt();
+    // The wavelength cannot matter with no layer to put a phase thickness in.
+    stack_amp(&[], n0, ns, 0.55, n0 * sin_i)
+}
+
 /// Both polarizations of one coherent stack, converted into the ray frame.
 ///
 /// Three conversions happen here and nowhere else.

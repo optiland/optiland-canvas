@@ -30,8 +30,9 @@ use oc_core::vec::Vec2;
 use oc_core::vec3::{Aabb3, Isometry3, Ray3, Vec3};
 
 use crate::bvh3::Bvh3;
-use crate::fresnel::{beer_lambert, reflect3, reflectance, refract3};
+use crate::fresnel::{beer_lambert, reflect3, refract3};
 use crate::result3::*;
+use oc_core::polarization::{self, Mueller, PolRay, Stokes};
 
 /// Reference-tracer configuration. The reference is the exact path, so its
 /// defaults follow ghosts as far as the depth cap allows; the interactive preset
@@ -55,6 +56,16 @@ pub struct TraceConfig3 {
     /// The scene revision, copied into the result so a stale trace is discarded
     /// rather than shown (§3.3).
     pub revision: u64,
+    /// Carry a polarization state on every ray, and let each interface act on
+    /// it. On by default, because it is the physics.
+    ///
+    /// Turning it off is the **scalar-unpolarized approximation**: every
+    /// element sees unpolarized light, so it uses the mean of the s and p
+    /// powers and hands on unpolarized light. That is exactly right for one
+    /// interaction and wrong from the second polarization-sensitive element
+    /// onward. It is what the f32 preview does, so the parity suite runs the
+    /// reference this way to compare like with like.
+    pub polarization: bool,
 }
 
 impl Default for TraceConfig3 {
@@ -70,6 +81,7 @@ impl Default for TraceConfig3 {
             max_records: 4096,
             record_events: false,
             revision: 0,
+            polarization: true,
         }
     }
 }
@@ -87,8 +99,26 @@ pub fn launch_from_source(source: &oc_core::scene3::Source3) -> Vec<LaunchRay3> 
             lambda_um: e.lambda_um,
             flux: e.flux,
             source: Some(e.source),
+            pol: None,
         })
         .collect()
+}
+
+/// The state a launch ray starts in.
+///
+/// A source that declares no polarization emits unpolarized light, which looks
+/// the same in every frame; the frame is still chosen deterministically, so two
+/// runs of one scene agree on the numbers the state would carry once something
+/// polarizes it. A declared state is rescaled to the ray's flux, so `flux` stays
+/// the single source of truth for how much light there is.
+fn launch_state(lr: &LaunchRay3) -> PolRay {
+    match lr.pol {
+        Some(p) if p.stokes.s0 > 0.0 => PolRay {
+            stokes: p.stokes.scaled(lr.flux / p.stokes.s0),
+            x: p.x,
+        },
+        _ => PolRay::unpolarized(lr.ray.dir, lr.flux),
+    }
 }
 
 /// Every launch ray a scene's sources emit, deterministically (§6.10).
@@ -225,7 +255,9 @@ impl LocalResult {
 struct RayWork {
     ray: Ray3,
     lambda: f64,
-    flux: f64,
+    /// Flux **and** polarization. `pol.stokes.s0` is the flux: one number, not
+    /// two that could drift apart.
+    pol: PolRay,
     depth: u32,
     ghost_depth: u32,
     opl: f64,
@@ -233,6 +265,23 @@ struct RayWork {
     parent: Option<PathId>,
     from_tir: bool,
     ghost: bool,
+}
+
+impl RayWork {
+    fn flux(&self) -> f64 {
+        self.pol.stokes.s0
+    }
+
+    /// The state after the medium has taken its cut. Bulk absorption in an
+    /// isotropic medium is polarization-blind, so this is a pure scaling.
+    fn state_at(&self, flux: f64) -> Stokes {
+        let s0 = self.pol.stokes.s0;
+        if s0 > 0.0 {
+            self.pol.stokes.scaled(flux / s0)
+        } else {
+            Stokes::unpolarized(flux)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -353,7 +402,11 @@ fn trace_one(
     stack.push(RayWork {
         ray: lr.ray,
         lambda: lr.lambda_um,
-        flux: lr.flux,
+        // A source with no declared polarization emits unpolarized light, whose
+        // state is the same in every frame; the frame still has to be chosen
+        // deterministically so two runs agree on the numbers it would carry if
+        // something polarized it later.
+        pol: launch_state(&lr),
         depth: 0,
         ghost_depth: 0,
         opl: 0.0,
@@ -369,7 +422,7 @@ fn trace_one(
         if branches > cfg.max_branches {
             // Deposit the popped branch and everything still queued, so the cap
             // subtracts a named quantity rather than a silent one.
-            r.ledger.truncated_flux += w.flux + stack.iter().map(|x| x.flux).sum::<f64>();
+            r.ledger.truncated_flux += w.flux() + stack.iter().map(|x| x.flux()).sum::<f64>();
             r.terminations.record(TerminationReason::MaxBranches);
             break;
         }
@@ -381,7 +434,7 @@ fn trace_one(
             deposit_truncated(r, &w, TerminationReason::MaxGhostDepth);
             continue;
         }
-        if w.flux < min_flux {
+        if w.flux() < min_flux {
             deposit_truncated(r, &w, TerminationReason::FluxThreshold);
             continue;
         }
@@ -403,8 +456,8 @@ fn trace_one(
         let Some(ev) = nearest_event(scene, objs, bvh, cfg, &w, skip) else {
             // Nothing ahead: the branch leaves the scene.
             let end = w.ray.at(cfg.bounds_mm);
-            let flux_end = w.flux * beer_lambert(alpha, cfg.bounds_mm);
-            record_absorption(r, w.flux - flux_end);
+            let flux_end = w.flux() * beer_lambert(alpha, cfg.bounds_mm);
+            record_absorption(r, w.flux() - flux_end);
             push_segment(r, &w, end, flux_end, w.opl + n_here * cfg.bounds_mm);
             push_event(
                 r,
@@ -420,8 +473,8 @@ fn trace_one(
         };
 
         let l = ev.t;
-        let flux_at = w.flux * beer_lambert(alpha, l);
-        record_absorption(r, w.flux - flux_at);
+        let flux_at = w.flux() * beer_lambert(alpha, l);
+        record_absorption(r, w.flux() - flux_at);
         let opl_at = w.opl + n_here * l;
         push_segment(r, &w, ev.point, flux_at, opl_at);
 
@@ -492,7 +545,7 @@ fn trace_one(
 
 /// Deposit a culled branch's flux into `truncated_flux` and record the reason.
 fn deposit_truncated(r: &mut LocalResult, w: &RayWork, reason: TerminationReason) {
-    r.ledger.truncated_flux += w.flux;
+    r.ledger.truncated_flux += w.flux();
     r.terminations.record(reason);
 }
 
@@ -529,7 +582,7 @@ fn push_segment(r: &mut LocalResult, w: &RayWork, b: Vec3, flux_end: f64, opl1: 
     r.segments.push(Segment3 {
         a: w.ray.origin,
         b,
-        flux_start: w.flux,
+        flux_start: w.flux(),
         flux_end,
         lambda_um: w.lambda,
         opl0_mm: w.opl,
@@ -787,9 +840,10 @@ fn interact_surface(
     if let SurfaceResponse::ThinLens { focal_length_mm } = response {
         let f = *focal_length_mm;
         if !f.is_finite() || f == 0.0 {
-            r.report.reject(CapabilityIssue::UnsupportedSurfaceResponse {
-                surface: surface_ref,
-            });
+            r.report
+                .reject(CapabilityIssue::UnsupportedSurfaceResponse {
+                    surface: surface_ref,
+                });
             r.ledger.numerical_loss += flux_at;
             r.terminations.record(TerminationReason::UnsupportedPhysics);
             push_event(r, cfg, w, point, opl_at, lens_interact(Vec::new()));
@@ -815,11 +869,22 @@ fn interact_surface(
             .normalize();
             t.quat() * bent
         };
-        // Full transmission: no reflection branch, no absorption, no added OPL.
+        // Full transmission: no reflection branch, no absorption, no added OPL,
+        // and no polarization action either. The bend is not a reflection, so
+        // there is no plane of incidence to work in; the frame is carried across
+        // it by the shortest rotation, which is what parallel transport along a
+        // bent ray means.
+        let pol = PolRay {
+            stokes: w.state_at(flux_at),
+            x: polarization::transport_frame(w.pol.x, w.ray.dir, dir),
+        };
         let child = spawn(
-            stack, r, cfg, w, point, dir, flux_at, opl_at, false, false, min_flux,
+            stack, r, cfg, w, point, dir, pol, opl_at, false, false, min_flux,
         );
-        let children = child.map(|id| (ChildRole::ThinLens, id)).into_iter().collect();
+        let children = child
+            .map(|id| (ChildRole::ThinLens, id))
+            .into_iter()
+            .collect();
         push_event(r, cfg, w, point, opl_at, lens_interact(children));
         return;
     }
@@ -864,6 +929,38 @@ fn apply_response(
 ) {
     let cos_i = -n_oppose.dot(w.ray.dir).clamp(-1.0, 1.0);
     let sample = |s: &oc_core::scene3::SpectralScalar| s.sample(w.lambda);
+
+    // The plane of incidence, and the arriving state written on it. At normal
+    // incidence there is no such plane, and the ray keeps its own frame: that is
+    // the continuous limit, because there the two polarizations describe the
+    // same physical reflection and every azimuth gives the same answer.
+    let s_hat = polarization::incidence_axis(w.ray.dir, n_oppose).unwrap_or(w.pol.x);
+    let stokes_in = w
+        .state_at(flux_at)
+        .rotated(polarization::frame_angle(w.ray.dir, w.pol.x, s_hat));
+    // Everything that leaves this point leaves on the same s axis: the reflected
+    // and the transmitted ray both lie in the plane of incidence, so it is
+    // perpendicular to both of them.
+    //
+    // With polarization off, every element instead sees unpolarized light and
+    // hands on unpolarized light. That is the scalar-unpolarized approximation:
+    // the right flux for one interaction, and wrong from the second
+    // polarization-sensitive element onward. The preview runs it, so the parity
+    // tests can compare like with like.
+    // A phase-neutral element acting on *unpolarized* light assumes nothing:
+    // the mean is the right flux and the output is unpolarized either way. The
+    // assumption only bites once the light arriving is polarized, so that is
+    // when the report says so, rather than decorating every scene with a mirror
+    // in it.
+    let phase_assumed = cfg.polarization && stokes_in.dop() > 1e-12;
+    let out = |m: &Mueller| -> PolRay {
+        let stokes = if cfg.polarization {
+            m.apply(&stokes_in)
+        } else {
+            Stokes::unpolarized(m.unpolarized_gain() * flux_at)
+        };
+        PolRay { stokes, x: s_hat }
+    };
     // `medium_transition` doubles as the body marker: bodies are the interfaces
     // that transition media, zero-thickness surfaces never do (§6.6).
     let interact = |children: Vec<(ChildRole, PathId)>| TraceEventKind::Interact {
@@ -894,76 +991,93 @@ fn apply_response(
                     return;
                 }
             };
-            r.ledger.absorbed_surface += flux_at * (1.0 - refl);
+            // An ideal reflector: the same coefficient for s and p and no phase
+            // between them. A real metal mirror has both, and this response is a
+            // number rather than a stack, so the model choice is recorded rather
+            // than assumed.
+            if phase_assumed {
+                r.report.note_approx(
+                    PhysicsFeature::Mirror,
+                    "ideal reflector: equal s and p, no retardance",
+                );
+            }
+            let m = Mueller::attenuator(refl);
+            let child_pol = out(&m);
+            r.ledger.absorbed_surface += flux_at - child_pol.stokes.s0;
             let dir = reflect3(w.ray.dir, n_oppose);
             let child = spawn(
-                stack,
-                r,
-                cfg,
-                w,
-                point,
-                dir,
-                flux_at * refl,
-                opl_at,
-                false,
+                stack, r, cfg, w, point, dir, child_pol, opl_at, false,
                 false, // a mirror reflection is specular, not total internal reflection
                 min_flux,
             );
-            let children = child.map(|id| (ChildRole::Reflect, id)).into_iter().collect();
+            let children = child
+                .map(|id| (ChildRole::Reflect, id))
+                .into_iter()
+                .collect();
             push_event(r, cfg, w, point, opl_at, interact(children));
         }
         SurfaceResponse::DielectricFresnel { ar_residual } => {
             r.report.note_exact(PhysicsFeature::DielectricFresnel);
             let ar = sample(ar_residual).unwrap_or(1.0).clamp(0.0, 1.0);
+            // Amplitudes rather than the scalar mean: an interface is a diagonal
+            // Jones element, and past the critical angle the phase it puts
+            // between s and p is the whole of what it does.
+            let amp = oc_core::thinfilm::interface_amp(n1, n2, cos_i);
             match refract3(w.ray.dir, n_oppose, n1, n2) {
                 None => {
-                    // Total internal reflection: R = 1, primary path.
+                    // Total internal reflection: R = 1, primary path. The
+                    // retardance is real physics, and it is what a Fresnel rhomb
+                    // is built out of.
+                    let m = Mueller::from_diagonal_jones(amp.r_s, amp.r_p);
                     let dir = reflect3(w.ray.dir, n_oppose);
-                    let child =
-                        spawn_tir(stack, r, cfg, w, point, dir, flux_at, opl_at, min_flux);
+                    let child = spawn_tir(stack, r, cfg, w, point, dir, out(&m), opl_at, min_flux);
                     let children = child.map(|id| (ChildRole::Tir, id)).into_iter().collect();
                     push_event(r, cfg, w, point, opl_at, interact(children));
                 }
                 Some(dir_t) => {
-                    let refl = (reflectance(cos_i, n1, n2) * ar).clamp(0.0, 1.0);
-                    let tr = 1.0 - refl;
+                    let pw = amp.powers();
+                    let m_r = Mueller::from_diagonal_jones(amp.r_s, amp.r_p).scaled(ar);
+                    // A lossless interface has R + T = 1 in each polarization
+                    // separately, so suppressing the reflection with `ar` has to
+                    // hand that flux to the transmitted branch rather than lose
+                    // it. The two polarizations need different factors, which is
+                    // a rescaled diagonal Jones element and not a grey one.
+                    let keep = |rp: f64, tp: f64| {
+                        if tp > 0.0 {
+                            ((1.0 - ar * rp) / tp).max(0.0).sqrt()
+                        } else {
+                            1.0
+                        }
+                    };
+                    let m_t = Mueller::from_diagonal_jones(
+                        amp.t_s * keep(pw.r_s, pw.t_s),
+                        amp.t_p * keep(pw.r_p, pw.t_p),
+                    )
+                    .scaled(amp.t_power_scale);
+                    let pol_r = out(&m_r);
+                    let pol_t = out(&m_t);
                     let mut children = Vec::new();
                     if let Some(id) = spawn(
-                        stack,
-                        r,
-                        cfg,
-                        w,
-                        point,
-                        dir_t,
-                        flux_at * tr,
-                        opl_at,
-                        false,
-                        false,
-                        min_flux,
+                        stack, r, cfg, w, point, dir_t, pol_t, opl_at, false, false, min_flux,
                     ) {
                         children.push((ChildRole::Transmit, id));
                     }
-                    if cfg.ghosts && refl > 0.0 {
+                    // Whatever neither branch carries away was absorbed here.
+                    // Taking it from the states rather than from the nominal
+                    // coefficients keeps the ledger balanced by construction.
+                    r.ledger.absorbed_surface +=
+                        (flux_at - pol_r.stokes.s0 - pol_t.stokes.s0).max(0.0);
+                    if cfg.ghosts && pol_r.stokes.s0 > 0.0 {
                         let dir_r = reflect3(w.ray.dir, n_oppose);
                         if let Some(id) = spawn(
-                            stack,
-                            r,
-                            cfg,
-                            w,
-                            point,
-                            dir_r,
-                            flux_at * refl,
-                            opl_at,
-                            true,
-                            false,
-                            min_flux,
+                            stack, r, cfg, w, point, dir_r, pol_r, opl_at, true, false, min_flux,
                         ) {
                             children.push((ChildRole::Reflect, id));
                         }
-                    } else if refl > 0.0 {
+                    } else if pol_r.stokes.s0 > 0.0 {
                         // Ghosts off: the reflected flux is not followed, but it is
                         // still named rather than lost.
-                        r.ledger.truncated_flux += flux_at * refl;
+                        r.ledger.truncated_flux += pol_r.stokes.s0;
                     }
                     push_event(r, cfg, w, point, opl_at, interact(children));
                 }
@@ -985,23 +1099,29 @@ fn apply_response(
                     return;
                 }
             };
-            r.ledger.absorbed_surface += flux_at * (1.0 - refl - tr).max(0.0);
+            // Two numbers, and two numbers cannot describe a polarization
+            // interaction: powers fix the magnitudes of a diagonal Jones element
+            // and say nothing about the phase between them, nor about whether s
+            // and p differ at all. This treats the surface as an ideal grey
+            // attenuator, equal for both polarizations and phase-neutral, which
+            // is a declared model choice and not something the data establishes.
+            if phase_assumed {
+                r.report.note_approx(
+                    PhysicsFeature::ExplicitRt,
+                    "power-only response: treated as polarization-blind and phase-neutral",
+                );
+            }
+            let m_r = Mueller::attenuator(refl);
+            let m_t = Mueller::attenuator(tr);
+            let pol_r = out(&m_r);
+            let pol_t = out(&m_t);
+            r.ledger.absorbed_surface += (flux_at - pol_r.stokes.s0 - pol_t.stokes.s0).max(0.0);
             let mut children = Vec::new();
             // Reflected branch (specular).
             if refl > 0.0 {
                 let dir_r = reflect3(w.ray.dir, n_oppose);
                 if let Some(id) = spawn(
-                    stack,
-                    r,
-                    cfg,
-                    w,
-                    point,
-                    dir_r,
-                    flux_at * refl,
-                    opl_at,
-                    w.ghost,
-                    false,
-                    min_flux,
+                    stack, r, cfg, w, point, dir_r, pol_r, opl_at, w.ghost, false, min_flux,
                 ) {
                     children.push((ChildRole::Reflect, id));
                 }
@@ -1015,17 +1135,7 @@ fn apply_response(
                     w.ray.dir
                 };
                 if let Some(id) = spawn(
-                    stack,
-                    r,
-                    cfg,
-                    w,
-                    point,
-                    dir_t,
-                    flux_at * tr,
-                    opl_at,
-                    w.ghost,
-                    false,
-                    min_flux,
+                    stack, r, cfg, w, point, dir_t, pol_t, opl_at, w.ghost, false, min_flux,
                 ) {
                     children.push((ChildRole::Transmit, id));
                 }
@@ -1053,13 +1163,46 @@ fn apply_response(
                     return;
                 }
             };
-            r.ledger.absorbed_surface += flux_at * (1.0 - refl - tr).max(0.0);
+            // A coherent stack is a diagonal Jones element and has amplitudes.
+            // A plate-backed one adds its two faces incoherently, which is right
+            // for millimetres of glass and is not a Jones element at all: the
+            // relative phase is exactly what the incoherent sum throws away. In
+            // that case the powers still separate s from p, and only the phase
+            // between them is declared absent.
+            let amp = oc_core::thinfilm::coating_amp_at(coating, n1, n2, w.lambda, cos_i);
+            let (m_r, m_t) = match &amp {
+                Some(a) => (
+                    Mueller::from_diagonal_jones(a.r_s, a.r_p),
+                    Mueller::from_diagonal_jones(a.t_s, a.t_p).scaled(a.t_power_scale),
+                ),
+                None => {
+                    if phase_assumed {
+                        r.report.note_approx(
+                            PhysicsFeature::ThinFilmCoating,
+                            "plate-backed stack: faces added incoherently, no relative phase",
+                        );
+                    }
+                    let v = rt.as_ref().expect("checked above");
+                    (
+                        Mueller::from_diagonal_jones(
+                            oc_core::thinfilm::Cx::real(v.r_s.max(0.0).sqrt()),
+                            oc_core::thinfilm::Cx::real(v.r_p.max(0.0).sqrt()),
+                        ),
+                        Mueller::from_diagonal_jones(
+                            oc_core::thinfilm::Cx::real(v.t_s.max(0.0).sqrt()),
+                            oc_core::thinfilm::Cx::real(v.t_p.max(0.0).sqrt()),
+                        ),
+                    )
+                }
+            };
+            let pol_r = out(&m_r);
+            let pol_t = out(&m_t);
+            r.ledger.absorbed_surface += (flux_at - pol_r.stokes.s0 - pol_t.stokes.s0).max(0.0);
             let mut children = Vec::new();
             if refl > 0.0 {
                 let dir_r = reflect3(w.ray.dir, n_oppose);
                 if let Some(id) = spawn(
-                    stack, r, cfg, w, point, dir_r, flux_at * refl, opl_at, w.ghost, false,
-                    min_flux,
+                    stack, r, cfg, w, point, dir_r, pol_r, opl_at, w.ghost, false, min_flux,
                 ) {
                     children.push((ChildRole::Reflect, id));
                 }
@@ -1071,7 +1214,7 @@ fn apply_response(
                     w.ray.dir
                 };
                 if let Some(id) = spawn(
-                    stack, r, cfg, w, point, dir_t, flux_at * tr, opl_at, w.ghost, false, min_flux,
+                    stack, r, cfg, w, point, dir_t, pol_t, opl_at, w.ghost, false, min_flux,
                 ) {
                     children.push((ChildRole::Transmit, id));
                 }
@@ -1103,12 +1246,13 @@ fn spawn(
     parent: &RayWork,
     point: Vec3,
     dir: Vec3,
-    flux: f64,
+    pol: PolRay,
     opl: f64,
     ghost: bool,
     from_tir: bool,
     min_flux: f64,
 ) -> Option<PathId> {
+    let flux = pol.stokes.s0;
     let depth = parent.depth + 1;
     let ghost_depth = parent.ghost_depth + u32::from(ghost && !parent.ghost);
     let is_ghost = parent.ghost || ghost;
@@ -1134,7 +1278,7 @@ fn spawn(
     stack.push(RayWork {
         ray,
         lambda: parent.lambda,
-        flux,
+        pol,
         depth,
         ghost_depth,
         opl,
@@ -1154,7 +1298,7 @@ fn spawn_tir(
     parent: &RayWork,
     point: Vec3,
     dir: Vec3,
-    flux: f64,
+    pol: PolRay,
     opl: f64,
     min_flux: f64,
 ) -> Option<PathId> {
@@ -1166,7 +1310,7 @@ fn spawn_tir(
         parent,
         point,
         dir,
-        flux,
+        pol,
         opl,
         parent.ghost,
         true,
@@ -1187,7 +1331,10 @@ fn continue_probe(
         stack.push(RayWork {
             ray,
             lambda: w.lambda,
-            flux,
+            pol: PolRay {
+                stokes: w.state_at(flux),
+                x: w.pol.x,
+            },
             depth: w.depth,
             ghost_depth: w.ghost_depth,
             opl,
@@ -1219,12 +1366,37 @@ fn record_detector(
     r.report.note_exact(PhysicsFeature::AreaDetector);
     let d = &scene.detectors[det];
     let qe = detector_qe(scene, det, w.lambda);
+    let stokes = w.state_at(flux);
+
+    // The detector's own frame: its local `+X`, projected into the plane this
+    // ray's field lives in. Every hit is rotated onto that before being summed,
+    // so the aggregate is an addition of comparable components rather than of
+    // numbers that happen to sit in the same struct. How far that common frame
+    // can be trusted is the tilt recorded beside it.
+    let axis_world = d.common.transform.rotate(Vec3::X);
+    let dir = w.ray.dir;
+    let along = dir.dot(axis_world);
+    let projected = axis_world - dir * along;
+    let det_x = if projected.length() > 1e-9 {
+        projected.normalize()
+    } else {
+        // The ray runs along the detector's own X: no projection survives, so
+        // fall back to the ray's frame, which at least names an axis.
+        w.pol.x
+    };
+    let normal_world = d.common.transform.rotate(Vec3::Z);
+    let tilt = dir.dot(normal_world).abs().clamp(0.0, 1.0).acos();
+
     let out = &mut r.detectors[det];
     out.hits += 1;
     out.total_incident += flux;
     out.total_signal += flux * qe;
     out.flux_uv += uv * flux;
     out.flux_opl += opl * flux;
+    out.stokes_local = out
+        .stokes_local
+        .plus(&stokes.rotated(polarization::frame_angle(dir, w.pol.x, det_x)));
+    out.max_tilt_rad = out.max_tilt_rad.max(tilt);
     if let Some(cell) = detector_cell(d, uv) {
         out.incident_flux[cell] += flux;
         out.detected_signal[cell] += flux * qe;
@@ -1242,6 +1414,8 @@ fn record_detector(
             parent_path_id: w.parent,
             depth: w.depth,
             ghost_depth: w.ghost_depth,
+            stokes,
+            frame_x: w.pol.x,
         });
     }
 }

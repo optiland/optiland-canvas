@@ -2147,6 +2147,19 @@ impl Canvas {
         out
     }
 
+    /// The angle, in degrees, at which the scene's light meets this surface.
+    ///
+    /// The angle worth designing a coating for and worth plotting one at, since
+    /// it is the one the part is being used at. `NaN` for a non-surface id or a
+    /// scene with no light in it.
+    #[wasm_bindgen(js_name = surfaceAoiDeg)]
+    pub fn surface_aoi_deg(&self, id: f64) -> f64 {
+        self.scene3
+            .as_ref()
+            .and_then(|s| s.surface_axial_aoi_deg(id as u64))
+            .unwrap_or(f64::NAN)
+    }
+
     /// The thin-film stack on a surface's front face, or `null` if it carries
     /// none.
     ///
@@ -3579,7 +3592,10 @@ pub(crate) fn surface_object_kind(s: &oc_core::scene3::SurfaceObject3) -> &'stat
     );
     if f == "mirror" {
         "mirror"
-    } else if f == "dichroic" || b == "dichroic" || f == "coated" || b == "coated" {
+    } else if f == "film" || b == "film" || f == "dichroic" || b == "dichroic" || f == "coated" || b == "coated"
+    {
+        // A film is a dichroic to the rest of the app: same role in a scene, same
+        // colour treatment, same picking. What differs is that it knows the angle.
         "dichroic"
     } else if f == "split" || b == "split" {
         "beamsplitter"

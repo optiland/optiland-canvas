@@ -219,7 +219,7 @@ test.describe("component view", () => {
     expect(await incident(page, up)).toBeCloseTo(0.3, 9);
   });
 
-  test("a dichroic sends each line to its side, and its edge handle moves the split", async ({ page }) => {
+  test("a dichroic is a real film: it routes the lines and knows its angle", async ({ page }) => {
     await freshApp(page);
     await page.selectOption("#wlPreset", "fdc");
     await openInset(page);
@@ -228,29 +228,61 @@ test.describe("component view", () => {
     const id = (await insetView(page)).id;
     const up = await addUpDetector(page);
     const lines = [486.13, 587.56, 656.27];
-    // What the up arm should get: each line's reflectance, from the tables the
-    // tracer reads, times its third of the flux.
-    const expected = () => page.evaluate(([id, lines]) => {
-      const rt = (window as unknown as { __ocDebug: any }).__ocDebug.scene.surfaceRtF64(id, false, new Float64Array(lines)) as Float64Array;
+
+    // The plate hangs at 135°, so the light meets it at 45°, and that is the
+    // angle its stack was solved for and the angle its curve is plotted at.
+    const film = () => page.evaluate(
+      (id) => JSON.parse((window as unknown as { __ocDebug: any }).__ocDebug.scene.surfaceFilmJSON(id)),
+      id,
+    );
+    const f0 = await film();
+    expect(f0.aoiDeg).toBeCloseTo(45, 6);
+    expect(f0.layers.length).toBeGreaterThan(10);
+    expect(f0.edgeNm).toBeGreaterThan(545);
+    expect(f0.edgeNm).toBeLessThan(555);
+    await expect(page.locator("#componentInset .cv-read")).toContainText("used at");
+
+    // What the up arm should get: each line's reflectance at the angle the
+    // plate is used at, times its third of the flux. The 550 nm long-pass
+    // reflects the blue line and passes the other two.
+    const expected = () => page.evaluate(([id, lines, aoi]) => {
+      const rt = (window as unknown as { __ocDebug: any }).__ocDebug.scene
+        .surfaceRtF64(id, false, new Float64Array(lines as number[]), aoi as number) as Float64Array;
       return (rt[0] + rt[2] + rt[4]) / 3;
-    }, [id, lines] as const);
-
-    // The default long-pass edge at 550 nm reflects only the blue line.
-    expect(await expected()).toBeCloseTo(0.98 / 3, 12);
-    expect(await incident(page, up)).toBeCloseTo(await expected(), 9);
-    await expect(page.locator("#componentInset .cv-read")).toContainText("486.1");
-
-    // Move the edge past the yellow line: now two lines fold up.
-    await dragBy(page, await handle(page, "edge"), 60, 0);
-    const edge = await page.evaluate((id) => JSON.parse((window as unknown as { __ocDebug: any }).__ocDebug.scene.surfaceCoatingJSON(id)).front.dichroic.edgeNm, id);
-    expect(edge).toBeGreaterThan(600);
-    expect(await expected()).toBeGreaterThan(0.6);
+    }, [id, lines, f0.aoiDeg] as const);
+    expect(await expected()).toBeGreaterThan(0.3);
     expect(await incident(page, up)).toBeCloseTo(await expected(), 9);
 
-    // Short-pass swaps the arms.
+    // The same stack read on axis is a different coating: its band sits some
+    // 40 nm higher, so the yellow line it passes at 45° it reflects on axis.
+    const onAxis = await page.evaluate(([id, nm]) => {
+      const rt = (window as unknown as { __ocDebug: any }).__ocDebug.scene
+        .surfaceRtF64(id, false, new Float64Array([nm as number]), 0) as Float64Array;
+      return rt[0];
+    }, [id, 587.56] as const);
+    const atUse = await page.evaluate(([id, nm, aoi]) => {
+      const rt = (window as unknown as { __ocDebug: any }).__ocDebug.scene
+        .surfaceRtF64(id, false, new Float64Array([nm as number]), aoi as number) as Float64Array;
+      return rt[0];
+    }, [id, 587.56, f0.aoiDeg] as const);
+    expect(onAxis).toBeGreaterThan(atUse + 0.5);
+
+    // Dragging a layer boundary changes that layer and nothing to its left.
+    const before = (await film()).layers.map((l: { thicknessNm: number }) => l.thicknessNm);
+    await dragBy(page, await handle(page, "f0"), 14, 0);
+    const after = (await film()).layers.map((l: { thicknessNm: number }) => l.thicknessNm);
+    expect(after[0]).toBeGreaterThan(before[0] + 2);
+    expect(after[1]).toBeCloseTo(before[1], 9);
+    expect(await incident(page, up)).toBeCloseTo(await expected(), 9);
+
+    // Asking for a different edge rebuilds the stack, and it lands there.
+    await page.locator('#componentInset input[data-name="edge"]').fill("620");
+    await expect.poll(async () => (await film()).edgeNm).toBeGreaterThan(612);
+    await expect.poll(async () => (await film()).edgeNm).toBeLessThan(628);
+
+    // Short-pass swaps which side reflects.
     await page.locator("#componentInset button", { hasText: "short-pass" }).click();
-    await expect.poll(() => expected()).toBeLessThan(0.4);
-    expect(await incident(page, up)).toBeCloseTo(await expected(), 9);
+    await expect.poll(async () => (await film()).design.kind).toBe("short-pass");
 
     // The 2D section tints the plate by what it reflects.
     const tint = await page.evaluate(() => {

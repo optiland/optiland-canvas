@@ -866,7 +866,11 @@ async function main() {
   // Splitter and dichroic plates at 135°: the default beam meets their front
   // face and the reflected arm goes up (+Y).
   document.getElementById("addSplitter")!.onclick = () => addAndFocus(scene.addBeamSplitter(-35, 0, 15, 135, 0.5, 0.5));
-  document.getElementById("addDichroic")!.onclick = () => addAndFocus(scene.addDichroic(-35, 0, 15, 135, 550, 20, true));
+  // A real thin-film stack, solved for the 45° the plate is hung at. The older
+  // table-driven dichroic is still in the kernel for documents that carry one,
+  // but nothing in the UI creates one any more: it reports its normal-incidence
+  // numbers whatever angle it sits at, which for a 45° fold is 40 nm of lie.
+  document.getElementById("addDichroic")!.onclick = () => addAndFocus(scene.addFilmDichroic(-35, 0, 0, 15, 135, 550, true));
 
   // --- save .ocanvas — the Optiland handoff (§6) --------------------------
   // Save downloads the canonical 3D scene (the one the user actually edits) as a

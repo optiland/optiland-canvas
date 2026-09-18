@@ -579,6 +579,62 @@ impl Scene3 {
         Some(self.add_planar_element(pos, radius_mm, tilt_deg, r.clone(), r))
     }
 
+    /// Add an ideal linear polarizer: a round plate at `pos`, tilted
+    /// `tilt_deg`, passing the field along `axis_deg` from the plate's own
+    /// local `+X` and absorbing the rest.
+    ///
+    /// `extinction` is the power fraction of the blocked component that still
+    /// gets through: 0 is perfect, 1e-4 is an ordinary sheet. `None` for a
+    /// non-finite axis or an extinction outside `[0, 1]`.
+    ///
+    /// Unpolarized light loses half its flux here. That is the physics, not a
+    /// loss the model invented, and it is why the preview draws this as a 50%
+    /// attenuator: with no state to act on, half is all it can say.
+    pub fn add_polarizer(
+        &mut self,
+        pos: Vec3,
+        radius_mm: f64,
+        tilt_deg: f64,
+        axis_deg: f64,
+        extinction: f64,
+    ) -> Option<u64> {
+        if !axis_deg.is_finite() || !extinction.is_finite() || !(0.0..=1.0).contains(&extinction) {
+            return None;
+        }
+        let r = SurfaceResponse::Polarizer {
+            axis_deg,
+            extinction,
+        };
+        Some(self.add_planar_element(pos, radius_mm, tilt_deg, r.clone(), r))
+    }
+
+    /// Add an ideal linear retarder (a waveplate): a round plate at `pos`,
+    /// tilted `tilt_deg`, with its fast axis `axis_deg` from the plate's local
+    /// `+X` and `retardance_deg` of phase added to the slow axis.
+    ///
+    /// 90 degrees is a quarter wave, 180 a half wave. Lossless and zero
+    /// thickness: the polarization action of a waveplate without the crystal,
+    /// so no walk-off, no ordinary and extraordinary rays, and a retardance
+    /// that is the number given rather than one that follows from a thickness
+    /// and a birefringence at each wavelength. `None` for non-finite arguments.
+    pub fn add_retarder(
+        &mut self,
+        pos: Vec3,
+        radius_mm: f64,
+        tilt_deg: f64,
+        axis_deg: f64,
+        retardance_deg: f64,
+    ) -> Option<u64> {
+        if !axis_deg.is_finite() || !retardance_deg.is_finite() {
+            return None;
+        }
+        let r = SurfaceResponse::Retarder {
+            axis_deg,
+            retardance_deg,
+        };
+        Some(self.add_planar_element(pos, radius_mm, tilt_deg, r.clone(), r))
+    }
+
     /// Add a dichroic filter: a round plate at `pos`, tilted `tilt_deg`, with the
     /// coating `spec` on both faces. `None` for a non-finite spec.
     pub fn add_dichroic(
@@ -1720,8 +1776,8 @@ pub fn axial_aoi_deg(tilt_deg: f64) -> f64 {
 /// The short kind string for a surface response: `mirror`, `absorb`, `clear`
 /// (full transmission), `split` (constant reflectance and transmittance),
 /// `dichroic` (a [`DichroicSpec`] coating), `coated` (any other tabulated
-/// reflectance/transmittance), `film` (a real thin-film stack), `refract`, or
-/// `thin-lens`.
+/// reflectance/transmittance), `film` (a real thin-film stack), `polarizer`,
+/// `retarder`, `refract`, or `thin-lens`.
 pub fn response_kind(r: &SurfaceResponse) -> &'static str {
     match r {
         SurfaceResponse::Mirror { .. } => "mirror",
@@ -1744,6 +1800,8 @@ pub fn response_kind(r: &SurfaceResponse) -> &'static str {
             }
         }
         SurfaceResponse::Coating { .. } => "film",
+        SurfaceResponse::Polarizer { .. } => "polarizer",
+        SurfaceResponse::Retarder { .. } => "retarder",
         SurfaceResponse::DielectricFresnel { .. } => "refract",
         SurfaceResponse::ThinLens { .. } => "thin-lens",
     }

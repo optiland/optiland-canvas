@@ -395,6 +395,8 @@ pub enum PhysicsFeature {
     ExplicitRt,
     ThinFilmCoating,
     ThinLens,
+    Polarizer,
+    Retarder,
     VolumeAbsorption,
     SpectralResponse,
 }

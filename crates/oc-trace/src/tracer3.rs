@@ -888,6 +888,98 @@ fn interact_surface(
         push_event(r, cfg, w, point, opl_at, lens_interact(children));
         return;
     }
+    // A polarizer and a retarder act on the state in **their own** frame, not
+    // in the plane of incidence: a waveplate's fast axis is fixed in the
+    // element and does not turn with the ray that happens to arrive. So like
+    // the thin lens they need the surface's local frame, and are handled here.
+    if let SurfaceResponse::Polarizer { .. } | SurfaceResponse::Retarder { .. } = response {
+        let interact_ev = |children: Vec<(ChildRole, PathId)>| TraceEventKind::Interact {
+            surface: surface_ref,
+            body: false,
+            normal: n_oppose,
+            n1: n_here,
+            n2: n_here,
+            children,
+        };
+        // The element's axis: its local +X, projected into the plane the ray's
+        // field lives in. For a ray down the axis that is the axis itself; for
+        // an oblique one it is the projection, which is the usual idealisation
+        // and departs from a real polarizer at large obliquity.
+        let local_x = s.common.transform.rotate(Vec3::X);
+        let dir = w.ray.dir;
+        let projected = local_x - dir * dir.dot(local_x);
+        if projected.length() < 1e-9 {
+            // The ray runs along the element's own axis: there is no projection
+            // and no meaningful transmission axis to apply.
+            r.report.reject(CapabilityIssue::UnsupportedSurfaceResponse {
+                surface: surface_ref,
+            });
+            r.ledger.numerical_loss += flux_at;
+            r.terminations.record(TerminationReason::UnsupportedPhysics);
+            push_event(r, cfg, w, point, opl_at, interact_ev(Vec::new()));
+            return;
+        }
+        let frame_x = projected.normalize();
+
+        let (m, feature) = match response {
+            SurfaceResponse::Polarizer {
+                axis_deg,
+                extinction,
+            } => (
+                // Amplitude on the blocked axis is the square root of the power
+                // that leaks: extinction is quoted as a power ratio.
+                Mueller::from_diagonal_jones(
+                    oc_core::thinfilm::Cx::real(1.0),
+                    oc_core::thinfilm::Cx::real(extinction.clamp(0.0, 1.0).sqrt()),
+                )
+                .rotated(axis_deg.to_radians()),
+                PhysicsFeature::Polarizer,
+            ),
+            SurfaceResponse::Retarder {
+                axis_deg,
+                retardance_deg,
+            } => (
+                Mueller::linear_retarder(retardance_deg.to_radians())
+                    .rotated(axis_deg.to_radians()),
+                PhysicsFeature::Retarder,
+            ),
+            _ => unreachable!("matched above"),
+        };
+        r.report.note_exact(feature);
+
+        let stokes_in = w
+            .state_at(flux_at)
+            .rotated(polarization::frame_angle(dir, w.pol.x, frame_x));
+        let stokes_out = if cfg.polarization {
+            m.apply(&stokes_in)
+        } else {
+            // Without a state to act on, all an element like this can do is its
+            // average: half for a polarizer facing unpolarized light, all of it
+            // for a lossless retarder. The preview runs this, and it is why a
+            // crossed pair looks bright there and is dark in the reference.
+            Stokes::unpolarized(m.unpolarized_gain() * flux_at)
+        };
+        r.ledger.absorbed_surface += (flux_at - stokes_out.s0).max(0.0);
+        let child = spawn(
+            stack,
+            r,
+            cfg,
+            w,
+            point,
+            w.ray.dir,
+            PolRay {
+                stokes: stokes_out,
+                x: frame_x,
+            },
+            opl_at,
+            false,
+            false,
+            min_flux,
+        );
+        let children = child.map(|id| (ChildRole::Transmit, id)).into_iter().collect();
+        push_event(r, cfg, w, point, opl_at, interact_ev(children));
+        return;
+    }
     // A zero-thickness surface has the same medium on both sides (§6.6): no
     // refraction, transmission continues undeviated.
     apply_response(
@@ -1222,9 +1314,14 @@ fn apply_response(
             push_event(r, cfg, w, point, opl_at, interact(children));
         }
         // A thin lens on a body patch has no meaning: the bend depends on the
-        // hit position in a lens plane the patch does not define. Standalone
-        // surfaces intercept it in `interact_surface`; anything else refuses.
-        SurfaceResponse::ThinLens { .. } => {
+        // hit position in a lens plane the patch does not define. A polarizer or
+        // a retarder on one has none either: their axis is a direction in the
+        // element, and a curved patch of a solid does not define one. Standalone
+        // surfaces intercept all three in `interact_surface`; anything else
+        // refuses rather than picking an axis.
+        SurfaceResponse::ThinLens { .. }
+        | SurfaceResponse::Polarizer { .. }
+        | SurfaceResponse::Retarder { .. } => {
             r.report
                 .reject(CapabilityIssue::UnsupportedSurfaceResponse { surface });
             r.ledger.numerical_loss += flux_at;

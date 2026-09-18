@@ -2076,6 +2076,12 @@ impl Canvas {
                 // reporting a number here would be the very thing this is meant
                 // to stop. `surfaceFilmJSON` carries the stack instead.
                 SurfaceResponse::Coating { .. } => ("null".into(), "null".into()),
+                // Nor does a polarizing element: what it passes depends on the
+                // state arriving, which is not a property of the surface. Half
+                // is the answer only for unpolarized light.
+                SurfaceResponse::Polarizer { .. } | SurfaceResponse::Retarder { .. } => {
+                    ("null".into(), "null".into())
+                }
             };
             let dichroic = DichroicSpec::from_response(r).map_or("null".into(), |d| {
                 format!(
@@ -2155,6 +2161,13 @@ impl Canvas {
                         Some(v) => (Some(v.r()), Some(v.t())),
                         None => (None, None),
                     }
+                }
+                // What a polarizing element transmits depends on the state
+                // arriving, not on the surface, so there is no curve in
+                // wavelength to plot. Reporting the unpolarized half would read
+                // as a property of the part.
+                SurfaceResponse::Polarizer { .. } | SurfaceResponse::Retarder { .. } => {
+                    (None, None)
                 }
             };
             out.push(rr.unwrap_or(f64::NAN));

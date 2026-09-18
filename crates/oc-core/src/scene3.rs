@@ -422,6 +422,42 @@ pub enum SurfaceResponse {
     Coating {
         coating: crate::thinfilm::Coating,
     },
+    /// An ideal absorbing linear polarizer: it passes the field component along
+    /// its transmission axis and absorbs the perpendicular one.
+    ///
+    /// Zero thickness, no reflection, no dispersion, no angular dependence. It
+    /// models the polarization action of a polarizer and not a sheet of
+    /// anything: a real one reflects, has a contrast that varies with
+    /// wavelength, and degrades as it is tilted. Unpolarized light loses half
+    /// its flux here, which is a physical fact and not an assumption.
+    ///
+    /// `extinction` is the **power** fraction of the blocked component that
+    /// still gets through, so 0 is perfect and 1e-4 is an ordinary sheet
+    /// polarizer. Only meaningful on a standalone planar surface, whose local
+    /// `+X` the axis is measured from; a body patch authoring one is rejected.
+    Polarizer {
+        /// Transmission axis, degrees from the surface's local `+X`.
+        axis_deg: f64,
+        extinction: f64,
+    },
+    /// An ideal linear retarder: a waveplate, lossless, adding
+    /// `retardance_deg` of phase to the slow axis relative to the fast one.
+    ///
+    /// A quarter wave is 90 degrees and turns linear light at 45 degrees to its
+    /// axis into circular; a half wave is 180 and rotates a linear state by
+    /// twice the angle between them. Zero thickness, so this is the
+    /// polarization action alone: no walk-off, no ordinary and extraordinary
+    /// rays, no optical path through a crystal, and the retardance is the
+    /// number given rather than one that follows from a thickness and a
+    /// birefringence at each wavelength.
+    ///
+    /// Only meaningful on a standalone planar surface, whose local `+X` the
+    /// fast axis is measured from.
+    Retarder {
+        /// Fast axis, degrees from the surface's local `+X`.
+        axis_deg: f64,
+        retardance_deg: f64,
+    },
 }
 
 impl Default for SurfaceResponse {
@@ -488,7 +524,9 @@ impl SurfaceResponse {
                         // λ; bound it by the curve's own maximum (conservative
                         // only there, exact everywhere else).
                         let r = reflectance.sample(lam).unwrap_or_else(|| reflectance.max());
-                        let t = transmittance.sample(lam).unwrap_or_else(|| transmittance.max());
+                        let t = transmittance
+                            .sample(lam)
+                            .unwrap_or_else(|| transmittance.max());
                         r + t > 1.0 + 1e-12
                     })
                 };
@@ -535,8 +573,12 @@ impl SurfaceResponse {
                 }
                 if let crate::thinfilm::CoatingBacking::Plate { substrate, exit } = &coating.backing
                 {
-                    substrate.n.validate(&format!("{field}.coating.substrate.n"))?;
-                    substrate.k.validate(&format!("{field}.coating.substrate.k"))?;
+                    substrate
+                        .n
+                        .validate(&format!("{field}.coating.substrate.n"))?;
+                    substrate
+                        .k
+                        .validate(&format!("{field}.coating.substrate.k"))?;
                     if substrate.n.min() <= 0.0 {
                         return Err(range("coating.substrate.n", "must be positive"));
                     }
@@ -545,6 +587,30 @@ impl SurfaceResponse {
                             return Err(range("coating.exit.residual", "is outside [0, 1]"));
                         }
                     }
+                }
+                Ok(())
+            }
+            Self::Polarizer {
+                axis_deg,
+                extinction,
+            } => {
+                if !axis_deg.is_finite() {
+                    return Err(range("axis_deg", "must be finite"));
+                }
+                if !extinction.is_finite() || !(0.0..=1.0).contains(extinction) {
+                    return Err(range("extinction", "is outside [0, 1]"));
+                }
+                Ok(())
+            }
+            Self::Retarder {
+                axis_deg,
+                retardance_deg,
+            } => {
+                if !axis_deg.is_finite() {
+                    return Err(range("axis_deg", "must be finite"));
+                }
+                if !retardance_deg.is_finite() {
+                    return Err(range("retardance_deg", "must be finite"));
                 }
                 Ok(())
             }
@@ -1385,7 +1451,11 @@ impl Scene3 {
                         .position(|d| d.common.id.raw() == id)
                         .map(Slot::Detector)
                 })
-                .or_else(|| (self.sources.iter()).position(|s| s.id.raw() == id).map(Slot::Source));
+                .or_else(|| {
+                    (self.sources.iter())
+                        .position(|s| s.id.raw() == id)
+                        .map(Slot::Source)
+                });
             match slot {
                 Some(s) => slots.push(s),
                 None => {

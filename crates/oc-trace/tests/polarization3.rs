@@ -489,3 +489,259 @@ fn the_ledger_balances_with_a_state_on_every_ray() {
         assert!(residual < 1e-12, "ledger residual {residual:.3e}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Ideal elements, in a scene rather than in a matrix
+// ---------------------------------------------------------------------------
+
+/// A bare bench: nothing but what the test puts on it, one unpolarized ray down
+/// the axis, and a detector at the end. Returns the fraction of the launched
+/// flux that arrives and the state it arrives in.
+///
+/// Every plate faces the beam (tilt 0, so its normal is `+X`), which puts its
+/// local `+X` along world `-Z`. Only relative angles matter to any of these
+/// tests, so that is a fact to know rather than one to work around.
+fn bench(build: impl FnOnce(&mut Scene3)) -> (f64, oc_core::polarization::Stokes) {
+    let mut s = Scene3::new();
+    build(&mut s);
+    let det = add_rect_detector(
+        &mut s,
+        Vec3::new(60.0, 0.0, 0.0),
+        -Vec3::X,
+        20.0,
+        20.0,
+        [4, 4],
+    );
+    s.validate().expect("valid");
+    let launch = vec![launch(
+        Ray3::new(Vec3::new(-60.0, 0.0, 0.0), Vec3::X).unwrap(),
+        0.55,
+        1.0,
+    )];
+    let res = trace3(&s, &launch, &cfg());
+    let d = detector_named(&res, det);
+    (d.total_incident, d.stokes_local)
+}
+
+/// The same bench under the scalar-unpolarized model the preview runs.
+fn scalar_bench(build: impl FnOnce(&mut Scene3)) -> f64 {
+    let mut s = Scene3::new();
+    build(&mut s);
+    let det = add_rect_detector(
+        &mut s,
+        Vec3::new(60.0, 0.0, 0.0),
+        -Vec3::X,
+        20.0,
+        20.0,
+        [4, 4],
+    );
+    s.validate().expect("valid");
+    let launch = vec![launch(
+        Ray3::new(Vec3::new(-60.0, 0.0, 0.0), Vec3::X).unwrap(),
+        0.55,
+        1.0,
+    )];
+    detector_named(&trace3(&s, &launch, &scalar_cfg()), det).total_incident
+}
+
+fn add_pol(s: &mut Scene3, x: f64, axis_deg: f64, extinction: f64) {
+    s.add_polarizer(Vec3::new(x, 0.0, 0.0), 15.0, 0.0, axis_deg, extinction)
+        .expect("polarizer");
+}
+
+fn add_wave(s: &mut Scene3, x: f64, axis_deg: f64, retardance_deg: f64) {
+    s.add_retarder(Vec3::new(x, 0.0, 0.0), 15.0, 0.0, axis_deg, retardance_deg)
+        .expect("retarder");
+}
+
+/// Malus, built out of two parts in a scene.
+///
+/// The first polarizer halves unpolarized light, which is where the flux goes;
+/// the second passes the cosine squared of what is left. A model that averages
+/// s and p at each surface would pass a quarter of the light at every angle,
+/// crossed included.
+#[test]
+fn two_polarizers_obey_malus_law() {
+    let (open, st) = bench(|s| {
+        add_pol(s, -20.0, 0.0, 0.0);
+        add_pol(s, 0.0, 0.0, 0.0);
+    });
+    assert!(
+        (open - 0.5).abs() < 1e-12,
+        "parallel polarizers pass half of unpolarized light: {open}"
+    );
+    assert!(
+        (st.dop() - 1.0).abs() < 1e-12,
+        "and what passes is fully polarized: {}",
+        st.dop()
+    );
+
+    for deg in [0.0f64, 22.5, 30.0, 45.0, 60.0, 90.0] {
+        let (got, _) = bench(|s| {
+            add_pol(s, -20.0, 0.0, 0.0);
+            add_pol(s, 0.0, deg, 0.0);
+        });
+        let want = 0.5 * deg.to_radians().cos().powi(2);
+        assert!(
+            (got - want).abs() < 1e-12,
+            "at {deg} degrees: {got} vs {want}"
+        );
+    }
+}
+
+/// Crossed polarizers pass nothing, and an imperfect pair passes its extinction.
+#[test]
+fn crossed_polarizers_go_dark() {
+    let (dark, _) = bench(|s| {
+        add_pol(s, -20.0, 0.0, 0.0);
+        add_pol(s, 0.0, 90.0, 0.0);
+    });
+    assert!(dark < 1e-15, "crossed polarizers pass nothing: {dark}");
+
+    // A pair of sheet polarizers with a 1e-4 power extinction. Unpolarized in:
+    // half the flux sits on each axis. The component the first plate passes
+    // whole is then blocked to 1e-4, and the one it blocks to 1e-4 passes the
+    // second whole, so both halves contribute the same product.
+    let (leaked, _) = bench(|s| {
+        add_pol(s, -20.0, 0.0, 1e-4);
+        add_pol(s, 0.0, 90.0, 1e-4);
+    });
+    let want = 0.5 * (1e-4 + 1e-4);
+    assert!(
+        (leaked - want).abs() < 1e-15,
+        "a real sheet leaks its extinction: {leaked} vs {want}"
+    );
+}
+
+/// The three-polarizer paradox: inserting a third plate between two crossed
+/// ones lets light through.
+///
+/// Nothing in a flux-only model can produce this. It happens because the middle
+/// polarizer does not filter the beam, it rewrites its state, and the third one
+/// then has something to pass.
+#[test]
+fn a_third_polarizer_between_two_crossed_ones_lets_light_through() {
+    let (got, _) = bench(|s| {
+        add_pol(s, -30.0, 0.0, 0.0);
+        add_pol(s, -15.0, 45.0, 0.0);
+        add_pol(s, 0.0, 90.0, 0.0);
+    });
+    // Half through the first, then the cosine squared of 45 degrees at each of
+    // the other two.
+    assert!(
+        (got - 0.125).abs() < 1e-12,
+        "three polarizers pass an eighth: {got}"
+    );
+
+    // The same two without the middle one pass nothing, which is the half of
+    // the paradox that makes it one.
+    let (dark, _) = bench(|s| {
+        add_pol(s, -30.0, 0.0, 0.0);
+        add_pol(s, 0.0, 90.0, 0.0);
+    });
+    assert!(dark < 1e-15, "and without it, nothing: {dark}");
+}
+
+/// One quarter-wave plate at 45 degrees to the incoming linear state produces
+/// circular light: fully polarized, none of it linear, all of it in S3.
+#[test]
+fn a_quarter_wave_plate_makes_circular_light_in_a_scene() {
+    let (flux, st) = bench(|s| {
+        add_pol(s, -20.0, 0.0, 0.0);
+        add_wave(s, 0.0, 45.0, 90.0);
+    });
+    assert!(
+        (flux - 0.5).abs() < 1e-12,
+        "a retarder is lossless: {flux} of the half the polarizer passed"
+    );
+    assert!((st.dop() - 1.0).abs() < 1e-12, "still fully polarized");
+    assert!(
+        st.dolp() < 1e-12,
+        "and no longer linear at all: DoLP {}",
+        st.dolp()
+    );
+    assert!(
+        (st.s3.abs() - st.s0).abs() < 1e-12,
+        "all of it is circular: S3 {} of S0 {}",
+        st.s3,
+        st.s0
+    );
+}
+
+/// Two quarter waves at the same angle make a half wave, which turns a linear
+/// state at 0 into one at 90, where a crossed analyzer passes all of it.
+#[test]
+fn two_quarter_waves_rotate_linear_light_through_a_crossed_analyzer() {
+    let (got, _) = bench(|s| {
+        add_pol(s, -30.0, 0.0, 0.0);
+        add_wave(s, -20.0, 45.0, 90.0);
+        add_wave(s, -10.0, 45.0, 90.0);
+        add_pol(s, 0.0, 90.0, 0.0);
+    });
+    assert!(
+        (got - 0.5).abs() < 1e-12,
+        "the crossed analyzer should now pass everything reaching it: {got}"
+    );
+}
+
+/// A half-wave plate turns a linear state by twice the angle between them, and
+/// loses nothing doing it.
+#[test]
+fn a_half_wave_plate_rotates_and_does_not_absorb() {
+    for deg in [10.0f64, 22.5, 45.0] {
+        let (got, _) = bench(|s| {
+            add_pol(s, -30.0, 0.0, 0.0);
+            add_wave(s, -15.0, deg, 180.0);
+            // An analyzer at twice the plate's angle should pass all of it.
+            add_pol(s, 0.0, 2.0 * deg, 0.0);
+        });
+        assert!(
+            (got - 0.5).abs() < 1e-12,
+            "a half wave at {deg} rotates to {}: passed {got}",
+            2.0 * deg
+        );
+    }
+}
+
+/// With the state switched off, a polarizer can only be a 50% attenuator, so a
+/// crossed pair looks bright. That is the preview's model, and the reason a
+/// number has to say which model produced it.
+#[test]
+fn the_scalar_model_cannot_cross_two_polarizers() {
+    let got = scalar_bench(|s| {
+        add_pol(s, -20.0, 0.0, 0.0);
+        add_pol(s, 0.0, 90.0, 0.0);
+    });
+    assert!(
+        (got - 0.25).abs() < 1e-12,
+        "the scalar model passes a quarter whatever the angles: {got}"
+    );
+}
+
+/// A polarizer on a body patch has no axis to speak of, so the tracer refuses
+/// it rather than picking one.
+#[test]
+fn a_polarizer_on_a_solid_is_refused() {
+    let mut s = Scene3::new();
+    add_glass_slab(&mut s, -2.0, 2.0, 1.5168);
+    let b = s.bodies.last_mut().unwrap();
+    let r = oc_core::scene3::SurfaceResponse::Polarizer {
+        axis_deg: 0.0,
+        extinction: 0.0,
+    };
+    b.surface.default.from_outside = r.clone();
+    b.surface.default.from_inside = r;
+    s.validate()
+        .expect("the scene is well formed; the physics is what refuses");
+
+    let launch = vec![launch(
+        Ray3::new(Vec3::new(-40.0, 0.0, 0.0), Vec3::X).unwrap(),
+        0.55,
+        1.0,
+    )];
+    let res = trace3(&s, &launch, &cfg());
+    assert!(
+        !res.capability_report.rejected.is_empty(),
+        "a polarizing element on a solid must be reported, not guessed at"
+    );
+}

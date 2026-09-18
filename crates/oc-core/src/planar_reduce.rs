@@ -316,6 +316,11 @@ fn response_to_spec(object: u64, r: &SurfaceResponse) -> Result<SurfaceSpec, Red
         // pick an angle and bake it in, which is exactly the mistake the stack
         // was added to stop making. Refuse instead.
         SurfaceResponse::Coating { .. } => Err(unsupported("thin-film coating")),
+        // A v1 surface has no polarization state to act on, so there is
+        // nothing for these to reduce to. A polarizer would become "half
+        // the light", which is the right number and the wrong component.
+        SurfaceResponse::Polarizer { .. } => Err(unsupported("polarizer")),
+        SurfaceResponse::Retarder { .. } => Err(unsupported("retarder")),
         // v1 has no explicit reflectance/transmittance surface; the closest it
         // could do is a scaled Fresnel, which is a different physics. Refuse.
         SurfaceResponse::ExplicitRt { .. } => {

@@ -223,7 +223,13 @@ impl GpuScene3 {
         let mut reject = |object: u64, kind: String| rejected.push(Reject3 { object, kind });
 
         for b in &scene.bodies {
-            match compile_body(b, &norm, &scene.catalog, scene.env.ambient_index, &coat_lambdas) {
+            match compile_body(
+                b,
+                &norm,
+                &scene.catalog,
+                scene.env.ambient_index,
+                &coat_lambdas,
+            ) {
                 Ok(gb) => bodies.push(gb),
                 Err(kind) => reject(b.common.id.0, kind),
             }
@@ -838,6 +844,9 @@ fn classify_surface(r: &TwoSidedSurfaceResponse) -> Result<u32, String> {
         SurfaceResponse::ThinLens { .. } => {
             Err("thin lens on a body patch (only standalone surfaces carry it)".into())
         }
+        SurfaceResponse::Polarizer { .. } | SurfaceResponse::Retarder { .. } => {
+            Err("polarizing element on a body patch (only standalone surfaces carry one)".into())
+        }
         SurfaceResponse::Coating { .. } => {
             Err("thin-film coating on a body patch (not yet in the f32 preview)".into())
         }
@@ -1144,6 +1153,23 @@ fn compile_response(
             let far: Vec<f64> = coat_lambdas.iter().map(|_| ambient).collect();
             bake_coating(coating, ambient, coat_lambdas, &far)?
         }
+        // The preview carries no polarization state, so all these elements can
+        // be there is what they do to unpolarized light: a polarizer passes half
+        // of it plus whatever leaks past the blocked axis, and a lossless
+        // retarder passes all of it. Those are the right *numbers* under the
+        // preview's declared model, and they are the reason a crossed pair looks
+        // bright in the preview and goes dark in the reference. The component
+        // view says which model produced a number.
+        SurfaceResponse::Polarizer { extinction, .. } => GpuResponse::ExplicitRt {
+            r: spectral(&SpectralScalar::Constant(0.0))?,
+            t: spectral(&SpectralScalar::Constant(
+                0.5 * (1.0 + extinction.clamp(0.0, 1.0)),
+            ))?,
+        },
+        SurfaceResponse::Retarder { .. } => GpuResponse::ExplicitRt {
+            r: spectral(&SpectralScalar::Constant(0.0))?,
+            t: spectral(&SpectralScalar::Constant(1.0))?,
+        },
     })
 }
 

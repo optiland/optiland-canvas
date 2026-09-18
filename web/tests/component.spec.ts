@@ -434,6 +434,45 @@ test.describe("component view — polarizing elements", () => {
     await expect(page.locator('#componentInset input[data-name="substrate"]')).toBeVisible();
   });
 
+  test("a waveplate can be cut from a real crystal, and then it has a thickness", async ({ page }) => {
+    await freshApp(page);
+    await openInset(page);
+    await addAndSelect(page, "addPolarizer");
+    await addAndSelect(page, "addRetarder");
+    const id = (await insetView(page)).id;
+
+    // Ideal to begin with: no crystal, and the readout says the retardance
+    // holds everywhere rather than at one wavelength.
+    await expect(page.locator("#componentInset .cv-read")).toContainText("every wavelength");
+    await expect(page.locator('#componentInset input[data-name="order"]')).toBeHidden();
+
+    await page.locator('#componentInset button[data-value="quartz"]').click();
+    await expect(page.locator('#componentInset input[data-name="order"]')).toBeVisible();
+    // A zero-order quartz quarter wave is about 15 µm thick.
+    const crystal = async () =>
+      page.evaluate(
+        (i) => JSON.parse((window as unknown as { __ocDebug: any }).__ocDebug.scene.surfacePolarizationJSON(i)).crystal,
+        id,
+      );
+    const zero = await crystal();
+    expect(zero.order).toBe(0);
+    expect(zero.thicknessUm).toBeGreaterThan(10);
+    expect(zero.thicknessUm).toBeLessThan(20);
+    await expect(page.locator("#componentInset .cv-read")).toContainText("µm of quartz");
+
+    // Ten whole waves under it makes the same plate forty-one times thicker
+    // and forty-one times as fussy.
+    await page.locator('#componentInset input[data-name="order"]').fill("10");
+    const tenth = await crystal();
+    expect(tenth.order).toBe(10);
+    expect(tenth.thicknessUm / zero.thicknessUm).toBeCloseTo(41, 1);
+
+    // And back to ideal, which drops the crystal rather than hiding it.
+    await page.locator('#componentInset button[data-value="ideal"]').click();
+    expect(await crystal()).toBeNull();
+    await expect(page.locator('#componentInset input[data-name="order"]')).toBeHidden();
+  });
+
   test("the extinction field is there on a polarizer and not on a waveplate", async ({ page }) => {
     await freshApp(page);
     await openInset(page);

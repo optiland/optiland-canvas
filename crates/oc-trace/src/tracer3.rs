@@ -1018,16 +1018,73 @@ fn interact_surface(
                 ),
                 PhysicsFeature::Polarizer,
             ),
-            SurfaceResponse::Retarder { retardance_deg, .. } => (
-                Mueller::linear_retarder(retardance_deg.to_radians()),
-                PhysicsFeature::Retarder,
-            ),
+            SurfaceResponse::Retarder {
+                retardance_deg,
+                crystal,
+                ..
+            } => {
+                let nominal = retardance_deg.to_radians();
+                let rad = match crystal {
+                    // An ideal retarder: the number given, wherever the ray
+                    // came from and whatever colour it is.
+                    None => nominal,
+                    Some(c) => {
+                        // A slab of crystal instead. The transverse index
+                        // `n sin θ` is conserved across every parallel face, so
+                        // it is the ray's own here and the element's glass, if
+                        // it has any, does not come into it.
+                        let sin_i = (1.0 - cos_i * cos_i).max(0.0).sqrt();
+                        let thickness = c.thickness_um(*retardance_deg);
+                        // The optic axis is the slow one in a positive crystal
+                        // and the fast one in a negative crystal, and the
+                        // element always names its fast axis.
+                        let optic = if c.n_e >= c.n_o {
+                            axis_deg + 90.0
+                        } else {
+                            axis_deg
+                        };
+                        let (so, co) = optic.to_radians().sin_cos();
+                        let c_hat = t.rotate(Vec3::X) * co + t.rotate(Vec3::Y) * so;
+                        // Which way the ray leans, in the plate's own plane.
+                        let lean = dir - n_oppose * dir.dot(n_oppose);
+                        let cos_axis = if lean.length() > 1e-12 {
+                            lean.normalize().dot(c_hat)
+                        } else {
+                            0.0
+                        };
+                        polarization::a_plate_retardance(
+                            c.n_o,
+                            c.n_e,
+                            thickness,
+                            w.lambda,
+                            n_here * sin_i,
+                            cos_axis,
+                        )
+                        .abs()
+                    }
+                };
+                (Mueller::linear_retarder(rad), PhysicsFeature::Retarder)
+            }
             _ => unreachable!("matched above"),
         };
         r.report.note_exact(feature);
         if n_sub > 1.0 {
             r.report
                 .note_approx(feature, "element faces added singly: no bounce between them");
+        }
+        if matches!(
+            response,
+            SurfaceResponse::Retarder {
+                crystal: Some(_),
+                ..
+            }
+        ) {
+            // A real crystal sends the ordinary and the extraordinary wave off
+            // at slightly different angles inside the plate, so they come out
+            // side by side rather than on top of each other. Micrometres for a
+            // thin plate, and not modelled: one ray goes in and one comes out.
+            r.report
+                .note_approx(feature, "one ray through the crystal: no walk-off");
         }
 
         // Front face, then the layer on its own axis, then the back face. The

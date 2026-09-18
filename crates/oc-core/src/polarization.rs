@@ -536,9 +536,74 @@ pub fn incidence_axis(dir: Vec3, normal: Vec3) -> Option<Vec3> {
     Some(c * (1.0 / len))
 }
 
+/// The retardance of a uniaxial A-plate, in radians, at one wavelength and one
+/// direction. Positive when the extraordinary wave is the slower of the two.
+///
+/// An A-plate is cut with its optic axis lying in the plate's own plane, which
+/// is every ordinary waveplate. `thickness_um` and `lambda_um` share units, so
+/// only their ratio matters.
+///
+/// `q` is the ray's **transverse index**, `n sin θ` in whatever medium it
+/// arrives from. That is the quantity conserved across every parallel
+/// interface, so it is the same inside the crystal as outside and the plate's
+/// own faces never enter this. `cos_axis` is the cosine of the angle between
+/// the direction the ray leans in and the optic axis, both measured in the
+/// plate's plane; at `q = 0` it does not matter what it is.
+///
+/// Both indices are taken as constant with wavelength, so the only dispersion
+/// here is the `1/λ` in front. That is the larger half of a real plate's, and
+/// the rest is the dispersion of the birefringence itself.
+///
+/// The two waves see different indices along the plate normal, and the phase
+/// they arrive with differs by the thickness times that difference. Their
+/// common transverse phase cancels, which is why only the normal components
+/// appear. Solving the uniaxial wave-normal surface for the longitudinal
+/// component gives the ordinary `√(n_o² − q²)` and, for the extraordinary wave,
+/// a `q²` term weighted by how much of the transverse wavevector lies along the
+/// optic axis.
+pub fn a_plate_retardance(
+    n_o: f64,
+    n_e: f64,
+    thickness_um: f64,
+    lambda_um: f64,
+    q: f64,
+    cos_axis: f64,
+) -> f64 {
+    let (no2, ne2) = (n_o * n_o, n_e * n_e);
+    let q2 = q * q;
+    let ordinary = (no2 - q2).max(0.0).sqrt();
+    let extraordinary = (ne2 - q2 * (1.0 - cos_axis * cos_axis * (1.0 - ne2 / no2)))
+        .max(0.0)
+        .sqrt();
+    std::f64::consts::TAU * thickness_um / lambda_um * (extraordinary - ordinary)
+}
+
+/// The thickness of an A-plate that retards by `retardance_rad` on axis at
+/// `lambda_um`, in the same units as the wavelength.
+///
+/// `waves` whole waves are added on top, which is the difference between a
+/// true zero-order plate and the multi-order one usually sold as a quarter
+/// wave: the same retardance where it is specified, and many times more
+/// sensitive to wavelength and angle everywhere else.
+pub fn a_plate_thickness(
+    n_o: f64,
+    n_e: f64,
+    lambda_um: f64,
+    retardance_rad: f64,
+    waves: u32,
+) -> f64 {
+    let dn = (n_e - n_o).abs();
+    if dn < 1e-12 {
+        return 0.0;
+    }
+    let total = retardance_rad + std::f64::consts::TAU * f64::from(waves);
+    total * lambda_um / (std::f64::consts::TAU * dn)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::f64::consts::FRAC_PI_2;
 
     const TOL: f64 = 1e-12;
 
@@ -807,5 +872,104 @@ mod tests {
                 assert!(out.s0 <= s.s0 + 1e-12, "no element here amplifies");
             }
         }
+    }
+
+    // -- a real waveplate ----------------------------------------------------
+
+    // Crystal quartz at the sodium D line.
+    const QUARTZ: (f64, f64) = (1.54424, 1.55335);
+
+    #[test]
+    fn on_axis_a_plate_is_just_its_thickness_times_its_birefringence() {
+        let (no, ne) = QUARTZ;
+        let d = a_plate_thickness(no, ne, 0.55, FRAC_PI_2, 0);
+        // The thickness that gives a quarter wave: Δn d = λ/4.
+        assert!(close((ne - no) * d - 0.55 / 4.0, 0.0), "d = {d}");
+        let g = a_plate_retardance(no, ne, d, 0.55, 0.0, 0.0);
+        assert!(close(g, FRAC_PI_2), "{g}");
+        // And it does not matter which way a normally incident ray leans,
+        // because it does not lean.
+        assert!(close(a_plate_retardance(no, ne, d, 0.55, 0.0, 1.0), FRAC_PI_2));
+    }
+
+    #[test]
+    fn the_retardance_goes_as_one_over_the_wavelength() {
+        let (no, ne) = QUARTZ;
+        let d = a_plate_thickness(no, ne, 0.55, FRAC_PI_2, 0);
+        // A quarter wave at 550 nm is not one at 450: with the indices held
+        // constant the retardance is exactly λ0/λ times the nominal.
+        let g = a_plate_retardance(no, ne, d, 0.45, 0.0, 0.0);
+        assert!(close(g, FRAC_PI_2 * 0.55 / 0.45), "{g}");
+        assert!(g > FRAC_PI_2);
+    }
+
+    #[test]
+    fn leaning_across_the_optic_axis_and_along_it_move_the_retardance_apart() {
+        let (no, ne) = QUARTZ;
+        let d = a_plate_thickness(no, ne, 0.55, FRAC_PI_2, 0);
+        for deg in [5.0f64, 10.0, 20.0] {
+            let q = deg.to_radians().sin();
+            let s2 = q * q;
+            // Leaning perpendicular to the optic axis: the extraordinary wave
+            // still sees n_e, so only the two normal components move, and they
+            // move apart.
+            //
+            // Checked against the second-order shift *plus* the term that
+            // expansion drops, which is 3q⁴/(8n⁴) of the whole retardance. The
+            // exact answer sits on that to a few percent, so this pins how the
+            // retardance bends as well as its slope.
+            let across = a_plate_retardance(no, ne, d, 0.55, q, 0.0);
+            let want_across = FRAC_PI_2 * (1.0 + s2 / (2.0 * no * ne));
+            let n = 0.5 * (no + ne);
+            let fourth = FRAC_PI_2 * 3.0 * s2 * s2 / (8.0 * n.powi(4));
+            assert!(
+                ((across - want_across) - fourth).abs() < 0.1 * fourth,
+                "across at {deg}: {across} vs {want_across} plus {fourth}"
+            );
+            // Leaning in the plane of the optic axis, where the exact answer is
+            // the ordinary normal index scaled by Δn/n_o.
+            let along = a_plate_retardance(no, ne, d, 0.55, q, 1.0);
+            let exact = std::f64::consts::TAU * d / 0.55 * (no * no - s2).sqrt() * (ne - no) / no;
+            assert!(close(along, exact), "along at {deg}: {along} vs {exact}");
+            let want_along = FRAC_PI_2 * (1.0 - s2 / (2.0 * no * no));
+            assert!(
+                (along - want_along).abs() < FRAC_PI_2 * s2 * s2 / (4.0 * no.powi(4)),
+                "along at {deg}: {along} vs {want_along}"
+            );
+            assert!(across > FRAC_PI_2 && along < FRAC_PI_2);
+        }
+    }
+
+    #[test]
+    fn a_multi_order_plate_is_the_fragile_one() {
+        let (no, ne) = QUARTZ;
+        let zero = a_plate_thickness(no, ne, 0.55, FRAC_PI_2, 0);
+        let tenth = a_plate_thickness(no, ne, 0.55, FRAC_PI_2, 10);
+        // Both are a quarter wave where they are specified, modulo the whole
+        // waves nobody can see.
+        let turn = |g: f64| (g / std::f64::consts::TAU).fract() * std::f64::consts::TAU;
+        assert!(close(turn(a_plate_retardance(no, ne, zero, 0.55, 0.0, 0.0)), FRAC_PI_2));
+        assert!(
+            (turn(a_plate_retardance(no, ne, tenth, 0.55, 0.0, 0.0)) - FRAC_PI_2).abs() < 1e-9
+        );
+        // Ten degrees off axis costs the zero-order plate half a degree and the
+        // ten-order one over twenty, because the error is a fraction of the
+        // whole retardance and not of the visible quarter.
+        let q = 10.0f64.to_radians().sin();
+        let slip = |d: f64| {
+            (a_plate_retardance(no, ne, d, 0.55, q, 0.0)
+                - a_plate_retardance(no, ne, d, 0.55, 0.0, 0.0))
+            .to_degrees()
+        };
+        assert!(slip(zero) > 0.5 && slip(zero) < 0.7, "zero order: {}", slip(zero));
+        assert!(slip(tenth) > 22.0 && slip(tenth) < 24.0, "tenth order: {}", slip(tenth));
+    }
+
+    #[test]
+    fn a_plate_of_nothing_retards_by_nothing() {
+        // No birefringence, no thickness that could give a retardance, and no
+        // divide by zero on the way.
+        assert_eq!(a_plate_thickness(1.5, 1.5, 0.55, FRAC_PI_2, 0), 0.0);
+        assert!(close(a_plate_retardance(1.5, 1.5, 100.0, 0.55, 0.3, 0.5), 0.0));
     }
 }

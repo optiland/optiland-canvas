@@ -380,6 +380,54 @@ impl DetectorResponse {
     }
 }
 
+/// A real waveplate: a slab of uniaxial crystal cut with its optic axis lying
+/// in the plate's own plane, which is every ordinary waveplate.
+///
+/// Giving a retarder one of these replaces "the retardance is this number" with
+/// "the retardance is what this plate gives", so it moves with the wavelength
+/// and with the direction the ray arrives from. The nominal `retardance_deg`
+/// becomes what the plate gives on axis at `design_lambda_um`, which is how a
+/// waveplate is specified and sold.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Waveplate {
+    /// Ordinary index, taken as constant with wavelength.
+    pub n_o: f64,
+    /// Extraordinary index, taken as constant with wavelength. Larger than
+    /// `n_o` in a positive crystal like quartz, where the optic axis is the
+    /// slow one; smaller in a negative one like calcite, where it is the fast
+    /// one. The element's `axis_deg` names the fast axis either way.
+    pub n_e: f64,
+    /// Whole waves of retardance on top of the nominal. 0 is a true zero-order
+    /// plate; a quarter wave sold cheaply is often 5 or 10, and it is that many
+    /// times more sensitive to both wavelength and angle.
+    pub order: u32,
+    /// The wavelength the nominal retardance is quoted at, microns.
+    pub design_lambda_um: f64,
+}
+
+impl Waveplate {
+    /// Crystal quartz at the sodium D line, which is what most waveplates are.
+    pub fn quartz(order: u32, design_lambda_um: f64) -> Self {
+        Self {
+            n_o: 1.54424,
+            n_e: 1.55335,
+            order,
+            design_lambda_um,
+        }
+    }
+
+    /// The plate thickness the nominal retardance implies, in microns.
+    pub fn thickness_um(&self, retardance_deg: f64) -> f64 {
+        crate::polarization::a_plate_thickness(
+            self.n_o,
+            self.n_e,
+            self.design_lambda_um,
+            retardance_deg.to_radians(),
+            self.order,
+        )
+    }
+}
+
 /// A polarizing element with nothing around it: the polarization action alone,
 /// and no faces.
 ///
@@ -495,6 +543,11 @@ pub enum SurfaceResponse {
         /// [`bare_element`].
         #[serde(default = "bare_element")]
         substrate_index: f64,
+        /// What the plate is made of, if it is made of anything. `None` is an
+        /// ideal retarder: `retardance_deg` at every wavelength and every
+        /// angle.
+        #[serde(default)]
+        crystal: Option<Waveplate>,
     },
 }
 
@@ -648,6 +701,7 @@ impl SurfaceResponse {
                 axis_deg,
                 retardance_deg,
                 substrate_index,
+                crystal,
             } => {
                 if !axis_deg.is_finite() {
                     return Err(range("axis_deg", "must be finite"));
@@ -657,6 +711,26 @@ impl SurfaceResponse {
                 }
                 if !substrate_index.is_finite() || *substrate_index < 1.0 {
                     return Err(range("substrate_index", "must be at least 1"));
+                }
+                if let Some(c) = crystal {
+                    if !c.n_o.is_finite() || c.n_o < 1.0 {
+                        return Err(range("crystal.n_o", "must be at least 1"));
+                    }
+                    if !c.n_e.is_finite() || c.n_e < 1.0 {
+                        return Err(range("crystal.n_e", "must be at least 1"));
+                    }
+                    // An isotropic plate would silently retard by nothing
+                    // however thick it was asked to be, which is worse than
+                    // refusing it.
+                    if (c.n_e - c.n_o).abs() < 1e-9 {
+                        return Err(range("crystal", "has no birefringence to retard with"));
+                    }
+                    if !c.design_lambda_um.is_finite() || c.design_lambda_um <= 0.0 {
+                        return Err(range("crystal.design_lambda_um", "must be positive"));
+                    }
+                    if c.order > 1000 {
+                        return Err(range("crystal.order", "is beyond any real plate"));
+                    }
                 }
                 Ok(())
             }

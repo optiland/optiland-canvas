@@ -165,6 +165,9 @@
       .cv-bar .cv-label { opacity: 0.6; margin-left: 4px; }
       .cv-fields { display: grid; grid-template-columns: repeat(auto-fill, minmax(118px, 1fr)); gap: 2px 8px; }
       .cv-field { display: flex; align-items: center; gap: 4px; font-size: 11px; }
+      /* `display: flex` beats the browser's default for [hidden], so a field
+         an editor puts away has to be put away again here. */
+      .cv-field[hidden] { display: none; }
       .cv-field > span:first-child { min-width: 36px; opacity: 0.7; white-space: nowrap; }
       .cv-field input, .cv-field select { flex: 1; min-width: 0; width: 50px; background: #0a1220; color: #e8f6ff;
         border: 1px solid #24344d; border-radius: 4px; padding: 1px 4px; font: inherit; }

@@ -2145,7 +2145,7 @@ impl Canvas {
                 extinction,
                 substrate_index,
             } => format!(
-                "{{\"kind\":\"polarizer\",\"axisDeg\":{},\"extinction\":{},\"retardanceDeg\":null,\"substrateIndex\":{}}}",
+                "{{\"kind\":\"polarizer\",\"axisDeg\":{},\"extinction\":{},\"retardanceDeg\":null,\"substrateIndex\":{},\"crystal\":null}}",
                 json_num(*axis_deg),
                 json_num(*extinction),
                 json_num(*substrate_index)
@@ -2154,13 +2154,75 @@ impl Canvas {
                 axis_deg,
                 retardance_deg,
                 substrate_index,
+                crystal,
             } => format!(
-                "{{\"kind\":\"retarder\",\"axisDeg\":{},\"extinction\":null,\"retardanceDeg\":{},\"substrateIndex\":{}}}",
+                "{{\"kind\":\"retarder\",\"axisDeg\":{},\"extinction\":null,\"retardanceDeg\":{},\"substrateIndex\":{},\"crystal\":{}}}",
                 json_num(*axis_deg),
                 json_num(*retardance_deg),
-                json_num(*substrate_index)
+                json_num(*substrate_index),
+                match crystal {
+                    None => "null".to_string(),
+                    Some(c) => format!(
+                        "{{\"nO\":{},\"nE\":{},\"order\":{},\"designLambdaUm\":{},\"thicknessUm\":{}}}",
+                        json_num(c.n_o),
+                        json_num(c.n_e),
+                        c.order,
+                        json_num(c.design_lambda_um),
+                        json_num(c.thickness_um(*retardance_deg))
+                    ),
+                }
             ),
             _ => "null".into(),
+        }
+    }
+
+    /// Make a retarder out of a real crystal: two indices, how many whole
+    /// waves sit under the nominal retardance, and the wavelength that nominal
+    /// is quoted at.
+    ///
+    /// The retardance then follows from the plate rather than being a number:
+    /// it moves as `1/λ` and as the square of the angle off axis, and a
+    /// multi-order plate moves `order + 1` times as far as a zero-order one.
+    /// False for anything that is not a retarder, or for a crystal that could
+    /// not be one.
+    #[wasm_bindgen(js_name = setRetarderCrystal)]
+    pub fn set_retarder_crystal(
+        &mut self,
+        id: f64,
+        n_o: f64,
+        n_e: f64,
+        order: u32,
+        design_lambda_um: f64,
+    ) -> bool {
+        let Some(scene) = self.scene3.as_mut() else {
+            return false;
+        };
+        let c = oc_core::scene3::Waveplate {
+            n_o,
+            n_e,
+            order,
+            design_lambda_um,
+        };
+        if scene.set_retarder_crystal(id as u64, Some(c)) {
+            self.revision += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Make a retarder ideal again: the nominal retardance at every wavelength
+    /// and every angle.
+    #[wasm_bindgen(js_name = clearRetarderCrystal)]
+    pub fn clear_retarder_crystal(&mut self, id: f64) -> bool {
+        let Some(scene) = self.scene3.as_mut() else {
+            return false;
+        };
+        if scene.set_retarder_crystal(id as u64, None) {
+            self.revision += 1;
+            true
+        } else {
+            false
         }
     }
 

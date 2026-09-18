@@ -51,7 +51,7 @@ and does not change it.
 | `ExplicitRt` | Two numbers. Treated as an ideal grey attenuator, polarization-blind and phase-neutral. |
 | Ideal thin lens | No polarization action. |
 | Polarizer | Passes the field on its transmission axis, absorbs the perpendicular component, leaks its stated extinction. Optionally laminated in glass, whose two faces then do real Fresnel. |
-| Retarder | Adds a phase to its slow axis. Lossless, unless it is laminated, when its faces reflect. |
+| Retarder | Adds a phase to its slow axis. Either a number, or a real slab of uniaxial crystal, which moves with wavelength and angle. Lossless, unless it is laminated, when its faces reflect. |
 
 **Power data cannot supply a phase.** `Rs`, `Rp`, `Ts` and `Tp` fix the
 magnitudes of a diagonal Jones element and say nothing about the phase between
@@ -137,6 +137,53 @@ whenever an element has a substrate.
 
 What the faces reflect is a ghost like any other: followed when ghosts are on,
 named in the ledger when they are off, and absorbed in neither case.
+
+## A waveplate made of something
+
+An ideal retarder is a number: the same retardance at every wavelength and from
+every direction. No plate is. Give a retarder a crystal and the number becomes
+the **nominal**, what the plate gives on axis at the wavelength it was cut for,
+which is how a waveplate is specified and sold. Everywhere else the retardance
+follows from the plate.
+
+The thickness follows from the nominal and the birefringence. A quarter wave at
+550 nm is 15.09 µm of quartz, 11.65 µm of magnesium fluoride, or 0.799 µm of
+calcite, which is why nobody makes a zero-order calcite waveplate.
+
+**Wavelength.** With the indices held constant the retardance is exactly `λ0/λ`
+times the nominal, so a quarter wave cut for 550 nm retards by 110 degrees at
+450 and the light that came out circular comes out visibly elliptical. That is
+the larger half of a real plate's dispersion; the rest is the dispersion of the
+birefringence itself, which is not modelled.
+
+**Angle.** The two waves see different indices along the plate normal, and
+tilting the plate moves those apart. What is conserved across every face is the
+transverse index `n sin θ`, so the plate's own glass never enters, and the shift
+depends on **which way** the plate is tilted:
+
+| 15 degrees off axis, leaning | zero-order quarter wave | tenth-order quarter wave |
+|---|---|---|
+| across the optic axis | 91.28° | 142.63° |
+| halfway between | 90.01° | 90.22° |
+| along the optic axis | 88.73° | 37.80° |
+
+Two things fall out of that table. A multi-order plate is not a quarter wave
+any more 15 degrees off axis, because the error is a fraction of the whole
+retardance and a tenth-order plate carries 41 times as much of it. And the
+sensitivity nearly vanishes at 45 degrees to the axes, because the coefficient
+on one side is `1/(2·n_o·n_e)` and on the other `1/(2·n_o²)`, and quartz barely
+tells those apart. Tilt tuning works in the first geometry and does nothing in
+the second.
+
+The optic axis is the slow one in a positive crystal like quartz and the fast
+one in a negative crystal like calcite. The element names its **fast** axis
+either way, so which kind of crystal it is only shows in how the retardance
+moves when it is tilted.
+
+Still one ray in and one ray out: a real crystal sends the ordinary and the
+extraordinary wave off at slightly different angles, so they emerge side by
+side. Micrometres for a plate this thin, and the capability report says it is
+not modelled.
 
 ## Two convention bugs, and how they were caught
 
@@ -233,9 +280,11 @@ before.
   unpolarized and has to pass through a polarizer to become anything else.
 - **Birefringence.** A ray splitting into ordinary and extraordinary is a
   different feature, and a large one. It is Optiland's to have, not the canvas's.
-- **Dispersion in a retarder.** The retardance is one number, not a thickness
-  times a birefringence, so a quarter wave is a quarter wave at every
-  wavelength. Real waveplates are not.
+- **Dispersion of the birefringence.** A crystal waveplate's retardance moves
+  as `1/λ`, which is most of it, but `n_o` and `n_e` are each held constant. A
+  real plate's birefringence moves with wavelength too.
+- **Walk-off.** The ordinary and extraordinary waves leave a real crystal side
+  by side. One ray goes in here and one comes out.
 - **Depolarization.** Nothing here depolarizes. Scatter and roughness would, and
   neither is modelled.
 - **The polarizing layer's own acceptance angle.** The faces are modelled and
@@ -246,11 +295,5 @@ before.
 - **Thickness.** A substrate is an index and not a plate: no displacement of a
   beam through a tilted element, no optical path, and no bounce between the two
   faces.
-- **Retardance with angle.** A waveplate's retardance moves as the square of
-  the obliquity, up or down depending on which axis it is tilted about. For
-  quartz it is about 0.6% at 10 degrees and 2.4% at 20. A zero-order plate
-  barely notices; a tenth-order quarter wave is 23 degrees out at 10 degrees of
-  tilt, which is both why multi-order plates are angle-sensitive and why tilt
-  tuning works. The retardance here is one number at every angle.
 - **Coating phase in the preview.** The baked grid carries powers only. Adding
   amplitudes to it is possible and has not been measured to be worth it.

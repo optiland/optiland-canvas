@@ -594,6 +594,65 @@ fn add_pol(s: &mut Scene3, x: f64, axis_deg: f64, extinction: f64) {
         .expect("polarizer");
 }
 
+/// The bench at a wavelength of the test's choosing, since a real waveplate is
+/// only the plate it was specified as at one of them.
+fn bench_at(lambda_um: f64, build: impl FnOnce(&mut Scene3)) -> (f64, oc_core::polarization::Stokes) {
+    let mut s = Scene3::new();
+    build(&mut s);
+    let det = add_rect_detector(
+        &mut s,
+        Vec3::new(60.0, 0.0, 0.0),
+        -Vec3::X,
+        20.0,
+        20.0,
+        [4, 4],
+    );
+    s.validate().expect("valid");
+    let launch = vec![launch(
+        Ray3::new(Vec3::new(-60.0, 0.0, 0.0), Vec3::X).unwrap(),
+        lambda_um,
+        1.0,
+    )];
+    let res = trace3(&s, &launch, &cfg());
+    let d = detector_named(&res, det);
+    (d.total_incident, d.stokes_local)
+}
+
+/// One skew ray in a state of the test's choosing, written on a frame the test
+/// picks, so what reaches the detector can be read against an exact answer
+/// without a polarizer's own projection getting in the way.
+fn skew_state_bench(
+    tilt_deg: f64,
+    azimuth_deg: f64,
+    stokes: oc_core::polarization::Stokes,
+    frame_x: Vec3,
+    build: impl FnOnce(&mut Scene3),
+) -> oc_core::polarization::Stokes {
+    let dir = skew_dir(tilt_deg, azimuth_deg);
+    let mut s = Scene3::new();
+    build(&mut s);
+    let det = add_rect_detector(&mut s, dir * 60.0, -dir, 20.0, 20.0, [4, 4]);
+    s.validate().expect("valid");
+    let launch = vec![launch_polarized(
+        Ray3::new(dir * -60.0, dir).unwrap(),
+        0.55,
+        stokes,
+        frame_x,
+    )];
+    detector_named(&trace3(&s, &launch, &cfg()), det).stokes_local
+}
+
+/// A waveplate cut from crystal quartz, facing the bench axis.
+fn add_quartz_wave(s: &mut Scene3, x: f64, axis_deg: f64, nominal_deg: f64, order: u32) {
+    let id = s
+        .add_retarder(Vec3::new(x, 0.0, 0.0), 15.0, 0.0, axis_deg, nominal_deg)
+        .expect("retarder");
+    assert!(
+        s.set_retarder_crystal(id, Some(oc_core::scene3::Waveplate::quartz(order, 0.55))),
+        "crystal"
+    );
+}
+
 /// A perfect polarizer laminated in glass of index `n_sub`, facing the bench
 /// axis.
 fn add_pol_in_glass(s: &mut Scene3, x: f64, axis_deg: f64, n_sub: f64) {
@@ -1019,4 +1078,129 @@ fn a_laminated_waveplate_keeps_its_retardance_and_loses_its_faces() {
     // Still a quarter wave: fully polarized, and none of it linear.
     assert!((st.dop() - 1.0).abs() < 1e-12, "fully polarized: {}", st.dop());
     assert!(st.dolp() < 1e-12, "and circular: {}", st.dolp());
+}
+
+
+// ---------------------------------------------------------------------------
+// A waveplate made of something
+// ---------------------------------------------------------------------------
+
+/// A quartz quarter wave is a quarter wave at the wavelength it was cut for and
+/// nothing so tidy anywhere else.
+///
+/// With the indices held constant the retardance is exactly the nominal times
+/// `λ0/λ`, so a plate cut for 550 nm gives 110 degrees at 450 and the light
+/// that came out circular comes out elliptical. An ideal retarder in the same
+/// place gives 90 degrees at every colour.
+#[test]
+fn a_quartz_quarter_wave_is_not_a_quarter_wave_in_blue() {
+    let scene = |s: &mut Scene3| {
+        add_pol(s, -20.0, 0.0, 0.0);
+        add_quartz_wave(s, 0.0, 45.0, 90.0, 0);
+    };
+    // At the design wavelength: circular, which is a full S3 and no linear
+    // part at all.
+    let (_, st) = bench_at(0.55, scene);
+    assert!((st.dop() - 1.0).abs() < 1e-12, "dop {}", st.dop());
+    assert!(st.dolp() < 1e-12, "circular at 550: dolp {}", st.dolp());
+
+    // At 450 nm the same plate retards by 110 degrees.
+    let want = 90.0f64.to_radians() * 0.55 / 0.45;
+    let (flux, st) = bench_at(0.45, |s| {
+        add_pol(s, -20.0, 0.0, 0.0);
+        add_quartz_wave(s, 0.0, 45.0, 90.0, 0);
+    });
+    assert!((st.dop() - 1.0).abs() < 1e-12, "still fully polarized");
+    assert!(
+        ((st.s3 / st.s0).abs() - want.sin()).abs() < 1e-12,
+        "S3 says {} and the plate says {}",
+        (st.s3 / st.s0).abs(),
+        want.sin()
+    );
+    assert!(
+        (st.dolp() - want.cos().abs()).abs() < 1e-12,
+        "and the linear part says {} against {}",
+        st.dolp(),
+        want.cos().abs()
+    );
+    assert!(
+        (flux - 0.5).abs() < 1e-12,
+        "a bare plate is still lossless: {flux}"
+    );
+
+    // An ideal retarder does not care what colour the light is.
+    let (_, ideal) = bench_at(0.45, |s| {
+        add_pol(s, -20.0, 0.0, 0.0);
+        add_wave(s, 0.0, 45.0, 90.0);
+    });
+    assert!(ideal.dolp() < 1e-12, "ideal at 450: dolp {}", ideal.dolp());
+}
+
+/// A zero-order plate holds its retardance off axis and a multi-order one does
+/// not, because the error is a fraction of the whole retardance rather than of
+/// the quarter wave anybody can see.
+///
+/// The input is launched already linear at 45 degrees to the plate's axis *as
+/// this ray sees it*, so the only thing being read is what the plate did. The
+/// expected retardance comes from the closed form with the geometry worked out
+/// here: the transverse index is the ray's own `sin θ`, and the optic axis of a
+/// positive crystal sits across the fast axis the element names.
+#[test]
+fn a_multi_order_plate_slips_off_axis_where_a_zero_order_one_holds() {
+    let tilt = 15.0f64;
+    // Leaning along the fast axis, which is across the optic axis of a
+    // positive crystal and so the direction the retardance moves furthest in.
+    // Halfway between the two the shift very nearly cancels, because the
+    // coefficients either side are 1/(2·n_o·n_e) and 1/(2·n_o²) and quartz
+    // barely tells those apart.
+    let azimuth = 45.0f64;
+    let fast = 45.0f64;
+    let dir = skew_dir(tilt, azimuth);
+    let seen = seen_axis(fast, dir);
+    // Linear at 45 degrees to the axis the plate presents to this ray.
+    let input = oc_core::polarization::Stokes::linear(1.0, std::f64::consts::FRAC_PI_4);
+
+    let q = tilt.to_radians().sin();
+    let cos_axis = (azimuth - (fast + 90.0)).to_radians().cos();
+    let quartz = oc_core::scene3::Waveplate::quartz(0, 0.55);
+
+    for order in [0u32, 10] {
+        let plate = oc_core::scene3::Waveplate::quartz(order, 0.55);
+        let want = oc_core::polarization::a_plate_retardance(
+            quartz.n_o,
+            quartz.n_e,
+            plate.thickness_um(90.0),
+            0.55,
+            q,
+            cos_axis,
+        );
+        let st = skew_state_bench(tilt, azimuth, input, seen, |s| {
+            add_quartz_wave(s, 0.0, fast, 90.0, order);
+        });
+        assert!((st.dop() - 1.0).abs() < 1e-12, "lossless and pure");
+        assert!(
+            ((st.s3 / st.s0).abs() - want.sin().abs()).abs() < 1e-9,
+            "order {order}: S3 {} vs sin of {} degrees",
+            (st.s3 / st.s0).abs(),
+            want.to_degrees()
+        );
+        assert!(
+            (st.dolp() - want.cos().abs()).abs() < 1e-9,
+            "order {order}: dolp {} vs cos of {} degrees",
+            st.dolp(),
+            want.to_degrees()
+        );
+    }
+
+    // And the claim in plain terms: at fifteen degrees off axis the zero-order
+    // plate is still making nearly circular light and the tenth-order one is
+    // not making it at all.
+    let zero = skew_state_bench(tilt, azimuth, input, seen, |s| {
+        add_quartz_wave(s, 0.0, fast, 90.0, 0);
+    });
+    let tenth = skew_state_bench(tilt, azimuth, input, seen, |s| {
+        add_quartz_wave(s, 0.0, fast, 90.0, 10);
+    });
+    assert!(zero.dolp() < 0.05, "zero order holds: {}", zero.dolp());
+    assert!(tenth.dolp() > 0.5, "tenth order does not: {}", tenth.dolp());
 }

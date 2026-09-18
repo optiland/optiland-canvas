@@ -23,7 +23,9 @@
 
 import {
   fmt,
+  label,
   numberField,
+  segmented,
   type DragPhase,
   type Editor,
   type EditorContext,
@@ -31,13 +33,59 @@ import {
   type NumberField,
 } from "./ui";
 
+type Crystal = {
+  nO: number;
+  nE: number;
+  order: number;
+  designLambdaUm: number;
+  /** What those imply, computed in Rust so nothing here has to know how. */
+  thicknessUm: number;
+};
+
 type Pol = {
   kind: "polarizer" | "retarder";
   axisDeg: number;
   extinction: number | null;
   retardanceDeg: number | null;
   substrateIndex: number;
+  crystal: Crystal | null;
 };
+
+/** The crystals a waveplate is usually cut from, at the sodium D line.
+ *
+ *  Quartz and magnesium fluoride are positive, so their optic axis is the slow
+ *  one; calcite is negative, and its is the fast one. The element names its
+ *  fast axis either way, so which it is only shows in how the retardance moves
+ *  when the plate is tilted. */
+const CRYSTALS: Record<string, { nO: number; nE: number; text: string; title: string }> = {
+  quartz: {
+    nO: 1.54424,
+    nE: 1.55335,
+    text: "quartz",
+    title: "crystal quartz: the usual waveplate, birefringence 0.0091",
+  },
+  mgf2: {
+    nO: 1.3777,
+    nE: 1.3895,
+    text: "MgF₂",
+    title: "magnesium fluoride: birefringence 0.0118, so a thinner plate for the same retardance",
+  },
+  calcite: {
+    nO: 1.6584,
+    nE: 1.4864,
+    text: "calcite",
+    title: "calcite: negative and strongly birefringent, 0.172, so a very thin plate",
+  },
+};
+
+/** Which entry a crystal's indices came from, or null for an ideal plate. */
+function crystalKey(c: Crystal | null): string {
+  if (!c) return "ideal";
+  for (const [k, v] of Object.entries(CRYSTALS)) {
+    if (Math.abs(v.nO - c.nO) < 1e-6 && Math.abs(v.nE - c.nE) < 1e-6) return k;
+  }
+  return "quartz";
+}
 
 const AXIS_COLOR = "#7fd6ff";
 const CURVE_COLOR = "#ffd678";
@@ -48,6 +96,9 @@ export function createPolarizationEditor(ctx: EditorContext): Editor {
   let axisField: NumberField | null = null;
   let valueField: NumberField | null = null;
   let substrateField: NumberField | null = null;
+  let orderField: NumberField | null = null;
+  let designField: NumberField | null = null;
+  let crystalPick: { set: (v: string | null) => void } | null = null;
 
   // The two panels, in CSS px, set by `draw`: the face on the left and the
   // plot on the right.
@@ -61,6 +112,10 @@ export function createPolarizationEditor(ctx: EditorContext): Editor {
     if (pol.kind === "polarizer") valueField?.set(pol.extinction ?? 0);
     else valueField?.set(pol.retardanceDeg ?? 0);
     substrateField?.set(pol.substrateIndex ?? 1);
+    crystalPick?.set(crystalKey(pol.crystal));
+    orderField?.set(pol.crystal?.order ?? 0);
+    designField?.set((pol.crystal?.designLambdaUm ?? 0.55) * 1000);
+    showCrystalFields();
     writeReadout();
   }
 
@@ -101,6 +156,32 @@ export function createPolarizationEditor(ctx: EditorContext): Editor {
     ctx.redraw();
   }
 
+  /** Rebuild the crystal, or drop it, from whatever the controls now say. */
+  function setCrystal(key: string, order: number, designNm: number, settled: boolean) {
+    const ok = key === "ideal"
+      ? scene.clearRetarderCrystal(id)
+      : scene.setRetarderCrystal(id, CRYSTALS[key].nO, CRYSTALS[key].nE, Math.max(0, Math.round(order)), designNm / 1000);
+    if (!ok) {
+      ctx.note("refused", true);
+      return;
+    }
+    const next = JSON.parse(scene.surfacePolarizationJSON(id));
+    if (next) pol = next;
+    crystalPick?.set(crystalKey(pol.crystal));
+    showCrystalFields();
+    ctx.edited(settled);
+    writeReadout();
+    ctx.redraw();
+  }
+
+  /** The order and design wavelength only mean anything for a real plate. */
+  function showCrystalFields() {
+    const on = !!pol.crystal;
+    for (const f of [orderField, designField]) {
+      if (f) (f.input.closest(".cv-field") as HTMLElement | null)?.toggleAttribute("hidden", !on);
+    }
+  }
+
   // --- the controls -------------------------------------------------------
 
   axisField = numberField(ctx.fields, pol.kind === "polarizer" ? "axis" : "fast axis", "°", {
@@ -128,6 +209,40 @@ export function createPolarizationEditor(ctx: EditorContext): Editor {
       name: "retardance",
       title: "90° is a quarter wave, 180° a half wave",
     });
+  }
+
+  if (pol.kind === "retarder") {
+    label(ctx.fields, "cut from");
+    crystalPick = segmented(
+      ctx.fields,
+      [
+        {
+          value: "ideal",
+          text: "ideal",
+          title: "the retardance is the number above, at every wavelength and every angle",
+        },
+        ...Object.entries(CRYSTALS).map(([k, v]) => ({ value: k, text: v.text, title: v.title })),
+      ],
+      (v) => setCrystal(v, pol.crystal?.order ?? 0, (pol.crystal?.designLambdaUm ?? 0.55) * 1000, true),
+    );
+    orderField = numberField(ctx.fields, "order", "", {
+      commit: (v) => setCrystal(crystalKey(pol.crystal), v, (pol.crystal?.designLambdaUm ?? 0.55) * 1000, true),
+      step: 1,
+      digits: 0,
+      name: "order",
+      title: "whole waves under the retardance above: 0 is a true zero-order plate, and a cheap quarter wave is often 5 or 10",
+    });
+    designField = numberField(ctx.fields, "design λ", "nm", {
+      commit: (v) => setCrystal(crystalKey(pol.crystal), pol.crystal?.order ?? 0, v, true),
+      step: 10,
+      digits: 1,
+      name: "design",
+      title: "the wavelength the retardance above is quoted at",
+    });
+    crystalPick.set(crystalKey(pol.crystal));
+    orderField.set(pol.crystal?.order ?? 0);
+    designField.set((pol.crystal?.designLambdaUm ?? 0.55) * 1000);
+    showCrystalFields();
   }
 
   substrateField = numberField(ctx.fields, "substrate", "n", {
@@ -171,12 +286,27 @@ export function createPolarizationEditor(ctx: EditorContext): Editor {
       const d = pol.retardanceDeg ?? 0;
       const waves = d / 360;
       const name = near(d, 90) ? "quarter wave" : near(d, 180) ? "half wave" : near(d, 0) ? "no retardance" : `${fmt(waves, 3)} wave`;
-      const loss = bare() ? "lossless, and" : "";
+      const loss = bare() ? "lossless" : "its faces reflect";
+      const c = pol.crystal;
+      const where = c
+        ? `at ${fmt(c.designLambdaUm * 1000, 0)} nm on axis`
+        : "at every wavelength and every angle";
       line.textContent =
-        `retarder · fast axis ${fmt(pol.axisDeg, 1)}° · ${fmt(d, 1)}° (${name})` +
-        ` · ${loss} the same at every wavelength`.replace("·  ", "· ");
+        `retarder · fast axis ${fmt(pol.axisDeg, 1)}° · ${fmt(d, 1)}° (${name}) ${where}` +
+        ` · ${loss}`;
     }
     ctx.read.appendChild(line);
+    const c = pol.crystal;
+    if (c) {
+      const plate = document.createElement("div");
+      const total = (pol.retardanceDeg ?? 0) / 360 + c.order;
+      // How far the retardance moves for a given slip in wavelength or angle
+      // is set by the whole retardance, not by the quarter wave you can see.
+      plate.textContent =
+        `${fmt(c.thicknessUm, 3)} µm of ${CRYSTALS[crystalKey(c)].text}, ${fmt(total, 3)} waves in all:` +
+        ` it moves as 1/λ and as the square of the angle off axis, ${fmt(total * 4, 0)}× as far as a zero-order quarter wave`;
+      ctx.read.appendChild(plate);
+    }
     const faces = document.createElement("div");
     faces.textContent = facesLine();
     ctx.read.appendChild(faces);

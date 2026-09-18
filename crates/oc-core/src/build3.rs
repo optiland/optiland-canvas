@@ -36,6 +36,7 @@ use crate::scene3::{
     ObjectCommon, OutOfRangePolicy, PatchResponseOverride, PlanarShape2, SamplingSequence, Scene3,
     SolidGeometry3, Source3, SourceSampling, SpatialDistribution3, SpectralScalar,
     SurfaceGeometry3, SurfaceObject3, SurfaceProps3, SurfaceResponse, TwoSidedSurfaceResponse,
+    Waveplate,
 };
 use crate::vec::Vec2;
 use crate::vec3::{Isometry3, Plane3, Vec3};
@@ -633,6 +634,7 @@ impl Scene3 {
             axis_deg,
             retardance_deg,
             substrate_index: 1.0,
+            crystal: None,
         };
         Some(self.add_planar_element(pos, radius_mm, tilt_deg, r.clone(), r))
     }
@@ -705,6 +707,38 @@ impl Scene3 {
         let ok = self.map_polarizing(id, &mut |r| {
             if let SurfaceResponse::Retarder { retardance_deg: d, .. } = r {
                 *d = retardance_deg;
+                touched = true;
+            }
+        });
+        ok && touched
+    }
+
+    /// Make a retarder out of a real crystal, or `None` to make it ideal
+    /// again. False for anything that is not a retarder, and for a crystal
+    /// that could not be one: an index below 1, no birefringence to retard
+    /// with, or a design wavelength that is not positive.
+    ///
+    /// Its `retardance_deg` becomes the nominal: what the plate gives on axis
+    /// at the design wavelength. Everywhere else the retardance follows from
+    /// the plate, so it moves as `1/λ` and as the square of the obliquity.
+    pub fn set_retarder_crystal(&mut self, id: u64, crystal: Option<Waveplate>) -> bool {
+        if let Some(c) = &crystal {
+            let ok = c.n_o.is_finite()
+                && c.n_e.is_finite()
+                && c.n_o >= 1.0
+                && c.n_e >= 1.0
+                && (c.n_e - c.n_o).abs() >= 1e-9
+                && c.design_lambda_um.is_finite()
+                && c.design_lambda_um > 0.0
+                && c.order <= 1000;
+            if !ok {
+                return false;
+            }
+        }
+        let mut touched = false;
+        let ok = self.map_polarizing(id, &mut |r| {
+            if let SurfaceResponse::Retarder { crystal: c, .. } = r {
+                *c = crystal.clone();
                 touched = true;
             }
         });

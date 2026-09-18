@@ -393,6 +393,47 @@ test.describe("component view — polarizing elements", () => {
     await expect(page.locator("#componentInset .cv-read")).toContainText("half wave");
   });
 
+  test("the substrate field is on both, and putting one in glass costs it light", async ({ page }) => {
+    await freshApp(page);
+    await openInset(page);
+    await addAndSelect(page, "addPolarizer");
+
+    const field = page.locator('#componentInset input[data-name="substrate"]');
+    await expect(field).toBeVisible();
+    // A bare layer by default: the readout says so rather than showing a 1.
+    await expect(page.locator("#componentInset .cv-read")).toContainText("bare layer");
+
+    const id = (await insetView(page)).id;
+    const detector = (page: Page) =>
+      page.evaluate(() => {
+        const d = (window as unknown as { __ocDebug: any }).__ocDebug;
+        const dets = JSON.parse(d.scene.sceneObjectsJSON()).filter((o: any) => o.kind === "detector");
+        return JSON.parse(d.scene.detectorResultJSON(dets[0].id)).totalIncident as number;
+      });
+    const bare = await detector(page);
+
+    await field.fill("1.5");
+    await expect(page.locator("#stat")).toContainText("segs");
+    // The readout names the glass and what its faces cost on axis.
+    await expect(page.locator("#componentInset .cv-read")).toContainText("92.2%");
+    expect(
+      await page.evaluate(
+        (i) => JSON.parse((window as unknown as { __ocDebug: any }).__ocDebug.scene.surfacePolarizationJSON(i)).substrateIndex as number,
+        id,
+      ),
+    ).toBeCloseTo(1.5, 6);
+
+    // Two air-to-glass faces, so the detector loses about 8% of what it had.
+    const glass = await detector(page);
+    expect(glass / bare).toBeGreaterThan(0.90);
+    expect(glass / bare).toBeLessThan(0.93);
+
+    // And a waveplate has the field too, because it has faces for the same
+    // reason a polarizer does.
+    await addAndSelect(page, "addRetarder");
+    await expect(page.locator('#componentInset input[data-name="substrate"]')).toBeVisible();
+  });
+
   test("the extinction field is there on a polarizer and not on a waveplate", async ({ page }) => {
     await freshApp(page);
     await openInset(page);

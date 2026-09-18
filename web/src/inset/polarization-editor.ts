@@ -36,6 +36,7 @@ type Pol = {
   axisDeg: number;
   extinction: number | null;
   retardanceDeg: number | null;
+  substrateIndex: number;
 };
 
 const AXIS_COLOR = "#7fd6ff";
@@ -46,6 +47,7 @@ export function createPolarizationEditor(ctx: EditorContext): Editor {
   let pol: Pol = JSON.parse(scene.surfacePolarizationJSON(id));
   let axisField: NumberField | null = null;
   let valueField: NumberField | null = null;
+  let substrateField: NumberField | null = null;
 
   // The two panels, in CSS px, set by `draw`: the face on the left and the
   // plot on the right.
@@ -58,6 +60,7 @@ export function createPolarizationEditor(ctx: EditorContext): Editor {
     axisField?.set(pol.axisDeg);
     if (pol.kind === "polarizer") valueField?.set(pol.extinction ?? 0);
     else valueField?.set(pol.retardanceDeg ?? 0);
+    substrateField?.set(pol.substrateIndex ?? 1);
     writeReadout();
   }
 
@@ -82,6 +85,17 @@ export function createPolarizationEditor(ctx: EditorContext): Editor {
     }
     if (pol.kind === "polarizer") pol.extinction = Math.min(1, Math.max(0, v));
     else pol.retardanceDeg = v;
+    ctx.edited(settled);
+    writeReadout();
+    ctx.redraw();
+  }
+
+  function setSubstrate(v: number, settled: boolean) {
+    if (!scene.setPolarizingSubstrate(id, v)) {
+      ctx.note("a substrate cannot be thinner than air", true);
+      return;
+    }
+    pol.substrateIndex = v;
     ctx.edited(settled);
     writeReadout();
     ctx.redraw();
@@ -116,6 +130,33 @@ export function createPolarizationEditor(ctx: EditorContext): Editor {
     });
   }
 
+  substrateField = numberField(ctx.fields, "substrate", "n", {
+    commit: (v) => setSubstrate(v, true),
+    step: 0.05,
+    digits: 4,
+    name: "substrate",
+    title:
+      "index of the glass the element is laminated in, or 1 for a bare layer with no faces: the glass is what makes a real one care about the angle it is used at",
+  });
+
+  /** Whether the element is a bare layer or laminated in something. */
+  function bare(): boolean {
+    return (pol.substrateIndex ?? 1) <= 1 + 1e-9;
+  }
+
+  /** What the element's own faces do to the light, on axis. */
+  function facesLine(): string {
+    if (bare()) {
+      return "bare layer: no faces, so nothing here changes with the angle but the axis you see";
+    }
+    const n = pol.substrateIndex;
+    const r = ((n - 1) / (n + 1)) ** 2;
+    return (
+      `in n ${fmt(n, 3)} glass: its two faces pass ${fmt(100 * (1 - r) ** 2, 1)}% on axis,` +
+      ` and off axis they pass p better than s`
+    );
+  }
+
   function writeReadout() {
     ctx.read.replaceChildren();
     const line = document.createElement("div");
@@ -130,11 +171,15 @@ export function createPolarizationEditor(ctx: EditorContext): Editor {
       const d = pol.retardanceDeg ?? 0;
       const waves = d / 360;
       const name = near(d, 90) ? "quarter wave" : near(d, 180) ? "half wave" : near(d, 0) ? "no retardance" : `${fmt(waves, 3)} wave`;
+      const loss = bare() ? "lossless, and" : "";
       line.textContent =
         `retarder · fast axis ${fmt(pol.axisDeg, 1)}° · ${fmt(d, 1)}° (${name})` +
-        ` · lossless, and the same at every wavelength`;
+        ` · ${loss} the same at every wavelength`.replace("·  ", "· ");
     }
     ctx.read.appendChild(line);
+    const faces = document.createElement("div");
+    faces.textContent = facesLine();
+    ctx.read.appendChild(faces);
   }
 
   writeReadout();

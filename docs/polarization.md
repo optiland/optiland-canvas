@@ -50,8 +50,8 @@ and does not change it.
 | Mirror | One number. Treated as an ideal reflector: equal for s and p, no retardance. |
 | `ExplicitRt` | Two numbers. Treated as an ideal grey attenuator, polarization-blind and phase-neutral. |
 | Ideal thin lens | No polarization action. |
-| Polarizer | Passes the field on its transmission axis, absorbs the perpendicular component, leaks its stated extinction. |
-| Retarder | Adds a phase to its slow axis. Lossless. |
+| Polarizer | Passes the field on its transmission axis, absorbs the perpendicular component, leaks its stated extinction. Optionally laminated in glass, whose two faces then do real Fresnel. |
+| Retarder | Adds a phase to its slow axis. Lossless, unless it is laminated, when its faces reflect. |
 
 **Power data cannot supply a phase.** `Rs`, `Rp`, `Ts` and `Tp` fix the
 magnitudes of a diagonal Jones element and say nothing about the phase between
@@ -95,6 +95,48 @@ Both are zero thickness. They are the polarization action and not the crystal:
 no walk-off, no ordinary and extraordinary rays, no optical path, and a
 retardance that is the number you gave rather than one that follows from a
 thickness and a birefringence at each wavelength.
+
+## The glass around them
+
+An ideal layer is not a part you can buy. A sheet polarizer is laminated in
+glass, and those two faces reflect: less light on axis, and a different amount
+of s than of p as soon as the element is tilted. `substrate_index` is that
+glass. One is air, where a face reflects nothing and transmits everything, so
+the faces drop out of the arithmetic rather than being skipped by a branch.
+
+What it buys, for n = 1.5:
+
+| ray off axis | passing a polarizer on s | on p |
+|---|---|---|
+| on axis | 0.4608 | 0.4608 |
+| 20 degrees | 0.4540 | 0.4671 |
+| 45 degrees | 0.4122 | 0.4916 |
+| 60 degrees | 0.3390 | 0.4982 |
+
+as fractions of unpolarized light arriving, against a bare layer's flat 0.5 at
+every angle. By 45 degrees a polarizer that passes p gets a fifth more light
+than one that passes s, which is the single largest thing angle does to a real
+polarizer below its acceptance limit.
+
+The oracle is Fresnel twice over, and it is exact rather than fitted: the two
+faces are reversible, so a face meeting air from outside reflects exactly what
+it reflects meeting glass at the refracted angle from inside. The tests compare
+against `(1 - R)²` written out from the Fresnel formulas rather than against
+anything the kernel computed.
+
+Inside the glass the ray is straighter, so the axis projection shrinks. A
+laminated polarizer holds its contrast off axis better than a bare film does,
+and the model gets that for the same reason the real one does.
+
+The element is still zero thickness, so the two faces sit in the same place.
+There is no displacement, no optical path through the glass, and no bounce
+between the faces. That bounce is bounded by the square of a face's reflectance
+and crosses the polarizing layer twice more on the way, so a polarizer absorbs
+most of it and a lossless retarder does not. The capability report says so
+whenever an element has a substrate.
+
+What the faces reflect is a ghost like any other: followed when ghosts are on,
+named in the ledger when they are off, and absorbed in neither case.
 
 ## Two convention bugs, and how they were caught
 
@@ -196,12 +238,14 @@ before.
   wavelength. Real waveplates are not.
 - **Depolarization.** Nothing here depolarizes. Scatter and roughness would, and
   neither is modelled.
-- **Everything angle does to a polarizer beyond the projection.** A real one
-  has two faces that reflect, and more so as it is tilted. A wire grid loses
-  contrast off axis. A thin-film polarizer or a MacNeille cube is built around a
-  Brewster match at one angle and stops working a couple of degrees away from
-  it, which is the whole of its datasheet. A Glan-Taylor has a hard acceptance
-  cone. None of that is here: extinction is one number at every angle.
+- **The polarizing layer's own acceptance angle.** The faces are modelled and
+  the layer is not: a wire grid loses contrast off axis, a thin-film polarizer
+  or a MacNeille cube is built around a Brewster match at one angle and stops
+  working a couple of degrees away from it, and a Glan-Taylor has a hard
+  acceptance cone. Extinction here is one number at every angle.
+- **Thickness.** A substrate is an index and not a plate: no displacement of a
+  beam through a tilted element, no optical path, and no bounce between the two
+  faces.
 - **Retardance with angle.** A waveplate's retardance moves as the square of
   the obliquity, up or down depending on which axis it is tilted about. For
   quartz it is about 0.6% at 10 degrees and 2.4% at 20. A zero-order plate

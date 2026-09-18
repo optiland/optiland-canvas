@@ -604,6 +604,7 @@ impl Scene3 {
         let r = SurfaceResponse::Polarizer {
             axis_deg,
             extinction,
+            substrate_index: 1.0,
         };
         Some(self.add_planar_element(pos, radius_mm, tilt_deg, r.clone(), r))
     }
@@ -631,6 +632,7 @@ impl Scene3 {
         let r = SurfaceResponse::Retarder {
             axis_deg,
             retardance_deg,
+            substrate_index: 1.0,
         };
         Some(self.add_planar_element(pos, radius_mm, tilt_deg, r.clone(), r))
     }
@@ -707,6 +709,28 @@ impl Scene3 {
             }
         });
         ok && touched
+    }
+
+    /// Set the index of the glass a polarizing element is laminated in, or 1
+    /// for a bare layer with no faces. False below 1, for a non-finite value,
+    /// or for an element that is not a polarizer or a retarder.
+    ///
+    /// This is the element's own glass and not the medium it sits in. It is
+    /// what gives a real sheet polarizer most of its dependence on the angle
+    /// it is used at, and an ideal layer has none.
+    pub fn set_polarizing_substrate(&mut self, id: u64, index: f64) -> bool {
+        if !index.is_finite() || index < 1.0 {
+            return false;
+        }
+        self.map_polarizing(id, &mut |r| match r {
+            SurfaceResponse::Polarizer {
+                substrate_index, ..
+            }
+            | SurfaceResponse::Retarder {
+                substrate_index, ..
+            } => *substrate_index = index,
+            _ => {}
+        })
     }
 
     /// Apply `f` to both faces of a surface that carries a polarizing response.

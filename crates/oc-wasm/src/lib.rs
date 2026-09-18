@@ -2143,20 +2143,44 @@ impl Canvas {
             SurfaceResponse::Polarizer {
                 axis_deg,
                 extinction,
+                substrate_index,
             } => format!(
-                "{{\"kind\":\"polarizer\",\"axisDeg\":{},\"extinction\":{},\"retardanceDeg\":null}}",
+                "{{\"kind\":\"polarizer\",\"axisDeg\":{},\"extinction\":{},\"retardanceDeg\":null,\"substrateIndex\":{}}}",
                 json_num(*axis_deg),
-                json_num(*extinction)
+                json_num(*extinction),
+                json_num(*substrate_index)
             ),
             SurfaceResponse::Retarder {
                 axis_deg,
                 retardance_deg,
+                substrate_index,
             } => format!(
-                "{{\"kind\":\"retarder\",\"axisDeg\":{},\"extinction\":null,\"retardanceDeg\":{}}}",
+                "{{\"kind\":\"retarder\",\"axisDeg\":{},\"extinction\":null,\"retardanceDeg\":{},\"substrateIndex\":{}}}",
                 json_num(*axis_deg),
-                json_num(*retardance_deg)
+                json_num(*retardance_deg),
+                json_num(*substrate_index)
             ),
             _ => "null".into(),
+        }
+    }
+
+    /// Set the index of the glass a polarizing element is laminated in, or 1
+    /// for a bare layer with no faces at all.
+    ///
+    /// This is the element's own glass, not the medium it stands in. It is
+    /// what makes a real polarizer care about the angle it is used at: the two
+    /// faces pass p better than s, and by 45 degrees that is a fifth more light
+    /// for a polarizer passing p than for one passing s. False below 1.
+    #[wasm_bindgen(js_name = setPolarizingSubstrate)]
+    pub fn set_polarizing_substrate(&mut self, id: f64, index: f64) -> bool {
+        let Some(scene) = self.scene3.as_mut() else {
+            return false;
+        };
+        if scene.set_polarizing_substrate(id as u64, index) {
+            self.revision += 1;
+            true
+        } else {
+            false
         }
     }
 

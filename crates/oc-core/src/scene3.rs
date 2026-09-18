@@ -380,6 +380,22 @@ impl DetectorResponse {
     }
 }
 
+/// A polarizing element with nothing around it: the polarization action alone,
+/// and no faces.
+///
+/// An index of 1 is not a convention for "off". It is air, where a face
+/// reflects nothing and transmits everything, so the two faces drop out of the
+/// arithmetic rather than being skipped by a branch. An ordinary sheet
+/// polarizer is laminated in something near 1.5, and that glass is most of what
+/// makes a real one care about the angle it is used at.
+///
+/// Below 1 is refused rather than clamped: the front face could then reflect a
+/// ray totally before it ever reached the polarizing layer, which is a
+/// different element than the one anybody meant to place.
+fn bare_element() -> f64 {
+    1.0
+}
+
 /// What a surface does to a ray that reaches it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SurfaceResponse {
@@ -426,16 +442,17 @@ pub enum SurfaceResponse {
     /// An ideal absorbing linear polarizer: it passes the field component along
     /// its transmission axis and absorbs the perpendicular one.
     ///
-    /// Zero thickness, no reflection, no dispersion. It models the polarization
-    /// action of a polarizer and not a sheet of anything: a real one reflects,
-    /// has a contrast that varies with wavelength, and degrades as it is
-    /// tilted. Unpolarized light loses half its flux here, which is a physical
-    /// fact and not an assumption.
+    /// Zero thickness and no dispersion. The polarizing layer itself is ideal:
+    /// its contrast is one number at every wavelength and every angle, where a
+    /// real sheet's degrades as it is tilted and a thin-film or prism polarizer
+    /// has an acceptance cone of a few degrees. Unpolarized light loses half
+    /// its flux here, which is a physical fact and not an assumption.
     ///
-    /// Angle enters only through the geometry: the axis is a direction in the
-    /// element, and a skew ray sees its projection. That is enough for a
-    /// crossed pair to leak off axis and not enough for anything a datasheet
-    /// calls an acceptance angle.
+    /// Two things do depend on the angle. The axis is a direction in the
+    /// element, so a skew ray sees its projection, which is enough for a
+    /// crossed pair to leak off axis. And `substrate_index` puts the layer in
+    /// glass, whose two faces reflect, more of s than of p and more of both as
+    /// the element is tilted.
     ///
     /// `extinction` is the **power** fraction of the blocked component that
     /// still gets through, so 0 is perfect and 1e-4 is an ordinary sheet
@@ -445,9 +462,14 @@ pub enum SurfaceResponse {
         /// Transmission axis, degrees from the surface's local `+X`.
         axis_deg: f64,
         extinction: f64,
+        /// Index of the glass the polarizing layer is carried in. See
+        /// [`bare_element`].
+        #[serde(default = "bare_element")]
+        substrate_index: f64,
     },
-    /// An ideal linear retarder: a waveplate, lossless, adding
-    /// `retardance_deg` of phase to the slow axis relative to the fast one.
+    /// An ideal linear retarder: a waveplate adding `retardance_deg` of phase
+    /// to the slow axis relative to the fast one. Lossless unless it is given a
+    /// substrate, whose faces then reflect.
     ///
     /// A quarter wave is 90 degrees and turns linear light at 45 degrees to its
     /// axis into circular; a half wave is 180 and rotates a linear state by
@@ -459,7 +481,9 @@ pub enum SurfaceResponse {
     ///
     /// The retardance is the same at every angle of incidence. A real plate's
     /// moves as the square of the obliquity, which a zero-order plate barely
-    /// notices and a multi-order one does not survive.
+    /// notices and a multi-order one does not survive. `substrate_index` adds
+    /// the faces a real plate has; it does not make the retardance depend on
+    /// anything.
     ///
     /// Only meaningful on a standalone planar surface, whose local `+X` the
     /// fast axis is measured from.
@@ -467,6 +491,10 @@ pub enum SurfaceResponse {
         /// Fast axis, degrees from the surface's local `+X`.
         axis_deg: f64,
         retardance_deg: f64,
+        /// Index of the glass the waveplate is carried in. See
+        /// [`bare_element`].
+        #[serde(default = "bare_element")]
+        substrate_index: f64,
     },
 }
 
@@ -603,6 +631,7 @@ impl SurfaceResponse {
             Self::Polarizer {
                 axis_deg,
                 extinction,
+                substrate_index,
             } => {
                 if !axis_deg.is_finite() {
                     return Err(range("axis_deg", "must be finite"));
@@ -610,17 +639,24 @@ impl SurfaceResponse {
                 if !extinction.is_finite() || !(0.0..=1.0).contains(extinction) {
                     return Err(range("extinction", "is outside [0, 1]"));
                 }
+                if !substrate_index.is_finite() || *substrate_index < 1.0 {
+                    return Err(range("substrate_index", "must be at least 1"));
+                }
                 Ok(())
             }
             Self::Retarder {
                 axis_deg,
                 retardance_deg,
+                substrate_index,
             } => {
                 if !axis_deg.is_finite() {
                     return Err(range("axis_deg", "must be finite"));
                 }
                 if !retardance_deg.is_finite() {
                     return Err(range("retardance_deg", "must be finite"));
+                }
+                if !substrate_index.is_finite() || *substrate_index < 1.0 {
+                    return Err(range("substrate_index", "must be at least 1"));
                 }
                 Ok(())
             }

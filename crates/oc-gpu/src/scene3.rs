@@ -1160,17 +1160,43 @@ fn compile_response(
         // preview's declared model, and they are the reason a crossed pair looks
         // bright in the preview and goes dark in the reference. The component
         // view says which model produced a number.
-        SurfaceResponse::Polarizer { extinction, .. } => GpuResponse::ExplicitRt {
-            r: spectral(&SpectralScalar::Constant(0.0))?,
+        //
+        // An element laminated in glass also has two faces, and the preview
+        // takes them at normal incidence because it has no angle here. That is
+        // the same shape of approximation as the rest of this arm: the right
+        // number on axis and increasingly wrong as the part is tilted, where
+        // the reference splits s from p and this cannot.
+        SurfaceResponse::Polarizer {
+            extinction,
+            substrate_index,
+            ..
+        } => GpuResponse::ExplicitRt {
+            r: spectral(&SpectralScalar::Constant(face_reflectance(*substrate_index)))?,
             t: spectral(&SpectralScalar::Constant(
-                0.5 * (1.0 + extinction.clamp(0.0, 1.0)),
+                two_faces(*substrate_index) * 0.5 * (1.0 + extinction.clamp(0.0, 1.0)),
             ))?,
         },
-        SurfaceResponse::Retarder { .. } => GpuResponse::ExplicitRt {
-            r: spectral(&SpectralScalar::Constant(0.0))?,
-            t: spectral(&SpectralScalar::Constant(1.0))?,
+        SurfaceResponse::Retarder {
+            substrate_index, ..
+        } => GpuResponse::ExplicitRt {
+            r: spectral(&SpectralScalar::Constant(face_reflectance(*substrate_index)))?,
+            t: spectral(&SpectralScalar::Constant(two_faces(*substrate_index)))?,
         },
     })
+}
+
+/// One air-to-glass face's reflectance on axis, which is all the preview has
+/// room for: a polarizing element carries no baked angle grid the way a coating
+/// does.
+fn face_reflectance(n: f64) -> f64 {
+    let n = n.max(1.0);
+    ((n - 1.0) / (n + 1.0)).powi(2)
+}
+
+/// What the pair of faces passes on axis. Both faces reflect the same, so this
+/// is the square of one.
+fn two_faces(n: f64) -> f64 {
+    (1.0 - face_reflectance(n)).powi(2)
 }
 
 /// Angle samples in a baked coating grid, uniform in `sin2 theta` from 0 (on

@@ -901,11 +901,87 @@ fn interact_surface(
             n2: n_here,
             children,
         };
+        let dir = w.ray.dir;
+        let (axis_deg, n_sub) = match response {
+            SurfaceResponse::Polarizer {
+                axis_deg,
+                substrate_index,
+                ..
+            }
+            | SurfaceResponse::Retarder {
+                axis_deg,
+                substrate_index,
+                ..
+            } => (*axis_deg, substrate_index.max(1.0)),
+            _ => unreachable!("matched above"),
+        };
+
+        // The element's own faces. The polarizing layer is laminated in glass
+        // of index `substrate_index`, and a ray meets that glass going in and
+        // again coming out. An index of 1 is a bare layer, where a face
+        // reflects nothing and transmits everything, so none of this changes an
+        // answer.
+        //
+        // The element is still zero thickness, so the two faces sit in the same
+        // place: no displacement, no optical path through the glass, and no
+        // bounce between them. That bounce is bounded by the square of a face's
+        // reflectance and crosses the polarizing layer twice more, so a
+        // polarizer absorbs most of it and a lossless retarder does not.
+        let cos_i = -n_oppose.dot(dir).clamp(-1.0, 1.0);
+        let front = oc_core::thinfilm::interface_amp(n_here, n_sub, cos_i);
+
+        // Work on the plane of incidence, which the faces are diagonal in. The
+        // element's own frame and this one share `ŝ`: it is perpendicular to
+        // the plane of incidence, so it is the same inside the glass as
+        // outside, and only `p̂` turns with the ray and turns back on the way
+        // out.
+        let s_hat = polarization::incidence_axis(dir, n_oppose).unwrap_or(w.pol.x);
+        let stokes_in = w
+            .state_at(flux_at)
+            .rotated(polarization::frame_angle(dir, w.pol.x, s_hat));
+        let make = |m: &Mueller| -> Stokes {
+            if cfg.polarization {
+                m.apply(&stokes_in)
+            } else {
+                // Without a state to act on, all an element like this can do is
+                // its average: half for a polarizer facing unpolarized light,
+                // all of it for a lossless retarder. The preview runs this, and
+                // it is why a crossed pair looks bright there and is dark here.
+                Stokes::unpolarized(m.unpolarized_gain() * flux_at)
+            }
+        };
+
+        let Some(dir_in) = refract3(dir, n_oppose, n_here, n_sub) else {
+            // The element sits in something denser than its own glass and the
+            // ray is past the critical angle at the front face, so it never
+            // reaches the polarizing layer at all.
+            let stokes = make(&Mueller::from_diagonal_jones(front.r_s, front.r_p));
+            r.ledger.absorbed_surface += (flux_at - stokes.s0).max(0.0);
+            let child = spawn_tir(
+                stack,
+                r,
+                cfg,
+                w,
+                point,
+                reflect3(dir, n_oppose),
+                PolRay { stokes, x: s_hat },
+                opl_at,
+                min_flux,
+            );
+            let children = child.map(|id| (ChildRole::Tir, id)).into_iter().collect();
+            push_event(r, cfg, w, point, opl_at, interact_ev(children));
+            return;
+        };
+        let cos_t = -n_oppose.dot(dir_in).clamp(-1.0, 1.0);
+        let back = oc_core::thinfilm::interface_amp(n_sub, n_here, cos_t);
+
         // The axis is a direction in the element's own plane: its local `+X`
         // turned by `axis_deg` towards its local `+Y`, the plane its normal
         // (local `+Z`) stands on. What acts on the ray is that direction
-        // projected into the plane the field lives in, which is the usual
-        // idealisation and departs from a real polarizer at large obliquity.
+        // projected into the plane the field lives in, which inside the glass
+        // is set by the refracted direction. A substrate straightens the ray
+        // and so shrinks the projection, which is one reason a laminated
+        // polarizer holds its contrast off axis better than a bare film.
         //
         // Building the axis first and projecting second is not the same as
         // projecting `+X` and turning the result inside the ray's transverse
@@ -915,16 +991,10 @@ fn interact_surface(
         // angle between any two elements exactly, so a crossed pair would
         // extinguish perfectly seen from every direction. Real crossed
         // polarizers leak off axis, which is why a display has a viewing angle.
-        let axis_deg = match response {
-            SurfaceResponse::Polarizer { axis_deg, .. }
-            | SurfaceResponse::Retarder { axis_deg, .. } => *axis_deg,
-            _ => unreachable!("matched above"),
-        };
         let (sin_a, cos_a) = axis_deg.to_radians().sin_cos();
         let t = &s.common.transform;
         let axis = t.rotate(Vec3::X) * cos_a + t.rotate(Vec3::Y) * sin_a;
-        let dir = w.ray.dir;
-        let projected = axis - dir * dir.dot(axis);
+        let projected = axis - dir_in * dir_in.dot(axis);
         if projected.length() < 1e-9 {
             // The ray runs along the element's own axis: there is no projection
             // and no meaningful transmission axis to apply.
@@ -938,9 +1008,7 @@ fn interact_surface(
         }
         let frame_x = projected.normalize();
 
-        // `frame_x` is already the axis, so both elements are diagonal in it
-        // and neither needs turning.
-        let (m, feature) = match response {
+        let (layer, feature) = match response {
             SurfaceResponse::Polarizer { extinction, .. } => (
                 // Amplitude on the blocked axis is the square root of the power
                 // that leaks: extinction is quoted as a power ratio.
@@ -957,37 +1025,68 @@ fn interact_surface(
             _ => unreachable!("matched above"),
         };
         r.report.note_exact(feature);
+        if n_sub > 1.0 {
+            r.report
+                .note_approx(feature, "element faces added singly: no bounce between them");
+        }
 
-        let stokes_in = w
-            .state_at(flux_at)
-            .rotated(polarization::frame_angle(dir, w.pol.x, frame_x));
-        let stokes_out = if cfg.polarization {
-            m.apply(&stokes_in)
-        } else {
-            // Without a state to act on, all an element like this can do is its
-            // average: half for a polarizer facing unpolarized light, all of it
-            // for a lossless retarder. The preview runs this, and it is why a
-            // crossed pair looks bright there and is dark in the reference.
-            Stokes::unpolarized(m.unpolarized_gain() * flux_at)
+        // Front face, then the layer on its own axis, then the back face. The
+        // order is not decoration: the two faces commute with each other and
+        // neither commutes with the layer.
+        let faces = |a: &oc_core::thinfilm::FilmAmp| {
+            Mueller::from_diagonal_jones(a.t_s, a.t_p).scaled(a.t_power_scale)
         };
-        r.ledger.absorbed_surface += (flux_at - stokes_out.s0).max(0.0);
-        let child = spawn(
+        let turned = layer.rotated(polarization::frame_angle(dir_in, s_hat, frame_x));
+        let m_t = faces(&back).times(&turned.times(&faces(&front)));
+        let stokes_t = make(&m_t);
+        let stokes_r = make(&Mueller::from_diagonal_jones(front.r_s, front.r_p));
+        r.ledger.absorbed_surface += (flux_at - stokes_t.s0 - stokes_r.s0).max(0.0);
+
+        let mut children = Vec::new();
+        if let Some(id) = spawn(
             stack,
             r,
             cfg,
             w,
             point,
-            w.ray.dir,
+            dir,
             PolRay {
-                stokes: stokes_out,
-                x: frame_x,
+                stokes: stokes_t,
+                x: s_hat,
             },
             opl_at,
             false,
             false,
             min_flux,
-        );
-        let children = child.map(|id| (ChildRole::Transmit, id)).into_iter().collect();
+        ) {
+            children.push((ChildRole::Transmit, id));
+        }
+        if stokes_r.s0 > 0.0 {
+            if cfg.ghosts {
+                if let Some(id) = spawn(
+                    stack,
+                    r,
+                    cfg,
+                    w,
+                    point,
+                    reflect3(dir, n_oppose),
+                    PolRay {
+                        stokes: stokes_r,
+                        x: s_hat,
+                    },
+                    opl_at,
+                    true,
+                    false,
+                    min_flux,
+                ) {
+                    children.push((ChildRole::Reflect, id));
+                }
+            } else {
+                // Ghosts off: the reflected flux is not followed, but it is
+                // still named rather than lost.
+                r.ledger.truncated_flux += stokes_r.s0;
+            }
+        }
         push_event(r, cfg, w, point, opl_at, interact_ev(children));
         return;
     }

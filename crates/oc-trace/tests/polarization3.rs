@@ -594,6 +594,27 @@ fn add_pol(s: &mut Scene3, x: f64, axis_deg: f64, extinction: f64) {
         .expect("polarizer");
 }
 
+/// A perfect polarizer laminated in glass of index `n_sub`, facing the bench
+/// axis.
+fn add_pol_in_glass(s: &mut Scene3, x: f64, axis_deg: f64, n_sub: f64) {
+    let id = s
+        .add_polarizer(Vec3::new(x, 0.0, 0.0), 15.0, 0.0, axis_deg, 0.0)
+        .expect("polarizer");
+    assert!(s.set_polarizing_substrate(id, n_sub), "substrate");
+}
+
+/// The power reflectances `(s, p)` of one air-to-glass face, straight from
+/// Fresnel and not from the kernel, so a test that uses it is an oracle and not
+/// a mirror.
+fn face_reflectances(n: f64, aoi_deg: f64) -> (f64, f64) {
+    let ci = aoi_deg.to_radians().cos();
+    let st = aoi_deg.to_radians().sin() / n;
+    let ct = (1.0 - st * st).sqrt();
+    let rs = (ci - n * ct) / (ci + n * ct);
+    let rp = (n * ci - ct) / (n * ci + ct);
+    (rs * rs, rp * rp)
+}
+
 fn add_wave(s: &mut Scene3, x: f64, axis_deg: f64, retardance_deg: f64) {
     s.add_retarder(Vec3::new(x, 0.0, 0.0), 15.0, 0.0, axis_deg, retardance_deg)
         .expect("retarder");
@@ -773,6 +794,7 @@ fn a_polarizer_on_a_solid_is_refused() {
     let r = oc_core::scene3::SurfaceResponse::Polarizer {
         axis_deg: 0.0,
         extinction: 0.0,
+        substrate_index: 1.0,
     };
     b.surface.default.from_outside = r.clone();
     b.surface.default.from_inside = r;
@@ -856,4 +878,145 @@ fn one_polarizer_off_axis_still_halves_unpolarized_light() {
             "at {tilt} degrees off axis: {got}"
         );
     }
+}
+
+
+// ---------------------------------------------------------------------------
+// The glass a polarizing element is carried in
+// ---------------------------------------------------------------------------
+
+/// A polarizer in glass loses what its faces reflect before it has done
+/// anything a polarizer does.
+///
+/// Two air-to-glass faces pass 0.9216 of ordinary crown at normal incidence,
+/// which is part of why a real sheet polarizer's transmission for its own pass
+/// axis is well under one half.
+#[test]
+fn the_faces_of_a_laminated_polarizer_cost_what_they_reflect() {
+    let (bare, _) = bench(|s| add_pol(s, 0.0, 0.0, 0.0));
+    assert!((bare - 0.5).abs() < 1e-12, "a bare layer halves it: {bare}");
+
+    let n = 1.5;
+    let (got, _) = bench(|s| add_pol_in_glass(s, 0.0, 0.0, n));
+    let (rs, _) = face_reflectances(n, 0.0);
+    let want = 0.5 * (1.0 - rs).powi(2);
+    assert!((got - want).abs() < 1e-12, "in glass: {got} vs {want}");
+    assert!((want - 0.4608).abs() < 5e-5, "and that number is 0.4608: {want}");
+}
+
+/// Tilt a laminated polarizer and its transmission splits by which axis it
+/// passes: the faces let p through better than s, and by forty-five degrees
+/// that is a fifth more light for a polarizer that passes p than for one that
+/// passes s.
+///
+/// This is the angle dependence an ideal layer does not have and a real part
+/// cannot avoid. The oracle is Fresnel twice over, which is exact here because
+/// the two faces are reversible: a face meeting air at some angle from outside
+/// reflects what it reflects meeting glass at the refracted angle from inside.
+#[test]
+fn a_laminated_polarizer_transmits_by_which_axis_it_passes() {
+    let n = 1.5;
+    // Leaning in the plane of the element's local `+X` puts the s direction on
+    // its local `+Y`, which is an axis of 90 degrees, and p on its local `+X`.
+    for aoi in [0.0f64, 20.0, 45.0, 60.0] {
+        let (got_s, _) = skew_bench(aoi, 0.0, |s| add_pol_in_glass(s, 0.0, 90.0, n));
+        let (got_p, _) = skew_bench(aoi, 0.0, |s| add_pol_in_glass(s, 0.0, 0.0, n));
+        let (rs, rp) = face_reflectances(n, aoi);
+        let want_s = 0.5 * (1.0 - rs).powi(2);
+        let want_p = 0.5 * (1.0 - rp).powi(2);
+        assert!(
+            (got_s - want_s).abs() < 1e-12,
+            "s axis at {aoi}: {got_s} vs {want_s}"
+        );
+        assert!(
+            (got_p - want_p).abs() < 1e-12,
+            "p axis at {aoi}: {got_p} vs {want_p}"
+        );
+    }
+    let s45 = skew_bench(45.0, 0.0, |s| add_pol_in_glass(s, 0.0, 90.0, n)).0;
+    let p45 = skew_bench(45.0, 0.0, |s| add_pol_in_glass(s, 0.0, 0.0, n)).0;
+    let ratio = p45 / s45;
+    assert!(ratio > 1.15, "p beats s by a fifth at 45 degrees: {ratio}");
+    // A bare layer has none of this: both axes pass exactly half.
+    let bare_s = skew_bench(45.0, 0.0, |s| add_pol(s, 0.0, 90.0, 0.0)).0;
+    let bare_p = skew_bench(45.0, 0.0, |s| add_pol(s, 0.0, 0.0, 0.0)).0;
+    assert!(
+        (bare_s - 0.5).abs() < 1e-12 && (bare_p - 0.5).abs() < 1e-12,
+        "bare: {bare_s} and {bare_p}"
+    );
+}
+
+/// What a laminated face reflects is a ghost like any other: followed when
+/// ghosts are on, named when they are off, and absorbed in neither case.
+#[test]
+fn what_a_laminated_face_reflects_is_not_absorbed() {
+    let n = 1.5;
+    let (rs, _) = face_reflectances(n, 0.0);
+    for ghosts in [false, true] {
+        let mut s = Scene3::new();
+        add_pol_in_glass(&mut s, 0.0, 0.0, n);
+        add_rect_detector(
+            &mut s,
+            Vec3::new(60.0, 0.0, 0.0),
+            -Vec3::X,
+            20.0,
+            20.0,
+            [4, 4],
+        );
+        s.validate().expect("valid");
+        let launch = vec![launch(
+            Ray3::new(Vec3::new(-60.0, 0.0, 0.0), Vec3::X).unwrap(),
+            0.55,
+            1.0,
+        )];
+        let res = trace3(&s, &launch, &TraceConfig3 { ghosts, ..cfg() });
+        let l = &res.ledger;
+        let out = l.absorbed_volume
+            + l.absorbed_surface
+            + l.detected_incident
+            + l.escaped
+            + l.blocked_aperture
+            + l.truncated_flux
+            + l.numerical_loss;
+        let residual = (l.launched - out).abs() / l.launched;
+        assert!(residual < 1e-12, "ledger with ghosts {ghosts}: {residual:.3e}");
+        if ghosts {
+            assert!(
+                (l.escaped - rs).abs() < 1e-12,
+                "the reflection goes back out: {} vs {rs}",
+                l.escaped
+            );
+        } else {
+            assert!(
+                (l.truncated_flux - rs).abs() < 1e-12,
+                "and is named when it is not followed: {} vs {rs}",
+                l.truncated_flux
+            );
+        }
+    }
+}
+
+/// A waveplate in glass is no longer lossless, and that is the point: the
+/// retardance is still exact and the faces still take their cut.
+#[test]
+fn a_laminated_waveplate_keeps_its_retardance_and_loses_its_faces() {
+    let n = 1.5;
+    let (rs, _) = face_reflectances(n, 0.0);
+    let faces = (1.0 - rs).powi(2);
+
+    let (flux, st) = bench(|s| {
+        add_pol(s, -20.0, 0.0, 0.0);
+        let id = s
+            .add_retarder(Vec3::new(0.0, 0.0, 0.0), 15.0, 0.0, 45.0, 90.0)
+            .expect("retarder");
+        assert!(s.set_polarizing_substrate(id, n), "substrate");
+    });
+    assert!(
+        (flux - 0.5 * faces).abs() < 1e-12,
+        "the faces take their cut: {flux} vs {}",
+        0.5 * faces
+    );
+    // Still a quarter wave: fully polarized, and none of it linear.
+    assert!((st.dop() - 1.0).abs() < 1e-12, "fully polarized: {}", st.dop());
+    assert!(st.dolp() < 1e-12, "and circular: {}", st.dolp());
 }

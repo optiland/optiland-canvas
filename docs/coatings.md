@@ -120,13 +120,17 @@ special-cased. The exact tracer already resolved per-face responses and
 refracted through solids, so pointing the geometry at reality was enough:
 
 ```
-       coated face            far face
-            |                    |
-   ---------+                    |
-             \  refracted        |
-              \  path            |
-   ------------+-----------------+--------->   parallel, displaced
-                                                                     `-- and its own reflection back inside
+   incident          coated face        far face
+   ----------------->|                  |
+                     |\                 |
+                     | \ refracted      |
+                     |  \ path          |
+                     |   \              |
+                     |    +-------------|-----------> transmitted:
+                     |                  |             parallel, displaced
+                     |<-- reflected     |
+                                        `--> and its own reflection,
+                                             back through the glass
 ```
 
 The displacement is `t·sin(θ − θ′)/cos θ′`, measured perpendicular to the beam.

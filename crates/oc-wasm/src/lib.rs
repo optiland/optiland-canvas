@@ -3863,6 +3863,10 @@ pub(crate) fn surface_object_kind(s: &oc_core::scene3::SurfaceObject3) -> &'stat
         "dichroic"
     } else if f == "split" || b == "split" {
         "beamsplitter"
+    } else if f == "polarizer" || f == "retarder" {
+        // Named, because "surface" tells a reader nothing and these two are
+        // not interchangeable: one absorbs half the light and one absorbs none.
+        f
     } else {
         "surface"
     }

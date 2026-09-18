@@ -113,6 +113,13 @@ pub struct GpuBody3 {
     pub extrude: Option<GpuExtrude>,
     /// The revolved profile, when `kind == OBJ_REVOLVE`.
     pub revolve: Option<GpuRevolve>,
+    /// One entry per revolved face, in face order: the response that face
+    /// carries instead of the body's default, if any.
+    ///
+    /// This is how a coated plate is one object rather than two. The stack lives
+    /// on the face the light meets first and plain glass on the other, and the
+    /// difference between those two faces is the whole component.
+    pub face_resp: Vec<Option<GpuResponse>>,
     pub index_const: f32,
     pub dp: [f32; 6],
     /// Constant bulk attenuation, `mm⁻¹` (0 = none). Applied per world length.
@@ -216,7 +223,7 @@ impl GpuScene3 {
         let mut reject = |object: u64, kind: String| rejected.push(Reject3 { object, kind });
 
         for b in &scene.bodies {
-            match compile_body(b, &norm, &scene.catalog) {
+            match compile_body(b, &norm, &scene.catalog, scene.env.ambient_index, &coat_lambdas) {
                 Ok(gb) => bodies.push(gb),
                 Err(kind) => reject(b.common.id.0, kind),
             }
@@ -353,10 +360,27 @@ fn profile_edge_points(e: &oc_core::profile2::ProfileEdge2) -> Vec<oc_core::vec:
 }
 
 /// Compile one body, or return the reason it cannot be traced exactly.
+/// A body's refractive index at one wavelength, in f64, for baking a coating
+/// against the glass it actually sits on.
+fn body_index_at(
+    m: &Material,
+    catalog: &oc_core::material::GlassCatalog,
+    lambda_um: f64,
+) -> Option<f64> {
+    match m {
+        Material::AbbePoint { nd, vd } => Some(Cauchy::from_abbe(*nd, *vd).index(lambda_um)),
+        Material::Catalog(id) => catalog.get(*id).map(|g| g.sell.index(lambda_um)),
+        Material::Grin(f) => Some(f.base_index),
+        Material::Mirror { .. } | Material::Absorber => Some(1.0),
+    }
+}
+
 fn compile_body(
     b: &Body3,
     norm: &Norm,
     catalog: &oc_core::material::GlassCatalog,
+    ambient: f64,
+    coat_lambdas: &[f32],
 ) -> Result<GpuBody3, String> {
     let s = |v: f64| (v / norm.scale) as f32;
     // Body rotation from the transform. A cylinder composes an axis alignment on
@@ -412,6 +436,55 @@ fn compile_body(
     };
 
     let surface = classify_surface(&b.surface.default)?;
+    // Per-face responses, in the same order the revolved faces were built. A
+    // film on a face of a solid is backed by that solid's own glass, so it is
+    // baked against the body's index at each wavelength, not against air.
+    let mut face_resp: Vec<Option<GpuResponse>> = Vec::new();
+    let body_indices: Vec<f64> = if b.surface.overrides.is_empty() {
+        Vec::new()
+    } else {
+        coat_lambdas
+            .iter()
+            .map(|&l| body_index_at(&b.material, catalog, l as f64).unwrap_or(1.0))
+            .collect()
+    };
+    if let SolidGeometry3::Profile(prof) = &b.geometry {
+        for edge in &prof.profile.edges {
+            let two = b.surface.for_patch(edge.patch);
+            if std::ptr::eq(two, &b.surface.default) {
+                face_resp.push(None);
+                continue;
+            }
+            if two.from_outside != two.from_inside {
+                return Err("asymmetric per-face response (not yet in the f32 preview)".into());
+            }
+            match &two.from_outside {
+                SurfaceResponse::Coating { coating } => {
+                    face_resp.push(Some(bake_coating(
+                        coating,
+                        ambient,
+                        coat_lambdas,
+                        &body_indices,
+                    )?));
+                }
+                SurfaceResponse::DielectricFresnel { .. } => face_resp.push(None),
+                other => {
+                    return Err(format!(
+                        "per-face {} response (not yet in the f32 preview)",
+                        oc_core::build3::response_kind(other)
+                    ));
+                }
+            }
+        }
+    }
+    // Per-face responses are honoured below for revolved bodies, which is what
+    // a coated plate and a coated lens are. Anything else carrying an override
+    // is rejected by name rather than traced as if the override were not there:
+    // a dichroic silently reduced to plain glass is worse than a dichroic that
+    // says it cannot be previewed.
+    if !b.surface.overrides.is_empty() && !matches!(b.geometry, SolidGeometry3::Profile(_)) {
+        return Err("per-face response on a non-profile body (not yet in the f32 preview)".into());
+    }
     let alpha_per_mm = match &b.absorption {
         AbsorptionModel::None => 0.0,
         AbsorptionModel::Constant { alpha_per_mm } => *alpha_per_mm as f32,
@@ -430,6 +503,7 @@ fn compile_body(
         params,
         extrude,
         revolve,
+        face_resp,
         index_const: 1.0,
         dp: [0.0; 6],
         alpha_per_mm,
@@ -951,13 +1025,17 @@ pub enum GpuResponse {
 /// Bilinear lookup into a baked coating grid. The CPU mirror and the shader do
 /// exactly this, on exactly these numbers.
 ///
-/// A ray's wavelength is normally one of the baked columns exactly, so the
-/// wavelength weight comes out 0 or 1 and only the angle actually interpolates.
+/// `cos_i` is measured in `n_medium`, the medium the ray is actually in, and is
+/// converted to the ambient-medium angle the grid is indexed on by the conserved
+/// `n sin θ`. A ray's wavelength is normally one of the baked columns exactly, so
+/// the wavelength weight comes out 0 or 1 and only the angle interpolates.
 pub fn sample_coating_grid(
     lambdas: &[f32],
     rt: &[[f32; 2]],
     lambda_um: f32,
     cos_i: f32,
+    n_medium: f32,
+    n_ambient: f32,
 ) -> (f32, f32) {
     let n_l = lambdas.len();
     if n_l == 0 || rt.len() < n_l * COAT_ANGLES {
@@ -976,8 +1054,16 @@ pub fn sample_coating_grid(
         0.0
     };
 
-    let sin2 = (1.0 - cos_i * cos_i).clamp(0.0, 1.0);
-    let fa = (sin2 / 0.999).clamp(0.0, 1.0) * (COAT_ANGLES as f32 - 1.0);
+    // n sin(theta) is conserved, so carry it into the ambient medium the grid
+    // is indexed on. Past grazing there it saturates, which is where a ray is
+    // beyond total internal reflection at the outer face anyway.
+    let sin_local = (1.0 - cos_i * cos_i).max(0.0).sqrt();
+    let sin_amb = if n_ambient > 0.0 {
+        (n_medium * sin_local / n_ambient).clamp(0.0, 1.0)
+    } else {
+        sin_local
+    };
+    let fa = ((sin_amb * sin_amb) / 0.999).clamp(0.0, 1.0) * (COAT_ANGLES as f32 - 1.0);
     let a0 = fa.floor() as usize;
     let a1 = (a0 + 1).min(COAT_ANGLES - 1);
     let ta = fa - a0 as f32;
@@ -1054,7 +1140,10 @@ fn compile_response(
             r: spectral(reflectance)?,
             t: spectral(transmittance)?,
         },
-        SurfaceResponse::Coating { coating } => bake_coating(coating, ambient, coat_lambdas)?,
+        SurfaceResponse::Coating { coating } => {
+            let far: Vec<f64> = coat_lambdas.iter().map(|_| ambient).collect();
+            bake_coating(coating, ambient, coat_lambdas, &far)?
+        }
     })
 }
 
@@ -1066,7 +1155,7 @@ pub const COAT_ANGLES: usize = 64;
 pub const COAT_MAX_LAMBDAS: usize = 64;
 
 /// Evaluate a thin-film stack onto a grid: the wavelengths actually in flight,
-/// crossed with `COAT_ANGLES` samples uniform in `sin2 theta`.
+/// crossed with `COAT_ANGLES` samples of the angle.
 ///
 /// The transfer matrix is too much to run per ray in a shader, and baking is not
 /// a compromise: the grid is the *same* table for the CPU mirror and for the
@@ -1081,13 +1170,22 @@ pub const COAT_MAX_LAMBDAS: usize = 64;
 /// exactly on a sample in wavelength, leaving angle as the only axis that
 /// interpolates at all.
 ///
-/// That axis is uniform in `sin2 theta` rather than in theta because that is
-/// very nearly what the band shift is linear in: the edge of a quarter-wave
-/// stack moves as `sqrt(1 - sin2 theta / n_eff^2)`.
+/// `n_far` is the medium behind the coating at each wavelength: ambient for a
+/// standalone plate, and the body's own glass for a coated face of a solid.
+/// Baking a film with air behind it and then using it on glass is wrong by tens
+/// of percent, because what a stack reflects depends on what it is sitting on.
+///
+/// The angle axis is `sin²θ` measured **in the ambient medium**, not in whatever
+/// medium the ray happens to be in. A coated face of a plate is crossed from
+/// both sides, and the quantity both crossings share is `n sin θ`, which Snell
+/// conserves; indexing on it lets one grid serve a ray arriving through air and
+/// the same ray coming back out through the glass. It is also very nearly what
+/// the band shift is linear in.
 fn bake_coating(
     c: &oc_core::thinfilm::Coating,
     ambient: f64,
     lambdas: &[f32],
+    n_far: &[f64],
 ) -> Result<GpuResponse, String> {
     if lambdas.is_empty() {
         return Err("a coating in a scene that emits no light".to_string());
@@ -1099,8 +1197,9 @@ fn bake_coating(
         // degenerate and every coating reflects everything, which is true but
         // useless to interpolate toward.
         let cos_i = (1.0 - sin2 * 0.999).max(0.0).sqrt();
-        for &lam in lambdas {
-            let v = oc_core::thinfilm::coating_rt_at(c, ambient, ambient, lam as f64, cos_i)
+        for (i, &lam) in lambdas.iter().enumerate() {
+            let far = n_far.get(i).copied().unwrap_or(ambient);
+            let v = oc_core::thinfilm::coating_rt_at(c, ambient, far, lam as f64, cos_i)
                 .ok_or_else(|| {
                     "coating whose optical constants are tabulated away from this scene's wavelengths"
                         .to_string()

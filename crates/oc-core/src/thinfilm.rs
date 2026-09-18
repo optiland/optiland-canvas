@@ -907,6 +907,41 @@ impl BandSide {
     }
 }
 
+/// A coating for a face of real glass: the stack, solved so its edge lands where
+/// the design asks with `n_substrate` behind it.
+///
+/// This is the coating a **plate with thickness** carries, and the difference
+/// from [`plate_coating`] is the whole point of having thickness. There, the
+/// substrate and its far face were folded into one pair of numbers, because a
+/// plane has no room for glass. Here the glass is a body the tracer crosses on
+/// its own: it refracts at this face, travels, and meets the far face as a
+/// second interface. Folding anything in would count it twice.
+pub fn film_coating(design: CoatingDesign, n_incident: f64, n_substrate: f64) -> Coating {
+    Coating {
+        layers: design_layers(&design, n_incident, n_substrate),
+        backing: CoatingBacking::Medium,
+        incidence: Incidence::Film,
+        design: Some(design),
+    }
+}
+
+/// The sideways shift a plane-parallel plate gives a beam crossing it:
+/// `t sin(θ − θ′) / cos θ′`, measured perpendicular to the beam.
+///
+/// Nothing in the kernel uses this. It is the closed form the traced geometry is
+/// checked against, which is the only honest way to know that refracting in one
+/// face and out the other put the beam where a plate really puts it. A 3 mm
+/// plate of N-BK7 at 45° moves a beam almost exactly a millimetre.
+pub fn lateral_shift_mm(thickness_mm: f64, n_outside: f64, n_substrate: f64, aoi_deg: f64) -> f64 {
+    let theta = aoi_deg.to_radians();
+    let sin_t = n_outside * theta.sin() / n_substrate;
+    if !(-1.0..=1.0).contains(&sin_t) {
+        return 0.0;
+    }
+    let theta_p = sin_t.asin();
+    thickness_mm * (theta - theta_p).sin() / theta_p.cos()
+}
+
 /// Where a coating's reflectance actually crosses `level`, walking outward from
 /// the reflectance peak on `side`, or `None` if it never does inside
 /// `[lo_nm, hi_nm]`.

@@ -155,3 +155,100 @@ fn the_table_dichroic_still_traces_and_still_ignores_the_angle() {
     assert!(table(530.0) > 0.9, "inside the table's band");
     assert!(table(570.0) < 0.1, "outside it");
 }
+
+/// A coated plate with real thickness puts the beams where a real plate does.
+///
+/// This is the whole reason a plate is a body rather than a plane. Three things
+/// are checked against closed forms, not against the previous behaviour:
+///
+/// 1. the transmitted beam leaves **parallel** to the incident beam, which is
+///    what plane-parallel faces guarantee;
+/// 2. it is displaced sideways by `t·sin(θ−θ′)/cos θ′`, which for a 3 mm N-BK7
+///    plate at 45° is almost exactly a millimetre;
+/// 3. it carries the glass in its optical path length.
+#[test]
+fn a_thick_plate_walks_the_transmitted_beam_sideways() {
+    use oc_core::scene3::{AngularDistribution3, SpatialDistribution3};
+    use oc_core::thinfilm::lateral_shift_mm;
+
+    const T_MM: f64 = 3.0;
+    let mut s = Scene3::default_scene();
+    // One ray, on the axis, so its own displacement is the thing measured and
+    // not the spread of a bundle.
+    s.sources[0].spectrum = Spectrum::Lines(vec![(0.65, 1.0)]);
+    s.sources[0].spatial = SpatialDistribution3::Point;
+    s.sources[0].angular = AngularDistribution3::Direction { local_dir: Vec3::X };
+    s.add_plate_dichroic(Vec3::new(-35.0, 0.0, 0.0), 15.0, T_MM, TILT, 500.0, true)
+        .expect("the plate is valid");
+    s.validate().expect("the scene validates");
+
+    let res = trace_scene3(&s, &cfg());
+    // Between the plate and the lens: the beam is travelling free, so its height
+    // and direction there are the plate's doing and nothing else's.
+    let onward: Vec<_> = res
+        .segments
+        .iter()
+        .filter(|g| {
+            // The segment that leaves the far face and runs free toward the
+            // lens: it starts just past the plate and travels along +X.
+            let d = g.b - g.a;
+            d.x > 0.5 && g.a.x > -34.5 && g.a.x < -30.0
+        })
+        .collect();
+    assert!(
+        !onward.is_empty(),
+        "something must get through: {:?}",
+        res.segments
+    );
+
+    // 1. Parallel: plane-parallel faces cannot change a beam's direction.
+    for g in &onward {
+        let d = (g.b - g.a).normalize();
+        assert!(
+            d.y.abs() < 1e-12 && d.z.abs() < 1e-12,
+            "the transmitted beam must leave parallel to the incident one: {d:?}"
+        );
+    }
+
+    // 2. Displaced: the ray went in on y = 0 and comes out somewhere else.
+    let shift = onward.iter().map(|g| g.a.y.abs()).fold(0.0f64, f64::max);
+    let want = lateral_shift_mm(T_MM, 1.0, 1.5168, 45.0);
+    assert!(
+        (want - 1.0).abs() < 0.05,
+        "sanity: a 3 mm plate at 45 degrees shifts about 1 mm, not {want}"
+    );
+    assert!(
+        (shift - want).abs() < 0.02,
+        "traced shift {shift} mm against the closed form {want} mm"
+    );
+    // And it is a real displacement, not noise.
+    assert!(shift > 0.5, "the beam really did move: {shift} mm");
+}
+
+/// The plate's far face returns its own reflection, and the glass shows up in
+/// the optical path. Neither existed when the plate was a plane.
+#[test]
+fn a_thick_plate_has_a_second_surface() {
+    const T_MM: f64 = 4.0;
+    let mut s = Scene3::default_scene();
+    s.sources[0].spectrum = Spectrum::Lines(vec![(0.65, 1.0)]);
+    s.add_plate_dichroic(Vec3::new(-35.0, 0.0, 0.0), 15.0, T_MM, TILT, 500.0, true)
+        .expect("the plate is valid");
+    s.validate().expect("the scene validates");
+
+    let with_ghosts = TraceConfig3 {
+        ghosts: true,
+        max_ghost_bounces: 2,
+        record_detector_hits: true,
+        ..cfg()
+    };
+    let res = trace_scene3(&s, &with_ghosts);
+    // A ghost branch exists that leaves the plate region upward, which can only
+    // be the far face reflecting back out through the coated one.
+    let second_surface = res
+        .segments
+        .iter()
+        .any(|g| g.flags.ghost && (g.b - g.a).y.abs() > 1.0);
+    assert!(second_surface, "the far face must return a beam of its own");
+    assert!(res.ledger.residual() < 1e-12, "ledger {:?}", res.ledger);
+}

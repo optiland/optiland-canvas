@@ -139,11 +139,12 @@ fn shader3_structs_match_buffers3() {
         rust_layout!(Face3Buf {
             kind,
             is_conic,
-            _p0,
+            has_resp,
             _p1,
             a,
             b,
             coeffs,
+            resp,
         }),
     );
     assert_struct(

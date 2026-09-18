@@ -856,9 +856,20 @@ fn assert_tree_matches(scene: &Scene3, ray: (Vec3, Vec3, f64), ghosts: bool) -> 
 /// a ray goes does not depend on how much of it goes there.
 fn assert_tree_geometry_matches(scene: &Scene3, ray: (Vec3, Vec3, f64)) -> Vec<SegOut3> {
     let (emitted, launch) = rays_at(&[ray]);
-    let f64_res = trace3(scene, &launch, &TraceConfig3 { ghosts: false, ..cfg() });
+    let f64_res = trace3(
+        scene,
+        &launch,
+        &TraceConfig3 {
+            ghosts: false,
+            ..cfg()
+        },
+    );
     let gpu = GpuScene3::build_with_rays(scene, &emitted, opts(false));
-    assert!(gpu.rejected.is_empty(), "unexpected rejects: {:?}", gpu.rejected);
+    assert!(
+        gpu.rejected.is_empty(),
+        "unexpected rejects: {:?}",
+        gpu.rejected
+    );
     let tol = pos_tol(gpu.norm.scale);
     let f32_segs = cpu3::trace_segments(&gpu, 32).swap_remove(0);
     let f64_segs = &f64_res.segments;
@@ -1227,7 +1238,14 @@ fn a_thin_film_coating_matches_f64_within_the_grid_tolerance() {
             assert_eq!(segs.len(), 3, "both arms at {lambda_um}: {segs:?}");
         }
         let (emitted, launch) = rays_at(&rays);
-        let f64_res = trace3(&scene, &launch, &TraceConfig3 { ghosts: false, ..cfg() });
+        let f64_res = trace3(
+            &scene,
+            &launch,
+            &TraceConfig3 {
+                ghosts: false,
+                ..cfg()
+            },
+        );
         let gpu = GpuScene3::build_with_rays(&scene, &emitted, opts(false));
         assert!(gpu.rejected.is_empty(), "rejects: {:?}", gpu.rejected);
         let f32_res = cpu3::trace(&gpu, 32);
@@ -1250,4 +1268,78 @@ fn a_thin_film_coating_matches_f64_within_the_grid_tolerance() {
         "the baked grid drifts further from the matrix than documented: {worst}"
     );
     eprintln!("worst per-ray flux drift from the coating grid: {worst:.2e}");
+}
+
+/// A coated plate with real thickness, previewed against the exact tracer.
+///
+/// The plate is a body: the coating is on one face and plain glass on the other,
+/// so this is the first scene where the preview has to know *which face* it hit.
+/// Get that wrong and the film lands on the far face, which still splits the
+/// beam and still looks plausible, so the check is that the geometry matches
+/// the reference exactly: same segment count, same refracted path through the
+/// glass, same exit point.
+#[test]
+fn a_coated_plate_body_matches_f64() {
+    let mut scene = Scene3::new();
+    scene
+        .add_plate_dichroic(Vec3::new(0.0, 0.0, 0.0), 10.0, 3.0, 135.0, 550.0, true)
+        .expect("the plate is valid");
+    let through = add_rect_detector(
+        &mut scene,
+        Vec3::new(20.0, 0.0, 0.0),
+        -Vec3::X,
+        8.0,
+        8.0,
+        [3, 3],
+    );
+    let folded = add_rect_detector(
+        &mut scene,
+        Vec3::new(0.0, 20.0, 0.0),
+        -Vec3::Y,
+        8.0,
+        8.0,
+        [3, 3],
+    );
+    scene.validate().unwrap();
+
+    let mut worst: f64 = 0.0;
+    for lambda_um in [0.45, 0.50, 0.55, 0.60, 0.65] {
+        let rays: Vec<(Vec3, Vec3, f64)> = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (-1.5, 1.0)]
+            .iter()
+            .map(|&(y, z)| (Vec3::new(-15.0, y, z), Vec3::X, lambda_um))
+            .collect();
+        for &ray in &rays {
+            let segs = assert_tree_geometry_matches(&scene, ray);
+            assert!(
+                segs.len() >= 3,
+                "reflect, cross the glass, and carry on: {segs:?}"
+            );
+        }
+        let (emitted, launch) = rays_at(&rays);
+        let f64_res = trace3(
+            &scene,
+            &launch,
+            &TraceConfig3 {
+                ghosts: false,
+                ..cfg()
+            },
+        );
+        let gpu = GpuScene3::build_with_rays(&scene, &emitted, opts(false));
+        assert!(gpu.rejected.is_empty(), "rejects: {:?}", gpu.rejected);
+        let f32_res = cpu3::trace(&gpu, 32);
+        for det in [through, folded] {
+            let a = f64_res
+                .detectors
+                .iter()
+                .find(|d| d.detector.0 == det.0)
+                .expect("f64 detector");
+            let b = f32_res.detector(det.0).expect("f32 detector");
+            assert_eq!(a.hits, b.hits, "hit count at {lambda_um}");
+            worst = worst.max((a.total_incident - b.total as f64).abs() / rays.len() as f64);
+        }
+    }
+    assert!(
+        worst < 2e-3,
+        "the coating grid drifts further than documented: {worst}"
+    );
 }

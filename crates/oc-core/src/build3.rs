@@ -28,14 +28,14 @@ use crate::profile2::{
 };
 use crate::scene::Spectrum;
 use crate::thinfilm::{
-    plate_coating, Coating, CoatingDesign, DesignKind, ExitFace, Incidence,
+    film_coating, plate_coating, Coating, CoatingDesign, DesignKind, ExitFace, Incidence,
 };
 use crate::scene3::{
     AbsorptionModel, AngularDistribution3, Aperture3, ApertureInteraction, ApertureShape3, Body3,
     Detector3, DetectorGeometry3, DetectorResponse, DetectorTermination, Interpolation,
-    ObjectCommon, OutOfRangePolicy, PlanarShape2, SamplingSequence, Scene3, SolidGeometry3,
-    Source3, SourceSampling, SpatialDistribution3, SpectralScalar, SurfaceGeometry3,
-    SurfaceObject3, SurfaceProps3, SurfaceResponse,
+    ObjectCommon, OutOfRangePolicy, PatchResponseOverride, PlanarShape2, SamplingSequence, Scene3,
+    SolidGeometry3, Source3, SourceSampling, SpatialDistribution3, SpectralScalar,
+    SurfaceGeometry3, SurfaceObject3, SurfaceProps3, SurfaceResponse, TwoSidedSurfaceResponse,
 };
 use crate::vec::Vec2;
 use crate::vec3::{Isometry3, Plane3, Vec3};
@@ -609,6 +609,150 @@ impl Scene3 {
         };
         let r = spec.response();
         self.set_surface_responses(id, r.clone(), r)
+    }
+
+    /// Add a dichroic filter as a **real coated glass plate**: a disc of
+    /// substrate with the thin-film stack on the face the light meets first.
+    ///
+    /// The plate is a body, not a plane, and that is the difference. The tracer
+    /// crosses it the way light does: reflect at the coated face, refract into
+    /// the glass, cross at the internal angle, refract back out at the far face.
+    /// So the transmitted beam leaves parallel to where it started but displaced
+    /// sideways, about a millimetre for a 3 mm plate at 45°, carrying the glass
+    /// path in its optical path length, and the far face returns its own
+    /// reflection as a second beam. None of that is special-cased here; it is
+    /// what tracing a solid already does.
+    ///
+    /// The coating goes on one patch and plain glass on the other, which is why
+    /// this needs per-face responses rather than one response for the body.
+    pub fn add_plate_dichroic(
+        &mut self,
+        pos: Vec3,
+        radius_mm: f64,
+        thickness_mm: f64,
+        tilt_deg: f64,
+        edge_nm: f64,
+        long_pass: bool,
+    ) -> Option<BodyId> {
+        let design = CoatingDesign {
+            kind: if long_pass {
+                DesignKind::LongPass
+            } else {
+                DesignKind::ShortPass
+            },
+            ..CoatingDesign::long_pass(edge_nm, axial_aoi_deg(tilt_deg))
+        }
+        .sanitized()?;
+        let thickness_mm = if thickness_mm.is_finite() && thickness_mm > 0.0 {
+            thickness_mm
+        } else {
+            DEFAULT_PLATE_MM
+        };
+        let radius_mm = if radius_mm.is_finite() && radius_mm > 0.5 {
+            radius_mm
+        } else {
+            return None;
+        };
+        let coating = film_coating(design, self.env.ambient_index, PLATE_ND);
+        Some(self.add_coated_plate(pos, radius_mm, thickness_mm, tilt_deg, coating))
+    }
+
+    /// A glass disc with `coating` on the face that meets an axial beam, and
+    /// bare glass on the other.
+    pub fn add_coated_plate(
+        &mut self,
+        pos: Vec3,
+        radius_mm: f64,
+        thickness_mm: f64,
+        tilt_deg: f64,
+        coating: Coating,
+    ) -> BodyId {
+        // A plate is a singlet with both faces flat.
+        let g = SingletGeom {
+            r1_mm: f64::INFINITY,
+            r2_mm: f64::INFINITY,
+            thickness_mm,
+            semi_aperture_mm: radius_mm,
+            conic1: 0.0,
+            conic2: 0.0,
+        };
+        let curves = singlet_curves(g, SingletAspheres::default());
+        let edges: Vec<ProfileEdge2> = curves
+            .into_iter()
+            .map(|curve| ProfileEdge2 {
+                patch: self.alloc_patch_id(),
+                curve,
+            })
+            .collect();
+        // `singlet_curves` orders the loop [front face, rim, back face, rim],
+        // with the front face at local −X. The transform below carries local −X
+        // onto the plate normal, so the front face is the one an axial beam
+        // reaches first, and that is where the coating belongs.
+        let coated = edges[0].patch;
+        let phi = tilt_deg.to_radians();
+        let normal = Vec3::new(phi.cos(), phi.sin(), 0.0);
+        let q = glam::DQuat::from_rotation_arc(-Vec3::X, normal.normalize());
+        let id = self.alloc_object_id();
+        let mut common = ObjectCommon::new(id, LayerId(0));
+        common.transform =
+            Isometry3::new(pos, [q.x, q.y, q.z, q.w]).unwrap_or_else(|_| Isometry3::from_pos(pos));
+        let film = SurfaceResponse::Coating { coating };
+        self.bodies.push(Body3 {
+            common,
+            geometry: SolidGeometry3::Profile(ProfileSolid3 {
+                profile: ClosedProfile2 { edges },
+                construction: ProfileConstruction3::RevolveLocalX,
+            }),
+            material: Material::AbbePoint {
+                nd: PLATE_ND,
+                vd: PLATE_VD,
+            },
+            absorption: AbsorptionModel::None,
+            surface: SurfaceProps3 {
+                // Everything else on the body is plain glass: the far face and
+                // the rim get ordinary Fresnel, which is what they are.
+                default: TwoSidedSurfaceResponse::default(),
+                overrides: vec![PatchResponseOverride {
+                    patch: coated,
+                    response: TwoSidedSurfaceResponse {
+                        from_outside: film.clone(),
+                        from_inside: film,
+                    },
+                }],
+            },
+            priority: 0,
+        });
+        BodyId(id.0)
+    }
+
+    /// The coating on a body's coated face, if it carries one.
+    pub fn body_coating(&self, id: u64) -> Option<&Coating> {
+        let b = self.bodies.iter().find(|b| b.common.id.0 == id)?;
+        b.surface.overrides.iter().find_map(|o| {
+            match &o.response.from_outside {
+                SurfaceResponse::Coating { coating } => Some(coating),
+                _ => None,
+            }
+        })
+    }
+
+    /// The plate thickness and semi-aperture of a coated plate body, in mm.
+    pub fn plate_geometry(&self, id: u64) -> Option<(f64, f64)> {
+        let b = self.bodies.iter().find(|b| b.common.id.0 == id)?;
+        let SolidGeometry3::Profile(p) = &b.geometry else {
+            return None;
+        };
+        let mut lo = f64::INFINITY;
+        let mut hi = f64::NEG_INFINITY;
+        let mut ha: f64 = 0.0;
+        for e in &p.profile.edges {
+            for v in curve_extent(&e.curve) {
+                lo = lo.min(v.x);
+                hi = hi.max(v.x);
+                ha = ha.max(v.y.abs());
+            }
+        }
+        (hi > lo).then_some((hi - lo, ha))
     }
 
     /// Add a dichroic filter as a **real thin-film stack** on a glass plate.
@@ -1423,6 +1567,34 @@ fn response_from_kind(kind: &str) -> Option<SurfaceResponse> {
         },
         _ => return None,
     })
+}
+
+/// The substrate a plate is made of: N-BK7, the ordinary choice.
+pub const PLATE_ND: f64 = 1.5168;
+pub const PLATE_VD: f64 = 64.17;
+
+/// The substrate thickness a new plate gets, in mm.
+///
+/// Three millimetres is an ordinary catalogue beamsplitter: thin enough to drop
+/// into a beam without hunting for space, thick enough that the walk-off it
+/// gives a transmitted beam is a millimetre, which you can see rather than have
+/// to be told about.
+pub const DEFAULT_PLATE_MM: f64 = 3.0;
+
+/// The two endpoints of a profile curve, for measuring a plate.
+fn curve_extent(c: &Curve2) -> Vec<Vec2> {
+    match c {
+        Curve2::Line { a, b } => vec![*a, *b],
+        Curve2::Conic(p) => vec![
+            Vec2::new(p.vertex.x, p.half_ap),
+            Vec2::new(p.vertex.x, -p.half_ap),
+        ],
+        Curve2::EvenAsphere { base, .. } => vec![
+            Vec2::new(base.vertex.x, base.half_ap),
+            Vec2::new(base.vertex.x, -base.half_ap),
+        ],
+        _ => Vec::new(),
+    }
 }
 
 /// The angle an axial beam (along `+X`) meets a plate whose tilt is `tilt_deg`.

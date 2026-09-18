@@ -135,11 +135,14 @@ struct Seg {
 struct RFace {
     kind: u32,
     is_conic: u32,
-    _p0: u32,
+    // 1 when `resp` carries this face's own response instead of the body's: a
+    // coated plate is one body whose two faces do different things.
+    has_resp: u32,
     _p1: u32,
     a: vec4<f32>,
     b: vec4<f32>,
     coeffs: array<f32, 8>,
+    resp: Response,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -324,9 +327,9 @@ fn region_optics(p: vec3<f32>, lambda: f32) -> vec2<f32> {
 // Body geometry (local frame)
 // ---------------------------------------------------------------------------
 
-struct Hit { hit: bool, t: f32, n: vec3<f32> };
+struct Hit { hit: bool, t: f32, n: vec3<f32>, face: u32 };
 
-fn no_hit() -> Hit { return Hit(false, 0.0, vec3<f32>(0.0)); }
+fn no_hit() -> Hit { return Hit(false, 0.0, vec3<f32>(0.0), 0u); }
 
 fn sphere_hit(o: vec3<f32>, d: vec3<f32>, r: f32) -> Hit {
     let b = dot(o, d);
@@ -340,7 +343,7 @@ fn sphere_hit(o: vec3<f32>, d: vec3<f32>, r: f32) -> Hit {
     if (t0 <= EPS) { t = t1; }
     if (t <= EPS) { return no_hit(); }
     let p = o + d * t;
-    return Hit(true, t, p / r);
+    return Hit(true, t, p / r, 0u);
 }
 
 fn box_hit(o: vec3<f32>, d: vec3<f32>, half: vec3<f32>) -> Hit {
@@ -371,7 +374,7 @@ fn box_hit(o: vec3<f32>, d: vec3<f32>, half: vec3<f32>) -> Hit {
     let p = o + d * t;
     var nl = vec3<f32>(0.0);
     nl[ax] = sign(p[ax]);
-    return Hit(true, t, nl);
+    return Hit(true, t, nl, 0u);
 }
 
 fn cylinder_hit(o: vec3<f32>, d: vec3<f32>, r: f32, hl: f32) -> Hit {
@@ -389,7 +392,7 @@ fn cylinder_hit(o: vec3<f32>, d: vec3<f32>, r: f32, hl: f32) -> Hit {
                 let z = o.z + t * d.z;
                 if (t > EPS && abs(z) <= hl && (!best.hit || t < best.t)) {
                     let p = o + d * t;
-                    best = Hit(true, t, vec3<f32>(p.x, p.y, 0.0) / r);
+                    best = Hit(true, t, vec3<f32>(p.x, p.y, 0.0) / r, 0u);
                 }
             }
         }
@@ -402,7 +405,7 @@ fn cylinder_hit(o: vec3<f32>, d: vec3<f32>, r: f32, hl: f32) -> Hit {
             if (t > EPS && (!best.hit || t < best.t)) {
                 let p = o + d * t;
                 if (p.x * p.x + p.y * p.y <= r * r) {
-                    best = Hit(true, t, vec3<f32>(0.0, 0.0, nz[i]));
+                    best = Hit(true, t, vec3<f32>(0.0, 0.0, nz[i]), 0u);
                 }
             }
         }
@@ -442,7 +445,7 @@ fn extrude_hit(start: u32, count: u32, z_min: f32, z_max: f32, o: vec3<f32>, d: 
                     let p = o + d * t;
                     var n = vec3<f32>(s.y, s.z, 0.0);
                     if (extrude_contains(start, count, z_min, z_max, p + n * EPS)) { n = -n; }
-                    best = Hit(true, t, n);
+                    best = Hit(true, t, n, 0u);
                 }
             }
         }
@@ -455,7 +458,7 @@ fn extrude_hit(start: u32, count: u32, z_min: f32, z_max: f32, o: vec3<f32>, d: 
             if (t > EPS && (!best.hit || t < best.t)) {
                 let p = o + d * t;
                 if (poly_contains(start, count, vec2<f32>(p.x, p.y))) {
-                    best = Hit(true, t, vec3<f32>(0.0, 0.0, nz[i]));
+                    best = Hit(true, t, vec3<f32>(0.0, 0.0, nz[i]), 0u);
                 }
             }
         }
@@ -582,7 +585,7 @@ fn sag_accept(best: Hit, t: f32, tmin: f32, o: vec3<f32>, d: vec3<f32>, vertex_x
     let r = sqrt(p.y * p.y + p.z * p.z);
     let z = (p.x - vertex_x) * axis_sign;
     if (r <= outer_r + r_tol && z >= z_lo - z_tol && z <= z_hi + z_tol) {
-        return Hit(true, t, sag_normal(axis_sign, c, k, coeffs, p));
+        return Hit(true, t, sag_normal(axis_sign, c, k, coeffs, p), 0u);
     }
     return best;
 }
@@ -669,7 +672,7 @@ fn frustum_face_hit(f: RFace, o: vec3<f32>, d: vec3<f32>, tmin: f32) -> Hit {
         let r_hi = max(y0, y1);
         let pad = 1e-9 * (1.0 + r_hi);
         if (r >= r_lo - pad && r <= r_hi + pad) {
-            return Hit(true, t, vec3<f32>(1.0, 0.0, 0.0));
+            return Hit(true, t, vec3<f32>(1.0, 0.0, 0.0), 0u);
         }
         return no_hit();
     }
@@ -690,7 +693,7 @@ fn frustum_face_hit(f: RFace, o: vec3<f32>, d: vec3<f32>, tmin: f32) -> Hit {
         let p = o + d * t;
         let r_line = m * p.x + b;
         if (r_line >= -pad && p.x >= x_lo - pad && p.x <= x_hi + pad) {
-            best = Hit(true, t, normalize(vec3<f32>(-m * r_line, p.y, p.z)));
+            best = Hit(true, t, normalize(vec3<f32>(-m * r_line, p.y, p.z)), 0u);
         }
     }
     return best;
@@ -728,7 +731,7 @@ fn arc_face_hit(f: RFace, o: vec3<f32>, d: vec3<f32>, tmin: f32) -> Hit {
         let rad = sqrt(p.y * p.y + p.z * p.z);
         let ang = atan2(rad, p.x - center_x);
         if (angle_in_sweep(ang, a0, a1)) {
-            best = Hit(true, t, (p - c3) / r);
+            best = Hit(true, t, (p - c3) / r, 0u);
         }
     }
     return best;
@@ -751,6 +754,7 @@ fn revolve_hit(face_start: u32, face_count: u32, cstart: u32, ccount: u32,
         }
         if (h.hit && (!best.hit || h.t < best.t)) {
             best = h;
+            best.face = fi;
         }
     }
     if (best.hit) {
@@ -878,6 +882,44 @@ fn sample_spectral(s: Spectral, lambda: f32) -> vec2<f32> {
     return vec2<f32>(a.y + f * (b.y - a.y), 1.0);
 }
 
+// Bilinear lookup into a baked coating grid: COAT_ANGLES rows, uniform in the
+// ambient-medium sin^2(theta), of one (R, T) pair per baked wavelength.
+//
+// `cos_i` is measured in `n_medium`, the medium the ray is actually in. A coated
+// face of a plate is crossed from both sides, and the quantity both crossings
+// share is n*sin(theta), which Snell conserves, so that is what the grid is
+// indexed on. Mirrors scene3::sample_coating_grid exactly.
+fn sample_coating(resp: Response, lambda: f32, cos_i: f32, n_medium: f32) -> vec2<f32> {
+    let n_l = resp.t.tab_count;
+    if (n_l == 0u) { return vec2<f32>(0.0, 0.0); }
+    var l0 = 0u;
+    loop {
+        if (l0 + 2u >= n_l) { break; }
+        if (verts[resp.t.tab_start + l0 + 1u].x >= lambda) { break; }
+        l0 = l0 + 1u;
+    }
+    let l1 = min(l0 + 1u, n_l - 1u);
+    let lam_a = verts[resp.t.tab_start + l0].x;
+    let lam_b = verts[resp.t.tab_start + l1].x;
+    var tl = 0.0;
+    if (lam_b > lam_a) { tl = clamp((lambda - lam_a) / (lam_b - lam_a), 0.0, 1.0); }
+
+    let sin_local = sqrt(max(1.0 - cos_i * cos_i, 0.0));
+    var sin_amb = sin_local;
+    if (params.ambient > 0.0) {
+        sin_amb = clamp(n_medium * sin_local / params.ambient, 0.0, 1.0);
+    }
+    let fa = clamp((sin_amb * sin_amb) / 0.999, 0.0, 1.0) * f32(COAT_ANGLES - 1u);
+    let a0 = u32(floor(fa));
+    let a1 = min(a0 + 1u, COAT_ANGLES - 1u);
+    let ta = fa - floor(fa);
+
+    let base = resp.r.tab_start;
+    let lo = mix(verts[base + a0 * n_l + l0], verts[base + a0 * n_l + l1], tl);
+    let hi = mix(verts[base + a1 * n_l + l0], verts[base + a1 * n_l + l1], tl);
+    return mix(lo, hi, ta);
+}
+
 // ---------------------------------------------------------------------------
 // Per-thread branch stack
 // ---------------------------------------------------------------------------
@@ -913,15 +955,15 @@ fn push(w: Work, min_flux: f32) {
 // ---------------------------------------------------------------------------
 
 // kind: 0 body, 1 surface, 2 aperture, 3 detector, 4 none
-struct Event { t: f32, kind: u32, idx: u32, n: vec3<f32>, uv: vec2<f32> };
+struct Event { t: f32, kind: u32, idx: u32, n: vec3<f32>, uv: vec2<f32>, face: u32 };
 
 fn nearest_event(o: vec3<f32>, d: vec3<f32>) -> Event {
-    var ev = Event(params.bounds, 4u, 0u, vec3<f32>(0.0), vec2<f32>(0.0));
+    var ev = Event(params.bounds, 4u, 0u, vec3<f32>(0.0), vec2<f32>(0.0), 0u);
 
     for (var bi = 0u; bi < params.n_bodies; bi = bi + 1u) {
         let h = body_hit(bi, o, d);
         if (h.hit && h.t < ev.t) {
-            ev = Event(h.t, 0u, bi, h.n, vec2<f32>(0.0));
+            ev = Event(h.t, 0u, bi, h.n, vec2<f32>(0.0), h.face);
         }
     }
     for (var si = 0u; si < params.n_surfaces; si = si + 1u) {
@@ -929,7 +971,7 @@ fn nearest_event(o: vec3<f32>, d: vec3<f32>) -> Event {
         let f = plane_face(surface_rot(s), s.pos.xyz, o, d);
         if (f.hit && f.t < ev.t && shape_contains(s.shape_kind, s.shape_a, s.shape_b, s.poly_start, s.poly_count, f.uv)) {
             let n = normalize(surface_rot(s) * vec3<f32>(0.0, 0.0, 1.0));
-            ev = Event(f.t, 1u, si, n, f.uv);
+            ev = Event(f.t, 1u, si, n, f.uv, 0u);
         }
     }
     for (var ai = 0u; ai < params.n_apertures; ai = ai + 1u) {
@@ -948,14 +990,14 @@ fn nearest_event(o: vec3<f32>, d: vec3<f32>) -> Event {
             masked = shape_contains(a.outer_kind, a.outer_a, a.outer_b, a.outer_poly_start, a.outer_poly_count, uv);
         }
         if (masked) {
-            ev = Event(t, 2u, ai, vec3<f32>(0.0), vec2<f32>(0.0));
+            ev = Event(t, 2u, ai, vec3<f32>(0.0), vec2<f32>(0.0), 0u);
         }
     }
     for (var di = 0u; di < params.n_detectors; di = di + 1u) {
         let dd = detectors[di];
         let f = plane_face(detector_rot(dd), dd.pos.xyz, o, d);
         if (f.hit && f.t < ev.t && shape_contains(dd.shape_kind, dd.shape_a, dd.shape_b, 0u, 0u, f.uv)) {
-            ev = Event(f.t, 3u, di, vec3<f32>(0.0), f.uv);
+            ev = Event(f.t, 3u, di, vec3<f32>(0.0), f.uv, 0u);
         }
     }
     return ev;
@@ -1051,6 +1093,34 @@ fn interact_body(w: Work, ev: Event, point: vec3<f32>, flux_end: f32, lambda: f3
     let n1 = m1.x;
     let n2 = m2.x;
 
+    // A coated face of a solid: a real plate carries its film on one face and
+    // plain glass on the other, so the response belongs to the face. R and T
+    // come from the baked grid at this ray's own angle; the transmitted branch
+    // still refracts, because unlike a zero-thickness plate this interface
+    // really does change the medium. Mirrors cpu3::interact_body.
+    let b = bodies[ev.idx];
+    if (b.kind == OBJ_REVOLVE && ev.face < b.face_count) {
+        let f = faces[b.face_start + ev.face];
+        if (f.has_resp == 1u && f.resp.kind == RESP_COATING) {
+            let cos_ic = clamp(-dot(n, w.d), 0.0, 1.0);
+            let rt = sample_coating(f.resp, lambda, cos_ic, w.medium_n);
+            let rc = clamp(rt.x, 0.0, 1.0);
+            let tc = clamp(rt.y, 0.0, 1.0);
+            if (rc > 0.0) {
+                let dir = reflect3(w.d, n);
+                push(Work(point + dir * EPS, dir, flux_end * rc, w.depth + 1u, w.gdepth, w.medium_n, w.medium_alpha, w.flags & ~SEG_TIR), min_flux);
+            }
+            if (tc > 0.0) {
+                let resc = refract3(w.d, n, n1, n2);
+                if (resc.w >= 0.5) {
+                    let td2 = resc.xyz;
+                    push(Work(point + td2 * EPS, td2, flux_end * tc, w.depth + 1u, w.gdepth, n2, m2.y, w.flags & ~SEG_TIR), min_flux);
+                }
+            }
+            return;
+        }
+    }
+
     let res = refract3(w.d, n, n1, n2);
     if (res.w < 0.5) {
         // Total internal reflection.
@@ -1111,36 +1181,10 @@ fn interact_surface(w: Work, ev: Event, point: vec3<f32>, flux_end: f32, lambda:
         }
     } else if (kind == RESP_COATING) {
         // A real thin-film stack, read off the grid baked from the transfer
-        // matrix when the scene compiled. Bilinear in wavelength and in
-        // sin2(theta), and identical to what cpu3 computes on the same numbers.
-        // A ray's wavelength is normally one of the baked columns exactly, so
-        // the wavelength weight comes out 0 or 1 and only the angle actually
-        // interpolates. Both branches are primary paths, like explicit R/T.
-        let n_l = resp.t.tab_count;
-        if (n_l == 0u) { return; }
-        var l0 = 0u;
-        loop {
-            if (l0 + 2u >= n_l) { break; }
-            if (verts[resp.t.tab_start + l0 + 1u].x >= lambda) { break; }
-            l0 = l0 + 1u;
-        }
-        let l1 = min(l0 + 1u, n_l - 1u);
-        let lam_a = verts[resp.t.tab_start + l0].x;
-        let lam_b = verts[resp.t.tab_start + l1].x;
-        var tl = 0.0;
-        if (lam_b > lam_a) { tl = clamp((lambda - lam_a) / (lam_b - lam_a), 0.0, 1.0); }
-
+        // matrix when the scene compiled. Both branches are primary paths, like
+        // explicit R/T below.
         let cos_i = clamp(-dot(n_oppose, w.d), 0.0, 1.0);
-        let sin2 = clamp(1.0 - cos_i * cos_i, 0.0, 1.0);
-        let fa = clamp(sin2 / 0.999, 0.0, 1.0) * f32(COAT_ANGLES - 1u);
-        let a0 = u32(floor(fa));
-        let a1 = min(a0 + 1u, COAT_ANGLES - 1u);
-        let ta = fa - floor(fa);
-
-        let base = resp.r.tab_start;
-        let lo = mix(verts[base + a0 * n_l + l0], verts[base + a0 * n_l + l1], tl);
-        let hi = mix(verts[base + a1 * n_l + l0], verts[base + a1 * n_l + l1], tl);
-        let rt = mix(lo, hi, ta);
+        let rt = sample_coating(resp, lambda, cos_i, w.medium_n);
         let r = clamp(rt.x, 0.0, 1.0);
         let t = clamp(rt.y, 0.0, 1.0);
         if (r > 0.0) {

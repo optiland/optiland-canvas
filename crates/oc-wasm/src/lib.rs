@@ -2072,6 +2072,10 @@ impl Canvas {
                 SurfaceResponse::Absorber => ("0".into(), "0".into()),
                 SurfaceResponse::ThinLens { .. } => ("0".into(), "1".into()),
                 SurfaceResponse::DielectricFresnel { .. } => ("null".into(), "null".into()),
+                // A film has no constant R or T: both depend on the angle, and
+                // reporting a number here would be the very thing this is meant
+                // to stop. `surfaceFilmJSON` carries the stack instead.
+                SurfaceResponse::Coating { .. } => ("null".into(), "null".into()),
             };
             let dichroic = DichroicSpec::from_response(r).map_or("null".into(), |d| {
                 format!(
@@ -2088,15 +2092,42 @@ impl Canvas {
     }
 
     /// A surface face's reflectance and transmittance at each wavelength in
-    /// `nm`, as `[R, T, R, T, ...]`: the tables the tracer samples, so a plot
-    /// of them is the coating the rays see. A mirror reports its reflectivity
-    /// and no transmission; an uncoated dielectric face depends on the angle
-    /// of incidence and reports `NaN`, as does a table asked for a wavelength
+    /// `nm`, as `[R, T, R, T, ...]`, **for light arriving at `aoi_deg`**.
+    ///
+    /// A real coating is a function of two variables and always was; the
+    /// kernel just used to know only one of them. A thin-film face runs the
+    /// transfer matrix at the angle asked for, so plotting this at the angle
+    /// the part is actually used at is plotting what the rays see. The
+    /// responses that carry a table in wavelength alone ignore `aoi_deg` and
+    /// report the same curve at every angle, which is exactly what they do in
+    /// the tracer.
+    ///
+    /// A mirror reports its reflectivity and no transmission; an uncoated
+    /// dielectric face reports `NaN`, as does a table asked for a wavelength
     /// outside its range with no out-of-range value. Empty if `id` is not a
     /// surface.
     #[wasm_bindgen(js_name = surfaceRtF64)]
-    pub fn surface_rt_f64(&self, id: f64, back: bool, nm: &[f64]) -> Vec<f64> {
+    pub fn surface_rt_f64(&self, id: f64, back: bool, nm: &[f64], aoi_deg: f64) -> Vec<f64> {
         use oc_core::scene3::SurfaceResponse;
+        // A coated plate is a solid now, so its film is a face of a body rather
+        // than a surface response. Evaluate it against the glass behind it,
+        // which is what the tracer does and what makes the curve mean anything.
+        if let Some(scene) = self.scene3.as_ref() {
+            if scene.surface_responses(id as u64).is_none() {
+                if let Some(coating) = scene.coating_for_object(id as u64) {
+                    let cos_i = aoi_deg.to_radians().cos();
+                    let mut out = Vec::with_capacity(nm.len() * 2);
+                    for &w in nm {
+                        let um = w / 1000.0;
+                        let (n0, n_far) = scene.coated_face_media(id as u64, um);
+                        let v = oc_core::thinfilm::coating_rt_at(coating, n0, n_far, um, cos_i);
+                        out.push(v.map_or(f64::NAN, |x| x.r()));
+                        out.push(v.map_or(f64::NAN, |x| x.t()));
+                    }
+                    return out;
+                }
+            }
+        }
         let Some((front, back_r)) = self
             .scene3
             .as_ref()
@@ -2117,11 +2148,275 @@ impl Canvas {
                 SurfaceResponse::Absorber => (Some(0.0), Some(0.0)),
                 SurfaceResponse::ThinLens { .. } => (Some(0.0), Some(1.0)),
                 SurfaceResponse::DielectricFresnel { .. } => (None, None),
+                SurfaceResponse::Coating { coating } => {
+                    let cos_i = aoi_deg.to_radians().cos();
+                    let ambient = self.scene3.as_ref().map_or(1.0, |s| s.env.ambient_index);
+                    match oc_core::thinfilm::coating_rt(coating, ambient, um, cos_i) {
+                        Some(v) => (Some(v.r()), Some(v.t())),
+                        None => (None, None),
+                    }
+                }
             };
             out.push(rr.unwrap_or(f64::NAN));
             out.push(tt.unwrap_or(f64::NAN));
         }
         out
+    }
+
+    /// The angle, in degrees, at which the scene's light meets this surface.
+    ///
+    /// The angle worth designing a coating for and worth plotting one at, since
+    /// it is the one the part is being used at. `NaN` for a non-surface id or a
+    /// scene with no light in it.
+    #[wasm_bindgen(js_name = surfaceAoiDeg)]
+    pub fn surface_aoi_deg(&self, id: f64) -> f64 {
+        self.scene3
+            .as_ref()
+            .and_then(|s| s.object_axial_aoi_deg(id as u64))
+            .unwrap_or(f64::NAN)
+    }
+
+    /// The thin-film stack on a surface's front face, or `null` if it carries
+    /// none.
+    ///
+    /// `{aoiDeg, design: {kind, lambdaNm, aoiDeg, periods, nHigh, nLow} | null,
+    /// substrateN, layers: [{name, n, k, thicknessNm}], edgeNm, peakR}`.
+    ///
+    /// `aoiDeg` is the angle the scene's light actually meets this surface at,
+    /// and `edgeNm` is where the built stack really crosses 50 % at that angle,
+    /// measured rather than assumed. When the design asked for an edge the stack
+    /// cannot deliver, those two numbers disagree and the editor can say so.
+    #[wasm_bindgen(js_name = surfaceFilmJSON)]
+    pub fn surface_film_json(&self, id: f64) -> String {
+        use oc_core::thinfilm::{crossing_nm, BandSide, CoatingBacking, DesignKind};
+        let Some(scene) = self.scene3.as_ref() else {
+            return "null".into();
+        };
+        let Some(coating) = scene.coating_for_object(id as u64) else {
+            return "null".into();
+        };
+        let aoi = scene.object_axial_aoi_deg(id as u64).unwrap_or(0.0);
+        let ambient = scene.env.ambient_index;
+
+        let layers: Vec<String> = coating
+            .layers
+            .iter()
+            .map(|l| {
+                let n = l.material.n.sample(0.55).unwrap_or(f64::NAN);
+                let k = l.material.k.sample(0.55).unwrap_or(0.0);
+                format!(
+                    "{{\"name\":{},\"n\":{},\"k\":{},\"thicknessNm\":{}}}",
+                    serde_json::to_string(&l.material.name).unwrap_or_else(|_| "\"\"".into()),
+                    json_num(n),
+                    json_num(k),
+                    json_num(l.thickness_nm)
+                )
+            })
+            .collect();
+
+        let design = match &coating.design {
+            Some(d) => format!(
+                "{{\"kind\":\"{}\",\"lambdaNm\":{},\"aoiDeg\":{},\"periods\":{},\"nHigh\":{},\"nLow\":{}}}",
+                match d.kind {
+                    DesignKind::QuarterWaveStack => "mirror",
+                    DesignKind::LongPass => "long-pass",
+                    DesignKind::ShortPass => "short-pass",
+                    DesignKind::SingleLayerAr => "ar-1",
+                    DesignKind::BroadbandAr => "ar-3",
+                },
+                json_num(d.lambda_nm),
+                json_num(d.aoi_deg),
+                d.periods,
+                json_num(d.n_high),
+                json_num(d.n_low)
+            ),
+            None => "null".into(),
+        };
+        let plate = scene.plate_geometry(id as u64);
+        let substrate = match &coating.backing {
+            CoatingBacking::Plate { substrate, .. } => {
+                json_num(substrate.n.sample(0.55).unwrap_or(f64::NAN))
+            }
+            // A coating on a solid is backed by that solid's own glass, which is
+            // the scene's to report rather than the coating's.
+            CoatingBacking::Medium => {
+                if plate.is_some() {
+                    json_num(oc_core::build3::PLATE_ND)
+                } else {
+                    "null".into()
+                }
+            }
+        };
+        let long_pass = !matches!(
+            coating.design.map(|d| d.kind),
+            Some(DesignKind::ShortPass)
+        );
+        let edge = crossing_nm(
+            coating,
+            ambient,
+            ambient,
+            aoi,
+            0.5,
+            250.0,
+            1600.0,
+            BandSide::of(long_pass),
+        );
+        let peak = (250..=1600)
+            .step_by(5)
+            .filter_map(|nm| {
+                oc_core::thinfilm::coating_rt(coating, ambient, nm as f64 / 1000.0, aoi.to_radians().cos())
+            })
+            .map(|v| v.r())
+            .fold(0.0f64, f64::max);
+
+        format!(
+            "{{\"aoiDeg\":{},\"design\":{},\"substrateN\":{},\"layers\":[{}],\"edgeNm\":{},\"peakR\":{},\"thicknessMm\":{},\"radiusMm\":{}}}",
+            json_num(aoi),
+            design,
+            substrate,
+            layers.join(","),
+            edge.map(json_num).unwrap_or_else(|| "null".into()),
+            json_num(peak),
+            plate.map(|(t, _)| json_num(t)).unwrap_or_else(|| "null".into()),
+            plate.map(|(_, r)| json_num(r)).unwrap_or_else(|| "null".into())
+        )
+    }
+
+    /// Rebuild a surface's coating from a design, as a real quarter-wave stack
+    /// solved so its edge lands at `lambda_nm` **at `aoi_deg`**.
+    ///
+    /// `kind` is `long-pass`, `short-pass`, `mirror`, `ar-1` or `ar-3`. Bumps
+    /// the revision. `false` for an unknown kind, a non-finite number, or a
+    /// non-surface id.
+    #[wasm_bindgen(js_name = setSurfaceCoatingDesign)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_surface_coating_design(
+        &mut self,
+        id: f64,
+        kind: &str,
+        lambda_nm: f64,
+        aoi_deg: f64,
+        periods: u32,
+        n_high: f64,
+        n_low: f64,
+    ) -> bool {
+        use oc_core::thinfilm::{CoatingDesign, DesignKind};
+        let kind = match kind {
+            "long-pass" => DesignKind::LongPass,
+            "short-pass" => DesignKind::ShortPass,
+            "mirror" => DesignKind::QuarterWaveStack,
+            "ar-1" => DesignKind::SingleLayerAr,
+            "ar-3" => DesignKind::BroadbandAr,
+            _ => return false,
+        };
+        let design = CoatingDesign {
+            kind,
+            lambda_nm,
+            aoi_deg,
+            periods,
+            n_high,
+            n_low,
+        };
+        let Some(scene) = self.scene3.as_mut() else {
+            return false;
+        };
+        if scene.set_object_coating_design(id as u64, design) {
+            self.revision += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Set one film layer's physical thickness, in nanometres. Bumps the
+    /// revision. `false` for a bad index, a non-finite thickness, or a surface
+    /// with no film on it.
+    #[wasm_bindgen(js_name = setCoatingLayerThickness)]
+    pub fn set_coating_layer_thickness(&mut self, id: f64, index: usize, nm: f64) -> bool {
+        let Some(scene) = self.scene3.as_mut() else {
+            return false;
+        };
+        if scene.set_object_layer_thickness(id as u64, index, nm) {
+            self.revision += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Add a dichroic filter as a **real coated glass plate**: a disc of
+    /// substrate `thickness_mm` thick with the stack on the face the light
+    /// meets first, its edge solved for the angle the tilt implies.
+    ///
+    /// The plate is a solid, so the tracer crosses it the way light does: the
+    /// transmitted beam leaves displaced sideways, carrying the glass in its
+    /// optical path, and the far face returns its own reflection. Returns the
+    /// new object id, or -1.
+    #[wasm_bindgen(js_name = addPlateDichroic)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_plate_dichroic(
+        &mut self,
+        x: f64,
+        y: f64,
+        z: f64,
+        radius_mm: f64,
+        thickness_mm: f64,
+        tilt_deg: f64,
+        edge_nm: f64,
+        long_pass: bool,
+    ) -> f64 {
+        let Some(scene) = self.scene3.as_mut() else {
+            return -1.0;
+        };
+        match scene.add_plate_dichroic(
+            oc_core::vec3::Vec3::new(x, y, z),
+            radius_mm,
+            thickness_mm,
+            tilt_deg,
+            edge_nm,
+            long_pass,
+        ) {
+            Some(id) => {
+                self.revision += 1;
+                id.0 as f64
+            }
+            None => -1.0,
+        }
+    }
+
+    /// Add a dichroic filter as a zero-thickness plate carrying a real stack.
+    ///
+    /// The older shape of the same component, kept for documents that hold one
+    /// and for the tests that pin its behaviour. It gets the flux right and the
+    /// geometry wrong: no glass to cross, so no walk-off and no far face.
+    #[wasm_bindgen(js_name = addFilmDichroic)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_film_dichroic(
+        &mut self,
+        x: f64,
+        y: f64,
+        z: f64,
+        radius_mm: f64,
+        tilt_deg: f64,
+        edge_nm: f64,
+        long_pass: bool,
+    ) -> f64 {
+        let Some(scene) = self.scene3.as_mut() else {
+            return -1.0;
+        };
+        match scene.add_film_dichroic(
+            oc_core::vec3::Vec3::new(x, y, z),
+            radius_mm,
+            tilt_deg,
+            edge_nm,
+            long_pass,
+        ) {
+            Some(id) => {
+                self.revision += 1;
+                id as f64
+            }
+            None => -1.0,
+        }
     }
 
     /// Set a surface object's front/back responses (`mirror`, `absorb`,
@@ -3032,6 +3327,16 @@ pub(crate) fn pack_world(per_ray: &[Vec<oc_gpu::cpu3::SegOut3>]) -> Vec<f32> {
     out
 }
 
+/// A finite number for JSON, or `null`. `serde_json` refuses NaN and infinity,
+/// and a silent `0` there would be a lie about a measurement that failed.
+fn json_num(v: f64) -> String {
+    if v.is_finite() {
+        format!("{v}")
+    } else {
+        "null".to_string()
+    }
+}
+
 impl Canvas {
     /// The compiled f32 scene the interactive preview traces, on the CPU mirror
     /// or the GPU. `None` until a 3D scene is loaded.
@@ -3357,7 +3662,10 @@ pub(crate) fn surface_object_kind(s: &oc_core::scene3::SurfaceObject3) -> &'stat
     );
     if f == "mirror" {
         "mirror"
-    } else if f == "dichroic" || b == "dichroic" || f == "coated" || b == "coated" {
+    } else if f == "film" || b == "film" || f == "dichroic" || b == "dichroic" || f == "coated" || b == "coated"
+    {
+        // A film is a dichroic to the rest of the app: same role in a scene, same
+        // colour treatment, same picking. What differs is that it knows the angle.
         "dichroic"
     } else if f == "split" || b == "split" {
         "beamsplitter"
@@ -3403,6 +3711,18 @@ fn body_kind_construction(b: &oc_core::scene3::Body3) -> (&'static str, &'static
         SolidGeometry3::Sphere { .. } => ("sphere", "analytic"),
         SolidGeometry3::Box { .. } => ("box", "analytic"),
         SolidGeometry3::Cylinder { .. } => ("cylinder", "analytic"),
+        // A coated plate is a revolved solid like any lens, and calling it one
+        // tells you nothing about what it is for. Its film is the component.
+        SolidGeometry3::Profile(_)
+            if b.surface.overrides.iter().any(|o| {
+                matches!(
+                    o.response.from_outside,
+                    oc_core::scene3::SurfaceResponse::Coating { .. }
+                )
+            }) =>
+        {
+            ("dichroic", "coated plate")
+        }
         SolidGeometry3::Profile(p) => (
             "profile",
             match p.construction {
@@ -3885,6 +4205,69 @@ mod scene3_tests {
     }
 
     #[test]
+    fn a_film_dichroic_is_added_read_back_and_edited() {
+        let mut c = Canvas::new();
+        c.new_default_scene3();
+        // The real component: a coated glass plate with thickness.
+        let id = c.add_plate_dichroic(-35.0, 0.0, 0.0, 15.0, 3.0, 135.0, 550.0, true);
+        assert!(id >= 0.0, "the plate is valid");
+
+        let film: serde_json::Value =
+            serde_json::from_str(&c.surface_film_json(id)).expect("film JSON");
+        // The plate is hung at 135°, so the light meets it at 45°, and that is
+        // the angle the design was solved for and the readout reports.
+        assert!((film["aoiDeg"].as_f64().unwrap() - 45.0).abs() < 1e-9);
+        assert_eq!(film["design"]["kind"], "long-pass");
+        assert_eq!(film["design"]["lambdaNm"].as_f64(), Some(550.0));
+        // A real stack, and one that really does cut where it was asked to.
+        let layers = film["layers"].as_array().expect("layers");
+        assert_eq!(layers.len(), 17, "eight symmetric periods, half layers merged");
+        // It is a real plate: glass with a thickness and a clear aperture.
+        assert_eq!(film["thicknessMm"].as_f64(), Some(3.0));
+        assert_eq!(film["radiusMm"].as_f64(), Some(15.0));
+        assert!((film["substrateN"].as_f64().unwrap() - 1.5168).abs() < 1e-9);
+        assert!(layers[0]["thicknessNm"].as_f64().unwrap() > 10.0);
+        let edge = film["edgeNm"].as_f64().expect("a measured edge");
+        assert!((edge - 550.0).abs() < 4.0, "measured edge {edge}");
+        assert!(film["peakR"].as_f64().unwrap() > 0.98);
+
+        // R and T now depend on the angle, and the readout says so. The band
+        // walks blue as the angle opens up, so on axis this stack's edge sits
+        // some 40 nm HIGHER than the 550 nm it was solved for at 45°. A
+        // wavelength between the two edges is reflected by one and passed by
+        // the other, which is the whole behaviour that used to be missing.
+        let at = |aoi: f64| c.surface_rt_f64(id, false, &[575.0], aoi)[0];
+        assert!(
+            at(45.0) < 0.25,
+            "575 nm is past the edge at the design angle: {}",
+            at(45.0)
+        );
+        assert!(
+            at(0.0) > 0.8,
+            "on axis the band has not reached 575 nm yet: {}",
+            at(0.0)
+        );
+
+        // A layer edit reaches the stack the tracer reads.
+        assert!(c.set_coating_layer_thickness(id, 0, 90.0));
+        let after: serde_json::Value = serde_json::from_str(&c.surface_film_json(id)).unwrap();
+        assert_eq!(after["layers"][0]["thicknessNm"].as_f64(), Some(90.0));
+        assert!(!c.set_coating_layer_thickness(id, 99, 90.0), "no such layer");
+        assert!(!c.set_coating_layer_thickness(id, 0, f64::NAN));
+
+        // Re-designing replaces the stack.
+        assert!(c.set_surface_coating_design(id, "short-pass", 600.0, 45.0, 10, 2.35, 1.46));
+        let sp: serde_json::Value = serde_json::from_str(&c.surface_film_json(id)).unwrap();
+        assert_eq!(sp["design"]["kind"], "short-pass");
+        assert!((sp["edgeNm"].as_f64().unwrap() - 600.0).abs() < 5.0);
+        assert!(!c.set_surface_coating_design(id, "nonsense", 600.0, 45.0, 10, 2.35, 1.46));
+
+        // An object with no film says so rather than inventing one.
+        let plain = c.add_beam_splitter(-60.0, 0.0, 15.0, 135.0, 0.5, 0.5);
+        assert_eq!(c.surface_film_json(plain), "null");
+    }
+
+    #[test]
     fn splitters_and_dichroics_are_added_listed_and_read_back() {
         let mut c = Canvas::new();
         c.new_default_scene3();
@@ -3923,7 +4306,8 @@ mod scene3_tests {
         assert_eq!(c.surface_coating_json(-1.0), "null");
 
         // The curves the tracer samples.
-        let rt = c.surface_rt_f64(dc, false, &[450.0, 550.0, 650.0]);
+        // A table-driven dichroic ignores the angle, so 0 is as good as any.
+        let rt = c.surface_rt_f64(dc, false, &[450.0, 550.0, 650.0], 0.0);
         assert_eq!(rt.len(), 6);
         assert_eq!((rt[0], rt[1]), (0.98, 0.0));
         assert!((rt[2] - 0.49).abs() < 1e-12);
@@ -3931,7 +4315,7 @@ mod scene3_tests {
 
         // Edits.
         assert!(c.set_surface_split(bs, 0.2, 0.8));
-        assert_eq!(c.surface_rt_f64(bs, true, &[500.0]), vec![0.2, 0.8]);
+        assert_eq!(c.surface_rt_f64(bs, true, &[500.0], 0.0), vec![0.2, 0.8]);
         assert!(!c.set_surface_split(bs, 0.9, 0.9));
         assert!(c.set_surface_dichroic(dc, 600.0, 30.0, false, 0.9, 0.8));
         let coat: serde_json::Value = serde_json::from_str(&c.surface_coating_json(dc)).unwrap();

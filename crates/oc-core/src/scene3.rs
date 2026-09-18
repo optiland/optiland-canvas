@@ -174,7 +174,7 @@ pub enum AbsorptionModel {
 }
 
 impl AbsorptionModel {
-    fn validate(&self, field: &str) -> Result<(), SceneError> {
+    pub(crate) fn validate(&self, field: &str) -> Result<(), SceneError> {
         match self {
             Self::None => Ok(()),
             Self::Constant { alpha_per_mm } => {
@@ -233,7 +233,7 @@ impl SpectralScalar {
         }
     }
 
-    fn validate(&self, field: &str) -> Result<(), SceneError> {
+    pub(crate) fn validate(&self, field: &str) -> Result<(), SceneError> {
         match self {
             Self::Constant(v) => {
                 if !v.is_finite() {
@@ -262,6 +262,12 @@ impl SpectralScalar {
             .iter()
             .copied()
             .fold(f64::NEG_INFINITY, f64::max)
+    }
+
+    /// The smallest sample. Used where a quantity has a floor rather than a
+    /// ceiling, such as a film index that has to be positive.
+    pub(crate) fn min(&self) -> f64 {
+        self.values().iter().copied().fold(f64::INFINITY, f64::min)
     }
 }
 
@@ -405,6 +411,17 @@ pub enum SurfaceResponse {
     ThinLens {
         focal_length_mm: f64,
     },
+    /// A real thin-film coating: a stack of layers, evaluated by the transfer
+    /// matrix at the wavelength **and the angle of incidence** of each ray.
+    ///
+    /// This is the only response that knows what angle the light arrived at.
+    /// Every other one is a number, or a table in wavelength, and reports the
+    /// same value to a ray at 45° as to one down the axis. For a dichroic at 45°
+    /// that is wrong by tens of nanometres of edge position, which is the reason
+    /// this variant exists. See [`crate::thinfilm`].
+    Coating {
+        coating: crate::thinfilm::Coating,
+    },
 }
 
 impl Default for SurfaceResponse {
@@ -416,7 +433,7 @@ impl Default for SurfaceResponse {
 }
 
 impl SurfaceResponse {
-    fn validate(&self, field: &str) -> Result<(), SceneError> {
+    pub(crate) fn validate(&self, field: &str) -> Result<(), SceneError> {
         let range = |name: &str, reason: &str| SceneError::OutOfRange {
             object: None,
             field: format!("{field}.{name}"),
@@ -486,6 +503,51 @@ impl SurfaceResponse {
                 }
                 Ok(())
             }
+            Self::Coating { coating } => {
+                // A layer is a thickness and an index; both have to be real
+                // numbers or the transfer matrix has nothing to multiply. There
+                // is deliberately no bound on R or T here, unlike `ExplicitRt`:
+                // they are not stored, they are computed, and the calculation
+                // cannot return more than it was given.
+                for (i, layer) in coating.layers.iter().enumerate() {
+                    let at = |name: &str| format!("{field}.coating.layers[{i}].{name}");
+                    if !layer.thickness_nm.is_finite() || layer.thickness_nm < 0.0 {
+                        return Err(SceneError::OutOfRange {
+                            object: None,
+                            field: at("thickness_nm"),
+                            reason: "must be finite and not negative".to_string(),
+                        });
+                    }
+                    layer.material.n.validate(&at("material.n"))?;
+                    layer.material.k.validate(&at("material.k"))?;
+                    if layer.material.n.min() <= 0.0 {
+                        return Err(range(
+                            &format!("coating.layers[{i}].material.n"),
+                            "must be positive",
+                        ));
+                    }
+                    if layer.material.k.min() < 0.0 {
+                        return Err(range(
+                            &format!("coating.layers[{i}].material.k"),
+                            "must not be negative",
+                        ));
+                    }
+                }
+                if let crate::thinfilm::CoatingBacking::Plate { substrate, exit } = &coating.backing
+                {
+                    substrate.n.validate(&format!("{field}.coating.substrate.n"))?;
+                    substrate.k.validate(&format!("{field}.coating.substrate.k"))?;
+                    if substrate.n.min() <= 0.0 {
+                        return Err(range("coating.substrate.n", "must be positive"));
+                    }
+                    if let crate::thinfilm::ExitFace::AntiReflective { residual } = exit {
+                        if !residual.is_finite() || !(0.0..=1.0).contains(residual) {
+                            return Err(range("coating.exit.residual", "is outside [0, 1]"));
+                        }
+                    }
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -503,7 +565,7 @@ pub struct TwoSidedSurfaceResponse {
 }
 
 impl TwoSidedSurfaceResponse {
-    fn validate(&self, field: &str) -> Result<(), SceneError> {
+    pub(crate) fn validate(&self, field: &str) -> Result<(), SceneError> {
         self.from_outside
             .validate(&format!("{field}.from_outside"))?;
         self.from_inside.validate(&format!("{field}.from_inside"))

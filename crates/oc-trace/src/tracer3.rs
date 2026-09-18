@@ -1032,6 +1032,52 @@ fn apply_response(
             }
             push_event(r, cfg, w, point, opl_at, interact(children));
         }
+        // A real coating: the one response that reads `cos_i`. Everything else
+        // here answers the same for a ray at 45° as for one down the axis, which
+        // is what made a tilted dichroic report the wrong edge.
+        SurfaceResponse::Coating { coating } => {
+            r.report.note_exact(PhysicsFeature::ThinFilmCoating);
+            // The far side is the medium the transmitted ray would enter, which
+            // is the substrate for a coating sitting straight on glass. For a
+            // zero-thickness surface both sides are the same medium and the
+            // coating carries its own plate.
+            let rt = oc_core::thinfilm::coating_rt_at(coating, n1, n2, w.lambda, cos_i);
+            let (refl, tr) = match rt {
+                Some(v) => (v.r().clamp(0.0, 1.0), v.t().clamp(0.0, 1.0)),
+                None => {
+                    r.report
+                        .reject(CapabilityIssue::UnsupportedSurfaceResponse { surface });
+                    r.ledger.numerical_loss += flux_at;
+                    r.terminations.record(TerminationReason::UnsupportedPhysics);
+                    push_event(r, cfg, w, point, opl_at, interact(Vec::new()));
+                    return;
+                }
+            };
+            r.ledger.absorbed_surface += flux_at * (1.0 - refl - tr).max(0.0);
+            let mut children = Vec::new();
+            if refl > 0.0 {
+                let dir_r = reflect3(w.ray.dir, n_oppose);
+                if let Some(id) = spawn(
+                    stack, r, cfg, w, point, dir_r, flux_at * refl, opl_at, w.ghost, false,
+                    min_flux,
+                ) {
+                    children.push((ChildRole::Reflect, id));
+                }
+            }
+            if tr > 0.0 {
+                let dir_t = if medium_transition {
+                    refract3(w.ray.dir, n_oppose, n1, n2).unwrap_or(w.ray.dir)
+                } else {
+                    w.ray.dir
+                };
+                if let Some(id) = spawn(
+                    stack, r, cfg, w, point, dir_t, flux_at * tr, opl_at, w.ghost, false, min_flux,
+                ) {
+                    children.push((ChildRole::Transmit, id));
+                }
+            }
+            push_event(r, cfg, w, point, opl_at, interact(children));
+        }
         // A thin lens on a body patch has no meaning: the bend depends on the
         // hit position in a lens plane the patch does not define. Standalone
         // surfaces intercept it in `interact_surface`; anything else refuses.

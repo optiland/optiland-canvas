@@ -177,8 +177,9 @@ fn trace_one(
         out.push(seg(scene, &w, point, flux_end, lambda));
 
         match ev.kind {
-            EvKind::Body { body, normal } => interact_body(
-                scene, &mut stack, &w, body, point, normal, flux_end, lambda, max_depth, min_flux,
+            EvKind::Body { body, normal, face } => interact_body(
+                scene, &mut stack, &w, body, face, point, normal, flux_end, lambda, max_depth,
+                min_flux,
             ),
             EvKind::Surface { surf, normal } => interact_surface(
                 scene, &mut stack, &w, surf, point, normal, flux_end, lambda, max_depth, min_flux,
@@ -214,6 +215,7 @@ fn interact_body(
     stack: &mut Vec<Work>,
     w: &Work,
     body: usize,
+    face: usize,
     point: Vec3,
     hit_normal: Vec3,
     flux_end: f32,
@@ -231,6 +233,66 @@ fn interact_body(
     };
     let (n1, _a1) = region_optics(scene, point + n * EPS, lambda);
     let (n2, a2) = region_optics(scene, point - n * EPS, lambda);
+
+    // A coated face of a solid: a real plate's film sits on one face and plain
+    // glass on the other, so the response is per face rather than per body. R
+    // and T come from the baked grid at this ray's own angle, and the
+    // transmitted branch still refracts, because unlike a zero-thickness plate
+    // this interface really does change the medium.
+    if let Some(Some(GpuResponse::CoatingGrid { lambdas, rt })) = scene.bodies[body]
+        .face_resp
+        .get(face)
+    {
+        let cos_i = (-n.dot(w.d)).clamp(0.0, 1.0);
+        let (r, t) = crate::scene3::sample_coating_grid(
+            lambdas,
+            rt,
+            lambda,
+            cos_i,
+            w.medium_n,
+            scene.ambient,
+        );
+        if r > 0.0 {
+            let dir = reflect(w.d, n);
+            push(
+                stack,
+                Work {
+                    o: point + dir * EPS,
+                    d: dir,
+                    flux: flux_end * r,
+                    depth: w.depth + 1,
+                    gdepth: w.gdepth,
+                    medium_n: w.medium_n,
+                    medium_alpha: w.medium_alpha,
+                    flags: w.flags & !SEG_TIR,
+                },
+                max_depth,
+                min_flux,
+            );
+        }
+        if t > 0.0 {
+            // Snell across the boundary; total internal reflection ends the
+            // transmitted branch, as it does for any other interface.
+            if let Some(dir) = refract(w.d, n, n1, n2) {
+                push(
+                    stack,
+                    Work {
+                        o: point + dir * EPS,
+                        d: dir,
+                        flux: flux_end * t,
+                        depth: w.depth + 1,
+                        gdepth: w.gdepth,
+                        medium_n: n2,
+                        medium_alpha: a2,
+                        flags: w.flags & !SEG_TIR,
+                    },
+                    max_depth,
+                    min_flux,
+                );
+            }
+        }
+        return;
+    }
 
     match refract(w.d, n, n1, n2) {
         None => {
@@ -392,6 +454,27 @@ fn interact_surface(
                 transmit(stack, flux_end * t);
             }
         }
+        GpuResponse::CoatingGrid { lambdas, rt } => {
+            // A real thin-film stack, read off the grid that was baked from the
+            // transfer matrix when the scene compiled. Both branches are primary
+            // paths, exactly as for `ExplicitRt`; the only difference is that
+            // `R` and `T` now depend on the angle the ray arrived at.
+            let cos_i = (-n_oppose.dot(w.d)).clamp(0.0, 1.0);
+            let (r, t) = crate::scene3::sample_coating_grid(
+                lambdas,
+                rt,
+                lambda,
+                cos_i,
+                w.medium_n,
+                scene.ambient,
+            );
+            if r > 0.0 {
+                reflect_branch(stack, flux_end * r, false);
+            }
+            if t > 0.0 {
+                transmit(stack, flux_end * t);
+            }
+        }
         GpuResponse::ThinLens { f } => {
             // Ideal-lens slope law u' = u − h/f in the surface's local frame
             // (direction-aware; mirrors tracer3's f64 branch). Full
@@ -465,7 +548,12 @@ fn seg(scene: &GpuScene3, w: &Work, end_norm: Vec3, flux_end: f32, lambda: f32) 
 // ---------------------------------------------------------------------------
 
 enum EvKind {
-    Body { body: usize, normal: Vec3 },
+    Body {
+        body: usize,
+        normal: Vec3,
+        /// Index into the body's revolved faces, for a per-face response.
+        face: usize,
+    },
     Surface { surf: usize, normal: Vec3 },
     Aperture,
     Detector { det: usize, uv: Vec2 },
@@ -485,12 +573,13 @@ fn nearest_event(scene: &GpuScene3, o: Vec3, d: Vec3) -> Option<Event> {
     };
 
     for (bi, b) in scene.bodies.iter().enumerate() {
-        if let Some((t, nl)) = body_hit(b, o, d) {
+        if let Some((t, nl, face)) = body_hit(b, o, d) {
             consider(
                 t,
                 EvKind::Body {
                     body: bi,
                     normal: (b.rot * nl).normalize(),
+                    face,
                 },
             );
         }
@@ -513,14 +602,17 @@ fn nearest_event(scene: &GpuScene3, o: Vec3, d: Vec3) -> Option<Event> {
     best
 }
 
-fn body_hit(b: &GpuBody3, o: Vec3, d: Vec3) -> Option<(f32, Vec3)> {
+/// A body's `(t, world normal, face index)`. Only a revolved body distinguishes
+/// its faces; everything else reports face 0 and uses the body's one response.
+fn body_hit(b: &GpuBody3, o: Vec3, d: Vec3) -> Option<(f32, Vec3, usize)> {
     let ol = b.rot.transpose() * (o - b.pos);
     let dl = b.rot.transpose() * d;
+    let plain = |r: Option<(f32, Vec3)>| r.map(|(t, n)| (t, n, 0usize));
     match b.kind {
-        OBJ_SPHERE => sphere_hit(ol, dl, b.params.x, EPS),
-        OBJ_BOX => box_hit(ol, dl, b.params, EPS),
-        OBJ_CYLINDER => cylinder_hit(ol, dl, b.params.x, b.params.y, EPS),
-        OBJ_EXTRUDE => extrude_hit(b.extrude.as_ref()?, ol, dl, EPS),
+        OBJ_SPHERE => plain(sphere_hit(ol, dl, b.params.x, EPS)),
+        OBJ_BOX => plain(box_hit(ol, dl, b.params, EPS)),
+        OBJ_CYLINDER => plain(cylinder_hit(ol, dl, b.params.x, b.params.y, EPS)),
+        OBJ_EXTRUDE => plain(extrude_hit(b.extrude.as_ref()?, ol, dl, EPS)),
         OBJ_REVOLVE => revolve_hit(b.revolve.as_ref()?, ol, dl, EPS),
         _ => None,
     }
@@ -696,14 +788,14 @@ fn revolve_contains(rev: &GpuRevolve, p: Vec3) -> bool {
 /// Nearest revolved-profile intersection at `t > tmin`, with the outward local
 /// normal. Each face is exact; the normal is oriented by a containment probe,
 /// because a single surface cannot say which side is glass.
-fn revolve_hit(rev: &GpuRevolve, o: Vec3, d: Vec3, tmin: f32) -> Option<(f32, Vec3)> {
-    let mut best: Option<(f32, Vec3)> = None;
-    let keep = |best: &mut Option<(f32, Vec3)>, t: f32, n: Vec3| {
-        if t > tmin && best.map(|(bt, _)| t < bt).unwrap_or(true) {
-            *best = Some((t, orient_rev(rev, n, o + d * t)));
+fn revolve_hit(rev: &GpuRevolve, o: Vec3, d: Vec3, tmin: f32) -> Option<(f32, Vec3, usize)> {
+    let mut best: Option<(f32, Vec3, usize)> = None;
+    let keep = |best: &mut Option<(f32, Vec3, usize)>, t: f32, n: Vec3, i: usize| {
+        if t > tmin && best.map(|(bt, _, _)| t < bt).unwrap_or(true) {
+            *best = Some((t, orient_rev(rev, n, o + d * t), i));
         }
     };
-    for face in &rev.faces {
+    for (fi, face) in rev.faces.iter().enumerate() {
         match face {
             RevFace::Sag {
                 vertex_x,
@@ -724,11 +816,11 @@ fn revolve_hit(rev: &GpuRevolve, o: Vec3, d: Vec3, tmin: f32) -> Option<(f32, Ve
                 o,
                 d,
                 tmin,
-                &mut |t, n| keep(&mut best, t, n),
+                &mut |t, n| keep(&mut best, t, n, fi),
             ),
             RevFace::Frustum { x0, y0, x1, y1 } => {
                 frustum_hit(*x0, *y0, *x1, *y1, o, d, tmin, &mut |t, n| {
-                    keep(&mut best, t, n)
+                    keep(&mut best, t, n, fi)
                 })
             }
             RevFace::Arc {
@@ -737,7 +829,7 @@ fn revolve_hit(rev: &GpuRevolve, o: Vec3, d: Vec3, tmin: f32) -> Option<(f32, Ve
                 a0,
                 a1,
             } => arc_hit(*center_x, *r, *a0, *a1, o, d, tmin, &mut |t, n| {
-                keep(&mut best, t, n)
+                keep(&mut best, t, n, fi)
             }),
         }
     }

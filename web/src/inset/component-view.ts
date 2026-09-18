@@ -88,6 +88,9 @@ export function createComponentView(opts: {
   function kindFor(id: number): EditorKind {
     const o = objectOf(id);
     if (!o) return "none";
+    // A coated plate is a glass body, so it would read as a lens by its shape.
+    // Its film is the thing you came to edit, so it wins.
+    if (JSON.parse(scene.surfaceFilmJSON(id))) return "coating";
     if (JSON.parse(scene.singletShapeJSON(id, 2))) return "lens";
     if (o.kind === "aperture") return "aperture";
     if (o.kind === "detector") return "detector";

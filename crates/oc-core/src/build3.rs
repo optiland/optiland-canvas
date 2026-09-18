@@ -27,12 +27,15 @@ use crate::profile2::{
     ClosedProfile2, ConicParams2, Curve2, ProfileConstruction3, ProfileEdge2, ProfileSolid3,
 };
 use crate::scene::Spectrum;
+use crate::thinfilm::{
+    film_coating, plate_coating, Coating, CoatingDesign, DesignKind, ExitFace, Incidence,
+};
 use crate::scene3::{
     AbsorptionModel, AngularDistribution3, Aperture3, ApertureInteraction, ApertureShape3, Body3,
     Detector3, DetectorGeometry3, DetectorResponse, DetectorTermination, Interpolation,
-    ObjectCommon, OutOfRangePolicy, PlanarShape2, SamplingSequence, Scene3, SolidGeometry3,
-    Source3, SourceSampling, SpatialDistribution3, SpectralScalar, SurfaceGeometry3,
-    SurfaceObject3, SurfaceProps3, SurfaceResponse,
+    ObjectCommon, OutOfRangePolicy, PatchResponseOverride, PlanarShape2, SamplingSequence, Scene3,
+    SolidGeometry3, Source3, SourceSampling, SpatialDistribution3, SpectralScalar,
+    SurfaceGeometry3, SurfaceObject3, SurfaceProps3, SurfaceResponse, TwoSidedSurfaceResponse,
 };
 use crate::vec::Vec2;
 use crate::vec3::{Isometry3, Plane3, Vec3};
@@ -608,6 +611,379 @@ impl Scene3 {
         self.set_surface_responses(id, r.clone(), r)
     }
 
+    /// Add a dichroic filter as a **real coated glass plate**: a disc of
+    /// substrate with the thin-film stack on the face the light meets first.
+    ///
+    /// The plate is a body, not a plane, and that is the difference. The tracer
+    /// crosses it the way light does: reflect at the coated face, refract into
+    /// the glass, cross at the internal angle, refract back out at the far face.
+    /// So the transmitted beam leaves parallel to where it started but displaced
+    /// sideways, about a millimetre for a 3 mm plate at 45°, carrying the glass
+    /// path in its optical path length, and the far face returns its own
+    /// reflection as a second beam. None of that is special-cased here; it is
+    /// what tracing a solid already does.
+    ///
+    /// The coating goes on one patch and plain glass on the other, which is why
+    /// this needs per-face responses rather than one response for the body.
+    pub fn add_plate_dichroic(
+        &mut self,
+        pos: Vec3,
+        radius_mm: f64,
+        thickness_mm: f64,
+        tilt_deg: f64,
+        edge_nm: f64,
+        long_pass: bool,
+    ) -> Option<BodyId> {
+        let design = CoatingDesign {
+            kind: if long_pass {
+                DesignKind::LongPass
+            } else {
+                DesignKind::ShortPass
+            },
+            ..CoatingDesign::long_pass(edge_nm, axial_aoi_deg(tilt_deg))
+        }
+        .sanitized()?;
+        let thickness_mm = if thickness_mm.is_finite() && thickness_mm > 0.0 {
+            thickness_mm
+        } else {
+            DEFAULT_PLATE_MM
+        };
+        let radius_mm = if radius_mm.is_finite() && radius_mm > 0.5 {
+            radius_mm
+        } else {
+            return None;
+        };
+        let coating = film_coating(design, self.env.ambient_index, PLATE_ND);
+        Some(self.add_coated_plate(pos, radius_mm, thickness_mm, tilt_deg, coating))
+    }
+
+    /// A glass disc with `coating` on the face that meets an axial beam, and
+    /// bare glass on the other.
+    pub fn add_coated_plate(
+        &mut self,
+        pos: Vec3,
+        radius_mm: f64,
+        thickness_mm: f64,
+        tilt_deg: f64,
+        coating: Coating,
+    ) -> BodyId {
+        // A plate is a singlet with both faces flat.
+        let g = SingletGeom {
+            r1_mm: f64::INFINITY,
+            r2_mm: f64::INFINITY,
+            thickness_mm,
+            semi_aperture_mm: radius_mm,
+            conic1: 0.0,
+            conic2: 0.0,
+        };
+        let curves = singlet_curves(g, SingletAspheres::default());
+        let edges: Vec<ProfileEdge2> = curves
+            .into_iter()
+            .map(|curve| ProfileEdge2 {
+                patch: self.alloc_patch_id(),
+                curve,
+            })
+            .collect();
+        // `singlet_curves` orders the loop [front face, rim, back face, rim],
+        // with the front face at local −X. The transform below carries local −X
+        // onto the plate normal, so the front face is the one an axial beam
+        // reaches first, and that is where the coating belongs.
+        let coated = edges[0].patch;
+        let phi = tilt_deg.to_radians();
+        let normal = Vec3::new(phi.cos(), phi.sin(), 0.0);
+        let q = glam::DQuat::from_rotation_arc(-Vec3::X, normal.normalize());
+        let id = self.alloc_object_id();
+        let mut common = ObjectCommon::new(id, LayerId(0));
+        common.transform =
+            Isometry3::new(pos, [q.x, q.y, q.z, q.w]).unwrap_or_else(|_| Isometry3::from_pos(pos));
+        let film = SurfaceResponse::Coating { coating };
+        self.bodies.push(Body3 {
+            common,
+            geometry: SolidGeometry3::Profile(ProfileSolid3 {
+                profile: ClosedProfile2 { edges },
+                construction: ProfileConstruction3::RevolveLocalX,
+            }),
+            material: Material::AbbePoint {
+                nd: PLATE_ND,
+                vd: PLATE_VD,
+            },
+            absorption: AbsorptionModel::None,
+            surface: SurfaceProps3 {
+                // Everything else on the body is plain glass: the far face and
+                // the rim get ordinary Fresnel, which is what they are.
+                default: TwoSidedSurfaceResponse::default(),
+                overrides: vec![PatchResponseOverride {
+                    patch: coated,
+                    response: TwoSidedSurfaceResponse {
+                        from_outside: film.clone(),
+                        from_inside: film,
+                    },
+                }],
+            },
+            priority: 0,
+        });
+        BodyId(id.0)
+    }
+
+    /// The coating on a body's coated face, if it carries one.
+    pub fn body_coating(&self, id: u64) -> Option<&Coating> {
+        let b = self.bodies.iter().find(|b| b.common.id.0 == id)?;
+        b.surface.overrides.iter().find_map(|o| {
+            match &o.response.from_outside {
+                SurfaceResponse::Coating { coating } => Some(coating),
+                _ => None,
+            }
+        })
+    }
+
+    /// The plate thickness and semi-aperture of a coated plate body, in mm.
+    pub fn plate_geometry(&self, id: u64) -> Option<(f64, f64)> {
+        let b = self.bodies.iter().find(|b| b.common.id.0 == id)?;
+        let SolidGeometry3::Profile(p) = &b.geometry else {
+            return None;
+        };
+        let mut lo = f64::INFINITY;
+        let mut hi = f64::NEG_INFINITY;
+        let mut ha: f64 = 0.0;
+        for e in &p.profile.edges {
+            for v in curve_extent(&e.curve) {
+                lo = lo.min(v.x);
+                hi = hi.max(v.x);
+                ha = ha.max(v.y.abs());
+            }
+        }
+        (hi > lo).then_some((hi - lo, ha))
+    }
+
+    /// Add a dichroic filter as a **real thin-film stack** on a glass plate.
+    ///
+    /// The design is solved so the edge lands where asked *at the angle the
+    /// plate is being placed at*, which for the usual 45° fold is nowhere near
+    /// where the same stack would cut on axis.
+    ///
+    /// `tilt_deg` sets the plate normal to `(cos φ, sin φ, 0)`, so a beam down
+    /// the axis meets it at `arccos|cos φ|`: 0° for a plate square to the beam
+    /// at 180°, 45° for the usual 135° fold, and grazing at 90° where the plate
+    /// lies edge-on and the beam misses it entirely. Taking the design angle
+    /// from the placement is the whole point — a coating is designed for the
+    /// geometry it will be used in.
+    pub fn add_film_dichroic(
+        &mut self,
+        pos: Vec3,
+        radius_mm: f64,
+        tilt_deg: f64,
+        edge_nm: f64,
+        long_pass: bool,
+    ) -> Option<u64> {
+        let design = CoatingDesign {
+            kind: if long_pass {
+                DesignKind::LongPass
+            } else {
+                DesignKind::ShortPass
+            },
+                ..CoatingDesign::long_pass(edge_nm, axial_aoi_deg(tilt_deg))
+        }
+        .sanitized()?;
+        let (front, back) = self.coating_pair(design);
+        Some(self.add_planar_element(pos, radius_mm, tilt_deg, front, back))
+    }
+
+    /// Both faces of one coated plate: the film side, and the side that is
+    /// entered through the glass.
+    ///
+    /// A plate is one object with two faces and they are not the same surface.
+    /// Light arriving on the coated face meets the stack first; light arriving
+    /// from behind crosses the substrate and its far face before reaching the
+    /// stack. For a lossless stack reciprocity makes the two agree, and for one
+    /// with any absorption in it they do not.
+    fn coating_pair(&self, design: CoatingDesign) -> (SurfaceResponse, SurfaceResponse) {
+        let ambient = self.env.ambient_index;
+        let film = plate_coating(
+            design,
+            crate::thinfilm::materials::bk7(),
+            ExitFace::Bare,
+            ambient,
+        );
+        let mut back = film.clone();
+        back.incidence = Incidence::Substrate;
+        (
+            SurfaceResponse::Coating { coating: film },
+            SurfaceResponse::Coating { coating: back },
+        )
+    }
+
+    /// Rebuild the coating on a surface from a design. False (scene unchanged)
+    /// for a non-finite design or a non-surface id.
+    pub fn set_surface_coating_design(&mut self, id: u64, design: CoatingDesign) -> bool {
+        let Some(design) = design.sanitized() else {
+            return false;
+        };
+        let (front, back) = self.coating_pair(design);
+        self.set_surface_responses(id, front, back)
+    }
+
+    /// Set one layer's physical thickness, in nanometres, on both faces.
+    ///
+    /// This is the handle that makes the stack real rather than a recipe: a
+    /// deposition run misses its targets, and so can you. The design is kept so
+    /// the editor can still show what the stack started as, but the layers are
+    /// what the transfer matrix reads, so an edited stack is simply a different
+    /// coating. False for a bad index, a non-finite or negative thickness, a
+    /// non-surface id, or a surface that carries no film.
+    pub fn set_coating_layer_thickness(&mut self, id: u64, index: usize, nm: f64) -> bool {
+        if !nm.is_finite() || nm < 0.0 {
+            return false;
+        }
+        let Some(s) = self.surfaces.iter_mut().find(|s| s.common.id.0 == id) else {
+            return false;
+        };
+        let mut touched = false;
+        for side in [&mut s.response_front, &mut s.response_back] {
+            if let SurfaceResponse::Coating { coating } = side {
+                match coating.layers.get_mut(index) {
+                    Some(l) => {
+                        l.thickness_nm = nm;
+                        touched = true;
+                    }
+                    None => return false,
+                }
+            }
+        }
+        touched
+    }
+
+    /// The angle, in degrees, at which the scene's light actually meets this
+    /// surface: the angle between its normal and the first source's rays.
+    ///
+    /// A coating is a function of wavelength *and* angle, so a plot of one is
+    /// meaningless until you say which angle. This is the angle worth plotting
+    /// at by default, because it is the one the part is being used at. `None`
+    /// for a non-surface id or a scene with no light in it.
+    pub fn surface_axial_aoi_deg(&self, id: u64) -> Option<f64> {
+        let s = self.surfaces.iter().find(|s| s.common.id.0 == id)?;
+        let normal = s.common.transform.quat() * Vec3::Z;
+        let dir = self.sources.first()?.emit().first()?.ray.dir;
+        Some(dir.dot(normal).abs().clamp(0.0, 1.0).acos().to_degrees())
+    }
+
+    /// The media either side of an object's coated face at `lambda_um`:
+    /// `(incident, behind)`.
+    ///
+    /// For a coated solid the film sits on that solid's own glass, and what a
+    /// stack reflects depends on what it is sitting on, so a plot of one has to
+    /// be told. For a zero-thickness plate both sides are the ambient medium and
+    /// the coating carries its own substrate.
+    pub fn coated_face_media(&self, id: u64, lambda_um: f64) -> (f64, f64) {
+        let ambient = self.env.ambient_index;
+        let behind = self
+            .bodies
+            .iter()
+            .find(|b| b.common.id.0 == id)
+            .and_then(|b| match &b.material {
+                Material::AbbePoint { nd, vd } => {
+                    Some(crate::material::Cauchy::from_abbe(*nd, *vd).index(lambda_um))
+                }
+                Material::Catalog(gid) => {
+                    self.catalog.get(*gid).map(|g| g.sell.index(lambda_um))
+                }
+                _ => None,
+            })
+            .unwrap_or(ambient);
+        (ambient, behind)
+    }
+
+    /// The coating on an object, whether it is a zero-thickness plate or a
+    /// coated face of a solid.
+    ///
+    /// The editor should not have to know which, and after plates grew
+    /// thickness most of them are solids.
+    pub fn coating_for_object(&self, id: u64) -> Option<&Coating> {
+        self.surface_coating(id).or_else(|| self.body_coating(id))
+    }
+
+    /// The angle the scene's light meets an object's coated face at, degrees.
+    ///
+    /// A coating is a function of wavelength *and* angle, so a plot of one means
+    /// nothing until you say which angle. This is the angle worth plotting at,
+    /// because it is the one the part is being used at. `None` for an object
+    /// with no coating, or a scene with no light in it.
+    pub fn object_axial_aoi_deg(&self, id: u64) -> Option<f64> {
+        let normal = if let Some(s) = self.surfaces.iter().find(|s| s.common.id.0 == id) {
+            s.common.transform.quat() * Vec3::Z
+        } else {
+            // A coated plate is built with its local −X carried onto the plate
+            // normal, so that is where its coated face looks.
+            let b = self.bodies.iter().find(|b| b.common.id.0 == id)?;
+            b.common.transform.quat() * -Vec3::X
+        };
+        let dir = self.sources.first()?.emit().first()?.ray.dir;
+        Some(dir.dot(normal).abs().clamp(0.0, 1.0).acos().to_degrees())
+    }
+
+    /// Rebuild the coating on an object from a design, whichever kind it is.
+    pub fn set_object_coating_design(&mut self, id: u64, design: CoatingDesign) -> bool {
+        let Some(design) = design.sanitized() else {
+            return false;
+        };
+        if self.surfaces.iter().any(|s| s.common.id.0 == id) {
+            return self.set_surface_coating_design(id, design);
+        }
+        let ambient = self.env.ambient_index;
+        let Some(b) = self.bodies.iter_mut().find(|b| b.common.id.0 == id) else {
+            return false;
+        };
+        let coating = film_coating(design, ambient, PLATE_ND);
+        let mut touched = false;
+        for o in &mut b.surface.overrides {
+            if matches!(o.response.from_outside, SurfaceResponse::Coating { .. }) {
+                let film = SurfaceResponse::Coating {
+                    coating: coating.clone(),
+                };
+                o.response.from_outside = film.clone();
+                o.response.from_inside = film;
+                touched = true;
+            }
+        }
+        touched
+    }
+
+    /// Set one film layer's thickness on an object, whichever kind it is.
+    pub fn set_object_layer_thickness(&mut self, id: u64, index: usize, nm: f64) -> bool {
+        if !nm.is_finite() || nm < 0.0 {
+            return false;
+        }
+        if self.surfaces.iter().any(|s| s.common.id.0 == id) {
+            return self.set_coating_layer_thickness(id, index, nm);
+        }
+        let Some(b) = self.bodies.iter_mut().find(|b| b.common.id.0 == id) else {
+            return false;
+        };
+        let mut touched = false;
+        for o in &mut b.surface.overrides {
+            for side in [&mut o.response.from_outside, &mut o.response.from_inside] {
+                if let SurfaceResponse::Coating { coating } = side {
+                    match coating.layers.get_mut(index) {
+                        Some(l) => {
+                            l.thickness_nm = nm;
+                            touched = true;
+                        }
+                        None => return false,
+                    }
+                }
+            }
+        }
+        touched
+    }
+
+    /// The coating on a surface's front face, if it carries one.
+    pub fn surface_coating(&self, id: u64) -> Option<&Coating> {
+        let s = self.surfaces.iter().find(|s| s.common.id.0 == id)?;
+        match &s.response_front {
+            SurfaceResponse::Coating { coating } => Some(coating),
+            _ => None,
+        }
+    }
+
     fn set_surface_responses(
         &mut self,
         id: u64,
@@ -633,6 +1009,12 @@ impl Scene3 {
     /// Add a round optical element (a flat plate) at `pos`, tilted `tilt_deg` in
     /// the meridional plane, radius `radius_mm`, with configurable front/back
     /// responses — make either face reflective, absorbing, clear, or refractive.
+    /// The angle an axial beam meets a plate tilted by `tilt_deg`, in degrees.
+    ///
+    /// [`Scene3::add_planar_element`] points the normal along `(cos φ, sin φ, 0)`
+    /// and the default beam runs along `+X`, so the angle of incidence is
+    /// `arccos|cos φ|`. Worth its own function because getting it wrong is
+    /// invisible at 135°, where the two plausible formulas happen to agree.
     pub fn add_planar_element(
         &mut self,
         pos: Vec3,
@@ -1296,10 +1678,50 @@ fn response_from_kind(kind: &str) -> Option<SurfaceResponse> {
     })
 }
 
+/// The substrate a plate is made of: N-BK7, the ordinary choice.
+pub const PLATE_ND: f64 = 1.5168;
+pub const PLATE_VD: f64 = 64.17;
+
+/// The substrate thickness a new plate gets, in mm.
+///
+/// Three millimetres is an ordinary catalogue beamsplitter: thin enough to drop
+/// into a beam without hunting for space, thick enough that the walk-off it
+/// gives a transmitted beam is a millimetre, which you can see rather than have
+/// to be told about.
+pub const DEFAULT_PLATE_MM: f64 = 3.0;
+
+/// The two endpoints of a profile curve, for measuring a plate.
+fn curve_extent(c: &Curve2) -> Vec<Vec2> {
+    match c {
+        Curve2::Line { a, b } => vec![*a, *b],
+        Curve2::Conic(p) => vec![
+            Vec2::new(p.vertex.x, p.half_ap),
+            Vec2::new(p.vertex.x, -p.half_ap),
+        ],
+        Curve2::EvenAsphere { base, .. } => vec![
+            Vec2::new(base.vertex.x, base.half_ap),
+            Vec2::new(base.vertex.x, -base.half_ap),
+        ],
+        _ => Vec::new(),
+    }
+}
+
+/// The angle an axial beam (along `+X`) meets a plate whose tilt is `tilt_deg`.
+///
+/// [`Scene3::add_planar_element`] points the plate normal along
+/// `(cos φ, sin φ, 0)`, so the angle of incidence is `arccos|cos φ|`: 0° square
+/// to the beam at 180°, 45° at the usual 135° fold, 90° edge-on at 90°. Worth
+/// naming because the wrong formula is invisible at exactly 135°, where two
+/// plausible ones agree.
+pub fn axial_aoi_deg(tilt_deg: f64) -> f64 {
+    tilt_deg.to_radians().cos().abs().clamp(0.0, 1.0).acos().to_degrees()
+}
+
 /// The short kind string for a surface response: `mirror`, `absorb`, `clear`
 /// (full transmission), `split` (constant reflectance and transmittance),
 /// `dichroic` (a [`DichroicSpec`] coating), `coated` (any other tabulated
-/// reflectance/transmittance), `refract`, or `thin-lens`.
+/// reflectance/transmittance), `film` (a real thin-film stack), `refract`, or
+/// `thin-lens`.
 pub fn response_kind(r: &SurfaceResponse) -> &'static str {
     match r {
         SurfaceResponse::Mirror { .. } => "mirror",
@@ -1321,6 +1743,7 @@ pub fn response_kind(r: &SurfaceResponse) -> &'static str {
                 "coated"
             }
         }
+        SurfaceResponse::Coating { .. } => "film",
         SurfaceResponse::DielectricFresnel { .. } => "refract",
         SurfaceResponse::ThinLens { .. } => "thin-lens",
     }

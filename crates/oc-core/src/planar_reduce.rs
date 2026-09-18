@@ -311,6 +311,11 @@ fn response_to_spec(object: u64, r: &SurfaceResponse) -> Result<SurfaceSpec, Red
             absorb: true,
             ..SurfaceSpec::default()
         }),
+        // A thin-film stack is angle-dependent by construction, and v1's
+        // `SurfaceSpec` has nowhere to put an angle. Reducing one would have to
+        // pick an angle and bake it in, which is exactly the mistake the stack
+        // was added to stop making. Refuse instead.
+        SurfaceResponse::Coating { .. } => Err(unsupported("thin-film coating")),
         // v1 has no explicit reflectance/transmittance surface; the closest it
         // could do is a scaled Fresnel, which is a different physics. Refuse.
         SurfaceResponse::ExplicitRt { .. } => {

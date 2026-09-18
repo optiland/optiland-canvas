@@ -847,6 +847,52 @@ fn assert_tree_matches(scene: &Scene3, ray: (Vec3, Vec3, f64), ghosts: bool) -> 
     f32_segs
 }
 
+/// [`assert_tree_matches`] without the flux comparison: same branch structure
+/// and the same geometry, but each segment's flux left to the caller.
+///
+/// Only the thin-film coating needs this. Its preview reads a baked grid rather
+/// than running the transfer matrix, so its flux carries interpolation error
+/// that `flux_close` would reject — while the *paths* stay exact, because where
+/// a ray goes does not depend on how much of it goes there.
+fn assert_tree_geometry_matches(scene: &Scene3, ray: (Vec3, Vec3, f64)) -> Vec<SegOut3> {
+    let (emitted, launch) = rays_at(&[ray]);
+    let f64_res = trace3(
+        scene,
+        &launch,
+        &TraceConfig3 {
+            ghosts: false,
+            ..cfg()
+        },
+    );
+    let gpu = GpuScene3::build_with_rays(scene, &emitted, opts(false));
+    assert!(
+        gpu.rejected.is_empty(),
+        "unexpected rejects: {:?}",
+        gpu.rejected
+    );
+    let tol = pos_tol(gpu.norm.scale);
+    let f32_segs = cpu3::trace_segments(&gpu, 32).swap_remove(0);
+    let f64_segs = &f64_res.segments;
+    assert_eq!(
+        f64_segs.len(),
+        f32_segs.len(),
+        "segment count for {ray:?}:
+f64 {f64_segs:?}
+f32 {f32_segs:?}"
+    );
+    for (i, (a, b)) in f64_segs.iter().zip(&f32_segs).enumerate() {
+        let at = format!("seg {i} of {ray:?}");
+        assert_eq!(a.flags.ghost, b.is_ghost(), "{at}: ghost flag");
+        let d0 = (a.a - b.a).length();
+        assert!(d0 <= tol, "{at}: |Δstart| = {d0} mm > {tol}");
+        if (a.b - a.a).length() <= 1e3 {
+            let d1 = (a.b - b.b).length();
+            assert!(d1 <= tol, "{at}: |Δend| = {d1} mm > {tol}");
+        }
+    }
+    f32_segs
+}
+
 /// Every listed detector's readout, f64 against f32, for one launch set: equal
 /// hit counts, total and per-cell flux within [`flux_close`].
 fn assert_detectors_match(
@@ -1151,4 +1197,149 @@ fn a_tabulated_mirror_matches_f64() {
     let total = cpu3::trace(&gpu, 32).detector(folded.0).unwrap().total;
     let want = 0.865 * rays.len() as f32;
     assert!((total - want).abs() < 1e-5, "{total} vs {want}");
+}
+
+/// A thin-film coating in the preview against the exact transfer matrix.
+///
+/// This is the one response the preview does **not** evaluate exactly. Running
+/// a multilayer matrix per ray in a shader is not on, so the stack is baked onto
+/// a grid in wavelength and `sin²θ` when the scene compiles, and the preview
+/// reads that grid bilinearly. The CPU mirror and the GPU share the grid, so
+/// those two stay identical; what drifts is the preview against the f64
+/// reference, and only where the curve is steep.
+///
+/// So this test holds the branch **structure** exactly — same segments, same
+/// geometry, a ray goes the same ways — and holds the flux to a bound stated
+/// here rather than to `flux_close`. The bound is the honest cost of the grid,
+/// and the numbers the UI shows never come from this path.
+#[test]
+fn a_thin_film_coating_matches_f64_within_the_grid_tolerance() {
+    let design = oc_core::thinfilm::CoatingDesign::long_pass(550.0, 45.0);
+    let coating = oc_core::thinfilm::plate_coating(
+        design,
+        oc_core::thinfilm::materials::bk7(),
+        oc_core::thinfilm::ExitFace::Bare,
+        1.0,
+    );
+    let resp = SurfaceResponse::Coating { coating };
+    let mut scene = Scene3::new();
+    let (through, folded) = fold_with_two_arms(&mut scene, resp);
+    scene.validate().unwrap();
+
+    let mut worst: f64 = 0.0;
+    // Across the band: deep in the stopband, on the edge where the curve is
+    // steepest and the grid works hardest, and out in the passband ripple.
+    for lambda_um in [0.40, 0.46, 0.50, 0.53, 0.55, 0.57, 0.62, 0.70] {
+        let rays = fold_rays(lambda_um);
+        for &ray in &rays {
+            // Structure is exact: both arms exist, in the same order, landing in
+            // the same places.
+            let segs = assert_tree_geometry_matches(&scene, ray);
+            assert_eq!(segs.len(), 3, "both arms at {lambda_um}: {segs:?}");
+        }
+        let (emitted, launch) = rays_at(&rays);
+        let f64_res = trace3(
+            &scene,
+            &launch,
+            &TraceConfig3 {
+                ghosts: false,
+                ..cfg()
+            },
+        );
+        let gpu = GpuScene3::build_with_rays(&scene, &emitted, opts(false));
+        assert!(gpu.rejected.is_empty(), "rejects: {:?}", gpu.rejected);
+        let f32_res = cpu3::trace(&gpu, 32);
+        for det in [through, folded] {
+            let a = f64_res
+                .detectors
+                .iter()
+                .find(|d| d.detector.0 == det.0)
+                .expect("f64 detector");
+            let b = f32_res.detector(det.0).expect("f32 detector");
+            assert_eq!(a.hits, b.hits, "hit count at {lambda_um}");
+            worst = worst.max((a.total_incident - b.total as f64).abs() / rays.len() as f64);
+        }
+    }
+    // Stated as a fraction of one ray's launched flux. Measured at 7.6e-4 with
+    // the grid baked at the scene's own wavelengths, so the bound leaves room
+    // for the angle axis and nothing else.
+    assert!(
+        worst < 2e-3,
+        "the baked grid drifts further from the matrix than documented: {worst}"
+    );
+    eprintln!("worst per-ray flux drift from the coating grid: {worst:.2e}");
+}
+
+/// A coated plate with real thickness, previewed against the exact tracer.
+///
+/// The plate is a body: the coating is on one face and plain glass on the other,
+/// so this is the first scene where the preview has to know *which face* it hit.
+/// Get that wrong and the film lands on the far face, which still splits the
+/// beam and still looks plausible, so the check is that the geometry matches
+/// the reference exactly: same segment count, same refracted path through the
+/// glass, same exit point.
+#[test]
+fn a_coated_plate_body_matches_f64() {
+    let mut scene = Scene3::new();
+    scene
+        .add_plate_dichroic(Vec3::new(0.0, 0.0, 0.0), 10.0, 3.0, 135.0, 550.0, true)
+        .expect("the plate is valid");
+    let through = add_rect_detector(
+        &mut scene,
+        Vec3::new(20.0, 0.0, 0.0),
+        -Vec3::X,
+        8.0,
+        8.0,
+        [3, 3],
+    );
+    let folded = add_rect_detector(
+        &mut scene,
+        Vec3::new(0.0, 20.0, 0.0),
+        -Vec3::Y,
+        8.0,
+        8.0,
+        [3, 3],
+    );
+    scene.validate().unwrap();
+
+    let mut worst: f64 = 0.0;
+    for lambda_um in [0.45, 0.50, 0.55, 0.60, 0.65] {
+        let rays: Vec<(Vec3, Vec3, f64)> = [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (-1.5, 1.0)]
+            .iter()
+            .map(|&(y, z)| (Vec3::new(-15.0, y, z), Vec3::X, lambda_um))
+            .collect();
+        for &ray in &rays {
+            let segs = assert_tree_geometry_matches(&scene, ray);
+            assert!(
+                segs.len() >= 3,
+                "reflect, cross the glass, and carry on: {segs:?}"
+            );
+        }
+        let (emitted, launch) = rays_at(&rays);
+        let f64_res = trace3(
+            &scene,
+            &launch,
+            &TraceConfig3 {
+                ghosts: false,
+                ..cfg()
+            },
+        );
+        let gpu = GpuScene3::build_with_rays(&scene, &emitted, opts(false));
+        assert!(gpu.rejected.is_empty(), "rejects: {:?}", gpu.rejected);
+        let f32_res = cpu3::trace(&gpu, 32);
+        for det in [through, folded] {
+            let a = f64_res
+                .detectors
+                .iter()
+                .find(|d| d.detector.0 == det.0)
+                .expect("f64 detector");
+            let b = f32_res.detector(det.0).expect("f32 detector");
+            assert_eq!(a.hits, b.hits, "hit count at {lambda_um}");
+            worst = worst.max((a.total_incident - b.total as f64).abs() / rays.len() as f64);
+        }
+    }
+    assert!(
+        worst < 2e-3,
+        "the coating grid drifts further than documented: {worst}"
+    );
 }

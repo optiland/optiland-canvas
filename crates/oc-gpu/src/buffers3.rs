@@ -42,6 +42,9 @@ pub const RESP_MIRROR: u32 = 1;
 pub const RESP_DIELECTRIC: u32 = 2;
 pub const RESP_EXPLICIT_RT: u32 = 3;
 pub const RESP_THIN_LENS: u32 = 4;
+/// A baked thin-film coating: `r.tab_start` points at
+/// `COAT_ANGLES × COAT_LAMBDAS` `(R, T)` pairs in `verts`, row-major by angle.
+pub const RESP_COATING: u32 = 5;
 
 // Out-of-range policies of a tabulated response scalar.
 pub const POLICY_ERROR: u32 = 0;
@@ -141,7 +144,11 @@ pub struct Body3Buf {
 pub struct Face3Buf {
     pub kind: u32,
     pub is_conic: u32,
-    pub _p0: u32,
+    /// 1 when `resp` carries this face's own response instead of the body's.
+    ///
+    /// A coated plate is one body whose two faces do different things, so the
+    /// response has to travel with the face rather than with the body.
+    pub has_resp: u32,
     pub _p1: u32,
     /// Sag: `(vertex_x, axis_sign, c, k)`; frustum: `(x0,y0,x1,y1)`; arc:
     /// `(center_x, r, a0, a1)`.
@@ -150,6 +157,8 @@ pub struct Face3Buf {
     pub b: [f32; 4],
     /// Sag aspheric coefficients A4.. (unused by frustum/arc).
     pub coeffs: [f32; 8],
+    /// This face's own response, when `has_resp` is 1.
+    pub resp: Response3Buf,
 }
 
 /// A response scalar: the constant `value` when `tab_count == 0`, else
@@ -251,7 +260,7 @@ const _: () = {
     assert!(std::mem::size_of::<Ray3Buf>() == 32);
     assert!(std::mem::size_of::<Seg3Buf>() == 48);
     assert!(std::mem::size_of::<Body3Buf>() == 176);
-    assert!(std::mem::size_of::<Face3Buf>() == 80);
+    assert!(std::mem::size_of::<Face3Buf>() == 144);
     assert!(std::mem::size_of::<Spectral3Buf>() == 16);
     assert!(std::mem::size_of::<Response3Buf>() == 64);
     assert!(std::mem::size_of::<Surface3Buf>() == 224);
@@ -358,6 +367,28 @@ fn encode_response(resp: &GpuResponse, verts: &mut Vec<Vert3Buf>) -> Response3Bu
             (RESP_EXPLICIT_RT, r, encode_spectral(t, verts), zero)
         }
         GpuResponse::ThinLens { f } => (RESP_THIN_LENS, constant(*f), zero, zero),
+        GpuResponse::CoatingGrid { lambdas, rt } => {
+            // Both halves live in `verts`, which is already a list of pairs:
+            // the wavelength axis in the `t` slot, the grid itself in `r`. The
+            // grid is `COAT_ANGLES` rows of `t.tab_count` (R, T) pairs.
+            let lam_start = verts.len() as u32;
+            verts.extend(lambdas.iter().map(|l| [*l, 0.0]));
+            let axis = Spectral3Buf {
+                value: 0.0,
+                tab_start: lam_start,
+                tab_count: lambdas.len() as u32,
+                policy: POLICY_CLAMP,
+            };
+            let grid_start = verts.len() as u32;
+            verts.extend(rt.iter().copied());
+            let grid = Spectral3Buf {
+                value: 0.0,
+                tab_start: grid_start,
+                tab_count: rt.len() as u32,
+                policy: POLICY_CLAMP,
+            };
+            (RESP_COATING, grid, axis, zero)
+        }
     };
     Response3Buf {
         kind,
@@ -383,7 +414,16 @@ fn pack_body(b: &GpuBody3, verts: &mut Vec<Vert3Buf>, faces: &mut Vec<Face3Buf>)
     let (mut contour_start, mut contour_count) = (0u32, 0u32);
     if let Some(rev) = &b.revolve {
         face_start = faces.len() as u32;
-        faces.extend(rev.faces.iter().map(pack_face));
+        // A face's own response travels with the face, because a coated plate is
+        // one body whose two faces do different things.
+        for (i, f) in rev.faces.iter().enumerate() {
+            let mut packed = pack_face(f);
+            if let Some(Some(resp)) = b.face_resp.get(i) {
+                packed.has_resp = 1;
+                packed.resp = encode_response(resp, verts);
+            }
+            faces.push(packed);
+        }
         face_count = rev.faces.len() as u32;
         contour_start = verts.len() as u32;
         verts.extend(rev.contour.iter().map(|p| [p.x, p.y]));
@@ -416,6 +456,17 @@ fn pack_body(b: &GpuBody3, verts: &mut Vec<Vert3Buf>, faces: &mut Vec<Face3Buf>)
     }
 }
 
+/// A zeroed response, for a face that carries none of its own.
+fn zero_response() -> Response3Buf {
+    Response3Buf {
+        kind: RESP_ABSORBER,
+        _pad: [0; 3],
+        r: constant(0.0),
+        t: constant(0.0),
+        ar: constant(0.0),
+    }
+}
+
 fn pack_face(f: &RevFace) -> Face3Buf {
     match f {
         RevFace::Sag {
@@ -429,7 +480,8 @@ fn pack_face(f: &RevFace) -> Face3Buf {
         } => Face3Buf {
             kind: FACE_SAG,
             is_conic: *is_conic as u32,
-            _p0: 0,
+            has_resp: 0,
+            resp: zero_response(),
             _p1: 0,
             a: [*vertex_x, *axis_sign, *c, *k],
             b: [*outer_r, 0.0, 0.0, 0.0],
@@ -438,7 +490,8 @@ fn pack_face(f: &RevFace) -> Face3Buf {
         RevFace::Frustum { x0, y0, x1, y1 } => Face3Buf {
             kind: FACE_FRUSTUM,
             is_conic: 0,
-            _p0: 0,
+            has_resp: 0,
+            resp: zero_response(),
             _p1: 0,
             a: [*x0, *y0, *x1, *y1],
             b: [0.0; 4],
@@ -452,7 +505,8 @@ fn pack_face(f: &RevFace) -> Face3Buf {
         } => Face3Buf {
             kind: FACE_ARC,
             is_conic: 0,
-            _p0: 0,
+            has_resp: 0,
+            resp: zero_response(),
             _p1: 0,
             a: [*center_x, *r, *a0, *a1],
             b: [0.0; 4],

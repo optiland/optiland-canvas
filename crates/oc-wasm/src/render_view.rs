@@ -97,7 +97,7 @@ fn response_role(r: &SurfaceResponse) -> &'static str {
         "mirror" => "mirror",
         "absorb" => "absorber",
         "split" => "beamsplitter",
-        "dichroic" | "coated" => "dichroic",
+        "dichroic" | "coated" | "film" => "dichroic",
         _ => "generic_dielectric",
     }
 }
@@ -108,20 +108,43 @@ fn response_role(r: &SurfaceResponse) -> &'static str {
 /// A 50:50 splitter is mid grey in both; a long-pass dichroic reflects blue and
 /// transmits yellow. `None` for a face with no explicit coating.
 pub(crate) fn coat_colors(r: &SurfaceResponse) -> Option<([f32; 3], [f32; 3])> {
-    let SurfaceResponse::ExplicitRt {
-        reflectance,
-        transmittance,
-    } = r
-    else {
-        return None;
+    // A film is sampled at the angle it was designed for, which is the angle it
+    // is used at: a 45° dichroic drawn with its normal-incidence colours would
+    // be the wrong colour for the same reason it used to route the wrong light.
+    let film = match r {
+        SurfaceResponse::Coating { coating } => {
+            Some((coating, coating.design.map_or(0.0, |d| d.aoi_deg)))
+        }
+        _ => None,
     };
+    let table = match r {
+        SurfaceResponse::ExplicitRt {
+            reflectance,
+            transmittance,
+        } => Some((reflectance, transmittance)),
+        _ => None,
+    };
+    if film.is_none() && table.is_none() {
+        return None;
+    }
     let (mut white, mut rc, mut tc) = ([0.0f64; 3], [0.0f64; 3], [0.0f64; 3]);
     // 5 nm steps at the band's interior midpoints.
     for i in 0..80 {
         let um = 0.3825 + 0.005 * i as f64;
         let c = wavelength_um_to_linear(um as f32);
-        let rv = reflectance.sample(um).unwrap_or(0.0);
-        let tv = transmittance.sample(um).unwrap_or(0.0);
+        let (rv, tv) = match (&film, &table) {
+            (Some((coating, aoi)), _) => {
+                match oc_core::thinfilm::coating_rt(coating, 1.0, um, aoi.to_radians().cos()) {
+                    Some(v) => (v.r(), v.t()),
+                    None => (0.0, 0.0),
+                }
+            }
+            (_, Some((reflectance, transmittance))) => (
+                reflectance.sample(um).unwrap_or(0.0),
+                transmittance.sample(um).unwrap_or(0.0),
+            ),
+            _ => (0.0, 0.0),
+        };
         for k in 0..3 {
             white[k] += c[k] as f64;
             rc[k] += rv * c[k] as f64;

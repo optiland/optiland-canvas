@@ -66,7 +66,7 @@ fn proj_local(iso: &Isometry3, plane: &Plane3, x: f64, y: f64) -> Vec2 {
 fn body(b: &Body3, plane: &Plane3, out: &mut Vec<String>) {
     let iso = &b.common.transform;
     match &b.geometry {
-        SolidGeometry3::Profile(p) => profile(&p.profile, iso, plane, out),
+        SolidGeometry3::Profile(p) => profile(&p.profile, iso, plane, &b.surface, out),
         SolidGeometry3::Sphere { radius_mm } => sphere(iso, plane, *radius_mm, out),
         SolidGeometry3::Box { half_extents_mm } => box_xsec(iso, plane, *half_extents_mm, out),
         SolidGeometry3::Cylinder {
@@ -80,7 +80,13 @@ fn body(b: &Body3, plane: &Plane3, out: &mut Vec<String>) {
 /// A profile-authored body: each edge stroked in the plane it was drawn in
 /// (local `z = 0`), which is the meridian for a revolve and the section for an
 /// extrude — the classic 2D lens/prism outline.
-fn profile(profile: &ClosedProfile2, iso: &Isometry3, plane: &Plane3, out: &mut Vec<String>) {
+fn profile(
+    profile: &ClosedProfile2,
+    iso: &Isometry3,
+    plane: &Plane3,
+    props: &oc_core::scene3::SurfaceProps3,
+    out: &mut Vec<String>,
+) {
     for e in &profile.edges {
         let mut pts = Vec::new();
         sample_curve(&e.curve, &mut pts);
@@ -88,7 +94,21 @@ fn profile(profile: &ClosedProfile2, iso: &Isometry3, plane: &Plane3, out: &mut 
             .iter()
             .map(|p| proj_local(iso, plane, p.x, p.y))
             .collect();
-        if uv.len() >= 2 {
+        if uv.len() < 2 {
+            continue;
+        }
+        // A coated face of a solid draws as the coating it carries, tinted by
+        // what it reflects: on a plate that face is the whole component, and
+        // drawing it as one more edge of a glass disc would hide it.
+        let two = props.for_patch(e.patch);
+        let coated = matches!(two.from_outside, SurfaceResponse::Coating { .. });
+        if coated {
+            let line = poly("dichroic", false, &uv);
+            out.push(match coat_css(&two.from_outside) {
+                Some(css) => format!("{},\"tint\":\"{css}\"}}", &line[..line.len() - 1]),
+                None => line,
+            });
+        } else {
             out.push(poly("body", false, &uv));
         }
     }

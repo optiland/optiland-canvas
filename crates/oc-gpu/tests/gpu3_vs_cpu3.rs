@@ -870,3 +870,69 @@ fn dichroics_and_tabulated_responses_match_cpu() {
         assert_gpu_matches_cpu_at(&tracer, &scene, &fold_rays(&lambdas), ghost_opts(ghosts));
     }
 }
+
+/// A real thin-film coating on the GPU against the CPU mirror.
+///
+/// This is the only test that runs the shader's coating branch at all. Both
+/// sides read the same baked grid, so unlike every other physics comparison
+/// here this one is a check on the *indexing*: the shader walks a wavelength
+/// axis and a `sin²θ` row by hand, and an off-by-one in either would read a
+/// neighbouring column and quietly route light the wrong way.
+#[test]
+fn a_thin_film_coating_matches_cpu() {
+    let Some(tracer) = tracer_or_skip() else {
+        return;
+    };
+    let design = oc_core::thinfilm::CoatingDesign::long_pass(550.0, 45.0);
+    let coating = oc_core::thinfilm::plate_coating(
+        design,
+        oc_core::thinfilm::materials::bk7(),
+        oc_core::thinfilm::ExitFace::Bare,
+        1.0,
+    );
+    let mut scene = Scene3::new();
+    fold_with_two_arms(&mut scene, SurfaceResponse::Coating { coating });
+    scene.validate().unwrap();
+    // Across the edge, where the grid's two axes both matter, and out either
+    // side of it where they do not.
+    let lambdas = [0.42, 0.50, 0.53, 0.55, 0.57, 0.62, 0.70];
+    assert_gpu_matches_cpu_at(&tracer, &scene, &fold_rays(&lambdas), opts());
+}
+
+/// A coated plate body on the GPU against the CPU mirror.
+///
+/// The plate is a solid whose two faces do different things, so the shader has
+/// to pick the response by face. Getting that wrong still splits the beam and
+/// still looks plausible, which is exactly why it needs a test: the CPU mirror
+/// reads the same baked grid, so any difference here is the shader's face
+/// indexing and nothing else.
+#[test]
+fn a_coated_plate_body_matches_cpu() {
+    let Some(tracer) = tracer_or_skip() else {
+        return;
+    };
+    let mut scene = Scene3::new();
+    scene
+        .add_plate_dichroic(Vec3::new(0.0, 0.0, 0.0), 10.0, 3.0, 135.0, 550.0, true)
+        .expect("the plate is valid");
+    add_rect_detector(
+        &mut scene,
+        Vec3::new(20.0, 0.0, 0.0),
+        -Vec3::X,
+        8.0,
+        8.0,
+        [3, 3],
+    );
+    add_rect_detector(
+        &mut scene,
+        Vec3::new(0.0, 20.0, 0.0),
+        -Vec3::Y,
+        8.0,
+        8.0,
+        [3, 3],
+    );
+    scene.validate().unwrap();
+    // Across the edge, where both grid axes matter, and either side of it.
+    let lambdas = [0.45, 0.50, 0.53, 0.55, 0.58, 0.62, 0.70];
+    assert_gpu_matches_cpu_at(&tracer, &scene, &fold_rays(&lambdas), opts());
+}

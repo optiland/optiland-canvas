@@ -45,10 +45,11 @@ t = 2 η₀ / (η₀ B + C)            T = |t|² · Re(η_sub)/Re(η₀)
 Filters*, chapter 2.6. Complex indices work, so metal films are ordinary members
 of the model rather than a special case.
 
-s and p are computed separately throughout. The tracer is unpolarized and
-consumes their mean, but the two are kept apart because at 45 degrees a
-dichroic's s and p edges sit tens of nanometres apart, and a mean that hid that
-would be worse than no number at all.
+s and p are computed separately throughout, and the reference tracer now keeps
+them apart all the way to the detector: see [`polarization.md`](polarization.md).
+The same matrix also yields complex amplitudes, because a coating's retardance is
+as real as its reflectance, and a quarter-wave stack near its band edge puts tens
+of degrees between s and p.
 
 ## Why Optiland is the reference
 
@@ -213,23 +214,13 @@ drags, changing the thickness of the layer to its left.
 
 ## What is still missing
 
-- **Polarization.** This is the largest gap, and it is worth being precise about
-  what it costs.
+- **Polarization** is no longer missing. It has its own page,
+  [`polarization.md`](polarization.md).
 
-  The coating calculation *is* polarization-resolved: `FilmRt` carries `r_s`,
-  `r_p`, `t_s` and `t_p` separately all the way through. What is missing is
-  transport. A ray has no polarization state, so the tracer takes the mean and
-  the outgoing beam is unpolarized again.
+  It belongs in this one's list of gaps because a coating is where it bites.
+  The dichroic `＋ dichroic` builds, at 45 degrees, reflecting:
 
-  For a **single** element lit by unpolarized light, the mean is exactly right
-  for flux, so nothing is wrong yet. The error appears at the **second**
-  polarization-sensitive element, which in reality no longer sees unpolarized
-  light.
-
-  How far from unpolarized? The dichroic `＋ dichroic` builds, at 45 degrees,
-  reflecting:
-
-  | λ (nm) | R_s | R_p | mean used | degree of polarization |
+  | λ (nm) | R_s | R_p | unpolarized mean | degree of polarization |
   |---|---|---|---|---|
   | 460 | 0.9997 | 0.9937 | 0.9967 | 0.3% |
   | 520 | 0.9961 | 0.8668 | 0.9315 | 6.9% |
@@ -239,13 +230,12 @@ drags, changing the thickness of the layer to its left.
 
   Deep in the band both polarizations saturate and the mean is harmless. At the
   edge, which is exactly where a dichroic is used, the reflected beam is 95%
-  polarized: the part is very nearly a polarizer and the model calls its output
-  unpolarized. Put a second tilted dichroic after it and the answer is wrong by
-  whatever those two polarizations would have done to each other.
+  polarized. The reference tracer now carries that state on to whatever stands
+  in the folded arm. The f32 preview still takes the mean, which is the right
+  flux for one element and wrong for the second.
 
-  A polarizing beam splitter cannot be represented at all, and neither can a
-  waveplate, a polarizer, or the phase shift on total internal reflection that
-  makes a Fresnel rhomb work.
+  A **polarizing beam splitter** as a part is still missing, and so is any
+  source that emits polarized light without a polarizer in front of it.
 - **Coatings on lens faces.** The machinery is all there now (a coated plate is
   a revolved body with a film on one face, which is exactly what an AR-coated
   lens would be), but nothing authors one. Lens faces still use the scalar

@@ -77,7 +77,7 @@ Every edit goes through a Rust setter that refuses an invalid shape and leaves t
 
 ### The model
 
-Both are zero-thickness surfaces with `SurfaceResponse::ExplicitRt` on both faces. The model is scalar: nothing depends on the angle of incidence or on polarization, as everywhere in the kernel. The plate has no substrate, so there is no refraction through it and no back-surface reflection.
+Both are zero-thickness surfaces with `SurfaceResponse::ExplicitRt` on both faces. The model is two numbers: nothing depends on the angle of incidence, and two numbers cannot describe a polarization interaction either, so the reference tracer treats such a surface as an ideal phase-neutral attenuator and records that assumption when the light reaching it is already polarized ([`polarization.md`](polarization.md)). The plate has no substrate, so there is no refraction through it and no back-surface reflection.
 
 - **Beam splitter:** constant reflectance R and transmittance T, with `R + T ≤ 1`; the rest is absorbed. The default is 50:50.
 - **Dichroic (`DichroicSpec`):**

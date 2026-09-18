@@ -317,3 +317,91 @@ test.describe("component view", () => {
     expect(role).toBe("beamsplitter");
   });
 });
+
+// ---------------------------------------------------------------------------
+// The component view on a polarizing element
+// ---------------------------------------------------------------------------
+
+test.describe("component view — polarizing elements", () => {
+  /** Add an element through its own button and select it. */
+  async function addAndSelect(page: Page, button: string): Promise<number> {
+    const id = await page.evaluate((b) => {
+      const d = (window as unknown as { __ocDebug: any }).__ocDebug;
+      (document.getElementById(b) as HTMLButtonElement).click();
+      return d.scene.sceneRevision();
+    }, button);
+    expect(id).toBeGreaterThan(0);
+    await expect(page.locator("#stat")).toContainText("segs");
+    return id;
+  }
+
+  test("a polarizer opens its own editor, not the coating one", async ({ page }) => {
+    await freshApp(page);
+    await openInset(page);
+    await addAndSelect(page, "addPolarizer");
+
+    const view = await insetView(page);
+    expect(view.kind).toBe("polarizing");
+    // The subtitle names the part rather than calling it a surface.
+    await expect(page.locator("#componentInset .inset-sub")).toContainText("polarizer");
+    // Its axis is a handle, and there is no coating curve to drag.
+    expect(view.handles.map((h) => h.key)).toContain("axis");
+    // The readout says the thing a user needs to know about a polarizer.
+    await expect(page.locator("#componentInset .cv-read")).toContainText("loses half");
+  });
+
+  test("turning the axis handle changes the scene and the numbers follow", async ({ page }) => {
+    await freshApp(page);
+    await openInset(page);
+    await addAndSelect(page, "addPolarizer");
+    const id = (await insetView(page)).id;
+
+    const axisOf = (page: Page, id: number) =>
+      page.evaluate(
+        (i) => JSON.parse((window as unknown as { __ocDebug: any }).__ocDebug.scene.surfacePolarizationJSON(i)).axisDeg as number,
+        id,
+      );
+    const before = await axisOf(page, id);
+
+    const h = await handle(page, "axis");
+    await dragBy(page, h, -40, -40);
+    const after = await axisOf(page, id);
+    expect(Math.abs(after - before)).toBeGreaterThan(5);
+
+    // And the field shows what the scene holds.
+    const field = page.locator('#componentInset input[data-name="axis"]');
+    await expect(field).toHaveValue(String(Number(after.toFixed(4))));
+  });
+
+  test("a waveplate shows its retardance and a quarter wave makes the beam circular", async ({ page }) => {
+    await freshApp(page);
+    await openInset(page);
+    // A polarizer first, so there is a linear state for the plate to act on.
+    await addAndSelect(page, "addPolarizer");
+    await addAndSelect(page, "addRetarder");
+
+    const view = await insetView(page);
+    expect(view.kind).toBe("polarizing");
+    await expect(page.locator("#componentInset .inset-sub")).toContainText("retarder");
+    await expect(page.locator("#componentInset .cv-read")).toContainText("quarter wave");
+    expect(view.handles.map((h) => h.key)).toContain("retardance");
+
+    // Typing a half wave into the field changes what the tracer reports, and
+    // the readout renames the element.
+    const field = page.locator('#componentInset input[data-name="retardance"]');
+    await field.fill("180");
+    await expect(page.locator("#componentInset .cv-read")).toContainText("half wave");
+  });
+
+  test("the extinction field is there on a polarizer and not on a waveplate", async ({ page }) => {
+    await freshApp(page);
+    await openInset(page);
+    await addAndSelect(page, "addPolarizer");
+    await expect(page.locator('#componentInset input[data-name="extinction"]')).toBeVisible();
+    await expect(page.locator('#componentInset input[data-name="retardance"]')).toHaveCount(0);
+
+    await addAndSelect(page, "addRetarder");
+    await expect(page.locator('#componentInset input[data-name="retardance"]')).toBeVisible();
+    await expect(page.locator('#componentInset input[data-name="extinction"]')).toHaveCount(0);
+  });
+});

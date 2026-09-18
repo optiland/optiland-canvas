@@ -657,6 +657,79 @@ impl Scene3 {
         self.set_surface_responses(id, r.clone(), r)
     }
 
+    /// Turn a polarizing element's axis: a polarizer's transmission axis or a
+    /// retarder's fast axis, degrees from the surface's local `+X`.
+    ///
+    /// False (scene unchanged) for a non-finite angle, or an id that is not a
+    /// surface carrying one of those two responses. The angle is stored as
+    /// given rather than wrapped, because 370 and 10 are the same element and a
+    /// field the user is typing into should not jump under them.
+    pub fn set_polarization_axis(&mut self, id: u64, axis_deg: f64) -> bool {
+        if !axis_deg.is_finite() {
+            return false;
+        }
+        self.map_polarizing(id, &mut |r| match r {
+            SurfaceResponse::Polarizer { axis_deg: a, .. } => *a = axis_deg,
+            SurfaceResponse::Retarder { axis_deg: a, .. } => *a = axis_deg,
+            _ => {}
+        })
+    }
+
+    /// Set a polarizer's extinction: the **power** fraction of the blocked
+    /// component that still gets through. Clamped to `[0, 1]`. False for a
+    /// non-finite value or an element that is not a polarizer.
+    pub fn set_polarizer_extinction(&mut self, id: u64, extinction: f64) -> bool {
+        if !extinction.is_finite() {
+            return false;
+        }
+        let v = extinction.clamp(0.0, 1.0);
+        let mut touched = false;
+        let ok = self.map_polarizing(id, &mut |r| {
+            if let SurfaceResponse::Polarizer { extinction: e, .. } = r {
+                *e = v;
+                touched = true;
+            }
+        });
+        ok && touched
+    }
+
+    /// Set a retarder's retardance in degrees: 90 is a quarter wave, 180 a half
+    /// wave. False for a non-finite value or an element that is not a retarder.
+    pub fn set_retarder_retardance(&mut self, id: u64, retardance_deg: f64) -> bool {
+        if !retardance_deg.is_finite() {
+            return false;
+        }
+        let mut touched = false;
+        let ok = self.map_polarizing(id, &mut |r| {
+            if let SurfaceResponse::Retarder { retardance_deg: d, .. } = r {
+                *d = retardance_deg;
+                touched = true;
+            }
+        });
+        ok && touched
+    }
+
+    /// Apply `f` to both faces of a surface that carries a polarizing response.
+    /// False for any other id, so an edit cannot silently land on the wrong
+    /// kind of element.
+    fn map_polarizing(&mut self, id: u64, f: &mut dyn FnMut(&mut SurfaceResponse)) -> bool {
+        let Some(s) = self.surfaces.iter_mut().find(|s| s.common.id.0 == id) else {
+            return false;
+        };
+        let polarizing = |r: &SurfaceResponse| {
+            matches!(
+                r,
+                SurfaceResponse::Polarizer { .. } | SurfaceResponse::Retarder { .. }
+            )
+        };
+        if !polarizing(&s.response_front) && !polarizing(&s.response_back) {
+            return false;
+        }
+        f(&mut s.response_front);
+        f(&mut s.response_back);
+        true
+    }
+
     /// Give both faces of a surface object the dichroic coating `spec`. False
     /// (scene unchanged) for a non-finite spec or a non-surface id.
     pub fn set_surface_dichroic(&mut self, id: u64, spec: DichroicSpec) -> bool {

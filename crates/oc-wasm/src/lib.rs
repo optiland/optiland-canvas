@@ -2119,6 +2119,92 @@ impl Canvas {
         }
     }
 
+    /// A polarizing element's properties, or `null` for anything else.
+    ///
+    /// JSON `{kind, axisDeg, extinction, retardanceDeg}` where `kind` is
+    /// `"polarizer"` or `"retarder"`. `extinction` is null on a retarder and
+    /// `retardanceDeg` is null on a polarizer, because a property the element
+    /// does not have should read as absent and not as zero.
+    ///
+    /// The axis is measured from the surface's **own local +X**, not from any
+    /// world axis: it is a direction in the element, and it turns with the
+    /// element.
+    #[wasm_bindgen(js_name = surfacePolarizationJSON)]
+    pub fn surface_polarization_json(&self, id: f64) -> String {
+        use oc_core::scene3::SurfaceResponse;
+        let Some((front, _back)) = self
+            .scene3
+            .as_ref()
+            .and_then(|s| s.surface_responses(id as u64))
+        else {
+            return "null".into();
+        };
+        match front {
+            SurfaceResponse::Polarizer {
+                axis_deg,
+                extinction,
+            } => format!(
+                "{{\"kind\":\"polarizer\",\"axisDeg\":{},\"extinction\":{},\"retardanceDeg\":null}}",
+                json_num(*axis_deg),
+                json_num(*extinction)
+            ),
+            SurfaceResponse::Retarder {
+                axis_deg,
+                retardance_deg,
+            } => format!(
+                "{{\"kind\":\"retarder\",\"axisDeg\":{},\"extinction\":null,\"retardanceDeg\":{}}}",
+                json_num(*axis_deg),
+                json_num(*retardance_deg)
+            ),
+            _ => "null".into(),
+        }
+    }
+
+    /// Turn a polarizing element's axis (degrees from the surface's local
+    /// `+X`). False, and the scene unchanged, for anything that is not one.
+    #[wasm_bindgen(js_name = setPolarizationAxis)]
+    pub fn set_polarization_axis(&mut self, id: f64, axis_deg: f64) -> bool {
+        let Some(scene) = self.scene3.as_mut() else {
+            return false;
+        };
+        if scene.set_polarization_axis(id as u64, axis_deg) {
+            self.revision += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Set a polarizer's extinction: the power fraction of the blocked
+    /// component that still gets through, clamped to `[0, 1]`.
+    #[wasm_bindgen(js_name = setPolarizerExtinction)]
+    pub fn set_polarizer_extinction(&mut self, id: f64, extinction: f64) -> bool {
+        let Some(scene) = self.scene3.as_mut() else {
+            return false;
+        };
+        if scene.set_polarizer_extinction(id as u64, extinction) {
+            self.revision += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Set a retarder's retardance in degrees: 90 a quarter wave, 180 a half
+    /// wave.
+    #[wasm_bindgen(js_name = setRetarderRetardance)]
+    pub fn set_retarder_retardance(&mut self, id: f64, retardance_deg: f64) -> bool {
+        let Some(scene) = self.scene3.as_mut() else {
+            return false;
+        };
+        if scene.set_retarder_retardance(id as u64, retardance_deg) {
+            self.revision += 1;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Each face's coating, for the component view: `{front, back}`, each
     /// `{kind, r, t, dichroic}` with `kind` as in [`Canvas::surface_response_json`],
     /// `r`/`t` the constant reflectance and transmittance (a mirror's

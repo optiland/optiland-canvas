@@ -113,6 +113,28 @@ where it applies: a coated plate, whose front face polarizes the beam before its
 back face transmits it, moves by 2e-2 of a ray's flux between the two models,
 ten times the grid tolerance that suite exists to check.
 
+## In the component view
+
+A polarizing element is unlike everything else the component view edits. A lens
+has a shape and a coating has a curve in wavelength; these have an **axis**, and
+what they do depends on the state of the light reaching them rather than on any
+property of the surface alone. There is no R or T to plot.
+
+So the drawing is the element face on, with its axis across it and a handle to
+turn it, and beside that:
+
+- **Polarizer:** Malus' law, the fraction passed against the angle of an
+  incoming fully linear state, with the flat line at one half that unpolarized
+  light gets whatever the angle. Extinction is quoted the way a datasheet quotes
+  it, as a contrast ratio.
+- **Retarder:** the polarization ellipse that linear light at 45 degrees to the
+  fast axis comes out as, on a dial whose angle is the retardance. The quarter
+  wave is marked, and the readout names the setting as well as measuring it.
+
+They are asked about before the coating editor, because a polarizing element
+answers `surfaceCoatingJSON` too, with nulls where its R and T would be, and
+would otherwise open a coating editor showing two empty curves.
+
 ## At a detector
 
 Every hit records its state and the frame that state is written on, because

@@ -233,6 +233,25 @@ export class MaterialLibrary {
       case "beamsplitter":
       case "dichroic":
         return this.coated(role, group === FaceGroup.Back ? d.coat?.back ?? null : d.coat?.front ?? null);
+      case "polarizing":
+        // A polarizer or a waveplate: a smoky plate, so it reads as an element
+        // that does something to the light rather than as a clear window. The
+        // f32 preview cannot show what it does, so the plate saying "I am not a
+        // window" is the whole of what the 3D view can honestly convey.
+        return this.get("polarizing", () => {
+          const m = new THREE.MeshPhysicalNodeMaterial({
+            color: new THREE.Color(0.30, 0.31, 0.38),
+            metalness: 0,
+            roughness: 0.25,
+            transmission: 0.55,
+            ior: 1.5,
+            thickness: 0.4,
+            transparent: true,
+            opacity: 0.85,
+          });
+          m.depthWrite = false;
+          return m;
+        });
       case "slab_edge":
         // The edge of a display-only slab (a mirror or plate substrate).
         return this.get("slab_edge", () => new THREE.MeshStandardNodeMaterial({

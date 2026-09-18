@@ -1926,6 +1926,83 @@ impl Canvas {
         id as f64
     }
 
+    /// Add an ideal linear polarizer at `(x,y)`: a round plate of `radius` mm,
+    /// tilted `tilt_deg`, passing the field along `axis_deg` from the plate's
+    /// own local `+X` and absorbing the perpendicular component.
+    ///
+    /// `extinction` is the **power** fraction of the blocked component that
+    /// still gets through: 0 is perfect, 1e-4 an ordinary sheet. Unpolarized
+    /// light loses half its flux here, which is physics rather than a modelled
+    /// loss. Returns the new object id, or `-1`.
+    ///
+    /// The preview cannot do this: it carries no polarization state, so it
+    /// draws the plate as a 50% attenuator and a crossed pair stays bright
+    /// there while the reference goes dark.
+    #[wasm_bindgen(js_name = addPolarizer)]
+    pub fn add_polarizer(
+        &mut self,
+        x: f64,
+        y: f64,
+        radius: f64,
+        tilt_deg: f64,
+        axis_deg: f64,
+        extinction: f64,
+    ) -> f64 {
+        let Some(scene) = self.scene3.as_mut() else {
+            return -1.0;
+        };
+        match scene.add_polarizer(
+            Vec3::new(x, y, 0.0),
+            radius.max(0.5),
+            tilt_deg,
+            axis_deg,
+            extinction,
+        ) {
+            Some(id) => {
+                self.revision += 1;
+                id as f64
+            }
+            None => -1.0,
+        }
+    }
+
+    /// Add an ideal linear retarder (a waveplate) at `(x,y)`: a round plate of
+    /// `radius` mm, tilted `tilt_deg`, with its fast axis `axis_deg` from the
+    /// plate's local `+X` and `retardance_deg` of phase on the slow axis.
+    ///
+    /// 90 is a quarter wave, 180 a half wave. Lossless and zero thickness: the
+    /// polarization action of a waveplate and not the crystal, so no walk-off,
+    /// no ordinary and extraordinary rays, and the retardance is the number
+    /// given rather than one derived from a thickness at each wavelength.
+    /// Returns the new object id, or `-1`.
+    #[wasm_bindgen(js_name = addRetarder)]
+    pub fn add_retarder(
+        &mut self,
+        x: f64,
+        y: f64,
+        radius: f64,
+        tilt_deg: f64,
+        axis_deg: f64,
+        retardance_deg: f64,
+    ) -> f64 {
+        let Some(scene) = self.scene3.as_mut() else {
+            return -1.0;
+        };
+        match scene.add_retarder(
+            Vec3::new(x, y, 0.0),
+            radius.max(0.5),
+            tilt_deg,
+            axis_deg,
+            retardance_deg,
+        ) {
+            Some(id) => {
+                self.revision += 1;
+                id as f64
+            }
+            None => -1.0,
+        }
+    }
+
     /// Add a beam splitter at `(x,y)`: a round plate of `radius` mm, tilted
     /// `tilt_deg` in the meridional plane, reflecting `reflectance` and
     /// transmitting `transmittance` on both faces. Returns the new object id,
@@ -2592,7 +2669,16 @@ impl Canvas {
 
     /// The f64 reference readout for a detector by id (§4.1: the honest numbers).
     /// JSON `{hits, totalIncident, totalSignal, cellArea, centroid, meanOpl,
-    /// bins, incident}`, or `null` if there is no such detector.
+    /// bins, incident, dop, dolp, azimuthDeg, stokes, maxTiltDeg}`, or `null`
+    /// if there is no such detector.
+    ///
+    /// The polarization fields describe the summed state in the **detector's
+    /// own frame**: every ray is rotated onto the projection of the detector's
+    /// local `+X` before being added. `maxTiltDeg` is the worst angle between
+    /// an arriving ray and the detector normal, and it is the caveat on that
+    /// sum: rays from very different directions have genuinely different
+    /// transverse planes, and adding their `S1` is then arithmetic rather than
+    /// measurement. Total flux never has that problem.
     #[wasm_bindgen(js_name = detectorResultJSON)]
     pub fn detector_result_json(&self, detector_id: f64) -> String {
         let Some(scene) = &self.scene3 else {
@@ -2621,8 +2707,9 @@ impl Canvas {
             .cell_area_mm2
             .map_or("null".to_string(), |a| format!("{a}"));
         let incident: Vec<String> = d.incident_flux.iter().map(|v| format!("{v}")).collect();
+        let st = d.stokes_local;
         format!(
-            "{{\"hits\":{},\"totalIncident\":{},\"totalSignal\":{},\"cellArea\":{},\"centroid\":{},\"meanOpl\":{},\"bins\":[{},{}],\"incident\":[{}]}}",
+            "{{\"hits\":{},\"totalIncident\":{},\"totalSignal\":{},\"cellArea\":{},\"centroid\":{},\"meanOpl\":{},\"bins\":[{},{}],\"incident\":[{}],\"dop\":{},\"dolp\":{},\"azimuthDeg\":{},\"stokes\":[{},{},{},{}],\"maxTiltDeg\":{}}}",
             d.hits,
             d.total_incident,
             d.total_signal,
@@ -2631,7 +2718,15 @@ impl Canvas {
             mean_opl,
             d.bins[0],
             d.bins[1],
-            incident.join(",")
+            incident.join(","),
+            json_num(st.dop()),
+            json_num(st.dolp()),
+            json_num(st.azimuth_rad().to_degrees()),
+            json_num(st.s0),
+            json_num(st.s1),
+            json_num(st.s2),
+            json_num(st.s3),
+            json_num(d.max_tilt_rad.to_degrees())
         )
     }
 

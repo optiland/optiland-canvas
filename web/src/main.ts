@@ -492,7 +492,22 @@ async function main() {
     const c = info.centroid ? `(${info.centroid[0].toFixed(2)}, ${info.centroid[1].toFixed(2)})` : "—";
     const opl = info.meanOpl == null ? "—" : Number(info.meanOpl).toFixed(2);
     const tag = detId >= 0 ? `#${detId} · ` : "";
-    dockNums.textContent = `${tag}hits ${info.hits} · flux ${Number(info.totalIncident).toFixed(3)} · centroid ${c} mm · OPL ${opl} mm`;
+    // Polarization, when there is any. An unpolarized beam says nothing here
+    // rather than printing a zero the reader has to interpret. The tilt is the
+    // caveat on the numbers: the summed state is written in the detector's own
+    // frame, and a wide cone of arrival directions makes that a shared frame in
+    // name only.
+    let pol = "";
+    const dop = Number(info.dop);
+    if (Number.isFinite(dop) && dop > 1e-6) {
+      const kind = Number(info.dolp) > dop - 1e-6 ? `linear ${Number(info.azimuthDeg).toFixed(0)}°`
+        : Number(info.dolp) < 1e-6 ? "circular"
+        : `elliptical ${Number(info.azimuthDeg).toFixed(0)}°`;
+      const tilt = Number(info.maxTiltDeg);
+      const spread = Number.isFinite(tilt) && tilt > 5 ? ` (±${tilt.toFixed(0)}° cone)` : "";
+      pol = ` · pol ${(dop * 100).toFixed(1)}% ${kind}${spread}`;
+    }
+    dockNums.textContent = `${tag}hits ${info.hits} · flux ${Number(info.totalIncident).toFixed(3)} · centroid ${c} mm · OPL ${opl} mm${pol}`;
   }
 
   // Detector analysis-mode toggle (heatmap ⇄ spot).
@@ -873,6 +888,14 @@ async function main() {
   // table-driven dichroic is still in the kernel for documents that carry one,
   // but nothing in the UI creates one any more.
   document.getElementById("addDichroic")!.onclick = () => addAndFocus(scene.addPlateDichroic(-35, 0, 0, 15, 3, 135, 550, true));
+  // Polarizing elements face the beam (tilt 0) rather than folding it: their
+  // axis is a direction in the plate, so tilting one is a separate decision
+  // from choosing its axis. Both are ideal and zero thickness, and the f32
+  // preview has no polarization state to act on, so it draws a polarizer as a
+  // 50% attenuator and a waveplate as a window. The f64 readout is the one that
+  // knows what they do.
+  document.getElementById("addPolarizer")!.onclick = () => addAndFocus(scene.addPolarizer(-25, 0, 12, 0, 0, 0));
+  document.getElementById("addRetarder")!.onclick = () => addAndFocus(scene.addRetarder(-15, 0, 12, 0, 45, 90));
 
   // --- save .ocanvas — the Optiland handoff (§6) --------------------------
   // Save downloads the canonical 3D scene (the one the user actually edits) as a

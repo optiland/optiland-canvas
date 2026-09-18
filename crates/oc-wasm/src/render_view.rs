@@ -98,6 +98,10 @@ fn response_role(r: &SurfaceResponse) -> &'static str {
         "absorb" => "absorber",
         "split" => "beamsplitter",
         "dichroic" | "coated" | "film" => "dichroic",
+        // A polarizing element gets its own look. Drawn as plain glass it would
+        // read as a window, which is what it is to the preview and is not what
+        // it is.
+        "polarizer" | "retarder" => "polarizing",
         _ => "generic_dielectric",
     }
 }

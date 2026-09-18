@@ -84,6 +84,21 @@ test.describe("GPU 3D view appearance", () => {
     await shot(page, "splitter-dichroic.png");
   });
 
+  test("a film dichroic folding the beam", async ({ page }) => {
+    // The same fold, with a real thin-film stack solved for the 45° it hangs
+    // at. Its tint comes from what the stack reflects AT THAT ANGLE, so this
+    // shot is also a check that the display colour moved with the physics.
+    await page.evaluate(() => {
+      const s = (window as any).__ocDebug.scene;
+      s.setSourceWavelengths(new Float64Array([450, 520, 620]), new Float64Array(0));
+      s.addFilmDichroic(-30, 0, 0, 15, 135, 560, true);
+    });
+    await enter3d(page);
+    await page.keyboard.press("Escape");
+    await refresh3d(page);
+    await shot(page, "film-dichroic.png");
+  });
+
   test("three lenses with ghosts", async ({ page }) => {
     await lenses(page, 3);
     await page.locator("#ghosts").check();

@@ -874,6 +874,28 @@ async function main() {
     renderView();
     refreshReference();
   };
+
+  // A free spot on the axis near `x`, so a second click of the same button does
+  // not drop a plate exactly on top of the first.
+  //
+  // Two coincident zero-thickness surfaces are a degenerate scene, and the
+  // tracer resolves only one of them: the epsilon that stops a child ray
+  // re-hitting the surface it was born on cannot tell "the same surface" from
+  // "a different surface in the same place". Two crossed polarizers stacked at
+  // one point would report the light one of them passes, which is a wrong
+  // number arrived at quietly. Spreading them is the cheap half of the fix; the
+  // tracer learning to skip by identity rather than by distance is the other
+  // half, and is not done.
+  const GAP = 6;
+  const freeX = (x: number, y: number) => {
+    const taken = JSON.parse(scene.sceneObjectsJSON())
+      .filter((o: { pos: number[] }) => Math.abs(o.pos[1] - y) < GAP && Math.abs(o.pos[2]) < GAP)
+      .map((o: { pos: number[] }) => o.pos[0]);
+    let at = x;
+    // Step downstream until nothing is within a plate's width of the spot.
+    for (let i = 0; i < 64 && taken.some((t: number) => Math.abs(t - at) < GAP); i++) at += GAP;
+    return at;
+  };
   document.getElementById("addElement")!.onclick = () => addAndFocus(scene.addPlanarElement(25, 0, 8, 45));
   document.getElementById("addAperture")!.onclick = () => addAndFocus(scene.addAperture(-20, 0, 5, 0));
   document.getElementById("addPrism")!.onclick = () => addAndFocus(scene.addPrism(-40, 0, 16, 0, 1.62, 36));
@@ -894,8 +916,8 @@ async function main() {
   // preview has no polarization state to act on, so it draws a polarizer as a
   // 50% attenuator and a waveplate as a window. The f64 readout is the one that
   // knows what they do.
-  document.getElementById("addPolarizer")!.onclick = () => addAndFocus(scene.addPolarizer(-25, 0, 12, 0, 0, 0));
-  document.getElementById("addRetarder")!.onclick = () => addAndFocus(scene.addRetarder(-15, 0, 12, 0, 45, 90));
+  document.getElementById("addPolarizer")!.onclick = () => addAndFocus(scene.addPolarizer(freeX(-25, 0), 0, 12, 0, 0, 0));
+  document.getElementById("addRetarder")!.onclick = () => addAndFocus(scene.addRetarder(freeX(-15, 0), 0, 12, 0, 45, 90));
 
   // --- save .ocanvas — the Optiland handoff (§6) --------------------------
   // Save downloads the canonical 3D scene (the one the user actually edits) as a

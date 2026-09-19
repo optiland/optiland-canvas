@@ -415,6 +415,9 @@ export function initSlice3d(opts: {
     // A splitter half-silvered (dashed); a dichroic in the colour it reflects.
     splitter: { stroke: "rgba(215,225,240,0.95)", width: 2.5, dash: [5, 3] },
     dichroic: { stroke: "rgba(160,200,255,0.95)", width: 3 },
+    // A polarizer or a waveplate: hatched, because it does something to the
+    // light that a line cannot show and should not look like a plain window.
+    polarizing: { stroke: "rgba(186,168,235,0.95)", width: 2.5, dash: [2, 2] },
     surface: { stroke: "rgba(150,160,175,0.7)", width: 1.5 },
     detector: { stroke: "rgba(127,214,255,0.85)", width: 2 },
     aperture: { stroke: "rgba(210,165,120,0.85)", width: 2.5 },

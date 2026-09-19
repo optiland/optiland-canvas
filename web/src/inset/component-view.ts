@@ -20,6 +20,7 @@ import { parseDetectorMaps } from "../render3d/types";
 import { createCoatingEditor } from "./coating-editor";
 import type { InsetContent } from "./inset";
 import { createLensEditor } from "./lens-editor";
+import { createPolarizationEditor } from "./polarization-editor";
 import {
   drawHandle,
   fmt,
@@ -38,7 +39,7 @@ export type ComponentView = InsetContent & {
   debug: () => { id: number; kind: string; note: string; handles: { key: string; x: number; y: number }[] };
 };
 
-type EditorKind = "lens" | "coating" | "aperture" | "detector" | "source" | "summary" | "none";
+type EditorKind = "lens" | "coating" | "polarizing" | "aperture" | "detector" | "source" | "summary" | "none";
 
 export function createComponentView(opts: {
   scene: Canvas;
@@ -88,10 +89,19 @@ export function createComponentView(opts: {
   function kindFor(id: number): EditorKind {
     const o = objectOf(id);
     if (!o) return "none";
-    // A coated plate is a glass body, so it would read as a lens by its shape.
-    // Its film is the thing you came to edit, so it wins.
+    // A polarizing element answers `surfaceCoatingJSON` too, with nulls where
+    // its R and T would be, so it has to be asked about first or it would open
+    // the coating editor and show two empty curves.
+    if (JSON.parse(scene.surfacePolarizationJSON(id))) return "polarizing";
+    // A coated plate is a glass body, so it would read as a lens by its shape,
+    // and its film is the thing you came to edit. But a coated *lens* is still
+    // a lens: what tells them apart is curvature, since a plate is flat on both
+    // faces. Asking by shape first is what lets a lens keep its own editor once
+    // somebody puts an AR coating on it.
+    const lens = JSON.parse(scene.singletShapeJSON(id, 2));
+    if (lens && (lens.r1 != null || lens.r2 != null)) return "lens";
     if (JSON.parse(scene.surfaceFilmJSON(id))) return "coating";
-    if (JSON.parse(scene.singletShapeJSON(id, 2))) return "lens";
+    if (lens) return "lens";
     if (o.kind === "aperture") return "aperture";
     if (o.kind === "detector") return "detector";
     if (o.kind === "source") return "source";
@@ -131,6 +141,7 @@ export function createComponentView(opts: {
     switch (kind) {
       case "lens": editor = createLensEditor(ctx, () => { readObjects(); return objectOf(id); }); break;
       case "coating": editor = createCoatingEditor(ctx); break;
+      case "polarizing": editor = createPolarizationEditor(ctx); break;
       case "aperture": editor = apertureView(ctx, () => { readObjects(); return objectOf(id); }); break;
       case "detector": editor = detectorView(ctx); break;
       case "source": editor = sourceView(ctx); break;
@@ -144,7 +155,14 @@ export function createComponentView(opts: {
   function subtitle(id: number, kind: EditorKind) {
     const o = objectOf(id);
     if (!o || kind === "none") return "nothing selected";
-    const what = kind === "lens" ? "singlet" : o.kind === "profile" ? o.construction : o.kind;
+    const what = kind === "lens"
+      ? "singlet"
+      // "surface" says nothing a user wants; name the part.
+      : kind === "polarizing"
+      ? (JSON.parse(scene.surfacePolarizationJSON(id))?.kind ?? "surface")
+      : o.kind === "profile"
+      ? o.construction
+      : o.kind;
     return `#${id} · ${what}`;
   }
 

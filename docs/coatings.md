@@ -45,10 +45,11 @@ t = 2 η₀ / (η₀ B + C)            T = |t|² · Re(η_sub)/Re(η₀)
 Filters*, chapter 2.6. Complex indices work, so metal films are ordinary members
 of the model rather than a special case.
 
-s and p are computed separately throughout. The tracer is unpolarized and
-consumes their mean, but the two are kept apart because at 45 degrees a
-dichroic's s and p edges sit tens of nanometres apart, and a mean that hid that
-would be worse than no number at all.
+s and p are computed separately throughout, and the reference tracer now keeps
+them apart all the way to the detector: see [`polarization.md`](polarization.md).
+The same matrix also yields complex amplitudes, because a coating's retardance is
+as real as its reflectance, and a quarter-wave stack near its band edge puts tens
+of degrees between s and p.
 
 ## Why Optiland is the reference
 
@@ -211,25 +212,102 @@ Under the plot the stack is drawn as its layers, left to right from the incident
 medium inward, each as wide as it is thick and shaded by index. Every boundary
 drags, changing the thickness of the layer to its left.
 
+## Coating a lens
+
+Select a lens in the component view and each face takes one of two
+antireflection coatings, following whichever face is selected the same way `R`
+and `k` do. A real lens is coated a face at a time and the two are often
+different.
+
+Both are solved against **that lens's own glass**: the same three layers on
+crown and on flint are not the same coating, because what a stack reflects
+depends on what it is sitting on. They are designed at 550 nm on axis, which is
+where a general-purpose AR is centred and how a lens face is used. A face meant
+for 45 degrees is a different part.
+
+What it is worth, for the default singlet:
+
+| face | reflects at 550 nm |
+|---|---|
+| bare crown | 4.2% |
+| single quarter wave of MgF₂ | 1.3% |
+| quarter-half-quarter | lower again, and flatter across the visible |
+
+Through the default scene, to the detector:
+
+| both faces | passes |
+|---|---|
+| bare | 0.917 |
+| AR ×1 | 0.971 |
+| AR ×3 | 0.987 |
+
+The five percent that stops bouncing around inside the instrument is the
+reason coatings exist.
+
+**What an AR coat still reflects is a ghost.** It is the residual the coating
+failed to suppress, stray light for exactly the reason bare glass's reflection
+is, so the ghost switch decides whether it is traced, and with the switch off
+it is named in the ledger as truncated flux. A dichroic's reflected band, a
+mirror, and a polarizing splitter's s are the opposite case: the reflection is
+the part doing its job, and it is followed whichever way the switch is set.
+The design says which a stack is (`Coating::reflection_is_stray`), and a layer
+edit keeps the design, so a hand-thinned AR coat is still an AR coat. A stack
+with no design reads as a path. Until this was drawn, every coated face took
+the dichroic's branch, and coating a lens made its reflections appear as
+primary rays with the ghost layer off.
+
+**Light leaving the lens meets the coating from behind.** The layers are
+written from the air side inward, so a ray inside the glass meets them in the
+other order, and the face's inside copy says so (`Coating::seen_from_behind`).
+A single layer is its own mirror image and cannot tell. The three-layer AR is
+not, and walked in the written order from inside it put the layer meant to
+face the air against the glass: it reflected more than bare glass, and the
+lens passed 0.911 of the light, less than with no coating at all. The preview
+was never wrong about this. It bakes the grid from outside and reads a ray
+from inside at the conjugate angle, which a lossless stack allows because it
+reflects and transmits the same from either side; that is the property the
+test holds the two walks to, to 1e-12.
+
+**Past the critical angle the reflection is the ray.** Whether a reflection is
+stray is a question only while light gets through. A ray inside the glass past
+the critical angle cannot get out whatever the coating, because the air
+carries only an evanescent wave, so a coated face reflects it totally, exactly
+as bare glass does: a primary path, flagged as total internal reflection, and
+never a ghost. The transfer matrix gives R = 1 there for a lossless stack, and
+the test holds every such bounce to that. The preview cannot read this off its
+grid, which is baked from outside and saturates at grazing, so it takes R = 1
+outright. That is exact for every coating the app makes; a hand-written
+absorbing stack would reflect a little less in the reference than in the
+preview.
+
+A coated lens is still a lens. What separates a plate from a lens is curvature,
+not the film, so the object list and the component view keep calling it one and
+it keeps the lens editor. That was not free: the view used to ask "does this
+body carry a film" before "is this body a lens", which was right while only
+plates carried films.
+
+`ar_residual`, the single number that used to be the only way to say a lens was
+coated, is still on every uncoated face. It is not a coating model and its own
+doc comment says so.
+
+## Checked against published data
+
+The angle shift of an edge is the one relationship every filter vendor
+publishes, and it can be checked without knowing anybody's stack: one effective
+index, fitted once at 45 degrees, predicts this synthesis's edge to within 0.06
+nm from 10 to 50 degrees. See [`validation.md`](validation.md), which also says
+where a vendor curve is an oracle and where reproducing one would only be a
+test of guessing their design.
+
 ## What is still missing
 
-- **Polarization.** This is the largest gap, and it is worth being precise about
-  what it costs.
+- **Polarization** is no longer missing. It has its own page,
+  [`polarization.md`](polarization.md).
 
-  The coating calculation *is* polarization-resolved: `FilmRt` carries `r_s`,
-  `r_p`, `t_s` and `t_p` separately all the way through. What is missing is
-  transport. A ray has no polarization state, so the tracer takes the mean and
-  the outgoing beam is unpolarized again.
+  It belongs in this one's list of gaps because a coating is where it bites.
+  The dichroic `＋ dichroic` builds, at 45 degrees, reflecting:
 
-  For a **single** element lit by unpolarized light, the mean is exactly right
-  for flux, so nothing is wrong yet. The error appears at the **second**
-  polarization-sensitive element, which in reality no longer sees unpolarized
-  light.
-
-  How far from unpolarized? The dichroic `＋ dichroic` builds, at 45 degrees,
-  reflecting:
-
-  | λ (nm) | R_s | R_p | mean used | degree of polarization |
+  | λ (nm) | R_s | R_p | unpolarized mean | degree of polarization |
   |---|---|---|---|---|
   | 460 | 0.9997 | 0.9937 | 0.9967 | 0.3% |
   | 520 | 0.9961 | 0.8668 | 0.9315 | 6.9% |
@@ -239,17 +317,16 @@ drags, changing the thickness of the layer to its left.
 
   Deep in the band both polarizations saturate and the mean is harmless. At the
   edge, which is exactly where a dichroic is used, the reflected beam is 95%
-  polarized: the part is very nearly a polarizer and the model calls its output
-  unpolarized. Put a second tilted dichroic after it and the answer is wrong by
-  whatever those two polarizations would have done to each other.
+  polarized. The reference tracer now carries that state on to whatever stands
+  in the folded arm. The f32 preview still takes the mean, which is the right
+  flux for one element and wrong for the second.
 
-  A polarizing beam splitter cannot be represented at all, and neither can a
-  waveplate, a polarizer, or the phase shift on total internal reflection that
-  makes a Fresnel rhomb work.
-- **Coatings on lens faces.** The machinery is all there now (a coated plate is
-  a revolved body with a film on one face, which is exactly what an AR-coated
-  lens would be), but nothing authors one. Lens faces still use the scalar
-  `ar_residual`.
+  A **polarizing beam splitter** as a part is still missing, and so is any
+  source that emits polarized light without a polarizer in front of it.
+- **Anything but an AR on a lens, from the app.** The core will put any design
+  on either face of any revolved body, and the lens editor offers the two ARs,
+  which is what a lens is coated with. A mirror or an edge filter on a lens
+  face needs `setLensFaceCoating` from script.
 - **Wedged plates.** Both faces are parallel. A wedge, which is how real
   beamsplitters push their ghost out of the way, is not authorable.
 - **Scatter at the rim.** A ray that leaves through the edge of the glass is

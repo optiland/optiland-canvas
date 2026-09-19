@@ -31,14 +31,39 @@ use crate::thinfilm::{
     film_coating, plate_coating, Coating, CoatingDesign, DesignKind, ExitFace, Incidence,
 };
 use crate::scene3::{
-    AbsorptionModel, AngularDistribution3, Aperture3, ApertureInteraction, ApertureShape3, Body3,
+    AbsorptionModel, AngularDistribution3, AngularScalar, Aperture3, ApertureInteraction,
+    ApertureShape3, Body3,
     Detector3, DetectorGeometry3, DetectorResponse, DetectorTermination, Interpolation,
     ObjectCommon, OutOfRangePolicy, PatchResponseOverride, PlanarShape2, SamplingSequence, Scene3,
     SolidGeometry3, Source3, SourceSampling, SpatialDistribution3, SpectralScalar,
     SurfaceGeometry3, SurfaceObject3, SurfaceProps3, SurfaceResponse, TwoSidedSurfaceResponse,
+    Waveplate,
 };
 use crate::vec::Vec2;
 use crate::vec3::{Isometry3, Plane3, Vec3};
+
+/// Which face of a revolved body a coating goes on.
+///
+/// The profile `singlet_curves` builds runs [front face, rim, back face, rim],
+/// with the front at local `-X`, and every transform that places one of these
+/// carries local `-X` onto the direction an axial beam arrives from. So "front"
+/// is the face the light reaches first, for a lens and for a plate alike.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyFace {
+    /// The face an axial beam reaches first.
+    Front,
+    /// The one it leaves by.
+    Back,
+}
+
+impl BodyFace {
+    fn edge(self) -> usize {
+        match self {
+            Self::Front => 0,
+            Self::Back => 2,
+        }
+    }
+}
 
 /// The rotationally-symmetric geometry of a singlet lens, in its local frame
 /// (optical axis local +X, centred on its own body origin). Material is separate.
@@ -389,6 +414,26 @@ fn solve_dense(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Option<Vec<f64>> {
     x.iter().all(|v| v.is_finite()).then_some(x)
 }
 
+
+/// Both sides of a coated face of a solid.
+///
+/// The film sits on the outside of the glass, so light from outside meets it
+/// first and light from inside meets it last, layers in the other order. The
+/// inside copy says so ([`Coating::seen_from_behind`]); a copy that did not
+/// would walk the stack the wrong way round for every ray leaving the glass.
+fn coated_face(film: SurfaceResponse) -> TwoSidedSurfaceResponse {
+    let inside = match &film {
+        SurfaceResponse::Coating { coating } => SurfaceResponse::Coating {
+            coating: coating.seen_from_behind(),
+        },
+        other => other.clone(),
+    };
+    TwoSidedSurfaceResponse {
+        from_outside: film,
+        from_inside: inside,
+    }
+}
+
 impl Scene3 {
     /// Add a rotationally-symmetric singlet on the optical axis, its body centred
     /// at `center`, with glass `(nd, vd)`. Returns the new body id.
@@ -579,6 +624,183 @@ impl Scene3 {
         Some(self.add_planar_element(pos, radius_mm, tilt_deg, r.clone(), r))
     }
 
+    /// Add a polarizing beam splitter: a cube of glass with a coated diagonal,
+    /// which is what a real one is.
+    ///
+    /// Everything else in the canvas that polarizes does it by absorbing. This
+    /// does it by reflecting, and it is the one polarizing part here whose
+    /// behaviour is derived rather than declared: the stack is a plain
+    /// quarter-wave mirror, and what makes it polarizing is that it is used at
+    /// the Brewster angle between its own layers, where every p reflection
+    /// inside it vanishes. So its angle dependence, its wavelength dependence
+    /// and its contrast all come out of the transfer matrix at each ray's own
+    /// angle, with nothing declared and nothing tabulated.
+    ///
+    /// The cube glass is **not a free choice**: it is
+    /// [`macneille_glass`] of the coating pair, 1.754 for titania on silica,
+    /// which is why a polarizing cube is dense flint. Its outer faces carry
+    /// the scalar AR stand-in, which is not an approximation where they are
+    /// used: at normal incidence s and p are the same thing and one number is
+    /// the whole truth.
+    ///
+    /// Returns `(cube, diagonal)`. They are two objects, because a solid with
+    /// an interface inside it is not something the scene model can say yet;
+    /// they share a label so the object list at least calls them one part, and
+    /// moving one moves only that one.
+    ///
+    /// `None` for a cube smaller than a millimetre across or a design that
+    /// does not sanitize.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_polarizing_beam_splitter(
+        &mut self,
+        pos: Vec3,
+        half_mm: f64,
+        tilt_deg: f64,
+        lambda_nm: f64,
+        periods: u32,
+        n_high: f64,
+        n_low: f64,
+    ) -> Option<(u64, u64)> {
+        if !half_mm.is_finite() || half_mm < 0.5 || !tilt_deg.is_finite() {
+            return None;
+        }
+        let n0 = crate::thinfilm::macneille_glass(n_high, n_low);
+        if !n0.is_finite() || n0 < 1.05 {
+            return None;
+        }
+        let design = CoatingDesign {
+            kind: DesignKind::Polarizing,
+            lambda_nm,
+            aoi_deg: 45.0,
+            periods,
+            n_high,
+            n_low,
+        }
+        .sanitized()?;
+        let coating = film_coating(design, n0, n0);
+
+        // The whole part turns together: at the standard 135 degrees the cube
+        // is axis aligned and an axial beam meets its face square on, and any
+        // other tilt is that rigid assembly rotated.
+        let spin = glam::DQuat::from_rotation_z((tilt_deg - 135.0).to_radians());
+        let cube = self.alloc_object_id();
+        let mut common = ObjectCommon::new(cube, LayerId(0));
+        common.transform =
+            Isometry3::new(pos, [spin.x, spin.y, spin.z, spin.w]).unwrap_or_else(|_| Isometry3::from_pos(pos));
+        common.label = PBS_LABEL.to_string();
+        self.bodies.push(Body3 {
+            common,
+            geometry: SolidGeometry3::Box {
+                half_extents_mm: Vec3::new(half_mm, half_mm, half_mm),
+            },
+            material: Material::AbbePoint {
+                nd: n0,
+                vd: PBS_VD,
+            },
+            absorption: AbsorptionModel::None,
+            surface: SurfaceProps3 {
+                default: TwoSidedSurfaceResponse {
+                    from_outside: SurfaceResponse::DielectricFresnel {
+                        ar_residual: SpectralScalar::Constant(PBS_FACE_AR),
+                    },
+                    from_inside: SurfaceResponse::DielectricFresnel {
+                        ar_residual: SpectralScalar::Constant(PBS_FACE_AR),
+                    },
+                },
+                overrides: Vec::new(),
+            },
+            priority: 0,
+        });
+
+        // The diagonal, built with its own frame rather than by `facing`: the
+        // rectangle has to lie along the cube's diagonal and its edge, and the
+        // shortest rotation onto the normal puts neither there.
+        let (sin_t, cos_t) = tilt_deg.to_radians().sin_cos();
+        let cols = glam::DMat3::from_cols(
+            glam::DVec3::new(-sin_t, cos_t, 0.0),
+            glam::DVec3::Z,
+            glam::DVec3::new(cos_t, sin_t, 0.0),
+        );
+        let dq = glam::DQuat::from_mat3(&cols);
+        let diagonal = self.alloc_object_id();
+        let mut dc = ObjectCommon::new(diagonal, LayerId(0));
+        dc.transform =
+            Isometry3::new(pos, [dq.x, dq.y, dq.z, dq.w]).unwrap_or_else(|_| Isometry3::from_pos(pos));
+        dc.label = PBS_LABEL.to_string();
+        let film = SurfaceResponse::Coating { coating };
+        self.surfaces.push(SurfaceObject3 {
+            common: dc,
+            geometry: SurfaceGeometry3::Plane {
+                shape: PlanarShape2::Rectangle {
+                    half_width_mm: half_mm * std::f64::consts::SQRT_2,
+                    half_height_mm: half_mm,
+                },
+            },
+            response_front: film.clone(),
+            response_back: film,
+        });
+        Some((cube.0, diagonal.0))
+    }
+
+    /// Add an ideal linear polarizer: a round plate at `pos`, tilted
+    /// `tilt_deg`, passing the field along `axis_deg` from the plate's own
+    /// local `+X` and absorbing the rest.
+    ///
+    /// `extinction` is the power fraction of the blocked component that still
+    /// gets through: 0 is perfect, 1e-4 is an ordinary sheet. `None` for a
+    /// non-finite axis or an extinction outside `[0, 1]`.
+    ///
+    /// Unpolarized light loses half its flux here. That is the physics, not a
+    /// loss the model invented, and it is why the preview draws this as a 50%
+    /// attenuator: with no state to act on, half is all it can say.
+    pub fn add_polarizer(
+        &mut self,
+        pos: Vec3,
+        radius_mm: f64,
+        tilt_deg: f64,
+        axis_deg: f64,
+        extinction: f64,
+    ) -> Option<u64> {
+        if !axis_deg.is_finite() || !extinction.is_finite() || !(0.0..=1.0).contains(&extinction) {
+            return None;
+        }
+        let r = SurfaceResponse::Polarizer {
+            axis_deg,
+            extinction: AngularScalar::Constant(extinction),
+            substrate_index: 1.0,
+        };
+        Some(self.add_planar_element(pos, radius_mm, tilt_deg, r.clone(), r))
+    }
+
+    /// Add an ideal linear retarder (a waveplate): a round plate at `pos`,
+    /// tilted `tilt_deg`, with its fast axis `axis_deg` from the plate's local
+    /// `+X` and `retardance_deg` of phase added to the slow axis.
+    ///
+    /// 90 degrees is a quarter wave, 180 a half wave. Lossless and zero
+    /// thickness: the polarization action of a waveplate without the crystal,
+    /// so no walk-off, no ordinary and extraordinary rays, and a retardance
+    /// that is the number given rather than one that follows from a thickness
+    /// and a birefringence at each wavelength. `None` for non-finite arguments.
+    pub fn add_retarder(
+        &mut self,
+        pos: Vec3,
+        radius_mm: f64,
+        tilt_deg: f64,
+        axis_deg: f64,
+        retardance_deg: f64,
+    ) -> Option<u64> {
+        if !axis_deg.is_finite() || !retardance_deg.is_finite() {
+            return None;
+        }
+        let r = SurfaceResponse::Retarder {
+            axis_deg,
+            retardance_deg,
+            substrate_index: 1.0,
+            crystal: None,
+        };
+        Some(self.add_planar_element(pos, radius_mm, tilt_deg, r.clone(), r))
+    }
+
     /// Add a dichroic filter: a round plate at `pos`, tilted `tilt_deg`, with the
     /// coating `spec` on both faces. `None` for a non-finite spec.
     pub fn add_dichroic(
@@ -599,6 +821,184 @@ impl Scene3 {
             return false;
         };
         self.set_surface_responses(id, r.clone(), r)
+    }
+
+    /// Turn a polarizing element's axis: a polarizer's transmission axis or a
+    /// retarder's fast axis, degrees from the surface's local `+X`.
+    ///
+    /// False (scene unchanged) for a non-finite angle, or an id that is not a
+    /// surface carrying one of those two responses. The angle is stored as
+    /// given rather than wrapped, because 370 and 10 are the same element and a
+    /// field the user is typing into should not jump under them.
+    pub fn set_polarization_axis(&mut self, id: u64, axis_deg: f64) -> bool {
+        if !axis_deg.is_finite() {
+            return false;
+        }
+        self.map_polarizing(id, &mut |r| match r {
+            SurfaceResponse::Polarizer { axis_deg: a, .. } => *a = axis_deg,
+            SurfaceResponse::Retarder { axis_deg: a, .. } => *a = axis_deg,
+            _ => {}
+        })
+    }
+
+    /// Set a polarizer's extinction: the **power** fraction of the blocked
+    /// component that still gets through. Clamped to `[0, 1]`. False for a
+    /// non-finite value or an element that is not a polarizer.
+    pub fn set_polarizer_extinction(&mut self, id: u64, extinction: f64) -> bool {
+        if !extinction.is_finite() {
+            return false;
+        }
+        let v = extinction.clamp(0.0, 1.0);
+        let mut touched = false;
+        let ok = self.map_polarizing(id, &mut |r| {
+            if let SurfaceResponse::Polarizer { extinction: e, .. } = r {
+                *e = AngularScalar::Constant(v);
+                touched = true;
+            }
+        });
+        ok && touched
+    }
+
+    /// Set a polarizer's extinction from a datasheet: the power fraction that
+    /// leaks past the blocked axis, against angle of incidence in degrees.
+    ///
+    /// This is the only way to say where a polarizer stops working. A wire
+    /// grid loses contrast off axis, a thin-film polarizer or a MacNeille cube
+    /// is built around a Brewster match at one angle and gives up a couple of
+    /// degrees away from it, and a Glan prism has a hard acceptance cone. None
+    /// of that follows from anything the kernel can compute about an ideal
+    /// layer, so it comes from measurement or not at all.
+    ///
+    /// Outside the angles given, the table holds its endpoint. A real
+    /// polarizer is worse out there, not the same, so the range it was
+    /// measured over is the range to trust.
+    ///
+    /// False for an element that is not a polarizer, or for a table that is
+    /// not two or more strictly increasing angles in `[0, 90)` with values in
+    /// `[0, 1]`.
+    pub fn set_polarizer_extinction_table(
+        &mut self,
+        id: u64,
+        aoi_deg: &[f64],
+        extinction: &[f64],
+    ) -> bool {
+        let table = AngularScalar::Tabulated {
+            aoi_deg: aoi_deg.to_vec(),
+            values: extinction.to_vec(),
+            interpolation: Interpolation::Linear,
+            out_of_range: OutOfRangePolicy::Clamp,
+        };
+        if table.validate("extinction").is_err() || !table.is_unit_fraction() {
+            return false;
+        }
+        let mut touched = false;
+        let ok = self.map_polarizing(id, &mut |r| {
+            if let SurfaceResponse::Polarizer { extinction: e, .. } = r {
+                *e = table.clone();
+                touched = true;
+            }
+        });
+        ok && touched
+    }
+
+    /// A polarizer's extinction curve, if `id` is one.
+    pub fn polarizer_extinction(&self, id: u64) -> Option<&AngularScalar> {
+        let s = self.surfaces.iter().find(|s| s.common.id.0 == id)?;
+        match &s.response_front {
+            SurfaceResponse::Polarizer { extinction, .. } => Some(extinction),
+            _ => None,
+        }
+    }
+
+    /// Set a retarder's retardance in degrees: 90 is a quarter wave, 180 a half
+    /// wave. False for a non-finite value or an element that is not a retarder.
+    pub fn set_retarder_retardance(&mut self, id: u64, retardance_deg: f64) -> bool {
+        if !retardance_deg.is_finite() {
+            return false;
+        }
+        let mut touched = false;
+        let ok = self.map_polarizing(id, &mut |r| {
+            if let SurfaceResponse::Retarder { retardance_deg: d, .. } = r {
+                *d = retardance_deg;
+                touched = true;
+            }
+        });
+        ok && touched
+    }
+
+    /// Make a retarder out of a real crystal, or `None` to make it ideal
+    /// again. False for anything that is not a retarder, and for a crystal
+    /// that could not be one: an index below 1, no birefringence to retard
+    /// with, or a design wavelength that is not positive.
+    ///
+    /// Its `retardance_deg` becomes the nominal: what the plate gives on axis
+    /// at the design wavelength. Everywhere else the retardance follows from
+    /// the plate, so it moves as `1/λ` and as the square of the obliquity.
+    pub fn set_retarder_crystal(&mut self, id: u64, crystal: Option<Waveplate>) -> bool {
+        if let Some(c) = &crystal {
+            let ok = c.n_o.is_finite()
+                && c.n_e.is_finite()
+                && c.n_o >= 1.0
+                && c.n_e >= 1.0
+                && (c.n_e - c.n_o).abs() >= 1e-9
+                && c.design_lambda_um.is_finite()
+                && c.design_lambda_um > 0.0
+                && c.order <= 1000;
+            if !ok {
+                return false;
+            }
+        }
+        let mut touched = false;
+        let ok = self.map_polarizing(id, &mut |r| {
+            if let SurfaceResponse::Retarder { crystal: c, .. } = r {
+                *c = crystal.clone();
+                touched = true;
+            }
+        });
+        ok && touched
+    }
+
+    /// Set the index of the glass a polarizing element is laminated in, or 1
+    /// for a bare layer with no faces. False below 1, for a non-finite value,
+    /// or for an element that is not a polarizer or a retarder.
+    ///
+    /// This is the element's own glass and not the medium it sits in. It is
+    /// what gives a real sheet polarizer most of its dependence on the angle
+    /// it is used at, and an ideal layer has none.
+    pub fn set_polarizing_substrate(&mut self, id: u64, index: f64) -> bool {
+        if !index.is_finite() || index < 1.0 {
+            return false;
+        }
+        self.map_polarizing(id, &mut |r| match r {
+            SurfaceResponse::Polarizer {
+                substrate_index, ..
+            }
+            | SurfaceResponse::Retarder {
+                substrate_index, ..
+            } => *substrate_index = index,
+            _ => {}
+        })
+    }
+
+    /// Apply `f` to both faces of a surface that carries a polarizing response.
+    /// False for any other id, so an edit cannot silently land on the wrong
+    /// kind of element.
+    fn map_polarizing(&mut self, id: u64, f: &mut dyn FnMut(&mut SurfaceResponse)) -> bool {
+        let Some(s) = self.surfaces.iter_mut().find(|s| s.common.id.0 == id) else {
+            return false;
+        };
+        let polarizing = |r: &SurfaceResponse| {
+            matches!(
+                r,
+                SurfaceResponse::Polarizer { .. } | SurfaceResponse::Retarder { .. }
+            )
+        };
+        if !polarizing(&s.response_front) && !polarizing(&s.response_back) {
+            return false;
+        }
+        f(&mut s.response_front);
+        f(&mut s.response_back);
+        true
     }
 
     /// Give both faces of a surface object the dichroic coating `spec`. False
@@ -696,7 +1096,7 @@ impl Scene3 {
         let mut common = ObjectCommon::new(id, LayerId(0));
         common.transform =
             Isometry3::new(pos, [q.x, q.y, q.z, q.w]).unwrap_or_else(|_| Isometry3::from_pos(pos));
-        let film = SurfaceResponse::Coating { coating };
+        let film = coated_face(SurfaceResponse::Coating { coating });
         self.bodies.push(Body3 {
             common,
             geometry: SolidGeometry3::Profile(ProfileSolid3 {
@@ -714,10 +1114,7 @@ impl Scene3 {
                 default: TwoSidedSurfaceResponse::default(),
                 overrides: vec![PatchResponseOverride {
                     patch: coated,
-                    response: TwoSidedSurfaceResponse {
-                        from_outside: film.clone(),
-                        from_inside: film,
-                    },
+                    response: film,
                 }],
             },
             priority: 0,
@@ -866,6 +1263,70 @@ impl Scene3 {
         Some(dir.dot(normal).abs().clamp(0.0, 1.0).acos().to_degrees())
     }
 
+    /// Coat one face of a lens, a plate, or anything else built on the
+    /// four-edge revolved profile, or strip it back to bare glass with `None`.
+    ///
+    /// [`Scene3::set_object_coating_design`] rewrites films that are already
+    /// on a body, which is what editing a dichroic needs. This puts one where
+    /// there was none, which is what coating a bare lens needs, and it says
+    /// which face.
+    ///
+    /// The stack is solved against the body's **own glass**, because what a
+    /// coating reflects depends on what it is sitting on: the same three
+    /// layers on crown and on flint are not the same coating. False for an
+    /// unknown id, a body that is not a four-edge profile, or a design that
+    /// does not sanitize.
+    pub fn set_body_face_coating(
+        &mut self,
+        id: u64,
+        face: BodyFace,
+        design: Option<CoatingDesign>,
+    ) -> bool {
+        let (ambient, glass) = self.coated_face_media(id, crate::material::LAMBDA_D);
+        let film = match design {
+            None => None,
+            Some(d) => match d.sanitized() {
+                None => return false,
+                Some(d) => Some(SurfaceResponse::Coating {
+                    coating: film_coating(d, ambient, glass),
+                }),
+            },
+        };
+        let Some(b) = self.bodies.iter_mut().find(|b| b.common.id.0 == id) else {
+            return false;
+        };
+        let patch = {
+            let SolidGeometry3::Profile(solid) = &b.geometry else {
+                return false;
+            };
+            if solid.profile.edges.len() != 4 {
+                return false;
+            }
+            solid.profile.edges[face.edge()].patch
+        };
+        b.surface.overrides.retain(|o| o.patch != patch);
+        if let Some(f) = film {
+            b.surface.overrides.push(PatchResponseOverride {
+                patch,
+                response: coated_face(f),
+            });
+        }
+        true
+    }
+
+    /// The coating on one named face of a body, if that face carries one.
+    pub fn body_face_coating(&self, id: u64, face: BodyFace) -> Option<&Coating> {
+        let b = self.bodies.iter().find(|b| b.common.id.0 == id)?;
+        let SolidGeometry3::Profile(solid) = &b.geometry else {
+            return None;
+        };
+        let patch = solid.profile.edges.get(face.edge())?.patch;
+        b.surface.overrides.iter().find_map(|o| match &o.response.from_outside {
+            SurfaceResponse::Coating { coating } if o.patch == patch => Some(coating),
+            _ => None,
+        })
+    }
+
     /// The media either side of an object's coated face at `lambda_um`:
     /// `(incident, behind)`.
     ///
@@ -936,11 +1397,9 @@ impl Scene3 {
         let mut touched = false;
         for o in &mut b.surface.overrides {
             if matches!(o.response.from_outside, SurfaceResponse::Coating { .. }) {
-                let film = SurfaceResponse::Coating {
+                o.response = coated_face(SurfaceResponse::Coating {
                     coating: coating.clone(),
-                };
-                o.response.from_outside = film.clone();
-                o.response.from_inside = film;
+                });
                 touched = true;
             }
         }
@@ -1678,6 +2137,21 @@ fn response_from_kind(kind: &str) -> Option<SurfaceResponse> {
     })
 }
 
+/// What the object list calls both halves of a polarizing beam splitter, so it
+/// reads as one part even though the scene holds it as two objects.
+const PBS_LABEL: &str = "polarizing beam splitter";
+
+/// A dense flint of index 1.754 has an Abbe number around here. The cube's
+/// glass index is fixed by the coating pair; its dispersion is not, and this
+/// is a plausible glass rather than a measured one.
+const PBS_VD: f64 = 27.5;
+
+/// What is left of a cube face's Fresnel reflection after a good broadband AR:
+/// about half a percent a face, against 7.5% bare. `ar_residual` is one number
+/// and not a coating model, and at normal incidence that costs nothing,
+/// because there s and p are the same thing.
+const PBS_FACE_AR: f64 = 0.07;
+
 /// The substrate a plate is made of: N-BK7, the ordinary choice.
 pub const PLATE_ND: f64 = 1.5168;
 pub const PLATE_VD: f64 = 64.17;
@@ -1720,8 +2194,8 @@ pub fn axial_aoi_deg(tilt_deg: f64) -> f64 {
 /// The short kind string for a surface response: `mirror`, `absorb`, `clear`
 /// (full transmission), `split` (constant reflectance and transmittance),
 /// `dichroic` (a [`DichroicSpec`] coating), `coated` (any other tabulated
-/// reflectance/transmittance), `film` (a real thin-film stack), `refract`, or
-/// `thin-lens`.
+/// reflectance/transmittance), `film` (a real thin-film stack), `polarizer`,
+/// `retarder`, `refract`, or `thin-lens`.
 pub fn response_kind(r: &SurfaceResponse) -> &'static str {
     match r {
         SurfaceResponse::Mirror { .. } => "mirror",
@@ -1744,6 +2218,8 @@ pub fn response_kind(r: &SurfaceResponse) -> &'static str {
             }
         }
         SurfaceResponse::Coating { .. } => "film",
+        SurfaceResponse::Polarizer { .. } => "polarizer",
+        SurfaceResponse::Retarder { .. } => "retarder",
         SurfaceResponse::DielectricFresnel { .. } => "refract",
         SurfaceResponse::ThinLens { .. } => "thin-lens",
     }

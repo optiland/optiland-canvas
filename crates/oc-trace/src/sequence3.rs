@@ -125,6 +125,9 @@ pub fn axial_launch(source: &Source3) -> Result<LaunchRay3, SequenceError> {
         lambda_um: lambda,
         flux: 1.0,
         source: Some(source.id),
+        // Sequence extraction follows geometry, not power: what the state is
+        // cannot change which surfaces the axial ray meets.
+        pol: None,
     })
 }
 

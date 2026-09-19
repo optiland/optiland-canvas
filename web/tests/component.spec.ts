@@ -317,3 +317,301 @@ test.describe("component view", () => {
     expect(role).toBe("beamsplitter");
   });
 });
+
+// ---------------------------------------------------------------------------
+// The component view on a polarizing element
+// ---------------------------------------------------------------------------
+
+test.describe("component view — coating a lens", () => {
+  test("the default singlet can be given an AR coating, a face at a time", async ({ page }) => {
+    await freshApp(page);
+    await openInset(page);
+    // The default singlet is what the inset opens on.
+    const view = await insetView(page);
+    expect(view.kind).toBe("lens");
+    const id = view.id;
+
+    const faces = () =>
+      page.evaluate(
+        (i) => JSON.parse((window as unknown as { __ocDebug: any }).__ocDebug.scene.lensFaceCoatingsJSON(i)),
+        id,
+      );
+    const flux = () =>
+      page.evaluate(() => {
+        const d = (window as unknown as { __ocDebug: any }).__ocDebug;
+        const dets = JSON.parse(d.scene.sceneObjectsJSON()).filter((o: any) => o.kind === "detector");
+        return JSON.parse(d.scene.detectorResultJSON(dets[0].id)).totalIncident as number;
+      });
+
+    expect(await faces()).toEqual({ front: null, back: null });
+    await expect(page.locator("#componentInset .cv-read")).toContainText("bare / bare");
+    const bare = await flux();
+
+    // The control follows whichever face is selected, so coating twice needs
+    // the face buttons in between, the same way R and k do.
+    await page.locator('#componentInset button[data-value="ar-3"]').click();
+    expect((await faces()).front).toBe("ar-3");
+    expect((await faces()).back).toBeNull();
+    await expect(page.locator("#componentInset .cv-read")).toContainText("AR ×3 / bare");
+
+    const oneFace = await flux();
+    expect(oneFace).toBeGreaterThan(bare);
+
+    // And the lens keeps its own editor once it is coated, rather than being
+    // taken for a coated plate.
+    expect((await insetView(page)).kind).toBe("lens");
+
+    // Strip it again and the light goes back where it was.
+    await page.locator('#componentInset button[data-value="none"]').click();
+    expect((await faces()).front).toBeNull();
+    expect(await flux()).toBeCloseTo(bare, 9);
+  });
+
+  test("coating a lens draws no extra rays while the ghost layer is off", async ({ page }) => {
+    // An AR coat's reflection is a ghost, the same as bare glass's. It used to
+    // be traced as a primary ray, so coating the lens drew its reflections at
+    // full strength with the ghost layer switched off.
+    await freshApp(page);
+    await openInset(page);
+    await expect(page.locator("#ghosts")).not.toBeChecked();
+
+    const drawn = () =>
+      page.evaluate(() => {
+        const d = (window as unknown as { __ocDebug: any }).__ocDebug;
+        return {
+          preview: (d.cpuProjected() as Float32Array).length,
+          exact: (d.exactProjected() as Float32Array).length,
+        };
+      });
+    const bare = await drawn();
+
+    for (const kind of ["ar-1", "ar-3"]) {
+      await page.locator(`#componentInset button[data-value="${kind}"]`).click();
+      await expect(page.locator("#stat")).toContainText("segs");
+      // The preview draws the picture and the exact trace the numbers; both
+      // have to leave the reflection to the ghost switch.
+      expect(await drawn(), kind).toEqual(bare);
+    }
+
+    // With the ghost layer on, the reflections are there to see.
+    await page.locator("#ghosts").check();
+    await expect(page.locator("#stat")).toContainText("segs");
+    const lit = await drawn();
+    expect(lit.preview).toBeGreaterThan(bare.preview);
+    expect(lit.exact).toBeGreaterThan(bare.exact);
+  });
+});
+
+test.describe("component view — polarizing elements", () => {
+  /** Add an element through its own button and select it. */
+  async function addAndSelect(page: Page, button: string): Promise<number> {
+    const id = await page.evaluate((b) => {
+      const d = (window as unknown as { __ocDebug: any }).__ocDebug;
+      (document.getElementById(b) as HTMLButtonElement).click();
+      return d.scene.sceneRevision();
+    }, button);
+    expect(id).toBeGreaterThan(0);
+    await expect(page.locator("#stat")).toContainText("segs");
+    return id;
+  }
+
+  test("a polarizer opens its own editor, not the coating one", async ({ page }) => {
+    await freshApp(page);
+    await openInset(page);
+    await addAndSelect(page, "addPolarizer");
+
+    const view = await insetView(page);
+    expect(view.kind).toBe("polarizing");
+    // The subtitle names the part rather than calling it a surface.
+    await expect(page.locator("#componentInset .inset-sub")).toContainText("polarizer");
+    // Its axis is a handle, and there is no coating curve to drag.
+    expect(view.handles.map((h) => h.key)).toContain("axis");
+    // The readout says the thing a user needs to know about a polarizer.
+    await expect(page.locator("#componentInset .cv-read")).toContainText("loses half");
+  });
+
+  test("turning the axis handle changes the scene and the numbers follow", async ({ page }) => {
+    await freshApp(page);
+    await openInset(page);
+    await addAndSelect(page, "addPolarizer");
+    const id = (await insetView(page)).id;
+
+    const axisOf = (page: Page, id: number) =>
+      page.evaluate(
+        (i) => JSON.parse((window as unknown as { __ocDebug: any }).__ocDebug.scene.surfacePolarizationJSON(i)).axisDeg as number,
+        id,
+      );
+    const before = await axisOf(page, id);
+
+    const h = await handle(page, "axis");
+    await dragBy(page, h, -40, -40);
+    const after = await axisOf(page, id);
+    expect(Math.abs(after - before)).toBeGreaterThan(5);
+
+    // And the field shows what the scene holds.
+    const field = page.locator('#componentInset input[data-name="axis"]');
+    await expect(field).toHaveValue(String(Number(after.toFixed(4))));
+  });
+
+  test("a waveplate shows its retardance and a quarter wave makes the beam circular", async ({ page }) => {
+    await freshApp(page);
+    await openInset(page);
+    // A polarizer first, so there is a linear state for the plate to act on.
+    await addAndSelect(page, "addPolarizer");
+    await addAndSelect(page, "addRetarder");
+
+    const view = await insetView(page);
+    expect(view.kind).toBe("polarizing");
+    await expect(page.locator("#componentInset .inset-sub")).toContainText("retarder");
+    await expect(page.locator("#componentInset .cv-read")).toContainText("quarter wave");
+    expect(view.handles.map((h) => h.key)).toContain("retardance");
+
+    // Typing a half wave into the field changes what the tracer reports, and
+    // the readout renames the element.
+    const field = page.locator('#componentInset input[data-name="retardance"]');
+    await field.fill("180");
+    await expect(page.locator("#componentInset .cv-read")).toContainText("half wave");
+  });
+
+  test("the substrate field is on both, and putting one in glass costs it light", async ({ page }) => {
+    await freshApp(page);
+    await openInset(page);
+    await addAndSelect(page, "addPolarizer");
+
+    const field = page.locator('#componentInset input[data-name="substrate"]');
+    await expect(field).toBeVisible();
+    // A bare layer by default: the readout says so rather than showing a 1.
+    await expect(page.locator("#componentInset .cv-read")).toContainText("bare layer");
+
+    const id = (await insetView(page)).id;
+    const detector = (page: Page) =>
+      page.evaluate(() => {
+        const d = (window as unknown as { __ocDebug: any }).__ocDebug;
+        const dets = JSON.parse(d.scene.sceneObjectsJSON()).filter((o: any) => o.kind === "detector");
+        return JSON.parse(d.scene.detectorResultJSON(dets[0].id)).totalIncident as number;
+      });
+    const bare = await detector(page);
+
+    await field.fill("1.5");
+    await expect(page.locator("#stat")).toContainText("segs");
+    // The readout names the glass and what its faces cost on axis.
+    await expect(page.locator("#componentInset .cv-read")).toContainText("92.2%");
+    expect(
+      await page.evaluate(
+        (i) => JSON.parse((window as unknown as { __ocDebug: any }).__ocDebug.scene.surfacePolarizationJSON(i)).substrateIndex as number,
+        id,
+      ),
+    ).toBeCloseTo(1.5, 6);
+
+    // Two air-to-glass faces, so the detector loses about 8% of what it had.
+    const glass = await detector(page);
+    expect(glass / bare).toBeGreaterThan(0.90);
+    expect(glass / bare).toBeLessThan(0.93);
+
+    // And a waveplate has the field too, because it has faces for the same
+    // reason a polarizer does.
+    await addAndSelect(page, "addRetarder");
+    await expect(page.locator('#componentInset input[data-name="substrate"]')).toBeVisible();
+  });
+
+  test("a waveplate can be cut from a real crystal, and then it has a thickness", async ({ page }) => {
+    await freshApp(page);
+    await openInset(page);
+    await addAndSelect(page, "addPolarizer");
+    await addAndSelect(page, "addRetarder");
+    const id = (await insetView(page)).id;
+
+    // Ideal to begin with: no crystal, and the readout says the retardance
+    // holds everywhere rather than at one wavelength.
+    await expect(page.locator("#componentInset .cv-read")).toContainText("every wavelength");
+    await expect(page.locator('#componentInset input[data-name="order"]')).toBeHidden();
+
+    await page.locator('#componentInset button[data-value="quartz"]').click();
+    await expect(page.locator('#componentInset input[data-name="order"]')).toBeVisible();
+    // A zero-order quartz quarter wave is about 15 µm thick.
+    const crystal = async () =>
+      page.evaluate(
+        (i) => JSON.parse((window as unknown as { __ocDebug: any }).__ocDebug.scene.surfacePolarizationJSON(i)).crystal,
+        id,
+      );
+    const zero = await crystal();
+    expect(zero.order).toBe(0);
+    expect(zero.thicknessUm).toBeGreaterThan(10);
+    expect(zero.thicknessUm).toBeLessThan(20);
+    await expect(page.locator("#componentInset .cv-read")).toContainText("µm of quartz");
+
+    // Ten whole waves under it makes the same plate forty-one times thicker
+    // and forty-one times as fussy.
+    await page.locator('#componentInset input[data-name="order"]').fill("10");
+    const tenth = await crystal();
+    expect(tenth.order).toBe(10);
+    expect(tenth.thicknessUm / zero.thicknessUm).toBeCloseTo(41, 1);
+
+    // And back to ideal, which drops the crystal rather than hiding it.
+    await page.locator('#componentInset button[data-value="ideal"]').click();
+    expect(await crystal()).toBeNull();
+    await expect(page.locator('#componentInset input[data-name="order"]')).toBeHidden();
+  });
+
+  test("a polarizer's contrast can come off a datasheet and the plot says so", async ({ page }) => {
+    await freshApp(page);
+    await openInset(page);
+    await addAndSelect(page, "addPolarizer");
+    const id = (await insetView(page)).id;
+
+    // Ideal to begin with: one number, and the readout says it holds anywhere.
+    await expect(page.locator("#componentInset .cv-read")).toContainText("at every angle");
+
+    const ok = await page.evaluate(
+      (i) =>
+        (window as unknown as { __ocDebug: any }).__ocDebug.scene.setPolarizerExtinctionTable(
+          i,
+          new Float64Array([0, 10, 25, 40]),
+          new Float64Array([1e-4, 3e-4, 5e-3, 8e-2]),
+        ),
+      id,
+    );
+    expect(ok).toBe(true);
+    await expect(page.locator("#stat")).toContainText("segs");
+    // A table is set from script, not from the panel, so nudge the inset the
+    // way reopening it would.
+    await page.evaluate(() => {
+      const d = (window as unknown as { __ocDebug: any }).__ocDebug;
+      d.inset.close();
+      d.inset.open();
+    });
+
+    // The readout names the range somebody measured rather than implying the
+    // number holds everywhere.
+    await expect(page.locator("#componentInset .cv-read")).toContainText("measured out to 40°");
+    const table = await page.evaluate(
+      (i) => JSON.parse((window as unknown as { __ocDebug: any }).__ocDebug.scene.surfacePolarizationJSON(i)).extinctionTable,
+      id,
+    );
+    expect(table.aoiDeg).toEqual([0, 10, 25, 40]);
+    // The field still shows the on-axis contrast, which is the headline number.
+    await expect(page.locator('#componentInset input[data-name="extinction"]')).toHaveValue("1.000e-4");
+
+    // Typing one number puts it back to an ideal layer.
+    await page.locator('#componentInset input[data-name="extinction"]').fill("1e-5");
+    await expect(page.locator("#componentInset .cv-read")).toContainText("at every angle");
+    expect(
+      await page.evaluate(
+        (i) => JSON.parse((window as unknown as { __ocDebug: any }).__ocDebug.scene.surfacePolarizationJSON(i)).extinctionTable,
+        id,
+      ),
+    ).toBeNull();
+  });
+
+  test("the extinction field is there on a polarizer and not on a waveplate", async ({ page }) => {
+    await freshApp(page);
+    await openInset(page);
+    await addAndSelect(page, "addPolarizer");
+    await expect(page.locator('#componentInset input[data-name="extinction"]')).toBeVisible();
+    await expect(page.locator('#componentInset input[data-name="retardance"]')).toHaveCount(0);
+
+    await addAndSelect(page, "addRetarder");
+    await expect(page.locator('#componentInset input[data-name="retardance"]')).toBeVisible();
+    await expect(page.locator('#componentInset input[data-name="extinction"]')).toHaveCount(0);
+  });
+});

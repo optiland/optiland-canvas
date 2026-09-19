@@ -768,6 +768,70 @@ fn splitter_50_50() -> SurfaceResponse {
     }
 }
 
+/// An AR coat's reflection is a ghost in the shader too, on a lens face and on
+/// a zero-thickness window alike.
+///
+/// Both coating paths in the shader used to push the reflection as a primary
+/// ray for every stack, so an AR-coated lens drew its reflections with ghosts
+/// switched off. The shader reads the stray bit the preview compiles from the
+/// coating; this holds it to the CPU mirror with the switch both ways.
+#[test]
+fn an_ar_coat_reflects_ghosts_like_cpu() {
+    use oc_core::build3::{BodyFace, SingletGeom};
+    use oc_core::thinfilm::{materials, plate_coating, CoatingDesign, DesignKind, ExitFace};
+
+    let Some(tracer) = tracer_or_skip() else {
+        return;
+    };
+    let ar = CoatingDesign {
+        kind: DesignKind::BroadbandAr,
+        lambda_nm: 550.0,
+        aoi_deg: 0.0,
+        periods: 1,
+        n_high: 2.35,
+        n_low: 1.38,
+    };
+
+    // A coated lens: the body-face path.
+    let mut lens = Scene3::new();
+    let id = lens.add_singlet(Vec3::ZERO, SingletGeom::biconvex(), 1.5168, 64.17);
+    for face in [BodyFace::Front, BodyFace::Back] {
+        assert!(lens.set_body_face_coating(id.0, face, Some(ar)));
+    }
+    lens.validate().unwrap();
+
+    // An AR-coated window: the zero-thickness surface path.
+    let mut window = Scene3::new();
+    let coating = plate_coating(ar, materials::bk7(), ExitFace::Bare, 1.0);
+    add_surface(
+        &mut window,
+        Vec3::ZERO,
+        -Vec3::X,
+        10.0,
+        SurfaceResponse::Coating { coating },
+    );
+    window.validate().unwrap();
+
+    let rays: Vec<(Vec3, Vec3, f64)> = [0.0, 1.5, -3.0]
+        .iter()
+        .flat_map(|&y| {
+            [0.48, 0.55, 0.62]
+                .into_iter()
+                .map(move |l| (Vec3::new(-30.0, y, 0.5), Vec3::X, l))
+        })
+        .collect();
+    // The lens also gets one ray inside the glass past the critical angle,
+    // where the coated face reflects totally and the reflection is the ray.
+    let t = 60f64.to_radians();
+    let mut lens_rays = rays.clone();
+    lens_rays.push((Vec3::ZERO, Vec3::new(t.cos(), t.sin(), 0.0), 0.55));
+    for (scene, rays) in [(&lens, &lens_rays), (&window, &rays)] {
+        for ghosts in [false, true] {
+            assert_gpu_matches_cpu_at(&tracer, scene, rays, ghost_opts(ghosts));
+        }
+    }
+}
+
 #[test]
 fn a_beam_splitter_matches_cpu() {
     let Some(tracer) = tracer_or_skip() else {

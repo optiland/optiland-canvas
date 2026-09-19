@@ -252,3 +252,338 @@ fn a_thick_plate_has_a_second_surface() {
     assert!(second_surface, "the far face must return a beam of its own");
     assert!(res.ledger.residual() < 1e-12, "ledger {:?}", res.ledger);
 }
+
+
+// ---------------------------------------------------------------------------
+// A coating on a lens, which is what a coating is mostly for
+// ---------------------------------------------------------------------------
+
+/// An AR coating on a lens face does what an AR coating does: a face that
+/// reflected four percent reflects about one, and the light goes through
+/// instead of bouncing around inside the instrument.
+///
+/// The oracle is the single-layer quarter-wave formula, `((n0·ns − nf²) /
+/// (n0·ns + nf²))²`, which for magnesium fluoride on this crown is 1.3% where
+/// bare glass is 4.2%. Two faces, so the transmission goes from about 0.92 to
+/// about 0.97.
+#[test]
+fn an_ar_coating_on_a_lens_face_passes_more_light() {
+    use oc_core::build3::BodyFace;
+    use oc_core::thinfilm::DesignKind;
+
+    let n_glass = 1.5168f64;
+    let n_film = 1.38f64;
+    let bare_r = ((1.0 - n_glass) / (1.0 + n_glass)).powi(2);
+    let ar_r = ((n_glass - n_film * n_film) / (n_glass + n_film * n_film)).powi(2);
+    assert!(bare_r > 0.041 && bare_r < 0.043, "bare face: {bare_r}");
+    assert!(ar_r > 0.012 && ar_r < 0.014, "coated face: {ar_r}");
+
+    let ar = CoatingDesign {
+        kind: DesignKind::SingleLayerAr,
+        lambda_nm: 550.0,
+        aoi_deg: 0.0,
+        periods: 1,
+        n_high: 2.35,
+        n_low: n_film,
+    };
+
+    let measure = |coat: bool| -> f64 {
+        let mut s = Scene3::default_scene();
+        let lens = s
+            .bodies
+            .first()
+            .map(|b| b.common.id.0)
+            .expect("the default scene has a singlet");
+        if coat {
+            assert!(
+                s.set_body_face_coating(lens, BodyFace::Front, Some(ar)),
+                "front face coats"
+            );
+            assert!(
+                s.set_body_face_coating(lens, BodyFace::Back, Some(ar)),
+                "back face coats"
+            );
+        }
+        let det = s.detectors[0].common.id;
+        s.validate().expect("valid");
+        let res = trace_scene3(&s, &TraceConfig3::default());
+        detector_named(&res, det).total_incident
+    };
+
+    let bare = measure(false);
+    let coated = measure(true);
+    assert!(coated > bare, "coating a lens helps: {coated} vs {bare}");
+    // Both faces, so roughly (1 - ar_r)² / (1 - bare_r)² more light. The beam
+    // is not collimated and the faces are curved, so the rays meet them at a
+    // spread of angles and the ratio is near that rather than on it.
+    let want = ((1.0 - ar_r) / (1.0 - bare_r)).powi(2);
+    let got = coated / bare;
+    assert!(
+        (got - want).abs() < 0.01,
+        "and by about the right amount: {got} vs {want}"
+    );
+}
+
+/// Coating a face is a thing you can undo, and it lands on the face you named.
+#[test]
+fn a_lens_face_can_be_coated_and_stripped_one_side_at_a_time() {
+    use oc_core::build3::BodyFace;
+    use oc_core::thinfilm::DesignKind;
+
+    let ar = CoatingDesign {
+        kind: DesignKind::SingleLayerAr,
+        lambda_nm: 550.0,
+        aoi_deg: 0.0,
+        periods: 1,
+        n_high: 2.35,
+        n_low: 1.38,
+    };
+    let mut s = Scene3::default_scene();
+    let lens = s.bodies.first().map(|b| b.common.id.0).expect("a singlet");
+
+    assert!(s.body_face_coating(lens, BodyFace::Front).is_none());
+    assert!(s.set_body_face_coating(lens, BodyFace::Front, Some(ar)));
+    assert!(s.body_face_coating(lens, BodyFace::Front).is_some());
+    // And only that face: the back is still bare glass.
+    assert!(s.body_face_coating(lens, BodyFace::Back).is_none());
+    s.validate().expect("a coated lens is a valid scene");
+
+    assert!(s.set_body_face_coating(lens, BodyFace::Back, Some(ar)));
+    assert!(s.body_face_coating(lens, BodyFace::Back).is_some());
+    assert!(s.set_body_face_coating(lens, BodyFace::Front, None));
+    assert!(s.body_face_coating(lens, BodyFace::Front).is_none());
+    assert!(
+        s.body_face_coating(lens, BodyFace::Back).is_some(),
+        "stripping one face leaves the other alone"
+    );
+
+    // A detector is not a body with faces, and neither is a nonexistent id.
+    let det = s.detectors[0].common.id.0;
+    assert!(!s.set_body_face_coating(det, BodyFace::Front, Some(ar)));
+    assert!(!s.set_body_face_coating(9_999_999, BodyFace::Front, Some(ar)));
+}
+
+/// An AR coat's reflection is a ghost, the same as bare glass's.
+///
+/// A face is coated to suppress what it reflects, so what it still reflects is
+/// stray light: with ghosts off it is named in the ledger and not traced, and
+/// with ghosts on it is traced as a ghost. It used to take the branch a
+/// dichroic's reflected band takes, which is a designed path followed whether
+/// ghosts are on or not, so coating a lens made its reflections appear as
+/// primary rays with the ghost layer switched off.
+#[test]
+fn an_ar_coats_reflection_is_a_ghost_like_bare_glass() {
+    use oc_core::build3::BodyFace;
+    use oc_core::thinfilm::DesignKind;
+
+    let scene = |kind: Option<DesignKind>| {
+        let mut s = Scene3::default_scene();
+        let lens = s
+            .bodies
+            .first()
+            .map(|b| b.common.id.0)
+            .expect("the default scene has a singlet");
+        if let Some(kind) = kind {
+            let d = CoatingDesign {
+                kind,
+                lambda_nm: 550.0,
+                aoi_deg: 0.0,
+                periods: 1,
+                n_high: 2.35,
+                n_low: 1.38,
+            };
+            for face in [BodyFace::Front, BodyFace::Back] {
+                assert!(s.set_body_face_coating(lens, face, Some(d)), "{face:?} coats");
+            }
+        }
+        s.validate().expect("valid");
+        s
+    };
+    let ghosts = |on: bool| TraceConfig3 {
+        ghosts: on,
+        ..TraceConfig3::default()
+    };
+
+    let bare = trace_scene3(&scene(None), &ghosts(false));
+    for kind in [DesignKind::SingleLayerAr, DesignKind::BroadbandAr] {
+        let s = scene(Some(kind));
+
+        // Ghosts off: the coated lens draws exactly the rays the bare one does,
+        // and what its faces reflect is named in the ledger instead.
+        let off = trace_scene3(&s, &ghosts(false));
+        assert_eq!(
+            off.segments.len(),
+            bare.segments.len(),
+            "{kind:?}: coating a lens adds no rays with ghosts off"
+        );
+        assert!(off.segments.iter().all(|g| !g.flags.ghost));
+        assert!(
+            off.ledger.truncated_flux > 0.0,
+            "{kind:?}: the reflection is accounted for, not lost"
+        );
+        assert!(off.ledger.residual() < 1e-10, "{kind:?}: the ledger closes");
+
+        // Ghosts on: the reflections are traced, and every one of them is a
+        // ghost, so the primary path is the same with the switch either way.
+        let on = trace_scene3(&s, &ghosts(true));
+        let primary = on.segments.iter().filter(|g| !g.flags.ghost).count();
+        assert_eq!(
+            primary,
+            off.segments.len(),
+            "{kind:?}: the primary path does not depend on the ghost switch"
+        );
+        assert!(
+            on.segments.len() > primary,
+            "{kind:?}: and the reflections are there, as ghosts"
+        );
+    }
+}
+
+/// A dichroic's reflection stays a path.
+///
+/// The counterpart to the AR test: a dichroic, a mirror or a polarizing
+/// splitter exists to reflect something, so its reflected light is the part
+/// doing its job and is followed with ghosts off. Only a design whose whole
+/// purpose is to transmit leaves its reflection to the ghost switch.
+#[test]
+fn a_dichroics_reflection_is_still_a_path_with_ghosts_off() {
+    let mut s = Scene3::default_scene();
+    s.add_plate_dichroic(Vec3::new(-35.0, 0.0, 0.0), 15.0, 3.0, TILT, 500.0, true)
+        .expect("the plate is valid");
+    s.validate().expect("the scene validates");
+    let res = trace_scene3(&s, &no_ghosts());
+    let folded = res
+        .segments
+        .iter()
+        .filter(|g| !g.flags.ghost && (g.b - g.a).y > 1.0 && g.a.x < -30.0)
+        .count();
+    assert!(folded > 0, "the reflected band goes up as a primary path");
+}
+
+/// A broadband AR passes more than a single layer, which passes more than bare
+/// glass, and that has to hold for light leaving the lens as well as entering.
+///
+/// The light leaving a lens meets its back-face coating from inside the
+/// glass, layers in the reverse of the order they were written. The single
+/// layer is its own mirror image and cannot tell; the three-layer stack is
+/// not, and walked the written way from inside it put the layer meant to face
+/// the air against the glass. That coating passed 0.911 of the default beam to
+/// the detector against bare glass's 0.917: a lens made worse by coating it.
+#[test]
+fn a_broadband_ar_beats_a_single_layer_on_the_way_out_too() {
+    use oc_core::build3::BodyFace;
+    use oc_core::thinfilm::DesignKind;
+
+    let through = |kind: Option<DesignKind>| -> f64 {
+        let mut s = Scene3::default_scene();
+        let lens = s.bodies[0].common.id.0;
+        if let Some(kind) = kind {
+            let d = CoatingDesign {
+                kind,
+                lambda_nm: 550.0,
+                aoi_deg: 0.0,
+                periods: 1,
+                n_high: 2.35,
+                n_low: 1.38,
+            };
+            for face in [BodyFace::Front, BodyFace::Back] {
+                assert!(s.set_body_face_coating(lens, face, Some(d)));
+            }
+        }
+        let det = s.detectors[0].common.id;
+        s.validate().expect("valid");
+        detector_named(&trace_scene3(&s, &no_ghosts()), det).total_incident
+    };
+    let bare = through(None);
+    let one = through(Some(DesignKind::SingleLayerAr));
+    let three = through(Some(DesignKind::BroadbandAr));
+    assert!(one > bare, "a single layer helps: {one} vs {bare}");
+    assert!(three > one, "and three help more: {three} vs {one}");
+    // A broadband AR on both faces leaves about a percent of the light, where
+    // bare glass loses eight.
+    assert!(three > 0.98, "{three}");
+}
+
+/// Past the critical angle a coated face reflects everything, and that is the
+/// ray, not a ghost.
+///
+/// The stray rule is about what a coating fails to suppress while light gets
+/// through. Past the critical angle nothing gets through, whatever the stack:
+/// the air carries only an evanescent wave, and a lossless coating reflects
+/// all of it. So a ray inside a coated lens is totally internally reflected
+/// exactly as it is inside a bare one, a primary path with the ghost layer
+/// off. The first version of the stray rule got this wrong and dropped the
+/// whole ray.
+#[test]
+fn total_internal_reflection_at_a_coated_face_is_still_the_ray() {
+    use oc_core::build3::{BodyFace, SingletGeom};
+    use oc_core::material::LAMBDA_D;
+    use oc_core::vec3::Ray3;
+    use oc_core::thinfilm::DesignKind;
+    use oc_trace::trace3;
+
+    let lens = |kind: Option<DesignKind>| {
+        let mut s = Scene3::new();
+        let id = s.add_singlet(Vec3::ZERO, SingletGeom::biconvex(), 1.5168, 64.17);
+        if let Some(kind) = kind {
+            let d = CoatingDesign {
+                kind,
+                lambda_nm: 550.0,
+                aoi_deg: 0.0,
+                periods: 1,
+                n_high: 2.35,
+                n_low: 1.38,
+            };
+            for face in [BodyFace::Front, BodyFace::Back] {
+                assert!(s.set_body_face_coating(id.0, face, Some(d)));
+            }
+        }
+        s.validate().expect("valid");
+        s
+    };
+    // From the middle of the glass at 60 degrees: the back face is met at
+    // about 56 degrees, past the 41 degree critical angle of crown in air.
+    let t = 60f64.to_radians();
+    let ray = [launch(
+        Ray3::new(Vec3::ZERO, Vec3::new(t.cos(), t.sin(), 0.0)).unwrap(),
+        LAMBDA_D,
+        1.0,
+    )];
+
+    let bare = trace3(&lens(None), &ray, &no_ghosts());
+    assert!(bare.segments[1].flags.tir, "the bare lens reflects it totally");
+
+    for kind in [DesignKind::SingleLayerAr, DesignKind::BroadbandAr] {
+        let coated = trace3(&lens(Some(kind)), &ray, &no_ghosts());
+        assert_eq!(
+            coated.segments.len(),
+            bare.segments.len(),
+            "{kind:?}: the same path as the bare lens, with ghosts off"
+        );
+        for (i, (c, b)) in coated.segments.iter().zip(&bare.segments).enumerate() {
+            assert_eq!(c.flags.tir, b.flags.tir, "{kind:?} segment {i}: TIR flag");
+            assert!(!c.flags.ghost, "{kind:?} segment {i}: not a ghost");
+            assert!(
+                (c.b - c.a).normalize().distance((b.b - b.a).normalize()) < 1e-12,
+                "{kind:?} segment {i}: the coating does not steer the ray"
+            );
+            // Every totally reflected bounce keeps all of the light.
+            if c.flags.tir {
+                assert!(
+                    (c.flux_start - 1.0).abs() < 1e-12,
+                    "{kind:?} segment {i}: {}",
+                    c.flux_start
+                );
+            }
+        }
+        // And where the ray finally gets out, the coating lets more of it.
+        let out = |r: &oc_trace::TraceResult3| r.segments.last().unwrap().flux_start;
+        assert!(
+            out(&coated) > out(&bare),
+            "{kind:?}: {} vs {}",
+            out(&coated),
+            out(&bare)
+        );
+        assert!(coated.ledger.residual() < 1e-12);
+    }
+}

@@ -492,7 +492,22 @@ async function main() {
     const c = info.centroid ? `(${info.centroid[0].toFixed(2)}, ${info.centroid[1].toFixed(2)})` : "—";
     const opl = info.meanOpl == null ? "—" : Number(info.meanOpl).toFixed(2);
     const tag = detId >= 0 ? `#${detId} · ` : "";
-    dockNums.textContent = `${tag}hits ${info.hits} · flux ${Number(info.totalIncident).toFixed(3)} · centroid ${c} mm · OPL ${opl} mm`;
+    // Polarization, when there is any. An unpolarized beam says nothing here
+    // rather than printing a zero the reader has to interpret. The tilt is the
+    // caveat on the numbers: the summed state is written in the detector's own
+    // frame, and a wide cone of arrival directions makes that a shared frame in
+    // name only.
+    let pol = "";
+    const dop = Number(info.dop);
+    if (Number.isFinite(dop) && dop > 1e-6) {
+      const kind = Number(info.dolp) > dop - 1e-6 ? `linear ${Number(info.azimuthDeg).toFixed(0)}°`
+        : Number(info.dolp) < 1e-6 ? "circular"
+        : `elliptical ${Number(info.azimuthDeg).toFixed(0)}°`;
+      const tilt = Number(info.maxTiltDeg);
+      const spread = Number.isFinite(tilt) && tilt > 5 ? ` (±${tilt.toFixed(0)}° cone)` : "";
+      pol = ` · pol ${(dop * 100).toFixed(1)}% ${kind}${spread}`;
+    }
+    dockNums.textContent = `${tag}hits ${info.hits} · flux ${Number(info.totalIncident).toFixed(3)} · centroid ${c} mm · OPL ${opl} mm${pol}`;
   }
 
   // Detector analysis-mode toggle (heatmap ⇄ spot).
@@ -859,6 +874,28 @@ async function main() {
     renderView();
     refreshReference();
   };
+
+  // A free spot on the axis near `x`, so a second click of the same button does
+  // not drop a plate exactly on top of the first.
+  //
+  // Two coincident zero-thickness surfaces are a degenerate scene, and the
+  // tracer resolves only one of them: the epsilon that stops a child ray
+  // re-hitting the surface it was born on cannot tell "the same surface" from
+  // "a different surface in the same place". Two crossed polarizers stacked at
+  // one point would report the light one of them passes, which is a wrong
+  // number arrived at quietly. Spreading them is the cheap half of the fix; the
+  // tracer learning to skip by identity rather than by distance is the other
+  // half, and is not done.
+  const GAP = 6;
+  const freeX = (x: number, y: number) => {
+    const taken = JSON.parse(scene.sceneObjectsJSON())
+      .filter((o: { pos: number[] }) => Math.abs(o.pos[1] - y) < GAP && Math.abs(o.pos[2]) < GAP)
+      .map((o: { pos: number[] }) => o.pos[0]);
+    let at = x;
+    // Step downstream until nothing is within a plate's width of the spot.
+    for (let i = 0; i < 64 && taken.some((t: number) => Math.abs(t - at) < GAP); i++) at += GAP;
+    return at;
+  };
   document.getElementById("addElement")!.onclick = () => addAndFocus(scene.addPlanarElement(25, 0, 8, 45));
   document.getElementById("addAperture")!.onclick = () => addAndFocus(scene.addAperture(-20, 0, 5, 0));
   document.getElementById("addPrism")!.onclick = () => addAndFocus(scene.addPrism(-40, 0, 16, 0, 1.62, 36));
@@ -873,6 +910,23 @@ async function main() {
   // table-driven dichroic is still in the kernel for documents that carry one,
   // but nothing in the UI creates one any more.
   document.getElementById("addDichroic")!.onclick = () => addAndFocus(scene.addPlateDichroic(-35, 0, 0, 15, 3, 135, 550, true));
+  // Polarizing elements face the beam (tilt 0) rather than folding it: their
+  // axis is a direction in the plate, so tilting one is a separate decision
+  // from choosing its axis. Both are ideal and zero thickness, and the f32
+  // preview has no polarization state to act on, so it draws a polarizer as a
+  // 50% attenuator and a waveplate as a window. The f64 readout is the one that
+  // knows what they do.
+  document.getElementById("addPolarizer")!.onclick = () => addAndFocus(scene.addPolarizer(freeX(-25, 0), 0, 12, 0, 0, 0));
+  document.getElementById("addRetarder")!.onclick = () => addAndFocus(scene.addRetarder(freeX(-15, 0), 0, 12, 0, 45, 90));
+  // The polarizing cube is the odd one out: it is the only polarizing part
+  // here whose behaviour is computed rather than declared. The stack is a
+  // plain quarter-wave mirror, and what makes it polarizing is that it sits at
+  // the Brewster angle between its own layers, which is why the cube's glass
+  // is not an argument: the coating pair fixes it at 1.754, dense flint. So it
+  // has a real angular acceptance and a real passband, and nobody typed
+  // either.
+  document.getElementById("addPbs")!.onclick = () =>
+    addAndFocus(scene.addPolarizingBeamSplitter(freeX(-35, 0), 0, 0, 12, 135, 550, 12, 2.35, 1.46));
 
   // --- save .ocanvas — the Optiland handoff (§6) --------------------------
   // Save downloads the canonical 3D scene (the one the user actually edits) as a

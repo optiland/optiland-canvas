@@ -108,6 +108,22 @@ impl Cx {
     pub fn is_finite(self) -> bool {
         self.re.is_finite() && self.im.is_finite()
     }
+    /// `e^{iθ}`: a unit phasor, which is what a retardance is.
+    pub fn expi(theta: f64) -> Self {
+        let (s, c) = theta.sin_cos();
+        Self::new(c, s)
+    }
+    /// The phase, in radians, on `(-π, π]`.
+    pub fn arg(self) -> f64 {
+        self.im.atan2(self.re)
+    }
+}
+
+impl std::ops::Neg for Cx {
+    type Output = Self;
+    fn neg(self) -> Self {
+        Self::new(-self.re, -self.im)
+    }
 }
 
 impl std::ops::Add for Cx {
@@ -296,8 +312,9 @@ pub enum ExitFace {
 pub enum Incidence {
     /// The light meets the film stack first. This is the coated face.
     Film,
-    /// The light meets the substrate first and the stack on the way out: the
-    /// back of a coated plate.
+    /// The light arrives through what the stack is backed by and meets its
+    /// layers last first: the back of a coated plate, or a lens's own coated
+    /// face seen from inside the glass.
     Substrate,
 }
 
@@ -312,9 +329,48 @@ pub struct Coating {
     #[serde(default = "incidence_film")]
     pub incidence: Incidence,
     /// What this stack was designed for, carried so the editor can say so and
-    /// re-synthesize. Not used by the calculation: the layers are the truth.
+    /// re-synthesize.
+    ///
+    /// Not used by the reflectance calculation: the layers are the truth, and
+    /// an edited stack is simply a different coating. It does say what the
+    /// part is *for*, and one thing reads that: whether the light the stack
+    /// reflects is a path or a ghost ([`Coating::reflection_is_stray`]).
     #[serde(default)]
     pub design: Option<CoatingDesign>,
+}
+
+impl Coating {
+    /// The same coating, met from the side it is backed by.
+    ///
+    /// The layers stay in the order they were written, so a layer edit
+    /// addresses the same physical layer on both sides; only the side the
+    /// light arrives from changes, and the evaluation walks the stack from
+    /// there. See [`Incidence::Substrate`].
+    pub fn seen_from_behind(&self) -> Coating {
+        let mut c = self.clone();
+        c.incidence = Incidence::Substrate;
+        c
+    }
+
+    /// Is what this stack reflects stray light, rather than a path?
+    ///
+    /// An AR coat exists to transmit. The little it still reflects is the
+    /// residual it failed to suppress, which is a ghost for exactly the reason
+    /// bare glass's reflection is one, so it is traced when ghosts are and
+    /// named in the ledger when they are not. Every other design exists to
+    /// reflect something (a band, a mirror's whole spectrum, a splitter's s),
+    /// so its reflection is the part doing its job and is always followed.
+    ///
+    /// Read off the design because that is where the intent is written down.
+    /// A layer edit keeps the design, so a hand-thinned AR coat is still an AR
+    /// coat. A stack with no design at all reads as a path, which is what a
+    /// hand-written dichroic or mirror wants.
+    pub fn reflection_is_stray(&self) -> bool {
+        matches!(
+            self.design.map(|d| d.kind),
+            Some(DesignKind::SingleLayerAr | DesignKind::BroadbandAr)
+        )
+    }
 }
 
 fn incidence_film() -> Incidence {
@@ -348,6 +404,12 @@ pub enum DesignKind {
     /// The same, placed so the short-wavelength edge falls at the requested
     /// edge: long wavelengths reflect, short ones pass.
     ShortPass,
+    /// `(HL)^N H` again, but used at the angle where the pair's own interfaces
+    /// sit at Brewster: p reflects nothing anywhere in the stack, so the stack
+    /// passes p and reflects s. This is the polarizing beam splitter, and it
+    /// only works cemented in glass of the index the condition demands. See
+    /// [`macneille_glass`].
+    Polarizing,
     /// A single quarter wave of a low index: the classic single-layer AR.
     SingleLayerAr,
     /// Quarter-half-quarter, the broadband three-layer AR.
@@ -400,6 +462,28 @@ pub fn snell_cos(q: Cx, n: Cx) -> Cx {
     (n_bar_sq - q * q).sqrt() / n
 }
 
+/// Put an exit medium's propagation cosine on the **decaying** branch.
+///
+/// [`snell_cos`] takes the principal square root, which is what numpy returns
+/// and so what keeps this module bit-compatible with Optiland. On the negative
+/// real axis — a transparent medium past its critical angle — the principal
+/// branch is the *growing* evanescent wave in the `exp(i(ωt − kz))` convention
+/// the characteristic matrix is written in, where decay means `Im(n cos θ) ≤ 0`.
+///
+/// No power notices: past the critical angle `R = 1` and `T = 0` on either
+/// branch, which is why this went unremarked while the module only computed
+/// powers. The reflection **phase** notices, it is the only thing a polarization
+/// calculation reads, and it is the whole of what a Fresnel rhomb does. A finite
+/// layer is invariant under the flip (its matrix is even in `cos θ`), so the
+/// exit medium is the only place this can matter.
+fn decaying_cos(n: Cx, cos_t: Cx) -> Cx {
+    if (n * cos_t).im > 0.0 {
+        -cos_t
+    } else {
+        cos_t
+    }
+}
+
 /// Tilted optical admittance. `η_s = n cos θ`, `η_p = n̄² / (n cos θ)`.
 ///
 /// The free-space admittance is dropped: it is a constant factor that cancels in
@@ -416,20 +500,32 @@ fn admittance(n: Cx, cos_t: Cx, p_pol: bool) -> Cx {
 /// The imaginary unit, which the characteristic matrix is full of.
 const I: Cx = Cx::new(0.0, 1.0);
 
-/// One coherent stack: reflectance and transmittance for a single polarization.
+/// One coherent stack, as **complex amplitudes**.
 ///
-/// `layers` run from the incident side inward. `q` is the conserved
-/// `n₀ sin θ₀`.
-fn stack_rt_pol(
+/// `r` and `t` are Macleod's coefficients for the *tangential* field: for s
+/// polarization the field is wholly tangential and `t` is the whole of it, but
+/// for p the tangential part is `E cos θ`, so `t_p` here is
+/// `t_full · cos θ_sub / cos θ₀`. [`coating_amp_at`] undoes that; the power
+/// coefficients below never need it, because the same factor cancels against
+/// the admittance ratio.
+///
+/// Returns the two admittances as well, since the transmitted power needs them.
+/// `layers` run from the incident side inward; `q` is the conserved `n₀ sin θ₀`.
+///
+/// The phase convention is fixed by the sign of `δ` in the layer matrix and is
+/// `exp(-iωt)`, as `a_single_layer_matches_the_airy_formula_and_fixes_the_sign`
+/// establishes by comparing against an explicit two-interface sum. Everything
+/// downstream that reads a phase depends on that test.
+fn stack_amp_pol(
     layers: &[(Cx, f64)],
     n0: Cx,
     n_sub: Cx,
     lambda_um: f64,
     q: Cx,
     p_pol: bool,
-) -> (f64, f64) {
+) -> (Cx, Cx, Cx, Cx) {
     let cos0 = snell_cos(q, n0);
-    let cos_s = snell_cos(q, n_sub);
+    let cos_s = decaying_cos(n_sub, snell_cos(q, n_sub));
     let eta0 = admittance(n0, cos0, p_pol);
     let eta_s = admittance(n_sub, cos_s, p_pol);
 
@@ -463,16 +559,29 @@ fn stack_rt_pol(
     let big_c = c + eta_s * d;
     let denom = eta0 * big_b + big_c;
     if denom.norm_sqr() == 0.0 || !denom.is_finite() {
-        return (1.0, 0.0);
+        // A degenerate stack reflects everything rather than returning NaN.
+        return (Cx::real(1.0), Cx::real(0.0), eta0, eta_s);
     }
     let r = (eta0 * big_b - big_c) / denom;
-    let t_norm = (eta0 * 2.0 / denom).norm_sqr();
+    let t = eta0 * 2.0 / denom;
+    (r, t, eta0, eta_s)
+}
 
+/// One coherent stack: reflectance and transmittance for a single polarization.
+fn stack_rt_pol(
+    layers: &[(Cx, f64)],
+    n0: Cx,
+    n_sub: Cx,
+    lambda_um: f64,
+    q: Cx,
+    p_pol: bool,
+) -> (f64, f64) {
+    let (r, t, eta0, eta_s) = stack_amp_pol(layers, n0, n_sub, lambda_um, q, p_pol);
     let big_r = r.norm_sqr();
     // A substrate whose admittance has no real part carries no power: the wave
     // there is evanescent and everything that is not absorbed comes back.
     let big_t = if eta0.re.abs() > 0.0 {
-        (t_norm * eta_s.re / eta0.re).max(0.0)
+        (t.norm_sqr() * eta_s.re / eta0.re).max(0.0)
     } else {
         0.0
     };
@@ -522,6 +631,7 @@ pub fn coating_rt_at(
         }
         layers.push((n, l.thickness_nm));
     }
+    walk_from_the_incident_side(c, &mut layers);
 
     match &c.backing {
         // The stack sits straight on whatever the scene has on the far side: an
@@ -554,6 +664,168 @@ pub fn coating_rt_at(
 /// every zero-thickness surface in the scene (§6.6) and so every plate.
 pub fn coating_rt(c: &Coating, n_incident: f64, lambda_um: f64, cos_i: f64) -> Option<FilmRt> {
     coating_rt_at(c, n_incident, n_incident, lambda_um, cos_i)
+}
+
+/// A coating's **complex amplitude** response, in the kernel's ray frame.
+///
+/// Powers say how much light goes each way; these say what happens to its
+/// polarization, which needs the relative phase between s and p that
+/// [`FilmRt`] throws away. A quarter-wave stack near its band edge can put tens
+/// of degrees of retardance between the two, and a metal film or a total
+/// internal reflection puts in a great deal more.
+///
+/// The frame is the one [`crate::polarization`] defines: `ŝ = d̂ × n̂` shared by
+/// the incoming and outgoing rays, `p̂ = d̂ × ŝ` following each ray's own
+/// direction. Two conversions from Macleod's algebra live here and nowhere
+/// else:
+///
+/// - **`r_p` changes sign.** Macleod's p admittance makes `r_p = r_s` at normal
+///   incidence; in a frame where `p̂` follows the reflected ray, `p̂` itself
+///   flips, so the coefficient must too. Getting this wrong is invisible in any
+///   power and inverts every polarization result.
+/// - **`t_p` is rescaled** from the tangential field to the whole field, by
+///   `cos θ₀ / cos θ_exit`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FilmAmp {
+    pub r_s: Cx,
+    pub r_p: Cx,
+    /// Full-field transmitted amplitudes: `|t|²` is **not** the transmittance;
+    /// multiply by [`FilmAmp::t_power_scale`].
+    pub t_s: Cx,
+    pub t_p: Cx,
+    /// `Re(n_exit cos θ_exit) / Re(n₀ cos θ₀)`, the factor turning `|t|²` into a
+    /// transmittance. Zero when the far side is evanescent.
+    pub t_power_scale: f64,
+}
+
+impl FilmAmp {
+    /// The powers these amplitudes imply, which must agree with
+    /// [`coating_rt_at`] to the last bit; `the_amplitudes_and_the_powers_agree`
+    /// holds them to it.
+    pub fn powers(&self) -> FilmRt {
+        FilmRt {
+            r_s: self.r_s.norm_sqr().clamp(0.0, 1.0),
+            r_p: self.r_p.norm_sqr().clamp(0.0, 1.0),
+            t_s: (self.t_s.norm_sqr() * self.t_power_scale).clamp(0.0, 1.0),
+            t_p: (self.t_p.norm_sqr() * self.t_power_scale).clamp(0.0, 1.0),
+        }
+    }
+
+    /// Retardance the coating adds between p and s on reflection, radians.
+    pub fn reflection_retardance(&self) -> f64 {
+        self.r_p.arg() - self.r_s.arg()
+    }
+}
+
+/// [`coating_rt_at`]'s amplitudes: `r` and `t` for s and p, with their phases.
+///
+/// Returns `None` for a coating whose backing is a [`CoatingBacking::Plate`].
+/// That model adds two faces **incoherently**, which is right for millimetres of
+/// glass and is not a single Jones matrix: the relative phase between the two
+/// contributions is exactly what the incoherent sum discards, so there is no
+/// honest amplitude to return. A coating on a real glass body uses
+/// [`CoatingBacking::Medium`] and does have one.
+///
+/// The supported domain is a real, non-absorbing incident and exit medium; the
+/// layers themselves may be absorbing. Outside that, `T` and the amplitude
+/// normalisation stop meaning what this returns.
+pub fn coating_amp_at(
+    c: &Coating,
+    n_incident: f64,
+    n_far: f64,
+    lambda_um: f64,
+    cos_i: f64,
+) -> Option<FilmAmp> {
+    if matches!(c.backing, CoatingBacking::Plate { .. }) {
+        return None;
+    }
+    let n0 = Cx::real(n_incident.max(1e-9));
+    let n_far = Cx::real(n_far.max(1e-9));
+    let cos_i = cos_i.clamp(-1.0, 1.0).abs();
+    let sin_i = (1.0 - cos_i * cos_i).max(0.0).sqrt();
+    let q = n0 * sin_i;
+
+    let mut layers = Vec::with_capacity(c.layers.len());
+    for l in &c.layers {
+        let n = l.material.index_at(lambda_um)?;
+        if !n.is_finite() || n.re <= 0.0 || !l.thickness_nm.is_finite() || l.thickness_nm < 0.0 {
+            return None;
+        }
+        layers.push((n, l.thickness_nm));
+    }
+    walk_from_the_incident_side(c, &mut layers);
+    Some(stack_amp(&layers, n0, n_far, lambda_um, q))
+}
+
+/// Put a stack's layers in the order the light meets them.
+///
+/// They are written from the film side inward. A stack sitting straight on a
+/// medium and met from that medium, which is a lens's coated face seen from
+/// inside the glass, is met the other way round, and walking it in the
+/// written order would put the layer meant to face the air against the glass.
+/// A symmetric stack cannot tell the difference, which is how a single-layer
+/// AR hid this; a three-layer broadband AR is not symmetric, and walked the
+/// wrong way it reflects more than bare glass. A plate-backed stack handles
+/// its own two sides in `plate_rt` and is left alone here.
+fn walk_from_the_incident_side(c: &Coating, layers: &mut [(Cx, f64)]) {
+    if matches!(c.backing, CoatingBacking::Medium) && matches!(c.incidence, Incidence::Substrate) {
+        layers.reverse();
+    }
+}
+
+/// The complex amplitudes of a **bare** dielectric interface, in the ray frame.
+///
+/// A stack with no layers, which is what a bare interface is, so it comes out
+/// of the same matrix and needs no second implementation to keep in step. Past
+/// the critical angle it returns the reflection with its phase, which is the
+/// only thing an interface does there, and the transmitted amplitudes go to
+/// zero along with the scale.
+pub fn interface_amp(n1: f64, n2: f64, cos_i: f64) -> FilmAmp {
+    let n0 = Cx::real(n1.max(1e-9));
+    let ns = Cx::real(n2.max(1e-9));
+    let cos_i = cos_i.clamp(-1.0, 1.0).abs();
+    let sin_i = (1.0 - cos_i * cos_i).max(0.0).sqrt();
+    // The wavelength cannot matter with no layer to put a phase thickness in.
+    stack_amp(&[], n0, ns, 0.55, n0 * sin_i)
+}
+
+/// Both polarizations of one coherent stack, converted into the ray frame.
+///
+/// Three conversions happen here and nowhere else.
+///
+/// **The direction of time.** The characteristic matrix above is Macleod's, and
+/// Macleod writes a wave as `exp(i(ωt − kz))` with index `n − ik`; this module
+/// stores `n + ik` and conjugates on the way in, so the amplitudes that come
+/// out are his. The rest of the kernel, and every Stokes vector in
+/// [`crate::polarization`], uses `exp(-iωt)`. Conjugating the amplitudes is the
+/// whole of the conversion: conjugation turns his layer matrix into the other
+/// convention's term by term, and `r` and `t` are rational functions of it with
+/// real coefficients. Skipping it costs nothing in any power and inverts the
+/// handedness of every circular state the kernel produces.
+///
+/// **The p basis**, and **the tangential-to-whole-field rescaling of `t_p`**,
+/// both as [`FilmAmp`] describes.
+fn stack_amp(layers: &[(Cx, f64)], n0: Cx, n_sub: Cx, lambda_um: f64, q: Cx) -> FilmAmp {
+    let (r_s, t_s, eta0_s, eta_s_s) = stack_amp_pol(layers, n0, n_sub, lambda_um, q, false);
+    let (r_p, t_p, _, _) = stack_amp_pol(layers, n0, n_sub, lambda_um, q, true);
+    let cos0 = snell_cos(q, n0);
+    let cos_sub = snell_cos(q, n_sub);
+    // Tangential field to whole field for p. An evanescent exit carries no
+    // transmitted ray at all, so the scale goes to zero and the amplitude with
+    // it rather than through a division by nothing.
+    let (t_p_full, scale) = if cos_sub.norm_sqr() > 1e-300 && eta0_s.re.abs() > 0.0 {
+        (t_p * (cos0 / cos_sub), (eta_s_s.re / eta0_s.re).max(0.0))
+    } else {
+        (Cx::real(0.0), 0.0)
+    };
+    FilmAmp {
+        r_s: r_s.conj(),
+        // The one sign that separates Macleod's p basis from the ray frame.
+        r_p: -r_p.conj(),
+        t_s: t_s.conj(),
+        t_p: t_p_full.conj(),
+        t_power_scale: scale,
+    }
 }
 
 /// Both polarizations of one coherent stack.
@@ -708,6 +980,29 @@ impl CoatingDesign {
     }
 }
 
+/// The index of the glass a polarizing beam splitter's stack has to be
+/// cemented in, for a layer pair and a 45 degree cube.
+///
+/// A polarizing stack works by sitting at the Brewster angle **between its own
+/// layers**: there the p reflectance of every interface in the stack is
+/// exactly zero, so p passes and only s is reflected. Brewster fixes the angle
+/// inside the high-index layer at `tan θ_H = n_L / n_H`, and Snell carries
+/// that back out through the stack to the medium it is cemented in. At 45
+/// degrees, which is what a cube is,
+///
+/// ```text
+///   n₀ = √2 · n_H · n_L / √(n_H² + n_L²)
+/// ```
+///
+/// For titania and silica that is 1.754. This is why a polarizing cube is made
+/// of dense flint rather than crown: the glass is not a free choice, it is
+/// what the coating pair demands, and getting it wrong is the difference
+/// between a beam splitter that polarizes and one that does not.
+pub fn macneille_glass(n_high: f64, n_low: f64) -> f64 {
+    let (h, l) = (n_high.abs(), n_low.abs());
+    std::f64::consts::SQRT_2 * h * l / (h * h + l * l).sqrt()
+}
+
 /// `(HL)^N H`, the quarter-wave mirror, tilted for `aoi_deg` in `n_incident`.
 fn quarter_wave_pairs(
     d: &CoatingDesign,
@@ -794,7 +1089,13 @@ pub fn design_layers_for(
         None => return Vec::new(),
     };
     match d.kind {
-        DesignKind::QuarterWaveStack => quarter_wave_pairs(&d, d.lambda_nm, n_incident, d.periods),
+        // A polarizing stack is the same `(HL)^N H`. What makes it polarizing
+        // is not the layers but where it is used: at the Brewster angle
+        // between them, which the glass it is cemented in has to be chosen to
+        // deliver.
+        DesignKind::QuarterWaveStack | DesignKind::Polarizing => {
+            quarter_wave_pairs(&d, d.lambda_nm, n_incident, d.periods)
+        }
         DesignKind::LongPass | DesignKind::ShortPass => {
             let side = BandSide::of(d.kind == DesignKind::LongPass);
             // Where the edge is asked to sit is not where a stack built at that
@@ -1013,10 +1314,273 @@ pub fn crossing_nm(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_cube_glass_is_not_a_free_choice() {
+        // Titania and silica, the usual pair.
+        let (nh, nl) = (2.35f64, 1.46f64);
+        let right = macneille_glass(nh, nl);
+        assert!(
+            (right - 1.7538).abs() < 1e-3,
+            "a dense flint, not a crown: {right}"
+        );
+
+        let stack = |n0: f64| {
+            let d = CoatingDesign {
+                kind: DesignKind::Polarizing,
+                lambda_nm: 550.0,
+                aoi_deg: 45.0,
+                periods: 12,
+                n_high: nh,
+                n_low: nl,
+            };
+            let c = film_coating(d, n0, n0);
+            coating_rt_at(&c, n0, n0, 0.55, 45f64.to_radians().cos()).unwrap()
+        };
+
+        // In the glass the pair demands, the stack is a polarizer: s is
+        // reflected entirely and p goes through almost untouched.
+        let ok = stack(right);
+        assert!(ok.r_s > 0.999_999, "s reflects: {}", ok.r_s);
+        assert!(ok.t_p > 0.98, "p passes: {}", ok.t_p);
+        assert!(ok.t_s < 1e-9, "and s does not: {:.3e}", ok.t_s);
+
+        // Cement the same stack in ordinary crown and it is a mirror instead:
+        // p is reflected too, and nothing useful gets through either way. The
+        // glass is part of the design, and this is the whole reason a
+        // polarizing cube is made of expensive glass.
+        let wrong = stack(1.52);
+        assert!(
+            wrong.t_p < 0.2,
+            "in the wrong glass p stops passing: {}",
+            wrong.t_p
+        );
+    }
+
     use super::*;
 
     fn approx(a: f64, b: f64, tol: f64, what: &str) {
         assert!((a - b).abs() <= tol, "{what}: {a} vs {b} (tol {tol})");
+    }
+
+    /// A bare interface with nothing on it, for the amplitude tests.
+    fn bare() -> Coating {
+        Coating {
+            layers: vec![],
+            backing: CoatingBacking::Medium,
+            incidence: Incidence::Film,
+            design: None,
+        }
+    }
+
+    /// Which way does time run? The characteristic matrix carries a sign in its
+    /// `δ` that decides whether this module works in `exp(-iωt)` or its
+    /// conjugate, and every phase downstream — the retardance of a coating, the
+    /// handedness of the light a Fresnel rhomb makes — inverts with it. Powers
+    /// cannot see it, so no existing test can.
+    ///
+    /// So: one layer, compared against the Airy sum written out by hand. A round
+    /// trip inside the layer is `exp(+2iδ)` under `exp(-iωt)`, because a wave
+    /// travelling `+z` is `exp(i(kz − ωt))`.
+    #[test]
+    fn a_single_layer_matches_the_airy_formula_and_fixes_the_sign() {
+        let (n0, n1, n2) = (1.0, 1.72, 1.52);
+        let (d_nm, lambda_um) = (137.0, 0.55);
+        let c = Coating {
+            layers: vec![FilmLayer {
+                material: FilmMaterial::constant("test", n1),
+                thickness_nm: d_nm,
+            }],
+            backing: CoatingBacking::Medium,
+            incidence: Incidence::Film,
+            design: None,
+        };
+
+        for deg in [0.0f64, 35.0] {
+            let th0 = deg.to_radians();
+            let amp = coating_amp_at(&c, n0, n2, lambda_um, th0.cos()).unwrap();
+
+            // Angles inside the layer and the substrate, by Snell.
+            let s0 = th0.sin();
+            let c1 = (1.0 - (n0 * s0 / n1).powi(2)).sqrt();
+            let c2 = (1.0 - (n0 * s0 / n2).powi(2)).sqrt();
+            let c0 = th0.cos();
+            // Interface amplitudes in the ray frame (the p pair flips sign
+            // relative to Macleod, exactly as the stack does).
+            let rs = |na: f64, ca: f64, nb: f64, cb: f64| (na * ca - nb * cb) / (na * ca + nb * cb);
+            let rp = |na: f64, ca: f64, nb: f64, cb: f64| (nb * ca - na * cb) / (nb * ca + na * cb);
+            // One round trip through the layer: 2 · (2π/λ) · n₁ d cos θ₁.
+            let delta = std::f64::consts::TAU / lambda_um * n1 * (d_nm / 1000.0) * c1;
+            let phase = Cx::expi(2.0 * delta);
+
+            for (r_stack, r1, r2) in [
+                (amp.r_s, rs(n0, c0, n1, c1), rs(n1, c1, n2, c2)),
+                (amp.r_p, rp(n0, c0, n1, c1), rp(n1, c1, n2, c2)),
+            ] {
+                let (r1, r2) = (Cx::real(r1), Cx::real(r2));
+                let airy = (r1 + r2 * phase) / (Cx::real(1.0) + r1 * r2 * phase);
+                approx(r_stack.re, airy.re, 1e-12, &format!("{deg}° Re r"));
+                approx(r_stack.im, airy.im, 1e-12, &format!("{deg}° Im r"));
+            }
+        }
+    }
+
+    /// At normal incidence the two polarizations describe the same physical
+    /// reflection, so in a frame whose `p̂` follows the reflected ray they must
+    /// come out **equal and opposite**. This is the one test that catches the
+    /// `r_p` sign, and it catches it in both directions: a missing flip makes
+    /// them equal, a doubled one makes them equal again.
+    #[test]
+    fn at_normal_incidence_the_polarizations_are_equal_and_opposite() {
+        // Bare interface, and a real stack, since the sign lives in the
+        // conversion rather than in the layers.
+        let stack = film_coating(
+            CoatingDesign {
+                kind: DesignKind::QuarterWaveStack,
+                lambda_nm: 550.0,
+                aoi_deg: 0.0,
+                periods: 4,
+                n_high: 2.35,
+                n_low: 1.46,
+            },
+            1.0,
+            1.5168,
+        );
+        for c in [bare(), stack] {
+            // A hair off axis, where the frame is still defined but the physics
+            // has not had room to separate the two.
+            for cos_i in [1.0, (1e-6f64).cos()] {
+                let a = coating_amp_at(&c, 1.0, 1.5168, 0.55, cos_i).unwrap();
+                approx(a.r_p.re, -a.r_s.re, 1e-9, "Re r_p = -Re r_s");
+                approx(a.r_p.im, -a.r_s.im, 1e-9, "Im r_p = -Im r_s");
+                // Transmission has no basis flip: both rays travel forward.
+                approx(a.t_p.re, a.t_s.re, 1e-9, "Re t_p = Re t_s");
+                approx(a.t_p.im, a.t_s.im, 1e-9, "Im t_p = Im t_s");
+            }
+        }
+    }
+
+    /// The branch correction in [`decaying_cos`] moves the exit medium's cosine,
+    /// so it has to leave every power where it was: past the critical angle a
+    /// stack reflects all of it whichever branch you stand on. This is the
+    /// regression guard for that, in the one regime where the branch is live.
+    #[test]
+    fn past_the_critical_angle_nothing_gets_through() {
+        let (n1, n2) = (1.5168f64, 1.0f64);
+        let crit = (n2 / n1).asin().to_degrees();
+        let ar = film_coating(
+            CoatingDesign {
+                kind: DesignKind::SingleLayerAr,
+                lambda_nm: 550.0,
+                aoi_deg: 0.0,
+                periods: 1,
+                n_high: 2.35,
+                n_low: 1.38,
+            },
+            n1,
+            n2,
+        );
+        for c in [bare(), ar] {
+            for deg in [crit + 0.5, 50.0, 60.0, 80.0] {
+                let rt = coating_rt_at(&c, n1, n2, 0.55, deg.to_radians().cos()).unwrap();
+                approx(rt.r_s, 1.0, 1e-14, &format!("{deg}° R_s"));
+                approx(rt.r_p, 1.0, 1e-14, &format!("{deg}° R_p"));
+                approx(rt.t_s, 0.0, 1e-14, &format!("{deg}° T_s"));
+                approx(rt.t_p, 0.0, 1e-14, &format!("{deg}° T_p"));
+            }
+        }
+    }
+
+    /// The amplitudes and the powers come from one matrix, so they must agree
+    /// bit for bit with the power path that Optiland already validates.
+    #[test]
+    fn the_amplitudes_and_the_powers_agree() {
+        let designs = [
+            bare(),
+            film_coating(
+                CoatingDesign {
+                    kind: DesignKind::LongPass,
+                    lambda_nm: 550.0,
+                    aoi_deg: 45.0,
+                    periods: 8,
+                    n_high: 2.35,
+                    n_low: 1.46,
+                },
+                1.0,
+                1.5168,
+            ),
+            Coating {
+                layers: vec![FilmLayer {
+                    material: materials::aluminium(),
+                    thickness_nm: 12.0,
+                }],
+                backing: CoatingBacking::Medium,
+                incidence: Incidence::Film,
+                design: None,
+            },
+        ];
+        for c in &designs {
+            for deg in [0.0f64, 22.0, 45.0, 68.0] {
+                for nm in [450.0, 532.0, 610.0] {
+                    let cos_i = deg.to_radians().cos();
+                    let (lam, n0, n2) = (nm / 1000.0, 1.0, 1.5168);
+                    let want = coating_rt_at(c, n0, n2, lam, cos_i).unwrap();
+                    let got = coating_amp_at(c, n0, n2, lam, cos_i).unwrap().powers();
+                    approx(got.r_s, want.r_s, 1e-15, "R_s");
+                    approx(got.r_p, want.r_p, 1e-15, "R_p");
+                    approx(got.t_s, want.t_s, 1e-15, "T_s");
+                    approx(got.t_p, want.t_p, 1e-15, "T_p");
+                }
+            }
+        }
+    }
+
+    /// Past the critical angle a bare interface reflects everything and the only
+    /// thing left to get right is the phase it puts between s and p. The closed
+    /// form is the one a Fresnel rhomb is designed from:
+    ///
+    /// ```text
+    /// tan(Δ/2) = cos θ √(sin²θ − n²) / sin²θ,   n = n₂/n₁
+    /// ```
+    ///
+    /// A rhomb of n = 1.51 hits Δ = 45° twice and turns linear light circular
+    /// with no coating at all, which is the check at the end.
+    #[test]
+    fn total_internal_reflection_puts_the_right_phase_between_s_and_p() {
+        let (n1, n2) = (1.51f64, 1.0f64);
+        let n = n2 / n1;
+        let crit = n.asin();
+        for deg in [45.0f64, 50.0, 54.6231, 60.0, 70.0] {
+            let th = deg.to_radians();
+            assert!(th > crit, "{deg}° must be past critical");
+            let a = coating_amp_at(&bare(), n1, n2, 0.55, th.cos()).unwrap();
+            // Nothing gets out.
+            approx(a.r_s.norm_sqr(), 1.0, 1e-14, "|r_s|");
+            approx(a.r_p.norm_sqr(), 1.0, 1e-14, "|r_p|");
+            approx(a.powers().t_s, 0.0, 1e-14, "T_s");
+
+            // Sign as well as size. Under `exp(-iωt)` the evanescent wave must
+            // decay, which puts `cos θ_t` on the `+i` branch, and then
+            // `δ_s = −2 arctan(β/cos θ)` and `δ_p = −2 arctan(β/(n² cos θ))`
+            // with `β = √(sin²θ − n²)`. Since `n < 1` the p shift is the larger
+            // of the two negatives, so the retardance is **negative**. Its size
+            // is the rhomb formula.
+            let want =
+                -2.0 * (th.cos() * (th.sin().powi(2) - n * n).sqrt() / th.sin().powi(2)).atan();
+            let got = a.reflection_retardance();
+            approx(got, want, 1e-12, &format!("{deg}° retardance"));
+        }
+
+        // Two bounces at 54.6231° make a quarter wave, the rhomb's whole point.
+        let th = 54.6231f64.to_radians();
+        let one = coating_amp_at(&bare(), n1, n2, 0.55, th.cos())
+            .unwrap()
+            .reflection_retardance();
+        approx(
+            (2.0 * one).abs(),
+            std::f64::consts::FRAC_PI_2,
+            2e-5,
+            "two bounces make a quarter wave",
+        );
     }
 
     /// With no layers at all the machinery must reproduce plain Fresnel, at
@@ -1409,6 +1973,72 @@ mod tests {
 
     /// Helper mirroring the synthesis in `build3`, kept local so this module's
     /// tests do not depend on the authoring layer.
+    /// A lossless stack reflects the same from either side, provided the side
+    /// it is met from is the side it is walked from.
+    ///
+    /// The broadband AR is the stack that shows it: quarter, half, quarter of
+    /// three different materials, so it is not its own mirror image. Met from
+    /// inside the glass and walked in the order it was written, it is a
+    /// different coating, and a worse one than none at all.
+    #[test]
+    fn a_stack_met_from_behind_is_walked_from_behind() {
+        let n_glass = 1.5168;
+        let design = CoatingDesign {
+            kind: DesignKind::BroadbandAr,
+            lambda_nm: 550.0,
+            aoi_deg: 0.0,
+            periods: 1,
+            n_high: 2.35,
+            n_low: 1.38,
+        };
+        let front = film_coating(design, 1.0, n_glass);
+        let back = front.seen_from_behind();
+        assert!(
+            !front.layers.is_empty()
+                && front.layers.first().map(|l| &l.material) != front.layers.last().map(|l| &l.material),
+            "the stack is not symmetric, or the test proves nothing"
+        );
+
+        for (lambda, aoi_air) in [(0.45, 0.0), (0.55, 0.0), (0.65, 0.0), (0.55, 30.0)] {
+            // The same ray on either side of the interface: n sin theta is what
+            // Snell keeps, so the angle inside the glass is the conjugate one.
+            let cos_air = f64::to_radians(aoi_air).cos();
+            let sin_glass = f64::to_radians(aoi_air).sin() / n_glass;
+            let cos_glass = (1.0 - sin_glass * sin_glass).sqrt();
+
+            let outside = coating_rt_at(&front, 1.0, n_glass, lambda, cos_air).unwrap();
+            let inside = coating_rt_at(&back, n_glass, 1.0, lambda, cos_glass).unwrap();
+            for (name, a, b) in [
+                ("R_s", outside.r_s, inside.r_s),
+                ("R_p", outside.r_p, inside.r_p),
+                ("T_s", outside.t_s, inside.t_s),
+                ("T_p", outside.t_p, inside.t_p),
+            ] {
+                assert!(
+                    (a - b).abs() < 1e-12,
+                    "{name} at {lambda} um, {aoi_air} deg: {a} from air, {b} from glass"
+                );
+            }
+
+            // Walked the written way from inside, it is another coating.
+            let wrong = coating_rt_at(&front, n_glass, 1.0, lambda, cos_glass).unwrap();
+            assert!(
+                (wrong.r() - inside.r()).abs() > 1e-3,
+                "at {lambda} um the wrong walk should show: {} vs {}",
+                wrong.r(),
+                inside.r()
+            );
+        }
+
+        // And at the design wavelength the wrong walk reflects more than bare
+        // glass does, which is how it made a coated lens pass less light.
+        let bare = ((n_glass - 1.0) / (n_glass + 1.0)).powi(2);
+        let wrong = coating_rt_at(&front, n_glass, 1.0, 0.55, 1.0).unwrap().r();
+        let right = coating_rt_at(&back, n_glass, 1.0, 0.55, 1.0).unwrap().r();
+        assert!(right < 0.005, "the AR does its job from inside: {right}");
+        assert!(wrong > bare, "the wrong walk is worse than bare glass: {wrong} vs {bare}");
+    }
+
     fn quarter_wave_mirror(lambda_nm: f64, aoi_deg: f64, periods: u32) -> Coating {
         let h = FilmMaterial::constant("TiO2", 2.35);
         let l = FilmMaterial::constant("SiO2", 1.46);
@@ -1426,4 +2056,3 @@ mod tests {
         }
     }
 }
-

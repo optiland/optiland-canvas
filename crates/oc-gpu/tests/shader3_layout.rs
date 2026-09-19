@@ -162,6 +162,7 @@ fn shader3_structs_match_buffers3() {
         "Response",
         rust_layout!(Response3Buf {
             kind,
+            flags,
             _pad,
             r,
             t,

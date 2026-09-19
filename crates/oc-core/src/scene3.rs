@@ -273,6 +273,105 @@ impl SpectralScalar {
 
 /// A wavelength table is a function: strictly increasing, at least two samples,
 /// matched lengths, all finite.
+/// A quantity that varies with the angle a ray arrives at, in degrees from the
+/// element's normal.
+///
+/// [`SpectralScalar`] in the other variable. A coating needs nothing like this:
+/// its angle dependence falls out of its own stack, computed at each ray's own
+/// angle. This is here for the one thing no stack can supply, an ideal
+/// polarizing layer's contrast, which either comes off a datasheet or is not
+/// known at all.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum AngularScalar {
+    Constant(f64),
+    Tabulated {
+        aoi_deg: Vec<f64>,
+        values: Vec<f64>,
+        interpolation: Interpolation,
+        out_of_range: OutOfRangePolicy,
+    },
+}
+
+impl AngularScalar {
+    /// The value at an angle of incidence, or `None` where the table has no
+    /// answer and its policy says to refuse rather than invent one.
+    pub fn sample(&self, aoi_deg: f64) -> Option<f64> {
+        match self {
+            Self::Constant(v) => Some(*v),
+            Self::Tabulated {
+                aoi_deg: xs,
+                values,
+                out_of_range,
+                ..
+            } => interp_table(xs, values, aoi_deg, *out_of_range),
+        }
+    }
+
+    /// The value on axis, which is the one number anything without an angle
+    /// has to use: the f32 preview, and a datasheet headline.
+    pub fn on_axis(&self) -> f64 {
+        self.sample(0.0).unwrap_or_else(|| match self {
+            Self::Constant(v) => *v,
+            Self::Tabulated { values, .. } => values.first().copied().unwrap_or(0.0),
+        })
+    }
+
+    fn values(&self) -> &[f64] {
+        match self {
+            Self::Constant(v) => std::slice::from_ref(v),
+            Self::Tabulated { values, .. } => values,
+        }
+    }
+
+    /// Is every sample within `[0, 1]`? Used where the quantity is a fraction.
+    pub fn is_unit_fraction(&self) -> bool {
+        self.values().iter().all(|v| (0.0..=1.0).contains(v))
+    }
+
+    pub(crate) fn validate(&self, field: &str) -> Result<(), SceneError> {
+        match self {
+            Self::Constant(v) => {
+                if !v.is_finite() {
+                    return Err(SceneError::NonFinite {
+                        object: None,
+                        field: field.to_string(),
+                    });
+                }
+                Ok(())
+            }
+            Self::Tabulated {
+                aoi_deg, values, ..
+            } => validate_angle_table(field, aoi_deg, values),
+        }
+    }
+}
+
+/// The angle version of [`validate_table`]. Same rules, except that zero is the
+/// most important sample rather than an illegal one, and nothing past grazing
+/// means anything.
+fn validate_angle_table(field: &str, aoi_deg: &[f64], values: &[f64]) -> Result<(), SceneError> {
+    let bad = |reason: &str| SceneError::InvalidTable {
+        field: field.to_string(),
+        reason: reason.to_string(),
+    };
+    if aoi_deg.len() != values.len() {
+        return Err(bad("angle and value arrays have different lengths"));
+    }
+    if aoi_deg.len() < 2 {
+        return Err(bad("a table needs at least two samples to interpolate"));
+    }
+    if aoi_deg.iter().chain(values).any(|v| !v.is_finite()) {
+        return Err(bad("a sample is not finite"));
+    }
+    if aoi_deg.iter().any(|a| !(0.0..90.0).contains(a)) {
+        return Err(bad("angle of incidence must be in [0, 90)"));
+    }
+    if aoi_deg.windows(2).any(|w| w[1] <= w[0]) {
+        return Err(bad("angles must be strictly increasing"));
+    }
+    Ok(())
+}
+
 fn validate_table(field: &str, lambda_um: &[f64], values: &[f64]) -> Result<(), SceneError> {
     let bad = |reason: &str| SceneError::InvalidTable {
         field: field.to_string(),
@@ -380,13 +479,78 @@ impl DetectorResponse {
     }
 }
 
+/// A real waveplate: a slab of uniaxial crystal cut with its optic axis lying
+/// in the plate's own plane, which is every ordinary waveplate.
+///
+/// Giving a retarder one of these replaces "the retardance is this number" with
+/// "the retardance is what this plate gives", so it moves with the wavelength
+/// and with the direction the ray arrives from. The nominal `retardance_deg`
+/// becomes what the plate gives on axis at `design_lambda_um`, which is how a
+/// waveplate is specified and sold.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Waveplate {
+    /// Ordinary index, taken as constant with wavelength.
+    pub n_o: f64,
+    /// Extraordinary index, taken as constant with wavelength. Larger than
+    /// `n_o` in a positive crystal like quartz, where the optic axis is the
+    /// slow one; smaller in a negative one like calcite, where it is the fast
+    /// one. The element's `axis_deg` names the fast axis either way.
+    pub n_e: f64,
+    /// Whole waves of retardance on top of the nominal. 0 is a true zero-order
+    /// plate; a quarter wave sold cheaply is often 5 or 10, and it is that many
+    /// times more sensitive to both wavelength and angle.
+    pub order: u32,
+    /// The wavelength the nominal retardance is quoted at, microns.
+    pub design_lambda_um: f64,
+}
+
+impl Waveplate {
+    /// Crystal quartz at the sodium D line, which is what most waveplates are.
+    pub fn quartz(order: u32, design_lambda_um: f64) -> Self {
+        Self {
+            n_o: 1.54424,
+            n_e: 1.55335,
+            order,
+            design_lambda_um,
+        }
+    }
+
+    /// The plate thickness the nominal retardance implies, in microns.
+    pub fn thickness_um(&self, retardance_deg: f64) -> f64 {
+        crate::polarization::a_plate_thickness(
+            self.n_o,
+            self.n_e,
+            self.design_lambda_um,
+            retardance_deg.to_radians(),
+            self.order,
+        )
+    }
+}
+
+/// A polarizing element with nothing around it: the polarization action alone,
+/// and no faces.
+///
+/// An index of 1 is not a convention for "off". It is air, where a face
+/// reflects nothing and transmits everything, so the two faces drop out of the
+/// arithmetic rather than being skipped by a branch. An ordinary sheet
+/// polarizer is laminated in something near 1.5, and that glass is most of what
+/// makes a real one care about the angle it is used at.
+///
+/// Below 1 is refused rather than clamped: the front face could then reflect a
+/// ray totally before it ever reached the polarizing layer, which is a
+/// different element than the one anybody meant to place.
+fn bare_element() -> f64 {
+    1.0
+}
+
 /// What a surface does to a ray that reaches it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SurfaceResponse {
-    /// An uncoated dielectric interface: scalar Fresnel, the unpolarized average
-    /// of the s and p reflectances, with `ar_residual` scaling it. Polarization
-    /// is not modelled, here or anywhere in the kernel. **Not a coating model**
-    /// either: it is one number, and a coating is a stack.
+    /// An uncoated dielectric interface: the complex Fresnel amplitudes, with
+    /// `ar_residual` scaling the reflection and handing what it suppresses to
+    /// the transmitted branch. So it does polarize, and past the critical angle
+    /// it retards. **Not a coating model**: `ar_residual` is one number and a
+    /// coating is a stack.
     DielectricFresnel {
         ar_residual: SpectralScalar,
     },
@@ -421,6 +585,75 @@ pub enum SurfaceResponse {
     /// this variant exists. See [`crate::thinfilm`].
     Coating {
         coating: crate::thinfilm::Coating,
+    },
+    /// An ideal absorbing linear polarizer: it passes the field component along
+    /// its transmission axis and absorbs the perpendicular one.
+    ///
+    /// Zero thickness and no dispersion. The polarizing layer itself is ideal:
+    /// its contrast is one number at every wavelength and every angle, where a
+    /// real sheet's degrades as it is tilted and a thin-film or prism polarizer
+    /// has an acceptance cone of a few degrees. Unpolarized light loses half
+    /// its flux here, which is a physical fact and not an assumption.
+    ///
+    /// Two things do depend on the angle. The axis is a direction in the
+    /// element, so a skew ray sees its projection, which is enough for a
+    /// crossed pair to leak off axis. And `substrate_index` puts the layer in
+    /// glass, whose two faces reflect, more of s than of p and more of both as
+    /// the element is tilted.
+    ///
+    /// `extinction` is the **power** fraction of the blocked component that
+    /// still gets through, so 0 is perfect and 1e-4 is an ordinary sheet
+    /// polarizer. One number is an ideal layer that holds its contrast at every
+    /// angle; a table against angle of incidence is a real one, and is the only
+    /// way to say where a wire grid, a thin-film polarizer or a Glan prism
+    /// stops working, because no stack the kernel can compute will tell it.
+    ///
+    /// Only meaningful on a standalone planar surface, whose local `+X` the
+    /// axis is measured from; a body patch authoring one is rejected.
+    Polarizer {
+        /// Transmission axis, degrees from the surface's local `+X`.
+        axis_deg: f64,
+        /// The power fraction of the blocked component that still gets
+        /// through, either one number or a datasheet's curve against angle.
+        extinction: AngularScalar,
+        /// Index of the glass the polarizing layer is carried in. See
+        /// [`bare_element`].
+        #[serde(default = "bare_element")]
+        substrate_index: f64,
+    },
+    /// An ideal linear retarder: a waveplate adding `retardance_deg` of phase
+    /// to the slow axis relative to the fast one. Lossless unless it is given a
+    /// substrate, whose faces then reflect.
+    ///
+    /// A quarter wave is 90 degrees and turns linear light at 45 degrees to its
+    /// axis into circular; a half wave is 180 and rotates a linear state by
+    /// twice the angle between them. Zero thickness, so this is the
+    /// polarization action alone: no walk-off, no ordinary and extraordinary
+    /// rays, no optical path through a crystal, and the retardance is the
+    /// number given rather than one that follows from a thickness and a
+    /// birefringence at each wavelength.
+    ///
+    /// The retardance is the same at every angle of incidence. A real plate's
+    /// moves as the square of the obliquity, which a zero-order plate barely
+    /// notices and a multi-order one does not survive. `substrate_index` adds
+    /// the faces a real plate has; it does not make the retardance depend on
+    /// anything.
+    ///
+    /// Only meaningful on a standalone planar surface, whose local `+X` the
+    /// fast axis is measured from.
+    Retarder {
+        /// Fast axis, degrees from the surface's local `+X`.
+        axis_deg: f64,
+        retardance_deg: f64,
+        /// Index of the glass the waveplate is carried in. See
+        /// [`bare_element`].
+        #[serde(default = "bare_element")]
+        substrate_index: f64,
+        /// What the plate is made of, if it is made of anything. `None` is an
+        /// ideal retarder: `retardance_deg` at every wavelength and every
+        /// angle.
+        #[serde(default)]
+        crystal: Option<Waveplate>,
     },
 }
 
@@ -488,7 +721,9 @@ impl SurfaceResponse {
                         // λ; bound it by the curve's own maximum (conservative
                         // only there, exact everywhere else).
                         let r = reflectance.sample(lam).unwrap_or_else(|| reflectance.max());
-                        let t = transmittance.sample(lam).unwrap_or_else(|| transmittance.max());
+                        let t = transmittance
+                            .sample(lam)
+                            .unwrap_or_else(|| transmittance.max());
                         r + t > 1.0 + 1e-12
                     })
                 };
@@ -535,8 +770,12 @@ impl SurfaceResponse {
                 }
                 if let crate::thinfilm::CoatingBacking::Plate { substrate, exit } = &coating.backing
                 {
-                    substrate.n.validate(&format!("{field}.coating.substrate.n"))?;
-                    substrate.k.validate(&format!("{field}.coating.substrate.k"))?;
+                    substrate
+                        .n
+                        .validate(&format!("{field}.coating.substrate.n"))?;
+                    substrate
+                        .k
+                        .validate(&format!("{field}.coating.substrate.k"))?;
                     if substrate.n.min() <= 0.0 {
                         return Err(range("coating.substrate.n", "must be positive"));
                     }
@@ -544,6 +783,60 @@ impl SurfaceResponse {
                         if !residual.is_finite() || !(0.0..=1.0).contains(residual) {
                             return Err(range("coating.exit.residual", "is outside [0, 1]"));
                         }
+                    }
+                }
+                Ok(())
+            }
+            Self::Polarizer {
+                axis_deg,
+                extinction,
+                substrate_index,
+            } => {
+                if !axis_deg.is_finite() {
+                    return Err(range("axis_deg", "must be finite"));
+                }
+                extinction.validate(&format!("{field}.extinction"))?;
+                if !extinction.is_unit_fraction() {
+                    return Err(range("extinction", "is outside [0, 1]"));
+                }
+                if !substrate_index.is_finite() || *substrate_index < 1.0 {
+                    return Err(range("substrate_index", "must be at least 1"));
+                }
+                Ok(())
+            }
+            Self::Retarder {
+                axis_deg,
+                retardance_deg,
+                substrate_index,
+                crystal,
+            } => {
+                if !axis_deg.is_finite() {
+                    return Err(range("axis_deg", "must be finite"));
+                }
+                if !retardance_deg.is_finite() {
+                    return Err(range("retardance_deg", "must be finite"));
+                }
+                if !substrate_index.is_finite() || *substrate_index < 1.0 {
+                    return Err(range("substrate_index", "must be at least 1"));
+                }
+                if let Some(c) = crystal {
+                    if !c.n_o.is_finite() || c.n_o < 1.0 {
+                        return Err(range("crystal.n_o", "must be at least 1"));
+                    }
+                    if !c.n_e.is_finite() || c.n_e < 1.0 {
+                        return Err(range("crystal.n_e", "must be at least 1"));
+                    }
+                    // An isotropic plate would silently retard by nothing
+                    // however thick it was asked to be, which is worse than
+                    // refusing it.
+                    if (c.n_e - c.n_o).abs() < 1e-9 {
+                        return Err(range("crystal", "has no birefringence to retard with"));
+                    }
+                    if !c.design_lambda_um.is_finite() || c.design_lambda_um <= 0.0 {
+                        return Err(range("crystal.design_lambda_um", "must be positive"));
+                    }
+                    if c.order > 1000 {
+                        return Err(range("crystal.order", "is beyond any real plate"));
                     }
                 }
                 Ok(())
@@ -1385,7 +1678,11 @@ impl Scene3 {
                         .position(|d| d.common.id.raw() == id)
                         .map(Slot::Detector)
                 })
-                .or_else(|| (self.sources.iter()).position(|s| s.id.raw() == id).map(Slot::Source));
+                .or_else(|| {
+                    (self.sources.iter())
+                        .position(|s| s.id.raw() == id)
+                        .map(Slot::Source)
+                });
             match slot {
                 Some(s) => slots.push(s),
                 None => {

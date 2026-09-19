@@ -223,7 +223,13 @@ impl GpuScene3 {
         let mut reject = |object: u64, kind: String| rejected.push(Reject3 { object, kind });
 
         for b in &scene.bodies {
-            match compile_body(b, &norm, &scene.catalog, scene.env.ambient_index, &coat_lambdas) {
+            match compile_body(
+                b,
+                &norm,
+                &scene.catalog,
+                scene.env.ambient_index,
+                &coat_lambdas,
+            ) {
                 Ok(gb) => bodies.push(gb),
                 Err(kind) => reject(b.common.id.0, kind),
             }
@@ -455,7 +461,18 @@ fn compile_body(
                 face_resp.push(None);
                 continue;
             }
-            if two.from_outside != two.from_inside {
+            // A coated face's inside copy is the same stack met from behind.
+            // The grid is baked from outside and serves a ray from inside as
+            // well, because a lossless stack reflects and transmits the same
+            // from either side at conjugate angles; the inside copy exists to
+            // tell the reference which way round to walk the layers.
+            let mirrored = match (&two.from_outside, &two.from_inside) {
+                (SurfaceResponse::Coating { coating: a }, SurfaceResponse::Coating { coating: b }) => {
+                    a.seen_from_behind() == *b
+                }
+                _ => false,
+            };
+            if two.from_outside != two.from_inside && !mirrored {
                 return Err("asymmetric per-face response (not yet in the f32 preview)".into());
             }
             match &two.from_outside {
@@ -838,6 +855,9 @@ fn classify_surface(r: &TwoSidedSurfaceResponse) -> Result<u32, String> {
         SurfaceResponse::ThinLens { .. } => {
             Err("thin lens on a body patch (only standalone surfaces carry it)".into())
         }
+        SurfaceResponse::Polarizer { .. } | SurfaceResponse::Retarder { .. } => {
+            Err("polarizing element on a body patch (only standalone surfaces carry one)".into())
+        }
         SurfaceResponse::Coating { .. } => {
             Err("thin-film coating on a body patch (not yet in the f32 preview)".into())
         }
@@ -1019,6 +1039,10 @@ pub enum GpuResponse {
     CoatingGrid {
         lambdas: Vec<f32>,
         rt: Vec<[f32; 2]>,
+        /// The reflection is stray light (an AR coat's residual) and so a
+        /// ghost, rather than a designed path. See
+        /// `oc_core::thinfilm::Coating::reflection_is_stray`.
+        stray: bool,
     },
 }
 
@@ -1144,7 +1168,50 @@ fn compile_response(
             let far: Vec<f64> = coat_lambdas.iter().map(|_| ambient).collect();
             bake_coating(coating, ambient, coat_lambdas, &far)?
         }
+        // The preview carries no polarization state, so all these elements can
+        // be there is what they do to unpolarized light: a polarizer passes half
+        // of it plus whatever leaks past the blocked axis, and a lossless
+        // retarder passes all of it. Those are the right *numbers* under the
+        // preview's declared model, and they are the reason a crossed pair looks
+        // bright in the preview and goes dark in the reference. The component
+        // view says which model produced a number.
+        //
+        // An element laminated in glass also has two faces, and the preview
+        // takes them at normal incidence because it has no angle here. That is
+        // the same shape of approximation as the rest of this arm: the right
+        // number on axis and increasingly wrong as the part is tilted, where
+        // the reference splits s from p and this cannot.
+        SurfaceResponse::Polarizer {
+            extinction,
+            substrate_index,
+            ..
+        } => GpuResponse::ExplicitRt {
+            r: spectral(&SpectralScalar::Constant(face_reflectance(*substrate_index)))?,
+            t: spectral(&SpectralScalar::Constant(
+                two_faces(*substrate_index) * 0.5 * (1.0 + extinction.on_axis().clamp(0.0, 1.0)),
+            ))?,
+        },
+        SurfaceResponse::Retarder {
+            substrate_index, ..
+        } => GpuResponse::ExplicitRt {
+            r: spectral(&SpectralScalar::Constant(face_reflectance(*substrate_index)))?,
+            t: spectral(&SpectralScalar::Constant(two_faces(*substrate_index)))?,
+        },
     })
+}
+
+/// One air-to-glass face's reflectance on axis, which is all the preview has
+/// room for: a polarizing element carries no baked angle grid the way a coating
+/// does.
+fn face_reflectance(n: f64) -> f64 {
+    let n = n.max(1.0);
+    ((n - 1.0) / (n + 1.0)).powi(2)
+}
+
+/// What the pair of faces passes on axis. Both faces reflect the same, so this
+/// is the square of one.
+fn two_faces(n: f64) -> f64 {
+    (1.0 - face_reflectance(n)).powi(2)
 }
 
 /// Angle samples in a baked coating grid, uniform in `sin2 theta` from 0 (on
@@ -1210,6 +1277,7 @@ fn bake_coating(
     Ok(GpuResponse::CoatingGrid {
         lambdas: lambdas.to_vec(),
         rt,
+        stray: c.reflection_is_stray(),
     })
 }
 

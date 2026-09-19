@@ -1926,6 +1926,83 @@ impl Canvas {
         id as f64
     }
 
+    /// Add an ideal linear polarizer at `(x,y)`: a round plate of `radius` mm,
+    /// tilted `tilt_deg`, passing the field along `axis_deg` from the plate's
+    /// own local `+X` and absorbing the perpendicular component.
+    ///
+    /// `extinction` is the **power** fraction of the blocked component that
+    /// still gets through: 0 is perfect, 1e-4 an ordinary sheet. Unpolarized
+    /// light loses half its flux here, which is physics rather than a modelled
+    /// loss. Returns the new object id, or `-1`.
+    ///
+    /// The preview cannot do this: it carries no polarization state, so it
+    /// draws the plate as a 50% attenuator and a crossed pair stays bright
+    /// there while the reference goes dark.
+    #[wasm_bindgen(js_name = addPolarizer)]
+    pub fn add_polarizer(
+        &mut self,
+        x: f64,
+        y: f64,
+        radius: f64,
+        tilt_deg: f64,
+        axis_deg: f64,
+        extinction: f64,
+    ) -> f64 {
+        let Some(scene) = self.scene3.as_mut() else {
+            return -1.0;
+        };
+        match scene.add_polarizer(
+            Vec3::new(x, y, 0.0),
+            radius.max(0.5),
+            tilt_deg,
+            axis_deg,
+            extinction,
+        ) {
+            Some(id) => {
+                self.revision += 1;
+                id as f64
+            }
+            None => -1.0,
+        }
+    }
+
+    /// Add an ideal linear retarder (a waveplate) at `(x,y)`: a round plate of
+    /// `radius` mm, tilted `tilt_deg`, with its fast axis `axis_deg` from the
+    /// plate's local `+X` and `retardance_deg` of phase on the slow axis.
+    ///
+    /// 90 is a quarter wave, 180 a half wave. Lossless and zero thickness: the
+    /// polarization action of a waveplate and not the crystal, so no walk-off,
+    /// no ordinary and extraordinary rays, and the retardance is the number
+    /// given rather than one derived from a thickness at each wavelength.
+    /// Returns the new object id, or `-1`.
+    #[wasm_bindgen(js_name = addRetarder)]
+    pub fn add_retarder(
+        &mut self,
+        x: f64,
+        y: f64,
+        radius: f64,
+        tilt_deg: f64,
+        axis_deg: f64,
+        retardance_deg: f64,
+    ) -> f64 {
+        let Some(scene) = self.scene3.as_mut() else {
+            return -1.0;
+        };
+        match scene.add_retarder(
+            Vec3::new(x, y, 0.0),
+            radius.max(0.5),
+            tilt_deg,
+            axis_deg,
+            retardance_deg,
+        ) {
+            Some(id) => {
+                self.revision += 1;
+                id as f64
+            }
+            None => -1.0,
+        }
+    }
+
     /// Add a beam splitter at `(x,y)`: a round plate of `radius` mm, tilted
     /// `tilt_deg` in the meridional plane, reflecting `reflectance` and
     /// transmitting `transmittance` on both faces. Returns the new object id,
@@ -2042,6 +2119,217 @@ impl Canvas {
         }
     }
 
+    /// A polarizing element's properties, or `null` for anything else.
+    ///
+    /// JSON `{kind, axisDeg, extinction, retardanceDeg}` where `kind` is
+    /// `"polarizer"` or `"retarder"`. `extinction` is null on a retarder and
+    /// `retardanceDeg` is null on a polarizer, because a property the element
+    /// does not have should read as absent and not as zero.
+    ///
+    /// The axis is measured from the surface's **own local +X**, not from any
+    /// world axis: it is a direction in the element, and it turns with the
+    /// element.
+    #[wasm_bindgen(js_name = surfacePolarizationJSON)]
+    pub fn surface_polarization_json(&self, id: f64) -> String {
+        use oc_core::scene3::SurfaceResponse;
+        let Some((front, _back)) = self
+            .scene3
+            .as_ref()
+            .and_then(|s| s.surface_responses(id as u64))
+        else {
+            return "null".into();
+        };
+        match front {
+            SurfaceResponse::Polarizer {
+                axis_deg,
+                extinction,
+                substrate_index,
+            } => format!(
+                "{{\"kind\":\"polarizer\",\"axisDeg\":{},\"extinction\":{},\"retardanceDeg\":null,\"substrateIndex\":{},\"crystal\":null,\"extinctionTable\":{}}}",
+                json_num(*axis_deg),
+                json_num(extinction.on_axis()),
+                json_num(*substrate_index),
+                match extinction {
+                    oc_core::scene3::AngularScalar::Constant(_) => "null".to_string(),
+                    oc_core::scene3::AngularScalar::Tabulated {
+                        aoi_deg, values, ..
+                    } => format!(
+                        "{{\"aoiDeg\":[{}],\"extinction\":[{}]}}",
+                        aoi_deg.iter().map(|v| json_num(*v)).collect::<Vec<_>>().join(","),
+                        values.iter().map(|v| json_num(*v)).collect::<Vec<_>>().join(",")
+                    ),
+                }
+            ),
+            SurfaceResponse::Retarder {
+                axis_deg,
+                retardance_deg,
+                substrate_index,
+                crystal,
+            } => format!(
+                "{{\"kind\":\"retarder\",\"axisDeg\":{},\"extinction\":null,\"retardanceDeg\":{},\"substrateIndex\":{},\"crystal\":{}}}",
+                json_num(*axis_deg),
+                json_num(*retardance_deg),
+                json_num(*substrate_index),
+                match crystal {
+                    None => "null".to_string(),
+                    Some(c) => format!(
+                        "{{\"nO\":{},\"nE\":{},\"order\":{},\"designLambdaUm\":{},\"thicknessUm\":{}}}",
+                        json_num(c.n_o),
+                        json_num(c.n_e),
+                        c.order,
+                        json_num(c.design_lambda_um),
+                        json_num(c.thickness_um(*retardance_deg))
+                    ),
+                }
+            ),
+            _ => "null".into(),
+        }
+    }
+
+    /// Set a polarizer's extinction from a datasheet: the power fraction that
+    /// leaks past the blocked axis, against angle of incidence in degrees.
+    ///
+    /// The arrays must be the same length, at least two long, with angles
+    /// strictly increasing in `[0, 90)` and values in `[0, 1]`. Outside the
+    /// measured range the curve holds its endpoint, so the range somebody
+    /// measured is the range to trust: a real polarizer is worse out there,
+    /// not the same.
+    ///
+    /// `setPolarizerExtinction` puts it back to one number, which is an ideal
+    /// layer holding its contrast at every angle.
+    #[wasm_bindgen(js_name = setPolarizerExtinctionTable)]
+    pub fn set_polarizer_extinction_table(
+        &mut self,
+        id: f64,
+        aoi_deg: &[f64],
+        extinction: &[f64],
+    ) -> bool {
+        let Some(scene) = self.scene3.as_mut() else {
+            return false;
+        };
+        if scene.set_polarizer_extinction_table(id as u64, aoi_deg, extinction) {
+            self.revision += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Make a retarder out of a real crystal: two indices, how many whole
+    /// waves sit under the nominal retardance, and the wavelength that nominal
+    /// is quoted at.
+    ///
+    /// The retardance then follows from the plate rather than being a number:
+    /// it moves as `1/λ` and as the square of the angle off axis, and a
+    /// multi-order plate moves `order + 1` times as far as a zero-order one.
+    /// False for anything that is not a retarder, or for a crystal that could
+    /// not be one.
+    #[wasm_bindgen(js_name = setRetarderCrystal)]
+    pub fn set_retarder_crystal(
+        &mut self,
+        id: f64,
+        n_o: f64,
+        n_e: f64,
+        order: u32,
+        design_lambda_um: f64,
+    ) -> bool {
+        let Some(scene) = self.scene3.as_mut() else {
+            return false;
+        };
+        let c = oc_core::scene3::Waveplate {
+            n_o,
+            n_e,
+            order,
+            design_lambda_um,
+        };
+        if scene.set_retarder_crystal(id as u64, Some(c)) {
+            self.revision += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Make a retarder ideal again: the nominal retardance at every wavelength
+    /// and every angle.
+    #[wasm_bindgen(js_name = clearRetarderCrystal)]
+    pub fn clear_retarder_crystal(&mut self, id: f64) -> bool {
+        let Some(scene) = self.scene3.as_mut() else {
+            return false;
+        };
+        if scene.set_retarder_crystal(id as u64, None) {
+            self.revision += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Set the index of the glass a polarizing element is laminated in, or 1
+    /// for a bare layer with no faces at all.
+    ///
+    /// This is the element's own glass, not the medium it stands in. It is
+    /// what makes a real polarizer care about the angle it is used at: the two
+    /// faces pass p better than s, and by 45 degrees that is a fifth more light
+    /// for a polarizer passing p than for one passing s. False below 1.
+    #[wasm_bindgen(js_name = setPolarizingSubstrate)]
+    pub fn set_polarizing_substrate(&mut self, id: f64, index: f64) -> bool {
+        let Some(scene) = self.scene3.as_mut() else {
+            return false;
+        };
+        if scene.set_polarizing_substrate(id as u64, index) {
+            self.revision += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Turn a polarizing element's axis (degrees from the surface's local
+    /// `+X`). False, and the scene unchanged, for anything that is not one.
+    #[wasm_bindgen(js_name = setPolarizationAxis)]
+    pub fn set_polarization_axis(&mut self, id: f64, axis_deg: f64) -> bool {
+        let Some(scene) = self.scene3.as_mut() else {
+            return false;
+        };
+        if scene.set_polarization_axis(id as u64, axis_deg) {
+            self.revision += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Set a polarizer's extinction: the power fraction of the blocked
+    /// component that still gets through, clamped to `[0, 1]`.
+    #[wasm_bindgen(js_name = setPolarizerExtinction)]
+    pub fn set_polarizer_extinction(&mut self, id: f64, extinction: f64) -> bool {
+        let Some(scene) = self.scene3.as_mut() else {
+            return false;
+        };
+        if scene.set_polarizer_extinction(id as u64, extinction) {
+            self.revision += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Set a retarder's retardance in degrees: 90 a quarter wave, 180 a half
+    /// wave.
+    #[wasm_bindgen(js_name = setRetarderRetardance)]
+    pub fn set_retarder_retardance(&mut self, id: f64, retardance_deg: f64) -> bool {
+        let Some(scene) = self.scene3.as_mut() else {
+            return false;
+        };
+        if scene.set_retarder_retardance(id as u64, retardance_deg) {
+            self.revision += 1;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Each face's coating, for the component view: `{front, back}`, each
     /// `{kind, r, t, dichroic}` with `kind` as in [`Canvas::surface_response_json`],
     /// `r`/`t` the constant reflectance and transmittance (a mirror's
@@ -2076,6 +2364,12 @@ impl Canvas {
                 // reporting a number here would be the very thing this is meant
                 // to stop. `surfaceFilmJSON` carries the stack instead.
                 SurfaceResponse::Coating { .. } => ("null".into(), "null".into()),
+                // Nor does a polarizing element: what it passes depends on the
+                // state arriving, which is not a property of the surface. Half
+                // is the answer only for unpolarized light.
+                SurfaceResponse::Polarizer { .. } | SurfaceResponse::Retarder { .. } => {
+                    ("null".into(), "null".into())
+                }
             };
             let dichroic = DichroicSpec::from_response(r).map_or("null".into(), |d| {
                 format!(
@@ -2156,6 +2450,13 @@ impl Canvas {
                         None => (None, None),
                     }
                 }
+                // What a polarizing element transmits depends on the state
+                // arriving, not on the surface, so there is no curve in
+                // wavelength to plot. Reporting the unpolarized half would read
+                // as a property of the part.
+                SurfaceResponse::Polarizer { .. } | SurfaceResponse::Retarder { .. } => {
+                    (None, None)
+                }
             };
             out.push(rr.unwrap_or(f64::NAN));
             out.push(tt.unwrap_or(f64::NAN));
@@ -2219,6 +2520,7 @@ impl Canvas {
                 "{{\"kind\":\"{}\",\"lambdaNm\":{},\"aoiDeg\":{},\"periods\":{},\"nHigh\":{},\"nLow\":{}}}",
                 match d.kind {
                     DesignKind::QuarterWaveStack => "mirror",
+                    DesignKind::Polarizing => "polarizing",
                     DesignKind::LongPass => "long-pass",
                     DesignKind::ShortPass => "short-pass",
                     DesignKind::SingleLayerAr => "ar-1",
@@ -2328,6 +2630,101 @@ impl Canvas {
         }
     }
 
+    /// Coat one face of a lens (or any revolved body) with a real stack, or
+    /// strip it back to bare glass with `kind` = `none`.
+    ///
+    /// `face` is `front` (the one an axial beam reaches first) or `back`.
+    /// `kind` is `ar-1`, `ar-3`, `mirror`, `long-pass`, `short-pass` or
+    /// `none`. The stack is solved against the body's own glass, so the same
+    /// three layers on crown and on flint are not the same coating.
+    ///
+    /// This is what puts a coating where there was none. `setSurfaceCoatingDesign`
+    /// rewrites one that is already there, which is right for editing a
+    /// dichroic and no use at all for coating a bare lens.
+    #[wasm_bindgen(js_name = setLensFaceCoating)]
+    pub fn set_lens_face_coating(
+        &mut self,
+        id: f64,
+        face: &str,
+        kind: &str,
+        lambda_nm: f64,
+    ) -> bool {
+        use oc_core::build3::BodyFace;
+        use oc_core::thinfilm::{CoatingDesign, DesignKind};
+        let face = match face {
+            "front" => BodyFace::Front,
+            "back" => BodyFace::Back,
+            _ => return false,
+        };
+        let design = match kind {
+            "none" => None,
+            _ => {
+                let kind = match kind {
+                    "ar-1" => DesignKind::SingleLayerAr,
+                    "ar-3" => DesignKind::BroadbandAr,
+                    "mirror" => DesignKind::QuarterWaveStack,
+                    "long-pass" => DesignKind::LongPass,
+                    "short-pass" => DesignKind::ShortPass,
+                    _ => return false,
+                };
+                Some(CoatingDesign {
+                    kind,
+                    lambda_nm,
+                    // A lens face is used on axis, which is what an AR coating
+                    // for one is designed at. A face used at 45 degrees is a
+                    // different part.
+                    aoi_deg: 0.0,
+                    periods: 4,
+                    n_high: 2.35,
+                    n_low: 1.38,
+                })
+            }
+        };
+        let Some(scene) = self.scene3.as_mut() else {
+            return false;
+        };
+        if scene.set_body_face_coating(id as u64, face, design) {
+            self.revision += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// What each face of a body carries: `{front, back}`, each the design kind
+    /// as a string, `"film"` for a stack with no recorded recipe, or null for
+    /// bare glass. `null` for anything that is not a body with two faces.
+    #[wasm_bindgen(js_name = lensFaceCoatingsJSON)]
+    pub fn lens_face_coatings_json(&self, id: f64) -> String {
+        use oc_core::build3::BodyFace;
+        use oc_core::thinfilm::DesignKind;
+        let Some(scene) = self.scene3.as_ref() else {
+            return "null".into();
+        };
+        let name = |face: BodyFace| -> String {
+            match scene.body_face_coating(id as u64, face) {
+                None => "null".into(),
+                Some(c) => format!(
+                    "\"{}\"",
+                    match c.design.map(|d| d.kind) {
+                        Some(DesignKind::SingleLayerAr) => "ar-1",
+                        Some(DesignKind::BroadbandAr) => "ar-3",
+                        Some(DesignKind::QuarterWaveStack) => "mirror",
+                        Some(DesignKind::Polarizing) => "polarizing",
+                        Some(DesignKind::LongPass) => "long-pass",
+                        Some(DesignKind::ShortPass) => "short-pass",
+                        None => "film",
+                    }
+                ),
+            }
+        };
+        format!(
+            "{{\"front\":{},\"back\":{}}}",
+            name(BodyFace::Front),
+            name(BodyFace::Back)
+        )
+    }
+
     /// Set one film layer's physical thickness, in nanometres. Bumps the
     /// revision. `false` for a bad index, a non-finite thickness, or a surface
     /// with no film on it.
@@ -2352,6 +2749,50 @@ impl Canvas {
     /// transmitted beam leaves displaced sideways, carrying the glass in its
     /// optical path, and the far face returns its own reflection. Returns the
     /// new object id, or -1.
+    /// Add a polarizing beam splitter: a cube of glass with a coated diagonal.
+    ///
+    /// Returns the diagonal's id, which is the object worth selecting, or -1.
+    /// The cube is a second object with the same label; the scene model cannot
+    /// yet hold an interface inside a solid, so moving one moves only that one.
+    ///
+    /// The cube's glass is not an argument, because it is not a choice: the
+    /// Brewster condition the coating pair relies on fixes it at
+    /// `√2·n_H·n_L/√(n_H²+n_L²)`, 1.754 for titania on silica, which is why a
+    /// real polarizing cube is dense flint.
+    #[wasm_bindgen(js_name = addPolarizingBeamSplitter)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_polarizing_beam_splitter(
+        &mut self,
+        x: f64,
+        y: f64,
+        z: f64,
+        half_mm: f64,
+        tilt_deg: f64,
+        lambda_nm: f64,
+        periods: u32,
+        n_high: f64,
+        n_low: f64,
+    ) -> f64 {
+        let Some(scene) = self.scene3.as_mut() else {
+            return -1.0;
+        };
+        match scene.add_polarizing_beam_splitter(
+            oc_core::vec3::Vec3::new(x, y, z),
+            half_mm,
+            tilt_deg,
+            lambda_nm,
+            periods,
+            n_high,
+            n_low,
+        ) {
+            Some((_cube, diagonal)) => {
+                self.revision += 1;
+                diagonal as f64
+            }
+            None => -1.0,
+        }
+    }
+
     #[wasm_bindgen(js_name = addPlateDichroic)]
     #[allow(clippy::too_many_arguments)]
     pub fn add_plate_dichroic(
@@ -2579,7 +3020,16 @@ impl Canvas {
 
     /// The f64 reference readout for a detector by id (§4.1: the honest numbers).
     /// JSON `{hits, totalIncident, totalSignal, cellArea, centroid, meanOpl,
-    /// bins, incident}`, or `null` if there is no such detector.
+    /// bins, incident, dop, dolp, azimuthDeg, stokes, maxTiltDeg}`, or `null`
+    /// if there is no such detector.
+    ///
+    /// The polarization fields describe the summed state in the **detector's
+    /// own frame**: every ray is rotated onto the projection of the detector's
+    /// local `+X` before being added. `maxTiltDeg` is the worst angle between
+    /// an arriving ray and the detector normal, and it is the caveat on that
+    /// sum: rays from very different directions have genuinely different
+    /// transverse planes, and adding their `S1` is then arithmetic rather than
+    /// measurement. Total flux never has that problem.
     #[wasm_bindgen(js_name = detectorResultJSON)]
     pub fn detector_result_json(&self, detector_id: f64) -> String {
         let Some(scene) = &self.scene3 else {
@@ -2608,8 +3058,9 @@ impl Canvas {
             .cell_area_mm2
             .map_or("null".to_string(), |a| format!("{a}"));
         let incident: Vec<String> = d.incident_flux.iter().map(|v| format!("{v}")).collect();
+        let st = d.stokes_local;
         format!(
-            "{{\"hits\":{},\"totalIncident\":{},\"totalSignal\":{},\"cellArea\":{},\"centroid\":{},\"meanOpl\":{},\"bins\":[{},{}],\"incident\":[{}]}}",
+            "{{\"hits\":{},\"totalIncident\":{},\"totalSignal\":{},\"cellArea\":{},\"centroid\":{},\"meanOpl\":{},\"bins\":[{},{}],\"incident\":[{}],\"dop\":{},\"dolp\":{},\"azimuthDeg\":{},\"stokes\":[{},{},{},{}],\"maxTiltDeg\":{}}}",
             d.hits,
             d.total_incident,
             d.total_signal,
@@ -2618,7 +3069,15 @@ impl Canvas {
             mean_opl,
             d.bins[0],
             d.bins[1],
-            incident.join(",")
+            incident.join(","),
+            json_num(st.dop()),
+            json_num(st.dolp()),
+            json_num(st.azimuth_rad().to_degrees()),
+            json_num(st.s0),
+            json_num(st.s1),
+            json_num(st.s2),
+            json_num(st.s3),
+            json_num(d.max_tilt_rad.to_degrees())
         )
     }
 
@@ -3669,6 +4128,10 @@ pub(crate) fn surface_object_kind(s: &oc_core::scene3::SurfaceObject3) -> &'stat
         "dichroic"
     } else if f == "split" || b == "split" {
         "beamsplitter"
+    } else if f == "polarizer" || f == "retarder" {
+        // Named, because "surface" tells a reader nothing and these two are
+        // not interchangeable: one absorbs half the light and one absorbs none.
+        f
     } else {
         "surface"
     }
@@ -3705,6 +4168,21 @@ pub(crate) fn source_radius(s: &oc_core::scene3::Source3) -> f64 {
 }
 
 /// A body's geometry kind and 3D construction, for the inspector.
+/// Are both optical faces of a four-edge revolved profile flat? That is what
+/// tells a plate from a lens, and a coated one of each apart.
+fn flat_faces(p: &oc_core::profile2::ProfileSolid3) -> bool {
+    use oc_core::profile2::Curve2;
+    let flat = |c: &Curve2| match c {
+        Curve2::Conic(p) => p.c.abs() < 1e-12,
+        Curve2::EvenAsphere { base, coeffs } => {
+            base.c.abs() < 1e-12 && coeffs.iter().all(|v| v.abs() < 1e-18)
+        }
+        _ => false,
+    };
+    let e = &p.profile.edges;
+    e.len() == 4 && flat(&e[0].curve) && flat(&e[2].curve)
+}
+
 fn body_kind_construction(b: &oc_core::scene3::Body3) -> (&'static str, &'static str) {
     use oc_core::scene3::SolidGeometry3;
     match &b.geometry {
@@ -3713,13 +4191,18 @@ fn body_kind_construction(b: &oc_core::scene3::Body3) -> (&'static str, &'static
         SolidGeometry3::Cylinder { .. } => ("cylinder", "analytic"),
         // A coated plate is a revolved solid like any lens, and calling it one
         // tells you nothing about what it is for. Its film is the component.
-        SolidGeometry3::Profile(_)
-            if b.surface.overrides.iter().any(|o| {
-                matches!(
-                    o.response.from_outside,
-                    oc_core::scene3::SurfaceResponse::Coating { .. }
-                )
-            }) =>
+        //
+        // A coated *lens* is not that. Both faces flat is what makes a plate a
+        // plate, so a body with any curvature stays a lens however it is
+        // coated, and the object list keeps calling it one.
+        SolidGeometry3::Profile(p)
+            if flat_faces(p)
+                && b.surface.overrides.iter().any(|o| {
+                    matches!(
+                        o.response.from_outside,
+                        oc_core::scene3::SurfaceResponse::Coating { .. }
+                    )
+                }) =>
         {
             ("dichroic", "coated plate")
         }

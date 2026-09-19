@@ -388,6 +388,7 @@ fn surface(s: &SurfaceObject3, plane: &Plane3, out: &mut Vec<String>) {
         "mirror" => "mirror",
         "beamsplitter" => "splitter",
         "dichroic" => "dichroic",
+        "polarizer" | "retarder" => "polarizing",
         _ => "surface",
     };
     let tint = match kind {

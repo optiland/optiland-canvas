@@ -177,6 +177,7 @@ fn rays_at(rays: &[(Vec3, Vec3, f64)]) -> (Vec<EmittedRay3>, Vec<LaunchRay3>) {
             lambda_um,
             flux: 1.0,
             source: None,
+            pol: None,
         });
     }
     (emitted, launch)
@@ -187,6 +188,18 @@ fn cfg() -> TraceConfig3 {
         ghosts: false,
         flux_eps: 1e-9,
         max_depth: 32,
+        // The preview carries no polarization state: it averages s and p at
+        // each surface and hands on unpolarized light. So the reference runs
+        // the same model here. Comparing a polarization-aware f64 trace against
+        // an unpolarized f32 one would measure the difference between two
+        // physical models and call it a precision drift.
+        //
+        // The difference is not small where it applies: a coated plate, whose
+        // front face polarizes the beam before its back face transmits it,
+        // moves by 2e-2 of a ray's flux between the two models, which is ten
+        // times the grid tolerance this suite is checking.
+        // `oc-trace/tests/polarization3.rs` measures the gap deliberately.
+        polarization: false,
         ..TraceConfig3::default()
     }
 }
@@ -854,17 +867,14 @@ fn assert_tree_matches(scene: &Scene3, ray: (Vec3, Vec3, f64), ghosts: bool) -> 
 /// than running the transfer matrix, so its flux carries interpolation error
 /// that `flux_close` would reject — while the *paths* stay exact, because where
 /// a ray goes does not depend on how much of it goes there.
-fn assert_tree_geometry_matches(scene: &Scene3, ray: (Vec3, Vec3, f64)) -> Vec<SegOut3> {
+fn assert_tree_geometry_matches(
+    scene: &Scene3,
+    ray: (Vec3, Vec3, f64),
+    ghosts: bool,
+) -> Vec<SegOut3> {
     let (emitted, launch) = rays_at(&[ray]);
-    let f64_res = trace3(
-        scene,
-        &launch,
-        &TraceConfig3 {
-            ghosts: false,
-            ..cfg()
-        },
-    );
-    let gpu = GpuScene3::build_with_rays(scene, &emitted, opts(false));
+    let f64_res = trace3(scene, &launch, &TraceConfig3 { ghosts, ..cfg() });
+    let gpu = GpuScene3::build_with_rays(scene, &emitted, opts(ghosts));
     assert!(
         gpu.rejected.is_empty(),
         "unexpected rejects: {:?}",
@@ -1234,7 +1244,7 @@ fn a_thin_film_coating_matches_f64_within_the_grid_tolerance() {
         for &ray in &rays {
             // Structure is exact: both arms exist, in the same order, landing in
             // the same places.
-            let segs = assert_tree_geometry_matches(&scene, ray);
+            let segs = assert_tree_geometry_matches(&scene, ray, false);
             assert_eq!(segs.len(), 3, "both arms at {lambda_um}: {segs:?}");
         }
         let (emitted, launch) = rays_at(&rays);
@@ -1268,6 +1278,69 @@ fn a_thin_film_coating_matches_f64_within_the_grid_tolerance() {
         "the baked grid drifts further from the matrix than documented: {worst}"
     );
     eprintln!("worst per-ray flux drift from the coating grid: {worst:.2e}");
+}
+
+/// An AR-coated lens face reflects ghosts in the preview, as it does in the
+/// reference.
+///
+/// A body face with a coating reads its reflection off the baked grid, and
+/// that branch used to be pushed as a primary path for every stack, so an AR
+/// coat on a lens drew its reflections at full strength with ghosts switched
+/// off. The branch structure has to match the reference in both states: no
+/// reflection at all with ghosts off, and a ghost-flagged one with them on.
+#[test]
+fn an_ar_coated_lens_reflects_ghosts_like_f64() {
+    use oc_core::build3::{BodyFace, SingletGeom};
+    use oc_core::thinfilm::{CoatingDesign, DesignKind};
+
+    let mut scene = Scene3::new();
+    let lens = scene.add_singlet(Vec3::ZERO, SingletGeom::biconvex(), 1.5168, 64.17);
+    let ar = CoatingDesign {
+        kind: DesignKind::BroadbandAr,
+        lambda_nm: 550.0,
+        aoi_deg: 0.0,
+        periods: 1,
+        n_high: 2.35,
+        n_low: 1.38,
+    };
+    for face in [BodyFace::Front, BodyFace::Back] {
+        assert!(scene.set_body_face_coating(lens.0, face, Some(ar)));
+    }
+    scene.validate().unwrap();
+
+    for lambda_um in [0.48, 0.55, 0.62] {
+        for y in [0.0, 1.5, -3.0] {
+            let ray = (Vec3::new(-30.0, y, 0.5), Vec3::X, lambda_um);
+            let off = assert_tree_geometry_matches(&scene, ray, false);
+            assert!(
+                off.iter().all(|g| !g.is_ghost()),
+                "ghosts off draws no reflection: {off:?}"
+            );
+            // In, through the glass, out: nothing folds back.
+            assert_eq!(off.len(), 3, "{ray:?}: {off:?}");
+
+            let on = assert_tree_geometry_matches(&scene, ray, true);
+            assert!(
+                on.iter().any(|g| g.is_ghost()),
+                "ghosts on draws the reflection, as a ghost: {on:?}"
+            );
+            assert_eq!(
+                on.iter().filter(|g| !g.is_ghost()).count(),
+                3,
+                "and the primary path is the same either way"
+            );
+        }
+
+        // A ray inside the glass past the critical angle: total internal
+        // reflection at a coated face is the ray itself, a primary path in
+        // both tiers with the switch either way, never a stray reflection.
+        let t = 60f64.to_radians();
+        let inside = (Vec3::ZERO, Vec3::new(t.cos(), t.sin(), 0.0), lambda_um);
+        for ghosts in [false, true] {
+            let segs = assert_tree_geometry_matches(&scene, inside, ghosts);
+            assert!(segs[1].is_tir() && !segs[1].is_ghost(), "{segs:?}");
+        }
+    }
 }
 
 /// A coated plate with real thickness, previewed against the exact tracer.
@@ -1309,7 +1382,7 @@ fn a_coated_plate_body_matches_f64() {
             .map(|&(y, z)| (Vec3::new(-15.0, y, z), Vec3::X, lambda_um))
             .collect();
         for &ray in &rays {
-            let segs = assert_tree_geometry_matches(&scene, ray);
+            let segs = assert_tree_geometry_matches(&scene, ray, false);
             assert!(
                 segs.len() >= 3,
                 "reflect, cross the glass, and carry on: {segs:?}"

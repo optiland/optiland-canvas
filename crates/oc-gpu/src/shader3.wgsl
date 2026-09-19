@@ -71,7 +71,8 @@ struct Spectral {
 // `t` the explicit transmittance, `ar` the dielectric AR residual.
 struct Response {
     kind: u32,
-    _pad: array<u32, 3>,
+    flags: u32,
+    _pad: array<u32, 2>,
     r: Spectral,
     t: Spectral,
     ar: Spectral,
@@ -177,6 +178,9 @@ const RESP_DIELECTRIC: u32 = 2u;
 const RESP_EXPLICIT_RT: u32 = 3u;
 const RESP_THIN_LENS: u32 = 4u;
 const RESP_COATING: u32 = 5u;
+// Response.flags: the reflection is stray light (an AR coat's residual), so a
+// ghost like bare glass's. Must match buffers3::RESP_FLAG_STRAY.
+const RESP_FLAG_STRAY: u32 = 1u;
 
 // A baked thin-film coating. `resp.t` holds the wavelength axis (tab_count
 // entries at tab_start, x = lambda) and `resp.r` the grid itself: COAT_ANGLES
@@ -1102,20 +1106,34 @@ fn interact_body(w: Work, ev: Event, point: vec3<f32>, flux_end: f32, lambda: f3
     if (b.kind == OBJ_REVOLVE && ev.face < b.face_count) {
         let f = faces[b.face_start + ev.face];
         if (f.has_resp == 1u && f.resp.kind == RESP_COATING) {
+            // Past the critical angle nothing gets through whatever the stack,
+            // and the grid saturates at grazing rather than saying so: total
+            // internal reflection is the whole ray and a primary path, as at
+            // bare glass below. Mirrors cpu3::interact_body.
+            let resc = refract3(w.d, n, n1, n2);
+            if (resc.w < 0.5) {
+                let dir = reflect3(w.d, n);
+                push(Work(point + dir * EPS, dir, flux_end, w.depth + 1u, w.gdepth, w.medium_n, w.medium_alpha, w.flags | SEG_TIR), min_flux);
+                return;
+            }
             let cos_ic = clamp(-dot(n, w.d), 0.0, 1.0);
             let rt = sample_coating(f.resp, lambda, cos_ic, w.medium_n);
             let rc = clamp(rt.x, 0.0, 1.0);
             let tc = clamp(rt.y, 0.0, 1.0);
+            // An AR coat's reflection is a ghost, like bare glass's below; any
+            // other stack's is the path it was designed for.
+            let stray = (f.resp.flags & RESP_FLAG_STRAY) != 0u;
             if (rc > 0.0) {
                 let dir = reflect3(w.d, n);
-                push(Work(point + dir * EPS, dir, flux_end * rc, w.depth + 1u, w.gdepth, w.medium_n, w.medium_alpha, w.flags & ~SEG_TIR), min_flux);
+                if (!stray) {
+                    push(Work(point + dir * EPS, dir, flux_end * rc, w.depth + 1u, w.gdepth, w.medium_n, w.medium_alpha, w.flags & ~SEG_TIR), min_flux);
+                } else if (params.ghosts == 1u && w.gdepth < params.max_ghost) {
+                    push(Work(point + dir * EPS, dir, flux_end * rc, w.depth + 1u, w.gdepth + 1u, w.medium_n, w.medium_alpha, (w.flags & ~SEG_TIR) | SEG_GHOST), min_flux);
+                }
             }
             if (tc > 0.0) {
-                let resc = refract3(w.d, n, n1, n2);
-                if (resc.w >= 0.5) {
-                    let td2 = resc.xyz;
-                    push(Work(point + td2 * EPS, td2, flux_end * tc, w.depth + 1u, w.gdepth, n2, m2.y, w.flags & ~SEG_TIR), min_flux);
-                }
+                let td2 = resc.xyz;
+                push(Work(point + td2 * EPS, td2, flux_end * tc, w.depth + 1u, w.gdepth, n2, m2.y, w.flags & ~SEG_TIR), min_flux);
             }
             return;
         }
@@ -1182,14 +1200,20 @@ fn interact_surface(w: Work, ev: Event, point: vec3<f32>, flux_end: f32, lambda:
     } else if (kind == RESP_COATING) {
         // A real thin-film stack, read off the grid baked from the transfer
         // matrix when the scene compiled. Both branches are primary paths, like
-        // explicit R/T below.
+        // explicit R/T below, unless the stack is an AR coat, whose reflection
+        // is a ghost.
         let cos_i = clamp(-dot(n_oppose, w.d), 0.0, 1.0);
         let rt = sample_coating(resp, lambda, cos_i, w.medium_n);
         let r = clamp(rt.x, 0.0, 1.0);
         let t = clamp(rt.y, 0.0, 1.0);
+        let stray = (resp.flags & RESP_FLAG_STRAY) != 0u;
         if (r > 0.0) {
             let dir = reflect3(w.d, n_oppose);
-            push(Work(point + dir * EPS, dir, flux_end * r, w.depth + 1u, w.gdepth, w.medium_n, w.medium_alpha, w.flags & ~SEG_TIR), min_flux);
+            if (!stray) {
+                push(Work(point + dir * EPS, dir, flux_end * r, w.depth + 1u, w.gdepth, w.medium_n, w.medium_alpha, w.flags & ~SEG_TIR), min_flux);
+            } else if (params.ghosts == 1u && w.gdepth < params.max_ghost) {
+                push(Work(point + dir * EPS, dir, flux_end * r, w.depth + 1u, w.gdepth + 1u, w.medium_n, w.medium_alpha, (w.flags & ~SEG_TIR) | SEG_GHOST), min_flux);
+            }
         }
         if (t > 0.0) {
             push(Work(point + w.d * EPS, w.d, flux_end * t, w.depth + 1u, w.gdepth, w.medium_n, w.medium_alpha, w.flags & ~SEG_TIR), min_flux);

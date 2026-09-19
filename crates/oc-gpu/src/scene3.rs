@@ -461,7 +461,18 @@ fn compile_body(
                 face_resp.push(None);
                 continue;
             }
-            if two.from_outside != two.from_inside {
+            // A coated face's inside copy is the same stack met from behind.
+            // The grid is baked from outside and serves a ray from inside as
+            // well, because a lossless stack reflects and transmits the same
+            // from either side at conjugate angles; the inside copy exists to
+            // tell the reference which way round to walk the layers.
+            let mirrored = match (&two.from_outside, &two.from_inside) {
+                (SurfaceResponse::Coating { coating: a }, SurfaceResponse::Coating { coating: b }) => {
+                    a.seen_from_behind() == *b
+                }
+                _ => false,
+            };
+            if two.from_outside != two.from_inside && !mirrored {
                 return Err("asymmetric per-face response (not yet in the f32 preview)".into());
             }
             match &two.from_outside {
@@ -1028,6 +1039,10 @@ pub enum GpuResponse {
     CoatingGrid {
         lambdas: Vec<f32>,
         rt: Vec<[f32; 2]>,
+        /// The reflection is stray light (an AR coat's residual) and so a
+        /// ghost, rather than a designed path. See
+        /// `oc_core::thinfilm::Coating::reflection_is_stray`.
+        stray: bool,
     },
 }
 
@@ -1262,6 +1277,7 @@ fn bake_coating(
     Ok(GpuResponse::CoatingGrid {
         lambdas: lambdas.to_vec(),
         rt,
+        stray: c.reflection_is_stray(),
     })
 }
 

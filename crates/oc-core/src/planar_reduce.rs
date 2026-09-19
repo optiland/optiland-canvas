@@ -337,10 +337,14 @@ fn two_sided_to_spec(
     object: u64,
     r: &TwoSidedSurfaceResponse,
 ) -> Result<SurfaceSpec, ReductionIssue> {
+    // The kind first, so a response the plane cannot hold at all is refused
+    // for what it is. A coated face's two sides differ only in which way the
+    // stack is walked, and "asymmetric" would hide that it is a coating.
+    let spec = response_to_spec(object, &r.from_outside)?;
     if r.from_outside != r.from_inside {
         return Err(ReductionIssue::AsymmetricSurfaceResponse { object });
     }
-    response_to_spec(object, &r.from_outside)
+    Ok(spec)
 }
 
 /// A body's surface properties (default plus per-patch overrides) as v1

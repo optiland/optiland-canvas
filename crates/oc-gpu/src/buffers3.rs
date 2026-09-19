@@ -45,6 +45,10 @@ pub const RESP_THIN_LENS: u32 = 4;
 /// A baked thin-film coating: `r.tab_start` points at
 /// `COAT_ANGLES × COAT_LAMBDAS` `(R, T)` pairs in `verts`, row-major by angle.
 pub const RESP_COATING: u32 = 5;
+/// `Response3Buf::flags`: the reflection is stray light, an AR coat's
+/// residual, and so a ghost rather than a designed path. Must match the
+/// shader's `RESP_FLAG_STRAY`.
+pub const RESP_FLAG_STRAY: u32 = 1;
 
 // Out-of-range policies of a tabulated response scalar.
 pub const POLICY_ERROR: u32 = 0;
@@ -181,7 +185,9 @@ pub struct Spectral3Buf {
 #[derive(Debug, Clone, Copy, Pod, Zeroable, PartialEq)]
 pub struct Response3Buf {
     pub kind: u32,
-    pub _pad: [u32; 3],
+    /// `RESP_FLAG_*` bits. One so far: the reflection is stray light.
+    pub flags: u32,
+    pub _pad: [u32; 2],
     pub r: Spectral3Buf,
     pub t: Spectral3Buf,
     pub ar: Spectral3Buf,
@@ -358,6 +364,10 @@ fn encode_spectral(s: &Spectral32, verts: &mut Vec<Vert3Buf>) -> Spectral3Buf {
 /// in the `r` slot.
 fn encode_response(resp: &GpuResponse, verts: &mut Vec<Vert3Buf>) -> Response3Buf {
     let zero = constant(0.0);
+    let flags = match resp {
+        GpuResponse::CoatingGrid { stray: true, .. } => RESP_FLAG_STRAY,
+        _ => 0,
+    };
     let (kind, r, t, ar) = match resp {
         GpuResponse::Absorber => (RESP_ABSORBER, zero, zero, zero),
         GpuResponse::Mirror { r } => (RESP_MIRROR, encode_spectral(r, verts), zero, zero),
@@ -367,7 +377,7 @@ fn encode_response(resp: &GpuResponse, verts: &mut Vec<Vert3Buf>) -> Response3Bu
             (RESP_EXPLICIT_RT, r, encode_spectral(t, verts), zero)
         }
         GpuResponse::ThinLens { f } => (RESP_THIN_LENS, constant(*f), zero, zero),
-        GpuResponse::CoatingGrid { lambdas, rt } => {
+        GpuResponse::CoatingGrid { lambdas, rt, .. } => {
             // Both halves live in `verts`, which is already a list of pairs:
             // the wavelength axis in the `t` slot, the grid itself in `r`. The
             // grid is `COAT_ANGLES` rows of `t.tab_count` (R, T) pairs.
@@ -392,7 +402,8 @@ fn encode_response(resp: &GpuResponse, verts: &mut Vec<Vert3Buf>) -> Response3Bu
     };
     Response3Buf {
         kind,
-        _pad: [0; 3],
+        flags,
+        _pad: [0; 2],
         r,
         t,
         ar,
@@ -460,7 +471,8 @@ fn pack_body(b: &GpuBody3, verts: &mut Vec<Vert3Buf>, faces: &mut Vec<Face3Buf>)
 fn zero_response() -> Response3Buf {
     Response3Buf {
         kind: RESP_ABSORBER,
-        _pad: [0; 3],
+        flags: 0,
+        _pad: [0; 2],
         r: constant(0.0),
         t: constant(0.0),
         ar: constant(0.0),

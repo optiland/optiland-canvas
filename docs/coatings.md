@@ -233,9 +233,40 @@ What it is worth, for the default singlet:
 | single quarter wave of MgF₂ | 1.3% |
 | quarter-half-quarter | lower again, and flatter across the visible |
 
-Two faces, so an AR-coated singlet passes about 0.97 of the light where a bare
-one passes about 0.92, and the five percent that stops bouncing around inside
-the instrument is the reason coatings exist.
+Through the default scene, to the detector:
+
+| both faces | passes |
+|---|---|
+| bare | 0.917 |
+| AR ×1 | 0.971 |
+| AR ×3 | 0.987 |
+
+The five percent that stops bouncing around inside the instrument is the
+reason coatings exist.
+
+**What an AR coat still reflects is a ghost.** It is the residual the coating
+failed to suppress, stray light for exactly the reason bare glass's reflection
+is, so the ghost switch decides whether it is traced, and with the switch off
+it is named in the ledger as truncated flux. A dichroic's reflected band, a
+mirror, and a polarizing splitter's s are the opposite case: the reflection is
+the part doing its job, and it is followed whichever way the switch is set.
+The design says which a stack is (`Coating::reflection_is_stray`), and a layer
+edit keeps the design, so a hand-thinned AR coat is still an AR coat. A stack
+with no design reads as a path. Until this was drawn, every coated face took
+the dichroic's branch, and coating a lens made its reflections appear as
+primary rays with the ghost layer off.
+
+**Light leaving the lens meets the coating from behind.** The layers are
+written from the air side inward, so a ray inside the glass meets them in the
+other order, and the face's inside copy says so (`Coating::seen_from_behind`).
+A single layer is its own mirror image and cannot tell. The three-layer AR is
+not, and walked in the written order from inside it put the layer meant to
+face the air against the glass: it reflected more than bare glass, and the
+lens passed 0.911 of the light, less than with no coating at all. The preview
+was never wrong about this. It bakes the grid from outside and reads a ray
+from inside at the conjugate angle, which a lossless stack allows because it
+reflects and transmits the same from either side; that is the property the
+test holds the two walks to, to 1e-12.
 
 A coated lens is still a lens. What separates a plate from a lens is curvature,
 not the film, so the object list and the component view keep calling it one and

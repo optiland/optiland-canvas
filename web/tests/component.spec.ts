@@ -366,6 +366,40 @@ test.describe("component view — coating a lens", () => {
     expect((await faces()).front).toBeNull();
     expect(await flux()).toBeCloseTo(bare, 9);
   });
+
+  test("coating a lens draws no extra rays while the ghost layer is off", async ({ page }) => {
+    // An AR coat's reflection is a ghost, the same as bare glass's. It used to
+    // be traced as a primary ray, so coating the lens drew its reflections at
+    // full strength with the ghost layer switched off.
+    await freshApp(page);
+    await openInset(page);
+    await expect(page.locator("#ghosts")).not.toBeChecked();
+
+    const drawn = () =>
+      page.evaluate(() => {
+        const d = (window as unknown as { __ocDebug: any }).__ocDebug;
+        return {
+          preview: (d.cpuProjected() as Float32Array).length,
+          exact: (d.exactProjected() as Float32Array).length,
+        };
+      });
+    const bare = await drawn();
+
+    for (const kind of ["ar-1", "ar-3"]) {
+      await page.locator(`#componentInset button[data-value="${kind}"]`).click();
+      await expect(page.locator("#stat")).toContainText("segs");
+      // The preview draws the picture and the exact trace the numbers; both
+      // have to leave the reflection to the ghost switch.
+      expect(await drawn(), kind).toEqual(bare);
+    }
+
+    // With the ghost layer on, the reflections are there to see.
+    await page.locator("#ghosts").check();
+    await expect(page.locator("#stat")).toContainText("segs");
+    const lit = await drawn();
+    expect(lit.preview).toBeGreaterThan(bare.preview);
+    expect(lit.exact).toBeGreaterThan(bare.exact);
+  });
 });
 
 test.describe("component view — polarizing elements", () => {

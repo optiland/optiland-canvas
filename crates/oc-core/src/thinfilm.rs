@@ -312,8 +312,9 @@ pub enum ExitFace {
 pub enum Incidence {
     /// The light meets the film stack first. This is the coated face.
     Film,
-    /// The light meets the substrate first and the stack on the way out: the
-    /// back of a coated plate.
+    /// The light arrives through what the stack is backed by and meets its
+    /// layers last first: the back of a coated plate, or a lens's own coated
+    /// face seen from inside the glass.
     Substrate,
 }
 
@@ -328,9 +329,48 @@ pub struct Coating {
     #[serde(default = "incidence_film")]
     pub incidence: Incidence,
     /// What this stack was designed for, carried so the editor can say so and
-    /// re-synthesize. Not used by the calculation: the layers are the truth.
+    /// re-synthesize.
+    ///
+    /// Not used by the reflectance calculation: the layers are the truth, and
+    /// an edited stack is simply a different coating. It does say what the
+    /// part is *for*, and one thing reads that: whether the light the stack
+    /// reflects is a path or a ghost ([`Coating::reflection_is_stray`]).
     #[serde(default)]
     pub design: Option<CoatingDesign>,
+}
+
+impl Coating {
+    /// The same coating, met from the side it is backed by.
+    ///
+    /// The layers stay in the order they were written, so a layer edit
+    /// addresses the same physical layer on both sides; only the side the
+    /// light arrives from changes, and the evaluation walks the stack from
+    /// there. See [`Incidence::Substrate`].
+    pub fn seen_from_behind(&self) -> Coating {
+        let mut c = self.clone();
+        c.incidence = Incidence::Substrate;
+        c
+    }
+
+    /// Is what this stack reflects stray light, rather than a path?
+    ///
+    /// An AR coat exists to transmit. The little it still reflects is the
+    /// residual it failed to suppress, which is a ghost for exactly the reason
+    /// bare glass's reflection is one, so it is traced when ghosts are and
+    /// named in the ledger when they are not. Every other design exists to
+    /// reflect something (a band, a mirror's whole spectrum, a splitter's s),
+    /// so its reflection is the part doing its job and is always followed.
+    ///
+    /// Read off the design because that is where the intent is written down.
+    /// A layer edit keeps the design, so a hand-thinned AR coat is still an AR
+    /// coat. A stack with no design at all reads as a path, which is what a
+    /// hand-written dichroic or mirror wants.
+    pub fn reflection_is_stray(&self) -> bool {
+        matches!(
+            self.design.map(|d| d.kind),
+            Some(DesignKind::SingleLayerAr | DesignKind::BroadbandAr)
+        )
+    }
 }
 
 fn incidence_film() -> Incidence {
@@ -591,6 +631,7 @@ pub fn coating_rt_at(
         }
         layers.push((n, l.thickness_nm));
     }
+    walk_from_the_incident_side(c, &mut layers);
 
     match &c.backing {
         // The stack sits straight on whatever the scene has on the far side: an
@@ -712,7 +753,24 @@ pub fn coating_amp_at(
         }
         layers.push((n, l.thickness_nm));
     }
+    walk_from_the_incident_side(c, &mut layers);
     Some(stack_amp(&layers, n0, n_far, lambda_um, q))
+}
+
+/// Put a stack's layers in the order the light meets them.
+///
+/// They are written from the film side inward. A stack sitting straight on a
+/// medium and met from that medium, which is a lens's coated face seen from
+/// inside the glass, is met the other way round, and walking it in the
+/// written order would put the layer meant to face the air against the glass.
+/// A symmetric stack cannot tell the difference, which is how a single-layer
+/// AR hid this; a three-layer broadband AR is not symmetric, and walked the
+/// wrong way it reflects more than bare glass. A plate-backed stack handles
+/// its own two sides in `plate_rt` and is left alone here.
+fn walk_from_the_incident_side(c: &Coating, layers: &mut [(Cx, f64)]) {
+    if matches!(c.backing, CoatingBacking::Medium) && matches!(c.incidence, Incidence::Substrate) {
+        layers.reverse();
+    }
 }
 
 /// The complex amplitudes of a **bare** dielectric interface, in the ray frame.
@@ -1915,6 +1973,72 @@ mod tests {
 
     /// Helper mirroring the synthesis in `build3`, kept local so this module's
     /// tests do not depend on the authoring layer.
+    /// A lossless stack reflects the same from either side, provided the side
+    /// it is met from is the side it is walked from.
+    ///
+    /// The broadband AR is the stack that shows it: quarter, half, quarter of
+    /// three different materials, so it is not its own mirror image. Met from
+    /// inside the glass and walked in the order it was written, it is a
+    /// different coating, and a worse one than none at all.
+    #[test]
+    fn a_stack_met_from_behind_is_walked_from_behind() {
+        let n_glass = 1.5168;
+        let design = CoatingDesign {
+            kind: DesignKind::BroadbandAr,
+            lambda_nm: 550.0,
+            aoi_deg: 0.0,
+            periods: 1,
+            n_high: 2.35,
+            n_low: 1.38,
+        };
+        let front = film_coating(design, 1.0, n_glass);
+        let back = front.seen_from_behind();
+        assert!(
+            !front.layers.is_empty()
+                && front.layers.first().map(|l| &l.material) != front.layers.last().map(|l| &l.material),
+            "the stack is not symmetric, or the test proves nothing"
+        );
+
+        for (lambda, aoi_air) in [(0.45, 0.0), (0.55, 0.0), (0.65, 0.0), (0.55, 30.0)] {
+            // The same ray on either side of the interface: n sin theta is what
+            // Snell keeps, so the angle inside the glass is the conjugate one.
+            let cos_air = f64::to_radians(aoi_air).cos();
+            let sin_glass = f64::to_radians(aoi_air).sin() / n_glass;
+            let cos_glass = (1.0 - sin_glass * sin_glass).sqrt();
+
+            let outside = coating_rt_at(&front, 1.0, n_glass, lambda, cos_air).unwrap();
+            let inside = coating_rt_at(&back, n_glass, 1.0, lambda, cos_glass).unwrap();
+            for (name, a, b) in [
+                ("R_s", outside.r_s, inside.r_s),
+                ("R_p", outside.r_p, inside.r_p),
+                ("T_s", outside.t_s, inside.t_s),
+                ("T_p", outside.t_p, inside.t_p),
+            ] {
+                assert!(
+                    (a - b).abs() < 1e-12,
+                    "{name} at {lambda} um, {aoi_air} deg: {a} from air, {b} from glass"
+                );
+            }
+
+            // Walked the written way from inside, it is another coating.
+            let wrong = coating_rt_at(&front, n_glass, 1.0, lambda, cos_glass).unwrap();
+            assert!(
+                (wrong.r() - inside.r()).abs() > 1e-3,
+                "at {lambda} um the wrong walk should show: {} vs {}",
+                wrong.r(),
+                inside.r()
+            );
+        }
+
+        // And at the design wavelength the wrong walk reflects more than bare
+        // glass does, which is how it made a coated lens pass less light.
+        let bare = ((n_glass - 1.0) / (n_glass + 1.0)).powi(2);
+        let wrong = coating_rt_at(&front, n_glass, 1.0, 0.55, 1.0).unwrap().r();
+        let right = coating_rt_at(&back, n_glass, 1.0, 0.55, 1.0).unwrap().r();
+        assert!(right < 0.005, "the AR does its job from inside: {right}");
+        assert!(wrong > bare, "the wrong walk is worse than bare glass: {wrong} vs {bare}");
+    }
+
     fn quarter_wave_mirror(lambda_nm: f64, aoi_deg: f64, periods: u32) -> Coating {
         let h = FilmMaterial::constant("TiO2", 2.35);
         let l = FilmMaterial::constant("SiO2", 1.46);

@@ -414,6 +414,26 @@ fn solve_dense(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Option<Vec<f64>> {
     x.iter().all(|v| v.is_finite()).then_some(x)
 }
 
+
+/// Both sides of a coated face of a solid.
+///
+/// The film sits on the outside of the glass, so light from outside meets it
+/// first and light from inside meets it last, layers in the other order. The
+/// inside copy says so ([`Coating::seen_from_behind`]); a copy that did not
+/// would walk the stack the wrong way round for every ray leaving the glass.
+fn coated_face(film: SurfaceResponse) -> TwoSidedSurfaceResponse {
+    let inside = match &film {
+        SurfaceResponse::Coating { coating } => SurfaceResponse::Coating {
+            coating: coating.seen_from_behind(),
+        },
+        other => other.clone(),
+    };
+    TwoSidedSurfaceResponse {
+        from_outside: film,
+        from_inside: inside,
+    }
+}
+
 impl Scene3 {
     /// Add a rotationally-symmetric singlet on the optical axis, its body centred
     /// at `center`, with glass `(nd, vd)`. Returns the new body id.
@@ -1076,7 +1096,7 @@ impl Scene3 {
         let mut common = ObjectCommon::new(id, LayerId(0));
         common.transform =
             Isometry3::new(pos, [q.x, q.y, q.z, q.w]).unwrap_or_else(|_| Isometry3::from_pos(pos));
-        let film = SurfaceResponse::Coating { coating };
+        let film = coated_face(SurfaceResponse::Coating { coating });
         self.bodies.push(Body3 {
             common,
             geometry: SolidGeometry3::Profile(ProfileSolid3 {
@@ -1094,10 +1114,7 @@ impl Scene3 {
                 default: TwoSidedSurfaceResponse::default(),
                 overrides: vec![PatchResponseOverride {
                     patch: coated,
-                    response: TwoSidedSurfaceResponse {
-                        from_outside: film.clone(),
-                        from_inside: film,
-                    },
+                    response: film,
                 }],
             },
             priority: 0,
@@ -1291,10 +1308,7 @@ impl Scene3 {
         if let Some(f) = film {
             b.surface.overrides.push(PatchResponseOverride {
                 patch,
-                response: TwoSidedSurfaceResponse {
-                    from_outside: f.clone(),
-                    from_inside: f,
-                },
+                response: coated_face(f),
             });
         }
         true
@@ -1383,11 +1397,9 @@ impl Scene3 {
         let mut touched = false;
         for o in &mut b.surface.overrides {
             if matches!(o.response.from_outside, SurfaceResponse::Coating { .. }) {
-                let film = SurfaceResponse::Coating {
+                o.response = coated_face(SurfaceResponse::Coating {
                     coating: coating.clone(),
-                };
-                o.response.from_outside = film.clone();
-                o.response.from_inside = film;
+                });
                 touched = true;
             }
         }

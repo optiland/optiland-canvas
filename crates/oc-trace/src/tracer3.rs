@@ -1474,12 +1474,31 @@ fn apply_response(
             let pol_t = out(&m_t);
             r.ledger.absorbed_surface += (flux_at - pol_r.stokes.s0 - pol_t.stokes.s0).max(0.0);
             let mut children = Vec::new();
+            // What an AR coat reflects is stray light, a ghost exactly as bare
+            // glass's reflection is; what any other stack reflects is a path.
+            // See `Coating::reflection_is_stray`.
+            let stray = coating.reflection_is_stray();
             if refl > 0.0 {
-                let dir_r = reflect3(w.ray.dir, n_oppose);
-                if let Some(id) = spawn(
-                    stack, r, cfg, w, point, dir_r, pol_r, opl_at, w.ghost, false, min_flux,
-                ) {
-                    children.push((ChildRole::Reflect, id));
+                if stray && !cfg.ghosts {
+                    // Not followed, but named rather than lost, as for bare glass.
+                    r.ledger.truncated_flux += pol_r.stokes.s0;
+                } else {
+                    let dir_r = reflect3(w.ray.dir, n_oppose);
+                    if let Some(id) = spawn(
+                        stack,
+                        r,
+                        cfg,
+                        w,
+                        point,
+                        dir_r,
+                        pol_r,
+                        opl_at,
+                        w.ghost || stray,
+                        false,
+                        min_flux,
+                    ) {
+                        children.push((ChildRole::Reflect, id));
+                    }
                 }
             }
             if tr > 0.0 {

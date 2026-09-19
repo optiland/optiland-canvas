@@ -16,7 +16,7 @@ use oc_core::vec3::{Ray3, Vec3};
 use oc_trace::trace3;
 
 #[test]
-fn a_disc_detector_reports_an_area_normalized_density() {
+fn a_disc_detector_bins_into_the_squares_of_its_bounding_box() {
     let mut scene = Scene3::new();
     let det = add_disc_detector(&mut scene, Vec3::new(10.0, 0.0, 0.0), -Vec3::X, 3.0, [6, 6]);
     scene.validate().unwrap();
@@ -38,17 +38,72 @@ fn a_disc_detector_reports_an_area_normalized_density() {
     let d = detector_named(&res, det);
 
     assert_eq!(d.hits, 2);
-    let expected_cell = std::f64::consts::PI * 9.0 / 36.0;
+    // A 3 mm disc binned 6 by 6 has cells one millimetre square, because the
+    // grid is the bounding box and not the disc. Sharing the disc's own area
+    // out over the same cells would say 0.785 mm², and every density read off
+    // it would be 4/π high.
     assert!(
-        (d.cell_area_mm2.unwrap() - expected_cell).abs() < 1e-12,
+        (d.cell_area_mm2.unwrap() - 1.0).abs() < 1e-12,
         "cell area {:?}",
         d.cell_area_mm2
     );
-    // Density is flux / area, and it exists because the disc has area.
     let density = d.flux_density().expect("disc has a flux density");
     assert_eq!(density.len(), 36);
     let total_density: f64 = density.iter().sum();
-    assert!((total_density - 2.0 / expected_cell).abs() < 1e-9);
+    assert!((total_density - 2.0).abs() < 1e-9, "{total_density}");
+}
+
+/// Two shapes, the same light, the same reading.
+///
+/// A disc bins into the squares of its bounding box exactly as a rectangle
+/// does, so a patch of light landing well inside both has to read the same
+/// irradiance on both. It did not while the disc divided its own area by the
+/// cell count: the disc came out 4/π high, and nothing in the suite asked.
+#[test]
+fn a_disc_and_a_rectangle_read_the_same_irradiance_from_the_same_light() {
+    // One millimetre of flux spread evenly over one square millimetre, aimed
+    // at the cell spanning (0,0) to (1,1) on both faces.
+    let beam: Vec<_> = (0..8)
+        .flat_map(|i| (0..8).map(move |j| (i, j)))
+        .map(|(i, j)| {
+            let y = (i as f64 + 0.5) / 8.0;
+            let z = (j as f64 + 0.5) / 8.0;
+            launch(
+                Ray3::new(Vec3::new(-5.0, y, z), Vec3::X).unwrap(),
+                LAMBDA_D,
+                1.0 / 64.0,
+            )
+        })
+        .collect();
+
+    let read = |scene: &Scene3, det| {
+        let res = trace3(scene, &beam, &no_ghosts());
+        let d = detector_named(&res, det);
+        assert_eq!(d.hits, 64, "the whole patch lands");
+        let e = d.irradiance().expect("an area detector has irradiance");
+        e.into_iter().fold(0.0f64, f64::max)
+    };
+
+    let mut disc = Scene3::new();
+    let a = add_disc_detector(&mut disc, Vec3::new(10.0, 0.0, 0.0), -Vec3::X, 3.0, [6, 6]);
+    disc.validate().unwrap();
+
+    let mut rect = Scene3::new();
+    let b = add_rect_detector(
+        &mut rect,
+        Vec3::new(10.0, 0.0, 0.0),
+        -Vec3::X,
+        3.0,
+        3.0,
+        [6, 6],
+    );
+    rect.validate().unwrap();
+
+    // One unit of flux over one square millimetre is one unit of irradiance,
+    // and the shape of the surround has nothing to say about it.
+    for (name, got) in [("disc", read(&disc, a)), ("rectangle", read(&rect, b))] {
+        assert!((got - 1.0).abs() < 1e-12, "{name} reads {got}");
+    }
 }
 
 #[test]

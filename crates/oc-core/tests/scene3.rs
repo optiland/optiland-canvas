@@ -23,9 +23,10 @@ use oc_core::profile2::{Curve2, ProfileConstruction3};
 use oc_core::scene::Scene;
 use oc_core::scene3::{
     can_promote_to_extruded, can_promote_to_revolved, promote_body, AngularDistribution3, Body3,
-    DetectorGeometry3, ObjectCommon, PromotionCheck, Scene3, SceneError, SolidGeometry3,
-    SpatialDistribution3, SurfaceResponse,
+    DetectorGeometry3, DetectorMeasure, ObjectCommon, PromotionCheck, Scene3, SceneError,
+    SolidGeometry3, SpatialDistribution3, SurfaceResponse,
 };
+use oc_core::vec3::Vec3;
 
 /// The real v1 corpus: the `.ocanvas` documents the browser actually ships.
 ///
@@ -117,6 +118,90 @@ fn no_migrated_detector_gains_an_area() {
         d.geometry
     );
     assert!(!d.geometry.has_area());
+}
+
+/// A document written before detectors had a measure still reads power.
+///
+/// The field is new and every `.ocanvas` v2 in the wild predates it, so its
+/// absence has to mean the thing those files meant. Serde's default does the
+/// work; this is the test that says so, because a default that silently
+/// changed would change every old scene's numbers without touching a byte of
+/// them.
+#[test]
+fn a_detector_written_before_the_measure_still_reads_power() {
+    let mut scene = Scene3::new();
+    scene.add_area_detector(Vec3::new(10.0, 0.0, 0.0), -Vec3::X, 4.0, 4.0, [8, 8]);
+    let json = serde_json::to_string(&scene).expect("serializes");
+
+    // The field is there when it is written out.
+    assert!(json.contains("measure"), "the measure is serialized");
+
+    // And a document with the field struck out still loads, as power.
+    let mut value: serde_json::Value = serde_json::from_str(&json).expect("parses");
+    value["detectors"][0]
+        .as_object_mut()
+        .expect("a detector object")
+        .remove("measure")
+        .expect("there was a measure to remove");
+    let older: Scene3 = serde_json::from_value(value).expect("an older document loads");
+    assert_eq!(older.detectors[0].measure, DetectorMeasure::Power);
+    older.validate().expect("and it is valid");
+}
+
+/// The direction grid is laid out the way the face grid is.
+///
+/// `bins[0]` runs fastest in both, so the same reader draws either picture:
+/// the face map's columns are millimetres across the face and the direction
+/// map's are degrees away from the normal.
+#[test]
+fn the_direction_grid_runs_rings_fastest() {
+    let mut scene = Scene3::new();
+    let det = scene.add_area_detector(Vec3::ZERO, -Vec3::X, 4.0, 4.0, [5, 4]);
+    let d = scene
+        .detectors
+        .iter_mut()
+        .find(|d| d.id() == det)
+        .expect("the detector");
+    d.measure = DetectorMeasure::Intensity {
+        half_angle_deg: 50.0,
+        bins: [5, 4],
+    };
+
+    let d = &scene.detectors[0];
+    let cells = d.direction_cell_solid_angles().expect("a direction grid");
+    assert_eq!(cells.len(), 20);
+
+    // Every sector holds the same set of ring areas, so the grid repeats with
+    // a period of the ring count.
+    for sector in 1..4 {
+        for ring in 0..5 {
+            assert!(
+                (cells[sector * 5 + ring] - cells[ring]).abs() < 1e-15,
+                "sector {sector} ring {ring} differs from sector 0"
+            );
+        }
+    }
+    // Rings grow outward: the cap nearest the axis is the smallest.
+    for ring in 1..5 {
+        assert!(cells[ring] > cells[ring - 1], "ring {ring} is not larger");
+    }
+
+    // A ray straight down the normal lands in ring 0, and one at 49 degrees in
+    // the last ring, whichever side of the face it arrives from.
+    for sign in [-1.0, 1.0] {
+        let on_axis = d
+            .direction_cell(Vec3::new(0.0, 0.0, sign))
+            .expect("on axis is inside the cone");
+        assert_eq!(on_axis % 5, 0, "on axis is ring 0");
+        let t = 49f64.to_radians();
+        let far = d
+            .direction_cell(Vec3::new(t.sin(), 0.0, sign * t.cos()))
+            .expect("49 degrees is inside a 50 degree cone");
+        assert_eq!(far % 5, 4, "49 degrees is the outer ring");
+    }
+    // And one past the cone lands nowhere.
+    let t = 51f64.to_radians();
+    assert!(d.direction_cell(Vec3::new(t.sin(), 0.0, t.cos())).is_none());
 }
 
 #[test]

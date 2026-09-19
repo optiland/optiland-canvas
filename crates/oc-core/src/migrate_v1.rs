@@ -30,6 +30,7 @@ use crate::profile2::{
 };
 use crate::scene::{Detector, Element, Scene, Source, SourceKind, SurfaceSpec};
 use crate::scene3::{
+    DetectorMeasure,
     AbsorptionModel, AngularDistribution3, Body3, Detector3, DetectorGeometry3, DetectorResponse,
     DetectorTermination, Environment3, ObjectCommon, PatchResponseOverride, Scene3, SceneError,
     SceneIntent, SolidGeometry3, Source3, SourceSampling, SpatialDistribution3, SpectralScalar,
@@ -292,6 +293,9 @@ fn migrate_detector(d: &Detector, scene3: &mut Scene3, report: &mut MigrationRep
         bins: [d.bins.max(1), 1],
         response: DetectorResponse::Unity,
         termination: DetectorTermination::Terminate,
+        // A v1 detector measured flux and nothing else, so it keeps measuring
+        // flux. A line has no area to divide by in any case.
+        measure: DetectorMeasure::Power,
     }
 }
 

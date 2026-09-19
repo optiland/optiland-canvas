@@ -1205,11 +1205,84 @@ pub struct Detector3 {
     pub bins: [usize; 2],
     pub response: DetectorResponse,
     pub termination: DetectorTermination,
+    /// What the readings mean. A document written before there was a choice
+    /// has no field here and reads power, which is what it always read.
+    #[serde(default)]
+    pub measure: DetectorMeasure,
 }
 
 impl Detector3 {
     pub fn id(&self) -> DetectorId {
         DetectorId(self.common.id.0)
+    }
+
+    /// The area of one cell of the face grid, `mm²`, or `None` for a line
+    /// probe with no area.
+    ///
+    /// The grid is the shape's **bounding box**, which for a rectangle is the
+    /// shape and for a disc or annulus is not: a cell there is a square of the
+    /// box, and a cell at the rim has part of itself outside the shape and
+    /// reads the average over the whole square. Dividing the disc's own area
+    /// by the cell count instead would put every reading 4/π high, which is
+    /// what this did until the measure needed a unit.
+    pub fn cell_area_mm2(&self) -> Option<f64> {
+        let (nu, nv) = (self.bins[0].max(1), self.bins[1].max(1));
+        let (w, h) = match self.geometry {
+            DetectorGeometry3::Rectangle {
+                half_width_mm,
+                half_height_mm,
+            } => (2.0 * half_width_mm, 2.0 * half_height_mm),
+            DetectorGeometry3::Disc { radius_mm } => (2.0 * radius_mm, 2.0 * radius_mm),
+            DetectorGeometry3::Annulus { outer_mm, .. } => (2.0 * outer_mm, 2.0 * outer_mm),
+            DetectorGeometry3::LineProbeLegacy { .. } => return None,
+        };
+        Some(w * h / (nu * nv) as f64)
+    }
+
+    /// The direction cell an arriving ray falls in, row-major over the
+    /// measure's own `[rings, sectors]` as `sector * rings + ring`, or `None`
+    /// when the measure bins no directions or the ray came in past the cone.
+    ///
+    /// `dir_local` is the ray's direction in the detector's own frame. The
+    /// polar angle is taken to the normal **line**, not the normal vector, so
+    /// a detector reads the same whichever side light reaches it from, which
+    /// is the convention `max_tilt_rad` already uses.
+    pub fn direction_cell(&self, dir_local: Vec3) -> Option<usize> {
+        let (cone, rings, sectors) = self.measure.direction_grid()?;
+        let theta = dir_local.z.abs().clamp(0.0, 1.0).acos();
+        if theta > cone {
+            return None;
+        }
+        let ring = ((theta / cone * rings as f64) as usize).min(rings - 1);
+        let phi = dir_local
+            .y
+            .atan2(dir_local.x)
+            .rem_euclid(std::f64::consts::TAU);
+        let sector = ((phi / std::f64::consts::TAU * sectors as f64) as usize).min(sectors - 1);
+        Some(sector * rings + ring)
+    }
+
+    /// Every direction cell's solid angle, steradians, laid out like
+    /// [`Self::direction_cell`], or `None` when the measure bins none.
+    ///
+    /// Closed form and exact: a ring between polar angles `θ₀` and `θ₁`, cut
+    /// into azimuth sectors of width `Δφ`, gives each of its cells
+    /// `Δφ(cos θ₀ − cos θ₁)`. Nothing here is quadrature and nothing here
+    /// assumes a small cell, so a two-ring histogram is as exact as a
+    /// hundred-ring one.
+    pub fn direction_cell_solid_angles(&self) -> Option<Vec<f64>> {
+        let (cone, rings, sectors) = self.measure.direction_grid()?;
+        let dphi = std::f64::consts::TAU / sectors as f64;
+        let ring_cos: Vec<f64> = (0..=rings)
+            .map(|i| (cone * i as f64 / rings as f64).cos())
+            .collect();
+        let mut out = vec![0.0; rings * sectors];
+        for sector in 0..sectors {
+            for ring in 0..rings {
+                out[sector * rings + ring] = dphi * (ring_cos[ring] - ring_cos[ring + 1]);
+            }
+        }
+        Some(out)
     }
 }
 
@@ -1265,6 +1338,83 @@ pub enum DetectorTermination {
     Terminate,
     /// Record and carry on, unchanged in direction and flux.
     ProbeAndContinue,
+}
+
+/// What a detector's readings are, and so what unit they carry.
+///
+/// The bins hold flux whichever this is; the measure is the divisor, and the
+/// divisor is what makes the number mean something. Flux stays **relative**
+/// unless a source is calibrated and nothing here calibrates one, so
+/// `Irradiance` reads per `mm²` of the source's own flux rather than W/mm²
+/// (the units rule in `docs/architecture/canonical-3d-kernel.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub enum DetectorMeasure {
+    /// Flux landing in each cell of the face. What a detector read before
+    /// there was anything to choose.
+    #[default]
+    Power,
+
+    /// Flux over the cell's area, per `mm²`.
+    ///
+    /// The area is the face's, not the beam's cross-section. A beam arriving
+    /// at a slant spreads across more cells and each one reads less, so the
+    /// obliquity arrives on its own rather than being applied by hand.
+    ///
+    /// A line probe has no area and cannot ask for this (§3.2).
+    Irradiance,
+
+    /// Flux per steradian, binned by **the direction light arrived from**
+    /// instead of by where it landed.
+    ///
+    /// Intensity is an angular density, so it needs an angular histogram, and
+    /// this carries one of its own.
+    ///
+    /// The face histogram keeps filling as it always did, so a detector in
+    /// this mode holds both pictures and the hit map still draws.
+    Intensity {
+        /// The cone around the face normal the histogram spans, degrees in
+        /// `(0, 90]`. Flux arriving outside it still counts in the totals and
+        /// is binned nowhere, which the result reports rather than hides.
+        half_angle_deg: f64,
+        /// Polar rings out to that cone, and azimuth sectors around the
+        /// normal. `[24, 1]` is the `I(θ)` curve an LED datasheet plots.
+        ///
+        /// Its own resolution rather than the face's, because the two have
+        /// nothing to say to each other: a detector can want a fine spot on
+        /// its face and a coarse polar curve through it at the same time, and
+        /// sharing one number would make every mode switch a resolution
+        /// change as well.
+        bins: [usize; 2],
+    },
+}
+
+impl DetectorMeasure {
+    /// A cone in radians and the `[rings, sectors]` across it, or `None` if
+    /// this measure bins no directions at all.
+    pub fn direction_grid(&self) -> Option<(f64, usize, usize)> {
+        match *self {
+            Self::Intensity {
+                half_angle_deg,
+                bins,
+            } => Some((half_angle_deg.to_radians(), bins[0].max(1), bins[1].max(1))),
+            Self::Power | Self::Irradiance => None,
+        }
+    }
+
+    /// The cone this measure bins directions over, radians, or `None`.
+    pub fn cone_rad(&self) -> Option<f64> {
+        self.direction_grid().map(|(cone, _, _)| cone)
+    }
+
+    /// The unit one reading carries, with flux left as the relative thing it
+    /// is.
+    pub fn unit(&self) -> &'static str {
+        match self {
+            Self::Power => "flux",
+            Self::Irradiance => "flux/mm²",
+            Self::Intensity { .. } => "flux/sr",
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2058,6 +2208,34 @@ impl Scene3 {
             }
             if d.geometry.has_area() && (d.bins[0] == 0 || d.bins[1] == 0) {
                 return Err(range("bins", "is zero on an axis"));
+            }
+            match d.measure {
+                DetectorMeasure::Power => {}
+                DetectorMeasure::Irradiance => {
+                    if !d.geometry.has_area() {
+                        return Err(range(
+                            "measure",
+                            "asks a line probe for irradiance, and a line has no area",
+                        ));
+                    }
+                }
+                DetectorMeasure::Intensity {
+                    half_angle_deg,
+                    bins,
+                } => {
+                    if !half_angle_deg.is_finite() {
+                        return Err(SceneError::NonFinite {
+                            object: oid,
+                            field: "measure.half_angle_deg".to_string(),
+                        });
+                    }
+                    if half_angle_deg <= 0.0 || half_angle_deg > 90.0 {
+                        return Err(range("measure.half_angle_deg", "is outside (0, 90] degrees"));
+                    }
+                    if bins[0] == 0 || bins[1] == 0 {
+                        return Err(range("measure.bins", "has no rings or no sectors"));
+                    }
+                }
             }
             if let DetectorResponse::Tabulated {
                 lambda_um,

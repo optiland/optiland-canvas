@@ -58,6 +58,14 @@ pub struct DetReadout3 {
     pub incident: Vec<f32>,
     pub hits: u64,
     pub total: f32,
+    /// Flux per **direction** cell, row-major over `bins` as
+    /// `sector * rings + ring`, filled only under
+    /// [`DetectorMeasure::Intensity`].
+    pub direction: Vec<f32>,
+    /// Those cells' solid angles in steradians, alongside it.
+    pub solid_angle_sr: Vec<f32>,
+    /// Flux that arrived past the intensity cone and landed in no cell.
+    pub outside: f32,
 }
 
 impl DetReadout3 {
@@ -67,6 +75,18 @@ impl DetReadout3 {
             .iter()
             .map(|f| f / self.cell_area_mm2)
             .collect()
+    }
+
+    /// Radiant intensity per direction cell, flux per steradian, or `None`
+    /// unless the detector was asked to measure it.
+    pub fn radiant_intensity(&self) -> Option<Vec<f32>> {
+        (!self.direction.is_empty()).then(|| {
+            self.direction
+                .iter()
+                .zip(&self.solid_angle_sr)
+                .map(|(f, w)| if *w > 0.0 { f / w } else { 0.0 })
+                .collect()
+        })
     }
 }
 
@@ -117,6 +137,9 @@ pub fn trace(scene: &GpuScene3, max_depth: u32) -> Cpu3Result {
             incident: vec![0.0; d.bins[0].max(1) * d.bins[1].max(1)],
             hits: 0,
             total: 0.0,
+            direction: vec![0.0; d.solid_angle_sr.len()],
+            solid_angle_sr: d.solid_angle_sr.clone(),
+            outside: 0.0,
         })
         .collect();
 
@@ -186,7 +209,7 @@ fn trace_one(
             ),
             EvKind::Aperture => { /* blocked: the branch ends here */ }
             EvKind::Detector { det, uv } => {
-                record_detector(&mut detectors[det], &scene.detectors[det], uv, flux_end);
+                record_detector(&mut detectors[det], &scene.detectors[det], uv, w.d, flux_end);
                 if !scene.detectors[det].terminate {
                     // Probe: continue undeviated, just past the face.
                     push(
@@ -551,12 +574,39 @@ fn ar_at(ar: &Spectral32, lambda: f32) -> f32 {
     ar.sample(lambda).unwrap_or(1.0).clamp(0.0, 1.0)
 }
 
-fn record_detector(out: &mut DetReadout3, d: &GpuDetector3, uv: Vec2, flux: f32) {
+fn record_detector(out: &mut DetReadout3, d: &GpuDetector3, uv: Vec2, dir: Vec3, flux: f32) {
     out.hits += 1;
     out.total += flux;
     if let Some(cell) = d.shape.cell(uv, d.bins) {
         out.incident[cell] += flux;
     }
+    // The angular histogram, when the detector asked for one. `dir` is the
+    // world direction; `rot` is orthonormal, so its transpose takes it to the
+    // face's own frame.
+    if d.measure.cone_rad().is_some() {
+        let local = (d.rot.transpose() * dir).normalize_or_zero();
+        match direction_cell(d, local) {
+            Some(cell) => out.direction[cell] += flux,
+            None => out.outside += flux,
+        }
+    }
+}
+
+/// The direction cell an arrival falls in, mirroring `Detector3::direction_cell`
+/// in f32. The ring layout and the solid angles belong to the scene model, so
+/// only the arithmetic is repeated here, never the geometry.
+fn direction_cell(d: &GpuDetector3, dir_local: Vec3) -> Option<usize> {
+    let (cone, rings, sectors) = d.measure.direction_grid()?;
+    let cone = cone as f32;
+    let theta = dir_local.z.abs().clamp(0.0, 1.0).acos();
+    if theta > cone {
+        return None;
+    }
+    let ring = ((theta / cone * rings as f32) as usize).min(rings - 1);
+    let tau = std::f32::consts::TAU;
+    let phi = dir_local.y.atan2(dir_local.x).rem_euclid(tau);
+    let sector = ((phi / tau * sectors as f32) as usize).min(sectors - 1);
+    Some(sector * rings + ring)
 }
 
 fn push(stack: &mut Vec<Work>, w: Work, max_depth: u32, min_flux: f32) {

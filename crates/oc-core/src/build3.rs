@@ -31,6 +31,7 @@ use crate::thinfilm::{
     film_coating, plate_coating, Coating, CoatingDesign, DesignKind, ExitFace, Incidence,
 };
 use crate::scene3::{
+    DetectorMeasure,
     AbsorptionModel, AngularDistribution3, AngularScalar, Aperture3, ApertureInteraction,
     ApertureShape3, Body3,
     Detector3, DetectorGeometry3, DetectorResponse, DetectorTermination, Interpolation,
@@ -1650,6 +1651,7 @@ impl Scene3 {
             bins,
             response: DetectorResponse::Unity,
             termination: DetectorTermination::Terminate,
+            measure: DetectorMeasure::Power,
         });
         DetectorId(id.0)
     }

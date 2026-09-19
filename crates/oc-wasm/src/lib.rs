@@ -2920,6 +2920,61 @@ impl Canvas {
         id.0 as f64
     }
 
+    /// Set what a detector measures: `"power"`, `"irradiance"` or
+    /// `"intensity"`. Returns false if `id` is not a detector or the request
+    /// does not hold up.
+    ///
+    /// `half_angle_deg` is read only for intensity, where it is the cone the
+    /// angular histogram spans, and it must be in `(0, 90]`. Irradiance needs
+    /// a face with area, so a v1 line probe is refused rather than given a
+    /// denominator nobody authored.
+    #[wasm_bindgen(js_name = setDetectorMeasure)]
+    pub fn set_detector_measure(&mut self, id: f64, measure: &str, half_angle_deg: f64) -> bool {
+        use oc_core::scene3::DetectorMeasure as M;
+        let Some(scene) = self.scene3.as_mut() else {
+            return false;
+        };
+        let d_measure = scene
+            .detectors
+            .iter()
+            .find(|d| d.common.id.0 == id as u64)
+            .map(|d| d.measure);
+        let want = match measure {
+            "power" => M::Power,
+            "irradiance" => M::Irradiance,
+            "intensity" => M::Intensity {
+                half_angle_deg: half_angle_deg.clamp(0.1, 90.0),
+                // Whatever the detector already had, so flipping away and
+                // back does not quietly rescale the histogram; `[24, 1]` is
+                // the I(theta) curve a detector starts with.
+                bins: match d_measure {
+                    Some(M::Intensity { bins, .. }) => bins,
+                    _ => [24, 1],
+                },
+            },
+            _ => return false,
+        };
+        let Some(d) = scene.detectors.iter_mut().find(|d| d.common.id.0 == id as u64) else {
+            return false;
+        };
+        if d.measure == want {
+            return true;
+        }
+        let was = d.measure;
+        d.measure = want;
+        if scene.validate().is_err() {
+            scene
+                .detectors
+                .iter_mut()
+                .find(|d| d.common.id.0 == id as u64)
+                .expect("the detector is still there")
+                .measure = was;
+            return false;
+        }
+        self.revision += 1;
+        true
+    }
+
     /// An aperture's clear opening as `{"inner","outer"}` (min / max radius that
     /// passes, mm), or `null` if `id` is not an aperture. A plain disc opening
     /// reports `inner: 0`.
@@ -3059,8 +3114,31 @@ impl Canvas {
             .map_or("null".to_string(), |a| format!("{a}"));
         let incident: Vec<String> = d.incident_flux.iter().map(|v| format!("{v}")).collect();
         let st = d.stokes_local;
+        // What the detector measures, the cells in that measure, and the unit
+        // they carry. `incident` stays raw flux whatever the measure is, so a
+        // reader that wants the histogram itself is not made to undo a
+        // division.
+        let (readings, unit) = d.readings();
+        let cells: Vec<String> = readings.iter().map(|v| format!("{v}")).collect();
+        let (measure, cone) = match d.measure {
+            oc_core::scene3::DetectorMeasure::Power => ("power", "null".to_string()),
+            oc_core::scene3::DetectorMeasure::Irradiance => ("irradiance", "null".to_string()),
+            oc_core::scene3::DetectorMeasure::Intensity { half_angle_deg, .. } => {
+                ("intensity", format!("{half_angle_deg}"))
+            }
+        };
+        let solid: Vec<String> = d
+            .direction_solid_angle_sr
+            .iter()
+            .map(|v| format!("{v}"))
+            .collect();
+        // The direction histogram has its own shape, which is not the face's.
+        let (rings, sectors) = d
+            .measure
+            .direction_grid()
+            .map_or((0, 0), |(_, r, sct)| (r, sct));
         format!(
-            "{{\"hits\":{},\"totalIncident\":{},\"totalSignal\":{},\"cellArea\":{},\"centroid\":{},\"meanOpl\":{},\"bins\":[{},{}],\"incident\":[{}],\"dop\":{},\"dolp\":{},\"azimuthDeg\":{},\"stokes\":[{},{},{},{}],\"maxTiltDeg\":{}}}",
+            "{{\"hits\":{},\"totalIncident\":{},\"totalSignal\":{},\"cellArea\":{},\"centroid\":{},\"meanOpl\":{},\"bins\":[{},{}],\"incident\":[{}],\"measure\":\"{}\",\"unit\":\"{}\",\"coneDeg\":{},\"coneBins\":[{},{}],\"cells\":[{}],\"solidAngle\":[{}],\"outsideCone\":{},\"peak\":{},\"dop\":{},\"dolp\":{},\"azimuthDeg\":{},\"stokes\":[{},{},{},{}],\"maxTiltDeg\":{}}}",
             d.hits,
             d.total_incident,
             d.total_signal,
@@ -3070,6 +3148,15 @@ impl Canvas {
             d.bins[0],
             d.bins[1],
             incident.join(","),
+            measure,
+            unit,
+            cone,
+            rings,
+            sectors,
+            cells.join(","),
+            solid.join(","),
+            json_num(d.outside_cone_flux),
+            d.peak_reading().map_or("null".into(), |p| format!("{p}")),
             json_num(st.dop()),
             json_num(st.dolp()),
             json_num(st.azimuth_rad().to_degrees()),
@@ -5171,6 +5258,7 @@ mod scene3_tests {
             bins: [48, 48],
             response: DetectorResponse::Unity,
             termination: DetectorTermination::Terminate,
+            measure: oc_core::scene3::DetectorMeasure::Power,
         });
 
         scene.validate().expect("demo scene validates");
@@ -5282,6 +5370,7 @@ mod scene3_tests {
             bins: [48, 48],
             response: DetectorResponse::Unity,
             termination: DetectorTermination::Terminate,
+            measure: oc_core::scene3::DetectorMeasure::Power,
         });
 
         scene.validate().expect("fold scene validates");
@@ -5376,6 +5465,7 @@ mod scene3_tests {
             bins: [16, 16],
             response: DetectorResponse::Unity,
             termination: DetectorTermination::Terminate,
+            measure: oc_core::scene3::DetectorMeasure::Power,
         });
 
         let mut c = Canvas::new();

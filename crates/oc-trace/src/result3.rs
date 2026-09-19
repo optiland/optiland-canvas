@@ -12,6 +12,7 @@
 use oc_core::id::{
     ApertureId, BodyId, DetectorId, ObjectId, PatchId, PathId, SourceId, SurfaceRef,
 };
+use oc_core::scene3::{Detector3, DetectorMeasure};
 use oc_core::vec::Vec2;
 use oc_core::vec3::{Ray3, Vec3};
 
@@ -198,15 +199,39 @@ pub struct DetectorResult3 {
     /// The largest angle between an arriving ray and the detector's normal,
     /// radians. The caveat on `stokes_local`, as a number.
     pub max_tilt_rad: f64,
+
+    /// What this detector was asked to measure, copied from the scene so a
+    /// reader of the result knows which of the fields below hold anything.
+    pub measure: DetectorMeasure,
+    /// Flux per **direction** cell, row-major over `bins` as
+    /// `sector * rings + ring`. Filled only under
+    /// [`DetectorMeasure::Intensity`], because an angular histogram nobody
+    /// asked for is a second grid per detector paid for in every trace.
+    pub direction_flux: Vec<f64>,
+    /// Each of those cells' solid angle in steradians, alongside it.
+    pub direction_solid_angle_sr: Vec<f64>,
+    /// Flux that arrived past the intensity cone and so landed in no direction
+    /// cell. Named rather than dropped: `direction_flux` summing to less than
+    /// `total_incident` is then a fact to read instead of a discrepancy to
+    /// hunt.
+    pub outside_cone_flux: f64,
 }
 
 impl DetectorResult3 {
-    pub fn new(detector: DetectorId, bins: [usize; 2], cell_area_mm2: Option<f64>) -> Self {
+    /// An empty readout sized and configured by the detector it belongs to.
+    pub fn new(d: &Detector3) -> Self {
+        let bins = d.bins;
         let cells = (bins[0].max(1)) * (bins[1].max(1));
+        let direction_solid_angle_sr = d.direction_cell_solid_angles().unwrap_or_default();
+        let direction_flux = vec![0.0; direction_solid_angle_sr.len()];
         Self {
-            detector,
+            detector: d.id(),
             bins,
-            cell_area_mm2,
+            cell_area_mm2: d.cell_area_mm2(),
+            measure: d.measure,
+            direction_flux,
+            direction_solid_angle_sr,
+            outside_cone_flux: 0.0,
             incident_flux: vec![0.0; cells],
             detected_signal: vec![0.0; cells],
             stokes_local: oc_core::polarization::Stokes::ZERO,
@@ -236,6 +261,45 @@ impl DetectorResult3 {
         Some(self.incident_flux.iter().map(|f| f / area).collect())
     }
 
+    /// Irradiance per face cell, flux per `mm²`, or `None` for a line probe.
+    ///
+    /// The same numbers [`Self::flux_density`] always returned, under the name
+    /// the unit belongs to.
+    pub fn irradiance(&self) -> Option<Vec<f64>> {
+        self.flux_density()
+    }
+
+    /// Radiant intensity per direction cell, flux per steradian, or `None`
+    /// unless the detector was asked to measure it.
+    pub fn radiant_intensity(&self) -> Option<Vec<f64>> {
+        (!self.direction_flux.is_empty()).then(|| {
+            self.direction_flux
+                .iter()
+                .zip(&self.direction_solid_angle_sr)
+                .map(|(f, w)| if *w > 0.0 { f / w } else { 0.0 })
+                .collect()
+        })
+    }
+
+    /// The cells in whatever this detector measures, and the unit they are in,
+    /// for a reader that would rather not branch.
+    pub fn readings(&self) -> (Vec<f64>, &'static str) {
+        let cells = match self.measure {
+            DetectorMeasure::Power => Some(self.incident_flux.clone()),
+            DetectorMeasure::Irradiance => self.irradiance(),
+            DetectorMeasure::Intensity { .. } => self.radiant_intensity(),
+        };
+        (cells.unwrap_or_default(), self.measure.unit())
+    }
+
+    /// The largest reading, in the detector's own measure. `None` when there
+    /// is nothing to read.
+    pub fn peak_reading(&self) -> Option<f64> {
+        self.readings().0.into_iter().fold(None, |m: Option<f64>, v| {
+            Some(m.map_or(v, |m| m.max(v)))
+        })
+    }
+
     #[cfg(feature = "parallel")]
     pub(crate) fn merge(&mut self, other: &DetectorResult3) {
         for (a, b) in self.incident_flux.iter_mut().zip(&other.incident_flux) {
@@ -250,6 +314,14 @@ impl DetectorResult3 {
         self.flux_uv += other.flux_uv;
         self.flux_opl += other.flux_opl;
         self.records.extend_from_slice(&other.records);
+        for (a, b) in self
+            .direction_flux
+            .iter_mut()
+            .zip(&other.direction_flux)
+        {
+            *a += *b;
+        }
+        self.outside_cone_flux += other.outside_cone_flux;
         // Both sides already rotated into the same detector frame, so this is a
         // sum of comparable numbers rather than of different bases.
         self.stokes_local = self.stokes_local.plus(&other.stokes_local);

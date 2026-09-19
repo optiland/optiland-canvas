@@ -124,6 +124,7 @@ fn add_rect_detector(
         bins,
         response: DetectorResponse::Unity,
         termination: DetectorTermination::Terminate,
+        measure: oc_core::scene3::DetectorMeasure::Power,
     });
     id
 }
@@ -727,6 +728,170 @@ fn assert_detector_matches(scene: &Scene3, det: ObjectId, origins_dirs: &[(Vec3,
         assert!(
             (*a as f32 - *b).abs() < 1e-4,
             "cell {i}: f64 {a} vs f32 {b}"
+        );
+    }
+}
+
+/// A round face's pixels read the same irradiance in both tiers, rim pixels
+/// included.
+///
+/// The preview divides by the covered areas the scene model computes, not by
+/// a copy of the geometry of its own, and computes them only when asked. So
+/// the thing to hold is that asking gives the reference's numbers: a grid of
+/// rays across a disc, kept off the pixel edges so neither tier's rounding
+/// picks the pixel, lands in whole pixels and in pixels the rim cuts.
+#[test]
+fn a_round_face_reads_the_same_irradiance_in_both_tiers() {
+    let mut scene = Scene3::new();
+    let det = add_rect_detector(&mut scene, Vec3::new(20.0, 0.0, 0.0), -Vec3::X, 3.0, 3.0, [6, 6]);
+    scene.detectors[0].geometry = DetectorGeometry3::Disc { radius_mm: 3.0 };
+    scene.validate().expect("valid");
+
+    let offsets: Vec<f64> = (0..6).map(|i| i as f64 + 0.37 - 3.0).collect();
+    let origins_dirs: Vec<(Vec3, Vec3)> = offsets
+        .iter()
+        .flat_map(|&y| offsets.iter().map(move |&z| (y, z)))
+        .filter(|(y, z)| y * y + z * z < 8.5)
+        .map(|(y, z)| (Vec3::new(0.0, y, z), Vec3::X))
+        .collect();
+    let (emitted, launch) = rays(&origins_dirs);
+
+    let reference = trace3(&scene, &launch, &cfg());
+    let f64_det = reference
+        .detectors
+        .iter()
+        .find(|d| d.detector.0 == det.0)
+        .expect("f64 detector");
+    let gpu = GpuScene3::build_with_rays(
+        &scene,
+        &emitted,
+        BuildOpts {
+            ghosts: false,
+            flux_eps: 1e-9,
+            max_ghost: 0,
+        },
+    );
+    let preview = cpu3::trace(&gpu, 32);
+    let f32_det = preview.detector(det.0).expect("f32 detector");
+
+    let e64 = f64_det.irradiance().expect("an area detector");
+    let e32 = f32_det.density();
+    assert_eq!(e64.len(), e32.len());
+    let rim = f64_det
+        .covered_area_mm2
+        .iter()
+        .zip(&e64)
+        .filter(|(a, e)| **e > 0.0 && **a < 0.999)
+        .count();
+    assert!(rim >= 4, "rays reach rim pixels: {rim}");
+    for (i, (a, b)) in e64.iter().zip(&e32).enumerate() {
+        assert!(
+            (*a as f32 - *b).abs() <= 1e-5 * a.abs().max(1.0) as f32,
+            "pixel {i}: f64 {a} vs f32 {b}"
+        );
+    }
+}
+
+/// The preview bins directions the same way the reference does.
+///
+/// Irradiance and power come off the same face histogram the two tiers have
+/// always agreed on, so they need nothing new. Intensity does not: it is a
+/// second histogram over the arrival direction, written twice, once in f64
+/// and once in f32. Two copies of a ring layout is exactly the drift this
+/// suite exists to catch, so a fan of known angles goes in and both sides
+/// have to put it in the same rings.
+#[test]
+fn the_preview_bins_arrival_directions_like_the_reference() {
+    let mut scene = Scene3::new();
+    let det = add_rect_detector(
+        &mut scene,
+        Vec3::new(0.0, 0.0, 0.0),
+        -Vec3::X,
+        40.0,
+        40.0,
+        [6, 4],
+    );
+    scene
+        .detectors
+        .iter_mut()
+        .for_each(|d| {
+            d.measure = oc_core::scene3::DetectorMeasure::Intensity {
+                half_angle_deg: 30.0,
+                bins: [6, 4],
+            }
+        });
+    scene.validate().unwrap();
+
+    // A fan spread over polar angle and azimuth, so every ring and every
+    // sector gets something, with a few rays past the cone to land in the
+    // outside count.
+    //
+    // The angles are deliberately off every boundary. A ray arriving exactly
+    // on a ring or sector edge is a knife-edge that the two tiers can round
+    // to opposite sides of, which is a property of binning and not a defect
+    // in either of them; a test that sat on one would be measuring float
+    // width rather than agreement.
+    let mut rays = Vec::new();
+    for i in 0..14 {
+        let theta = (i as f64 + 0.5) * 2.5f64.to_radians();
+        for j in 0..9 {
+            let phi = (13.0 + j as f64 * 37.0).to_radians();
+            let dir = Vec3::new(
+                theta.cos(),
+                theta.sin() * phi.cos(),
+                theta.sin() * phi.sin(),
+            )
+            .normalize();
+            rays.push((dir * -50.0, dir));
+        }
+    }
+
+    let (emitted, launch) = rays_at(&rays.iter().map(|(o, d)| (*o, *d, 1.0)).collect::<Vec<_>>());
+    let f64_res = trace3(
+        &scene,
+        &launch,
+        &TraceConfig3 {
+            ghosts: false,
+            ..cfg()
+        },
+    );
+    let gpu = GpuScene3::build_with_rays(&scene, &emitted, opts(false));
+    let f32_res = cpu3::trace(&gpu, 32);
+
+    let a = &f64_res.detectors[0];
+    let b = f32_res.detector(det.0).expect("f32 detector");
+    assert_eq!(
+        a.direction_flux.len(),
+        b.direction.len(),
+        "the two grids are the same size"
+    );
+    assert!(
+        a.direction_flux.iter().filter(|f| **f > 0.0).count() > 15,
+        "the fan reaches most of the grid"
+    );
+    assert!(a.outside_cone_flux > 0.0, "and some of it misses the cone");
+
+    for (i, (x, y)) in a.direction_flux.iter().zip(&b.direction).enumerate() {
+        assert!(
+            flux_close(*x, *y),
+            "direction cell {i}: f64 {x} vs f32 {y}"
+        );
+    }
+    assert!(
+        flux_close(a.outside_cone_flux, b.outside),
+        "outside the cone: f64 {} vs f32 {}",
+        a.outside_cone_flux,
+        b.outside
+    );
+
+    // And the intensity itself, which is the flux over solid angles the scene
+    // model handed to both.
+    let ia = a.radiant_intensity().expect("f64 intensity");
+    let ib = b.radiant_intensity().expect("f32 intensity");
+    for (i, (x, y)) in ia.iter().zip(&ib).enumerate() {
+        assert!(
+            (x - *y as f64).abs() <= 1e-4 * x.abs().max(1.0),
+            "intensity cell {i}: f64 {x} vs f32 {y}"
         );
     }
 }

@@ -70,6 +70,77 @@ pub fn planar_shape_contains(shape: &PlanarShape2, p: Vec2) -> bool {
     }
 }
 
+/// The area where a disc of radius `r` centred on the origin overlaps the
+/// axis-aligned rectangle `[x0, x1] × [y0, y1]`, mm².
+///
+/// Exact, not sampled. Across `x` the disc is the chord `[-h(x), h(x)]` with
+/// `h = √(r² − x²)`, and the rectangle clips it to `[y0, y1]`. Cutting `x`
+/// wherever the arc crosses `y0` or `y1` leaves pieces on which each limit is
+/// either a straight edge or the arc throughout, and `∫h dx` has the closed
+/// form `½(x h + r² asin(x/r))`. So the answer is a sum of those, with no
+/// quadrature and nothing assumed about the rectangle being small.
+///
+/// A detector needs this for the pixels at a round face's rim: the part of a
+/// pixel on the face is what its flux was collected over.
+pub fn disc_rect_overlap_area(r: f64, x0: f64, x1: f64, y0: f64, y1: f64) -> f64 {
+    let (a, b) = (x0.max(-r), x1.min(r));
+    if r.is_nan() || r <= 0.0 || b <= a || y1 <= y0 {
+        return 0.0;
+    }
+    // Whole rectangle inside the disc, or none of it: no arc to integrate.
+    let far_x = x0.abs().max(x1.abs());
+    let far_y = y0.abs().max(y1.abs());
+    if far_x * far_x + far_y * far_y <= r * r {
+        return (x1 - x0) * (y1 - y0);
+    }
+    let near_x = if x0 > 0.0 { x0 } else if x1 < 0.0 { -x1 } else { 0.0 };
+    let near_y = if y0 > 0.0 { y0 } else if y1 < 0.0 { -y1 } else { 0.0 };
+    if near_x * near_x + near_y * near_y >= r * r {
+        return 0.0;
+    }
+
+    let half_chord = |x: f64| (r * r - x * x).max(0.0).sqrt();
+    let chord_integral = |x: f64| {
+        let x = x.clamp(-r, r);
+        0.5 * (x * half_chord(x) + r * r * (x / r).asin())
+    };
+    // A line the arc only touches (`|y| = r`) still needs its cut at `x = 0`:
+    // without it the piece's middle lands on the tangent point, where the arc
+    // and the edge agree, and the whole piece reads as the edge.
+    let mut cuts = vec![a, b];
+    for y in [y0, y1] {
+        if y.abs() <= r {
+            let xc = half_chord(y);
+            cuts.extend([-xc, xc].into_iter().filter(|x| *x > a && *x < b));
+        }
+    }
+    cuts.sort_by(f64::total_cmp);
+
+    let mut area = 0.0;
+    for w in cuts.windows(2) {
+        let (p, q) = (w[0], w[1]);
+        if q <= p {
+            continue;
+        }
+        // Which limit is the arc holds across the whole piece, so the middle
+        // decides it.
+        let h = half_chord(0.5 * (p + q));
+        let top_is_arc = h < y1;
+        let bottom_is_arc = -h > y0;
+        let top = if top_is_arc { h } else { y1 };
+        let bottom = if bottom_is_arc { -h } else { y0 };
+        if top <= bottom {
+            continue;
+        }
+        let arc = chord_integral(q) - chord_integral(p);
+        let len = q - p;
+        let upper = if top_is_arc { arc } else { y1 * len };
+        let lower = if bottom_is_arc { -arc } else { y0 * len };
+        area += upper - lower;
+    }
+    area.max(0.0)
+}
+
 /// Even-odd point-in-polygon, robust to a horizontal-edge coincidence.
 ///
 /// Counts crossings of a ray from `p` along `+x`. The `(vi.y > p.y) != (vj.y > p.y)`

@@ -2920,6 +2920,149 @@ impl Canvas {
         id.0 as f64
     }
 
+    /// Set what a detector measures: `"power"`, `"irradiance"` or
+    /// `"intensity"`. Returns false if `id` is not a detector or the request
+    /// does not hold up.
+    ///
+    /// `half_angle_deg` is read only for intensity, where it is the cone the
+    /// angular histogram spans, and it must be in `(0, 90]`. Irradiance needs
+    /// a face with area, so a v1 line probe is refused rather than given a
+    /// denominator nobody authored.
+    #[wasm_bindgen(js_name = setDetectorMeasure)]
+    pub fn set_detector_measure(&mut self, id: f64, measure: &str, half_angle_deg: f64) -> bool {
+        use oc_core::scene3::DetectorMeasure as M;
+        let Some(scene) = self.scene3.as_mut() else {
+            return false;
+        };
+        let d_measure = scene
+            .detectors
+            .iter()
+            .find(|d| d.common.id.0 == id as u64)
+            .map(|d| d.measure);
+        let want = match measure {
+            "power" => M::Power,
+            "irradiance" => M::Irradiance,
+            "intensity" => M::Intensity {
+                half_angle_deg: half_angle_deg.clamp(0.1, 90.0),
+                // Whatever the detector already had, so flipping away and
+                // back does not quietly rescale the histogram; `[24, 1]` is
+                // the I(theta) curve a detector starts with.
+                bins: match d_measure {
+                    Some(M::Intensity { bins, .. }) => bins,
+                    _ => [24, 1],
+                },
+            },
+            _ => return false,
+        };
+        let Some(d) = scene.detectors.iter_mut().find(|d| d.common.id.0 == id as u64) else {
+            return false;
+        };
+        if d.measure == want {
+            return true;
+        }
+        let was = d.measure;
+        d.measure = want;
+        if scene.validate().is_err() {
+            scene
+                .detectors
+                .iter_mut()
+                .find(|d| d.common.id.0 == id as u64)
+                .expect("the detector is still there")
+                .measure = was;
+            return false;
+        }
+        self.revision += 1;
+        true
+    }
+
+    /// A detector's face as the component view edits it: its shape and full
+    /// size in mm, its pixels and their pitch, and the areas that follow. See
+    /// [`detector_face_json`] for the fields. `null` if `id` is not an area
+    /// detector.
+    #[wasm_bindgen(js_name = detectorFaceJSON)]
+    pub fn detector_face_json(&self, id: f64) -> String {
+        self.scene3
+            .as_ref()
+            .and_then(|s| s.detectors.iter().find(|d| d.common.id.0 == id as u64))
+            .and_then(detector_face_json)
+            .unwrap_or_else(|| "null".into())
+    }
+
+    /// Make a detector's face a `width` by `height` mm rectangle, centred
+    /// where it was. Its pixel counts stay, so the pitch follows. Bumps the
+    /// revision. False, with the scene unchanged, for a size that is not
+    /// positive and finite or an id that is not an area detector.
+    #[wasm_bindgen(js_name = setDetectorRectangle)]
+    pub fn set_detector_rectangle(&mut self, id: f64, width_mm: f64, height_mm: f64) -> bool {
+        use oc_core::scene3::DetectorGeometry3 as G;
+        self.edit_detector_face(id, G::Rectangle {
+            half_width_mm: 0.5 * width_mm,
+            half_height_mm: 0.5 * height_mm,
+        })
+    }
+
+    /// Make a detector's face a disc `diameter_mm` across. As
+    /// [`Canvas::set_detector_rectangle`] otherwise.
+    #[wasm_bindgen(js_name = setDetectorDisc)]
+    pub fn set_detector_disc(&mut self, id: f64, diameter_mm: f64) -> bool {
+        use oc_core::scene3::DetectorGeometry3 as G;
+        self.edit_detector_face(id, G::Disc {
+            radius_mm: 0.5 * diameter_mm,
+        })
+    }
+
+    /// Make a detector's face a ring, `outer_mm` across with a hole
+    /// `inner_mm` across. The hole must be smaller than the ring. As
+    /// [`Canvas::set_detector_rectangle`] otherwise.
+    #[wasm_bindgen(js_name = setDetectorAnnulus)]
+    pub fn set_detector_annulus(&mut self, id: f64, inner_mm: f64, outer_mm: f64) -> bool {
+        use oc_core::scene3::DetectorGeometry3 as G;
+        self.edit_detector_face(id, G::Annulus {
+            inner_mm: 0.5 * inner_mm,
+            outer_mm: 0.5 * outer_mm,
+        })
+    }
+
+    /// Set a detector's pixel counts across (`u`) and down (`v`) its face. The
+    /// face keeps its size, so the pitch follows. Bumps the revision. False,
+    /// with the scene unchanged, for a count that is not a whole number of at
+    /// least one, a grid past `MAX_DETECTOR_CELLS`, or an id that is not an
+    /// area detector.
+    #[wasm_bindgen(js_name = setDetectorPixels)]
+    pub fn set_detector_pixels(&mut self, id: f64, across: f64, down: f64) -> bool {
+        let (Some(nu), Some(nv)) = (whole_count(across), whole_count(down)) else {
+            return false;
+        };
+        let Some(scene) = self.scene3.as_mut() else {
+            return false;
+        };
+        if !scene.set_detector_pixels(id as u64, [nu, nv]) {
+            return false;
+        }
+        self.revision += 1;
+        true
+    }
+
+    /// Set the angular histogram of a detector that measures intensity:
+    /// polar `rings` out to its cone, azimuth `sectors` around the normal.
+    /// Bumps the revision. False, with the scene unchanged, for a detector
+    /// that measures anything else, a count that is not a whole number of at
+    /// least one, or a grid past `MAX_DETECTOR_CELLS`.
+    #[wasm_bindgen(js_name = setDetectorDirectionBins)]
+    pub fn set_detector_direction_bins(&mut self, id: f64, rings: f64, sectors: f64) -> bool {
+        let (Some(r), Some(s)) = (whole_count(rings), whole_count(sectors)) else {
+            return false;
+        };
+        let Some(scene) = self.scene3.as_mut() else {
+            return false;
+        };
+        if !scene.set_detector_direction_bins(id as u64, r, s) {
+            return false;
+        }
+        self.revision += 1;
+        true
+    }
+
     /// An aperture's clear opening as `{"inner","outer"}` (min / max radius that
     /// passes, mm), or `null` if `id` is not an aperture. A plain disc opening
     /// reports `inner: 0`.
@@ -3019,9 +3162,13 @@ impl Canvas {
     }
 
     /// The f64 reference readout for a detector by id (§4.1: the honest numbers).
-    /// JSON `{hits, totalIncident, totalSignal, cellArea, centroid, meanOpl,
-    /// bins, incident, dop, dolp, azimuthDeg, stokes, maxTiltDeg}`, or `null`
-    /// if there is no such detector.
+    /// JSON `{hits, totalIncident, totalSignal, pixelArea, faceArea,
+    /// meanIrradiance, face, centroid, meanOpl, bins, incident, measure, unit,
+    /// coneDeg, coneBins, cells, solidAngle, outsideCone, peak, dop, dolp,
+    /// azimuthDeg, stokes, maxTiltDeg}`, or `null` if there is no such
+    /// detector. `face` is [`Canvas::detector_face_json`]'s reply, so the
+    /// cells can be drawn to scale; `totalIncident` is the flux on the whole
+    /// face, which every view of the detector quotes.
     ///
     /// The polarization fields describe the summed state in the **detector's
     /// own frame**: every ray is rotated onto the projection of the detector's
@@ -3054,22 +3201,65 @@ impl Canvas {
         } else {
             "null".to_string()
         };
-        let cell_area = d
-            .cell_area_mm2
-            .map_or("null".to_string(), |a| format!("{a}"));
+        let pixel_area = d.pixel_area_mm2.map_or("null".to_string(), json_num);
+        let face_area = d.face_area_mm2.map_or("null".to_string(), json_num);
+        let mean_irradiance = d.mean_irradiance().map_or("null".to_string(), json_num);
+        // The face the cells cover, so a picture of them can be drawn to
+        // scale from this one reply rather than from a second question.
+        let face = scene
+            .detectors
+            .iter()
+            .find(|x| x.common.id.0 == detector_id as u64)
+            .and_then(detector_face_json)
+            .unwrap_or_else(|| "null".into());
         let incident: Vec<String> = d.incident_flux.iter().map(|v| format!("{v}")).collect();
         let st = d.stokes_local;
+        // What the detector measures, the cells in that measure, and the unit
+        // they carry. `incident` stays raw flux whatever the measure is, so a
+        // reader that wants the histogram itself is not made to undo a
+        // division.
+        let (readings, unit) = d.readings();
+        let cells: Vec<String> = readings.iter().map(|v| format!("{v}")).collect();
+        let (measure, cone) = match d.measure {
+            oc_core::scene3::DetectorMeasure::Power => ("power", "null".to_string()),
+            oc_core::scene3::DetectorMeasure::Irradiance => ("irradiance", "null".to_string()),
+            oc_core::scene3::DetectorMeasure::Intensity { half_angle_deg, .. } => {
+                ("intensity", format!("{half_angle_deg}"))
+            }
+        };
+        let solid: Vec<String> = d
+            .direction_solid_angle_sr
+            .iter()
+            .map(|v| format!("{v}"))
+            .collect();
+        // The direction histogram has its own shape, which is not the face's.
+        let (rings, sectors) = d
+            .measure
+            .direction_grid()
+            .map_or((0, 0), |(_, r, sct)| (r, sct));
         format!(
-            "{{\"hits\":{},\"totalIncident\":{},\"totalSignal\":{},\"cellArea\":{},\"centroid\":{},\"meanOpl\":{},\"bins\":[{},{}],\"incident\":[{}],\"dop\":{},\"dolp\":{},\"azimuthDeg\":{},\"stokes\":[{},{},{},{}],\"maxTiltDeg\":{}}}",
+            "{{\"hits\":{},\"totalIncident\":{},\"totalSignal\":{},\"pixelArea\":{},\"faceArea\":{},\"meanIrradiance\":{},\"face\":{},\"centroid\":{},\"meanOpl\":{},\"bins\":[{},{}],\"incident\":[{}],\"measure\":\"{}\",\"unit\":\"{}\",\"coneDeg\":{},\"coneBins\":[{},{}],\"cells\":[{}],\"solidAngle\":[{}],\"outsideCone\":{},\"peak\":{},\"dop\":{},\"dolp\":{},\"azimuthDeg\":{},\"stokes\":[{},{},{},{}],\"maxTiltDeg\":{}}}",
             d.hits,
             d.total_incident,
             d.total_signal,
-            cell_area,
+            pixel_area,
+            face_area,
+            mean_irradiance,
+            face,
             centroid,
             mean_opl,
             d.bins[0],
             d.bins[1],
             incident.join(","),
+            measure,
+            unit,
+            cone,
+            rings,
+            sectors,
+            cells.join(","),
+            solid.join(","),
+            json_num(d.outside_cone_flux),
+            d.peak_reading().map_or("null".into(), |p| format!("{p}")),
             json_num(st.dop()),
             json_num(st.dolp()),
             json_num(st.azimuth_rad().to_degrees()),
@@ -3796,6 +3986,48 @@ fn json_num(v: f64) -> String {
     }
 }
 
+/// A count typed into a field: a whole number from one up, or `None`. A
+/// fraction or a negative is refused rather than rounded, so what the scene
+/// holds is what was asked for.
+fn whole_count(v: f64) -> Option<usize> {
+    (v.is_finite() && v >= 1.0 && v.fract() == 0.0 && v <= oc_core::scene3::MAX_DETECTOR_CELLS as f64)
+        .then_some(v as usize)
+}
+
+/// A detector's face as JSON: `{shape, width, height, inner, pixels, pitch,
+/// pixelArea, faceArea, directionBins, maxCells}`, lengths in mm and areas in
+/// mm². `width` and `height` are the full size (a disc's diameter twice);
+/// `inner` is an annulus's hole diameter, 0 otherwise. `pitch` is the pixel
+/// size along each axis. `directionBins` is `[rings, sectors]` under the
+/// intensity measure, `null` otherwise. `None` for a line probe.
+fn detector_face_json(d: &oc_core::scene3::Detector3) -> Option<String> {
+    use oc_core::scene3::{DetectorGeometry3 as G, DetectorMeasure as M, MAX_DETECTOR_CELLS};
+    let (shape, inner) = match d.geometry {
+        G::Rectangle { .. } => ("rectangle", 0.0),
+        G::Disc { .. } => ("disc", 0.0),
+        G::Annulus { inner_mm, .. } => ("annulus", 2.0 * inner_mm),
+        G::LineProbeLegacy { .. } => return None,
+    };
+    let [w, h] = d.grid_extent_mm()?;
+    let [pu, pv] = d.pixel_pitch_mm()?;
+    let direction = match d.measure {
+        M::Intensity { bins, .. } => format!("[{},{}]", bins[0], bins[1]),
+        M::Power | M::Irradiance => "null".into(),
+    };
+    Some(format!(
+        "{{\"shape\":\"{shape}\",\"width\":{},\"height\":{},\"inner\":{},\"pixels\":[{},{}],\"pitch\":[{},{}],\"pixelArea\":{},\"faceArea\":{},\"directionBins\":{direction},\"maxCells\":{MAX_DETECTOR_CELLS}}}",
+        json_num(w),
+        json_num(h),
+        json_num(inner),
+        d.bins[0],
+        d.bins[1],
+        json_num(pu),
+        json_num(pv),
+        json_num(d.pixel_area_mm2()?),
+        json_num(d.face_area_mm2()?),
+    ))
+}
+
 impl Canvas {
     /// The compiled f32 scene the interactive preview traces, on the CPU mirror
     /// or the GPU. `None` until a 3D scene is loaded.
@@ -3817,6 +4049,19 @@ impl Canvas {
     }
 
     /// The f64 trace configuration, stamped with the current revision (§3.3).
+    /// Give a detector a new face through the scene's validating setter, and
+    /// bump the revision only if it took.
+    fn edit_detector_face(&mut self, id: f64, g: oc_core::scene3::DetectorGeometry3) -> bool {
+        let Some(scene) = self.scene3.as_mut() else {
+            return false;
+        };
+        if !scene.set_detector_geometry(id as u64, g) {
+            return false;
+        }
+        self.revision += 1;
+        true
+    }
+
     fn cfg3(&self) -> TraceConfig3 {
         TraceConfig3 {
             ghosts: self.ghosts,
@@ -4601,6 +4846,74 @@ mod scene3_tests {
         assert_eq!(c.last_detector_maps_f32(), vec![0.0]);
     }
 
+    /// The face the component view edits: a size and pixel counts in, the
+    /// pitch and the areas out, and a readout that carries the same face.
+    #[test]
+    fn a_detector_face_is_sized_and_pixelated_through_the_bridge() {
+        use serde_json::{json, Value};
+        let mut c = Canvas::new();
+        c.new_default_scene3();
+        let id = c.scene3.as_ref().unwrap().detectors[0].common.id.0 as f64;
+        let face = |c: &Canvas| -> Value { serde_json::from_str(&c.detector_face_json(id)).unwrap() };
+        let num = |v: &Value| v.as_f64().unwrap();
+
+        let rev = c.revision;
+        assert!(c.set_detector_rectangle(id, 6.0, 3.0));
+        assert!(c.set_detector_pixels(id, 12.0, 3.0));
+        assert!(c.revision > rev, "an edit bumps the revision");
+        let f = face(&c);
+        assert_eq!(f["shape"], "rectangle");
+        assert_eq!((num(&f["width"]), num(&f["height"])), (6.0, 3.0));
+        assert_eq!((num(&f["pitch"][0]), num(&f["pitch"][1])), (0.5, 1.0));
+        assert_eq!(num(&f["pixelArea"]), 0.5);
+        assert_eq!(num(&f["faceArea"]), 18.0);
+        assert_eq!(f["directionBins"], Value::Null);
+
+        // Refused edits change nothing, not even the revision.
+        let rev = c.revision;
+        for (u, v) in [(0.0, 4.0), (2.5, 4.0), (-3.0, 4.0), (f64::NAN, 4.0), (2048.0, 1024.0)] {
+            assert!(!c.set_detector_pixels(id, u, v), "{u} x {v}");
+        }
+        assert!(!c.set_detector_rectangle(id, -1.0, 2.0));
+        assert!(!c.set_detector_annulus(id, 4.0, 4.0), "a hole as wide as the ring");
+        assert!(!c.set_detector_disc(id + 1000.0, 4.0), "no such detector");
+        assert_eq!(c.revision, rev);
+        assert_eq!(face(&c)["pixels"], json!([12, 3]));
+
+        // A disc: the grid is its square box, cut into the same counts.
+        assert!(c.set_detector_disc(id, 8.0));
+        let f = face(&c);
+        assert_eq!(f["shape"], "disc");
+        assert!((num(&f["pitch"][0]) - 8.0 / 12.0).abs() < 1e-15);
+        assert!((num(&f["pitch"][1]) - 8.0 / 3.0).abs() < 1e-15);
+        assert!((num(&f["faceArea"]) - std::f64::consts::PI * 16.0).abs() < 1e-12);
+
+        // The readout carries the face it was read on, and its flux is the
+        // whole face's: every hit is in some pixel.
+        let r: Value = serde_json::from_str(&c.detector_result_json(id)).unwrap();
+        assert_eq!(r["face"], face(&c));
+        let total = num(&r["totalIncident"]);
+        assert!(total > 0.0, "the focused beam lands on the disc");
+        let binned: f64 = r["incident"].as_array().unwrap().iter().map(num).sum();
+        assert!((binned - total).abs() <= 1e-12 * total, "{binned} vs {total}");
+        let mean = num(&r["meanIrradiance"]);
+        assert!((mean - total / num(&r["faceArea"])).abs() <= 1e-15 * mean.max(1.0));
+
+        // A ring with a 2 mm hole at the focus: the spot goes through the
+        // hole, which is what a ring there should say.
+        assert!(c.set_detector_annulus(id, 2.0, 8.0));
+        assert_eq!(num(&face(&c)["inner"]), 2.0);
+        let r: Value = serde_json::from_str(&c.detector_result_json(id)).unwrap();
+        assert!(num(&r["totalIncident"]) < total, "less lands on the ring than the disc");
+
+        // Angular bins belong to intensity alone.
+        assert!(!c.set_detector_direction_bins(id, 12.0, 4.0));
+        assert!(c.set_detector_measure(id, "intensity", 30.0));
+        assert!(c.set_detector_direction_bins(id, 12.0, 4.0));
+        assert_eq!(face(&c)["directionBins"], json!([12, 4]));
+        assert!(!c.set_detector_direction_bins(id, 12.5, 4.0), "a fraction of a ring");
+    }
+
     #[test]
     fn sources_are_listed_for_the_3d_view_only() {
         let mut c = Canvas::new();
@@ -5171,6 +5484,7 @@ mod scene3_tests {
             bins: [48, 48],
             response: DetectorResponse::Unity,
             termination: DetectorTermination::Terminate,
+            measure: oc_core::scene3::DetectorMeasure::Power,
         });
 
         scene.validate().expect("demo scene validates");
@@ -5282,6 +5596,7 @@ mod scene3_tests {
             bins: [48, 48],
             response: DetectorResponse::Unity,
             termination: DetectorTermination::Terminate,
+            measure: oc_core::scene3::DetectorMeasure::Power,
         });
 
         scene.validate().expect("fold scene validates");
@@ -5376,6 +5691,7 @@ mod scene3_tests {
             bins: [16, 16],
             response: DetectorResponse::Unity,
             termination: DetectorTermination::Terminate,
+            measure: oc_core::scene3::DetectorMeasure::Power,
         });
 
         let mut c = Canvas::new();

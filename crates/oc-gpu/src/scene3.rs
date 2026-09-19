@@ -28,6 +28,7 @@ use glam::{DQuat, DVec3, Mat3, Vec2, Vec3};
 use oc_core::material::{Cauchy, Material};
 use oc_core::profile2::{ClosedProfile2, ProfileConstruction3};
 use oc_core::scene3::{
+    DetectorMeasure,
     AbsorptionModel, Aperture3, Body3, Detector3, DetectorGeometry3, DetectorTermination,
     Interpolation, OutOfRangePolicy, PlanarShape2, Scene3, SolidGeometry3, SpectralScalar,
     SurfaceGeometry3, SurfaceObject3, SurfaceResponse, TwoSidedSurfaceResponse,
@@ -1383,14 +1384,24 @@ pub struct GpuDetector3 {
     pub shape: DetShape,
     pub bins: [usize; 2],
     pub terminate: bool,
-    /// Cell area in `mm²` (physical, not normalized), for flux density.
-    pub cell_area_mm2: f32,
+    /// The face in physical millimetres, as the scene has it. What a flux
+    /// density divides by is computed from this on demand, not on every
+    /// compile: the preview recompiles every frame of a drag, and a round
+    /// face's exact rim areas are a cost nothing in that loop reads.
+    pub geometry: DetectorGeometry3,
+    /// What the readout means, mirrored so the preview reports the quantity
+    /// the reference reports.
+    pub measure: DetectorMeasure,
+    /// Each direction cell's solid angle in steradians, empty unless the
+    /// measure bins directions. Computed in f64 by the scene model, so the two
+    /// tiers cannot disagree about the geometry, only about the flux.
+    pub solid_angle_sr: Vec<f32>,
     pub object: u64,
 }
 
 fn compile_detector(d: &Detector3, norm: &Norm) -> Result<GpuDetector3, String> {
     let s = |v: f64| (v / norm.scale) as f32;
-    let (shape, total_mm2) = match &d.geometry {
+    let (shape, _total_mm2) = match &d.geometry {
         DetectorGeometry3::Rectangle {
             half_width_mm,
             half_height_mm,
@@ -1417,14 +1428,18 @@ fn compile_detector(d: &Detector3, norm: &Norm) -> Result<GpuDetector3, String> 
         }
     };
     let (rot, pos) = rigid(&d.common.transform, norm);
-    let cells = (d.bins[0].max(1) * d.bins[1].max(1)) as f64;
     Ok(GpuDetector3 {
         rot,
         pos,
         shape,
         bins: d.bins,
         terminate: matches!(d.termination, DetectorTermination::Terminate),
-        cell_area_mm2: (total_mm2 / cells) as f32,
+        geometry: d.geometry.clone(),
+        measure: d.measure,
+        solid_angle_sr: d
+            .direction_cell_solid_angles()
+            .map(|v| v.into_iter().map(|w| w as f32).collect())
+            .unwrap_or_default(),
         object: d.common.id.0,
     })
 }

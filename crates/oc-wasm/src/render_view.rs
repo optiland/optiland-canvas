@@ -374,7 +374,7 @@ pub fn render_objects_json(scene: &Scene3, tracker: &mut RenderTracker) -> Strin
             id,
             fingerprint(&[&"detector", &d.geometry]),
             fingerprint(&[&d.common.transform]),
-            fingerprint(&[&d.response, &d.termination]),
+            fingerprint(&[&d.response, &d.termination, &d.measure]),
         );
         let (hw, hh) = crate::detector_half_extents(d);
         out.push(descriptor(

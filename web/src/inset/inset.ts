@@ -6,6 +6,8 @@
 // big it is are remembered in this browser. What the window shows belongs to
 // its content (component-view.ts); this file only handles the frame.
 
+import { bringToFront } from "../cards";
+
 export type InsetContent = {
   /** The window opened or closed. */
   setOpen: (open: boolean) => void;
@@ -55,6 +57,7 @@ function loadPlacement(): Placement {
   return out;
 }
 
+
 export function initInset(opts: {
   tab: HTMLElement;
   /** The top bar; dropping the window's header on it closes the window. */
@@ -68,6 +71,11 @@ export function initInset(opts: {
   const sub = frame.querySelector(".inset-sub") as HTMLElement;
   const closeBtn = frame.querySelector(".inset-close") as HTMLButtonElement;
   const grip = frame.querySelector(".inset-resize") as HTMLElement;
+  // The window joins the same floating stack the inspector cards use, so
+  // touching it brings it forward. Without this it sat under every card and a
+  // control the card happened to cover could not be reached at all.
+  frame.addEventListener("pointerdown", () => bringToFront(frame), true);
+  bringToFront(frame);
   let content: InsetContent | null = null;
   const place = loadPlacement();
 

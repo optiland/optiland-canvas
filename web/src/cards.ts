@@ -68,9 +68,23 @@ export interface CardManager {
   drawLeaders: (ctx: CanvasRenderingContext2D, selected: number) => void;
 }
 
+/** The top of the floating stack, shared by every window that can cover
+ *  another: the inspector cards and the component inset.
+ *
+ *  It has to be shared. Cards used to climb from 40 without bound while the
+ *  inset sat at a fixed 30, so a card that opened over the inset buried it
+ *  permanently and a control under the card could not be clicked at all. One
+ *  counter makes the rule the obvious one: whatever you touched last is on
+ *  top. */
+let zTop = 40;
+
+/** Bring a floating element to the front of that stack. */
+export function bringToFront(el: HTMLElement) {
+  el.style.zIndex = String(++zTop);
+}
+
 export function createCardManager(source: CardSource): CardManager {
   const cards: Card[] = [];
-  let zTop = 40;
   const cardOf = (id: number): Card | undefined => cards.find((c) => c.id === id);
 
   function open(id: number) {
@@ -78,7 +92,7 @@ export function createCardManager(source: CardSource): CardManager {
     if (existing) {
       renderOne(existing);
       positionOne(existing);
-      existing.root.style.zIndex = String(++zTop);
+      bringToFront(existing.root);
       return;
     }
     const frag = source.template.content.cloneNode(true) as DocumentFragment;
@@ -93,7 +107,7 @@ export function createCardManager(source: CardSource): CardManager {
     source.wire(id, root, { rerender: (i) => render(i) });
     renderOne(card);
     positionOne(card);
-    root.style.zIndex = String(++zTop);
+    bringToFront(root);
   }
 
   function close(id: number) {
@@ -117,7 +131,7 @@ export function createCardManager(source: CardSource): CardManager {
 
   function wireGeneric(card: Card) {
     const q = <T extends HTMLElement>(sel: string) => card.root.querySelector(sel) as T;
-    card.root.addEventListener("pointerdown", () => { card.root.style.zIndex = String(++zTop); });
+    card.root.addEventListener("pointerdown", () => bringToFront(card.root));
     q<HTMLButtonElement>(".c-close").addEventListener("click", () => close(card.id));
 
     // pin the card's *location* (park it; it stops following the element).
@@ -135,7 +149,7 @@ export function createCardManager(source: CardSource): CardManager {
       if ((e.target as HTMLElement).closest("button")) return; // buttons aren't drag
       const r = card.root.getBoundingClientRect();
       grab = { x: e.clientX - r.left, y: e.clientY - r.top };
-      card.root.style.zIndex = String(++zTop);
+      bringToFront(card.root);
       header.setPointerCapture(e.pointerId);
       e.preventDefault();
     });

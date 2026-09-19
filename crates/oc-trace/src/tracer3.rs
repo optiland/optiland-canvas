@@ -21,7 +21,7 @@
 //! cap, and a cap deposits the remaining flux in `truncated_flux`.
 
 use oc_core::geom3::{Containment, Intersect3, ToleranceContext};
-use oc_core::id::{DetectorId, ObjectId, PathId, SurfaceRef};
+use oc_core::id::{ObjectId, PathId, SurfaceRef};
 use oc_core::scene3::{
     Aperture3, Detector3, DetectorGeometry3, DetectorTermination, PlanarShape2, Scene3,
     SolidGeometry3, SurfaceObject3, SurfaceResponse,
@@ -158,8 +158,11 @@ pub fn trace3(scene: &Scene3, launch: &[LaunchRay3], cfg: &TraceConfig3) -> Trac
         }
     }
 
+    // Each detector's empty readout, built once: the exact rim areas in it are
+    // worth computing once per trace, not once per worker.
+    let blank: Vec<DetectorResult3> = scene.detectors.iter().map(DetectorResult3::new).collect();
     let identity = || Local {
-        result: LocalResult::new(scene, cfg, base_report.clone()),
+        result: LocalResult::new(blank.clone(), base_report.clone()),
     };
 
     #[cfg(feature = "parallel")]
@@ -216,12 +219,7 @@ struct LocalResult {
 }
 
 impl LocalResult {
-    fn new(scene: &Scene3, _cfg: &TraceConfig3, report: CapabilityReport) -> Self {
-        let detectors = scene
-            .detectors
-            .iter()
-            .map(|d| DetectorResult3::new(DetectorId(d.common.id.0), d.bins, detector_cell_area(d)))
-            .collect();
+    fn new(detectors: Vec<DetectorResult3>, report: CapabilityReport) -> Self {
         Self {
             segments: Vec::new(),
             detectors,
@@ -1713,6 +1711,14 @@ fn record_detector(
         out.incident_flux[cell] += flux;
         out.detected_signal[cell] += flux * qe;
     }
+    // The angular histogram, when the detector was asked for one. A ray past
+    // the cone is counted somewhere rather than nowhere.
+    if d.measure.cone_rad().is_some() {
+        match d.direction_cell(dir_local) {
+            Some(cell) => out.direction_flux[cell] += flux,
+            None => out.outside_cone_flux += flux,
+        }
+    }
     if cfg.record_detector_hits && out.records.len() < cfg.max_records {
         out.records.push(DetectorHit3 {
             point_world: point,
@@ -1885,21 +1891,6 @@ fn detector_aabb(d: &Detector3) -> Option<Aabb3> {
     Some(bb.padded(1e-6 * ext.max_element().max(1.0)))
 }
 
-fn detector_cell_area(d: &Detector3) -> Option<f64> {
-    let (nu, nv) = (d.bins[0].max(1), d.bins[1].max(1));
-    let total = match d.geometry {
-        DetectorGeometry3::Rectangle {
-            half_width_mm,
-            half_height_mm,
-        } => 4.0 * half_width_mm * half_height_mm,
-        DetectorGeometry3::Disc { radius_mm } => std::f64::consts::PI * radius_mm * radius_mm,
-        DetectorGeometry3::Annulus { inner_mm, outer_mm } => {
-            std::f64::consts::PI * (outer_mm * outer_mm - inner_mm * inner_mm)
-        }
-        DetectorGeometry3::LineProbeLegacy { .. } => return None,
-    };
-    Some(total / (nu * nv) as f64)
-}
 
 /// The cell index a local `(u, v)` hit falls in, row-major over `bins`. A
 /// rectangle maps to an even grid (equal-area cells, the normalization test);

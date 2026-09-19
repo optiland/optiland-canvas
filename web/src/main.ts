@@ -14,7 +14,8 @@ import { createFastPreview } from "./fastpreview";
 import { initInset } from "./inset/inset";
 import { createComponentView, type ComponentView } from "./inset/component-view";
 import { initOpenUc2 } from "./features/openuc2/OpenUc2Page";
-import { heatRgb } from "./heat";
+import { drawFacePixels, faceBox, facePath, formatFlux, type DetectorFace, type DetectorReadout } from "./detector-face";
+import { drawPolarMap } from "./polarmap";
 
 const SCALE = 6.5; // px per mm
 type V2 = { x: number; y: number };
@@ -416,79 +417,107 @@ async function main() {
   let detMode: DetMode = "heatmap";
   const detHead = document.getElementById("detHead")!;
 
-  // The centred square drawing region of the dock canvas (detectors are square-ish).
+  // The centred square drawing region of the dock canvas, for the polar map.
   function detSquare() {
     const s = Math.min(hist.width, hist.height);
     return { s, ox: (hist.width - s) / 2, oy: (hist.height - s) / 2 };
   }
 
-  // The flux heatmap ramp (heat.ts), shared with the 3D view's detector faces.
-  function heatColor(t: number): string {
-    const [r, g, b] = heatRgb(t);
-    return `rgb(${r},${g},${b})`;
-  }
-
-  // 2D binning: paint the nu×nv incident-flux grid as a heatmap. Detector v
-  // increases upward, canvas y downward, so the rows are flipped.
-  function drawHeatmap(info: { bins: [number, number]; incident: number[] }) {
-    const [nu, nv] = info.bins;
-    const cells = info.incident;
-    const max = Math.max(...cells, 1e-12);
+  // The angular histogram, when the detector measures intensity. A different
+  // histogram from the face one, so a different picture: polar angle outward
+  // from the middle rather than millimetres across a face.
+  function drawPolar(info: {
+    cells: number[];
+    coneBins: [number, number];
+    coneDeg: number;
+  }) {
     const { s, ox, oy } = detSquare();
-    const cw = s / nu, ch = s / nv;
-    for (let v = 0; v < nv; v++) {
-      for (let u = 0; u < nu; u++) {
-        hctx.fillStyle = heatColor(cells[v * nu + u] / max);
-        hctx.fillRect(ox + u * cw, oy + (nv - 1 - v) * ch, Math.ceil(cw), Math.ceil(ch));
-      }
-    }
-    hctx.strokeStyle = "rgba(127,214,255,0.25)";
-    hctx.strokeRect(ox + 0.5, oy + 0.5, s - 1, s - 1);
+    drawPolarMap(
+      hctx,
+      {
+        cells: info.cells,
+        rings: info.coneBins[0],
+        sectors: info.coneBins[1],
+        coneDeg: info.coneDeg,
+      },
+      { x: ox, y: oy, w: s, h: s },
+    );
   }
 
-  // Spot diagram: the actual ray-detector hits, scaled into the face and coloured
+  // The face, pixel by pixel, in its true proportions and clipped to its
+  // shape: flux per pixel, or under irradiance that flux over each pixel's
+  // area on the face. The component inset draws the same picture from the
+  // same reply (detector-face.ts). Irradiance is scaled to its reported peak,
+  // which skips rim slivers, so one sliver cannot darken the rest.
+  function drawHeatmap(info: DetectorReadout) {
+    if (!info.face) return;
+    const irradiance = info.measure === "irradiance";
+    drawFacePixels(
+      hctx,
+      info.face,
+      irradiance ? info.cells : info.incident,
+      { x: 0, y: 0, w: hist.width, h: hist.height },
+      irradiance ? info.peak : null,
+    );
+  }
+
+  // Spot diagram: the actual ray-detector hits on the face, to scale, coloured
   // by wavelength (the linear-light rgb the tracer records, normalized to a dot).
-  function drawSpot(detId: number) {
+  function drawSpot(detId: number, face: DetectorFace) {
     const a = detId >= 0 ? scene.detectorHitsF32(detId) : scene.firstDetectorHitsF32();
-    const { s, ox, oy } = detSquare();
+    const b = faceBox(face, { x: 0, y: 0, w: hist.width, h: hist.height });
     hctx.fillStyle = "#04060a";
-    hctx.fillRect(ox, oy, s, s);
-    hctx.strokeStyle = "rgba(127,214,255,0.25)";
-    hctx.strokeRect(ox + 0.5, oy + 0.5, s - 1, s - 1);
+    facePath(hctx, face, b);
+    hctx.fill("evenodd");
     // Crosshair at the face centre.
     hctx.strokeStyle = "rgba(127,214,255,0.12)";
     hctx.beginPath();
-    hctx.moveTo(ox + s / 2, oy); hctx.lineTo(ox + s / 2, oy + s);
-    hctx.moveTo(ox, oy + s / 2); hctx.lineTo(ox + s, oy + s / 2);
+    hctx.moveTo(b.x + b.w / 2, b.y); hctx.lineTo(b.x + b.w / 2, b.y + b.h);
+    hctx.moveTo(b.x, b.y + b.h / 2); hctx.lineTo(b.x + b.w, b.y + b.h / 2);
+    hctx.stroke();
+    hctx.strokeStyle = "rgba(127,214,255,0.25)";
+    facePath(hctx, face, b);
     hctx.stroke();
     if (a.length < 3) return;
-    const hw = a[0] || 1, hh = a[1] || 1, n = a[2];
+    const n = a[2];
     for (let i = 0; i < n; i++) {
       const k = 3 + i * 6;
       const u = a[k], v = a[k + 1];
-      const r = a[k + 2], g = a[k + 3], b = a[k + 4];
-      const m = Math.max(r, g, b, 1e-6);
-      const px = ox + (u / hw * 0.5 + 0.5) * s;
-      const py = oy + (1 - (v / hh * 0.5 + 0.5)) * s; // flip v to screen-down
-      hctx.fillStyle = `rgb(${(r / m * 255) | 0},${(g / m * 255) | 0},${(b / m * 255) | 0})`;
+      const r = a[k + 2], g = a[k + 3], bl = a[k + 4];
+      const m = Math.max(r, g, bl, 1e-6);
+      const px = b.x + (u / face.width + 0.5) * b.w;
+      const py = b.y + (0.5 - v / face.height) * b.h; // v up, screen down
+      hctx.fillStyle = `rgb(${(r / m * 255) | 0},${(g / m * 255) | 0},${(bl / m * 255) | 0})`;
       hctx.fillRect(px - 0.75, py - 0.75, 1.7, 1.7);
     }
   }
 
   function refresh3dDetector() {
+    // Whatever made the dock re-read (an edit settling, a trace setting such
+    // as the ghost layer that moves no scene revision) makes the component
+    // inset re-read too, so the two never quote different traces.
+    componentView?.retraced();
     hctx.clearRect(0, 0, hist.width, hist.height);
     // Show the selected detector if one is selected, else the first — so a scene
     // with several detectors reports whichever the user is inspecting.
     const sel = selectedBody3d();
     const selInfo = sel >= 0 ? JSON.parse(scene.detectorResultJSON(sel)) : null;
     const detId = selInfo ? sel : -1;
-    const info = selInfo ?? JSON.parse(scene.firstDetectorResultJSON());
+    const info = (selInfo ?? JSON.parse(scene.firstDetectorResultJSON())) as DetectorReadout | null;
     if (!info || info.hits === 0) {
       dockNums.textContent = info ? "no rays on detector" : "no detector";
       return;
     }
-    if (detMode === "spot") drawSpot(detId);
-    else drawHeatmap(info);
+    if (detMode === "spot") {
+      if (info.face) drawSpot(detId, info.face);
+    } else if (info.measure === "intensity") {
+      // Not a heatmap of anything on the face, so the label stops saying so.
+      detHead.textContent = "detector — intensity, polar (f64)";
+      drawPolar({ cells: info.cells, coneBins: info.coneBins, coneDeg: info.coneDeg ?? 0 });
+    } else {
+      detHead.textContent = info.measure === "irradiance" ? "detector — irradiance heatmap (f64)" : "detector — heatmap (f64)";
+      drawHeatmap(info);
+    }
     const c = info.centroid ? `(${info.centroid[0].toFixed(2)}, ${info.centroid[1].toFixed(2)})` : "—";
     const opl = info.meanOpl == null ? "—" : Number(info.meanOpl).toFixed(2);
     const tag = detId >= 0 ? `#${detId} · ` : "";
@@ -507,7 +536,18 @@ async function main() {
       const spread = Number.isFinite(tilt) && tilt > 5 ? ` (±${tilt.toFixed(0)}° cone)` : "";
       pol = ` · pol ${(dop * 100).toFixed(1)}% ${kind}${spread}`;
     }
-    dockNums.textContent = `${tag}hits ${info.hits} · flux ${Number(info.totalIncident).toFixed(3)} · centroid ${c} mm · OPL ${opl} mm${pol}`;
+    // What the detector measures, next to the flux it collected. Power says
+    // nothing extra, because the peak of a flux histogram in flux is the
+    // number already there under another name.
+    let reads = "";
+    if (info.measure === "irradiance") {
+      reads = ` · peak ${formatFlux(info.peak)} ${info.unit}`;
+    } else if (info.measure === "intensity") {
+      const share = Number(info.totalIncident) > 0 ? Number(info.outsideCone) / Number(info.totalIncident) : 0;
+      const past = share > 1e-9 ? `, ${(share * 100).toFixed(0)}% past ${Number(info.coneDeg).toFixed(0)}°` : "";
+      reads = ` · peak ${formatFlux(info.peak)} ${info.unit}${past}`;
+    }
+    dockNums.textContent = `${tag}hits ${info.hits} · flux ${formatFlux(info.totalIncident)}${reads} · centroid ${c} mm · OPL ${opl} mm${pol}`;
   }
 
   // Detector analysis-mode toggle (heatmap ⇄ spot).
@@ -813,6 +853,8 @@ async function main() {
       setViewMode: (m: "2d" | "3d") => setViewMode(m),
       // The selection the active view (and the material picker) targets.
       selectedBody3d: () => selectedBody3d(),
+      // Select an object in the cross-section view, as a click on it would.
+      select: (id: number) => { slice3d!.setSelected(id); renderView(); },
       // The component view's inset window.
       inset: {
         open: () => inset.open(),

@@ -122,6 +122,16 @@ largest normal, and values whose shortest decimal form is not their exact one. I
 needs `serde_json`'s `float_roundtrip` feature, which the workspace enables, and
 it is not free: without it a value can come back one ULP off.
 
+## Fields added after v2 shipped
+
+A field added to v2 carries a serde default that reads as what documents
+written before it meant, so no file is invalidated by the kernel growing. The
+default is the old behaviour, never a new one:
+
+| field | on | absent means | added |
+|---|---|---|---|
+| `measure` | detector | `Power`, flux per cell, which is what a detector read before there was a choice | [what a detector measures](detectors.md) |
+
 ## What a document may not contain
 
 Validation runs on load and refuses, rather than repairs:

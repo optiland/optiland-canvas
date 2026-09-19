@@ -14,7 +14,7 @@ use oc_core::profile2::{
 };
 use oc_core::scene3::{
     Aperture3, ApertureInteraction, ApertureShape3, Body3, Detector3, DetectorGeometry3,
-    DetectorResponse, DetectorTermination, ObjectCommon, PlanarShape2, SolidGeometry3,
+    DetectorMeasure, DetectorResponse, DetectorTermination, ObjectCommon, PlanarShape2, SolidGeometry3,
     SpectralScalar, SurfaceGeometry3, SurfaceObject3, SurfaceProps3, SurfaceResponse,
 };
 use oc_core::vec::Vec2;
@@ -428,8 +428,19 @@ fn add_detector(
         bins,
         response: DetectorResponse::Unity,
         termination: DetectorTermination::Terminate,
+        measure: DetectorMeasure::Power,
     });
     id
+}
+
+/// Point an existing detector at a different measure.
+pub fn set_detector_measure(scene: &mut Scene3, det: ObjectId, measure: DetectorMeasure) {
+    scene
+        .detectors
+        .iter_mut()
+        .find(|d| d.common.id == det)
+        .expect("a detector with that id")
+        .measure = measure;
 }
 
 /// An aperture with a polygon clear opening inside a disc mask.

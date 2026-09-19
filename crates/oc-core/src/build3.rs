@@ -31,6 +31,7 @@ use crate::thinfilm::{
     film_coating, plate_coating, Coating, CoatingDesign, DesignKind, ExitFace, Incidence,
 };
 use crate::scene3::{
+    DetectorMeasure,
     AbsorptionModel, AngularDistribution3, AngularScalar, Aperture3, ApertureInteraction,
     ApertureShape3, Body3,
     Detector3, DetectorGeometry3, DetectorResponse, DetectorTermination, Interpolation,
@@ -1650,8 +1651,69 @@ impl Scene3 {
             bins,
             response: DetectorResponse::Unity,
             termination: DetectorTermination::Terminate,
+            measure: DetectorMeasure::Power,
         });
         DetectorId(id.0)
+    }
+
+    /// Give an area detector a new face, keeping its pixel counts, measure and
+    /// pose. Sizes are the face's own: a rectangle's half width and height, a
+    /// disc's or annulus's radii.
+    ///
+    /// The pixel counts stay, so the pitch follows the size. False, with the
+    /// scene unchanged, for an id that is not an area detector (a v1 line probe
+    /// has no face to resize), or a face that does not validate: a size that
+    /// is not positive and finite, or an annulus whose hole is not inside it.
+    pub fn set_detector_geometry(&mut self, id: u64, geometry: DetectorGeometry3) -> bool {
+        if !geometry.has_area() {
+            return false;
+        }
+        self.edit_area_detector(id, |d| d.geometry = geometry)
+    }
+
+    /// Set an area detector's pixel counts, `[along u, along v]`. The face
+    /// keeps its size, so the pitch follows the counts. False, with the scene
+    /// unchanged, for a count of zero, a grid past
+    /// [`crate::scene3::MAX_DETECTOR_CELLS`], or an id that is not an area
+    /// detector.
+    pub fn set_detector_pixels(&mut self, id: u64, bins: [usize; 2]) -> bool {
+        self.edit_area_detector(id, |d| d.bins = bins)
+    }
+
+    /// Set the angular histogram of a detector that measures intensity:
+    /// `rings` polar rings out to its cone and `sectors` azimuth sectors
+    /// around the normal. False, with the scene unchanged, for a detector that
+    /// measures something else (it has no angular histogram to resize), a
+    /// count of zero, or a grid past [`crate::scene3::MAX_DETECTOR_CELLS`].
+    pub fn set_detector_direction_bins(&mut self, id: u64, rings: usize, sectors: usize) -> bool {
+        let is_intensity = self.detectors.iter().any(|d| {
+            d.common.id.0 == id && matches!(d.measure, DetectorMeasure::Intensity { .. })
+        });
+        is_intensity
+            && self.edit_area_detector(id, |d| {
+                if let DetectorMeasure::Intensity { bins, .. } = &mut d.measure {
+                    *bins = [rings, sectors];
+                }
+            })
+    }
+
+    /// Apply `edit` to the area detector `id`, then keep it only if the scene
+    /// still validates; otherwise put the detector back as it was.
+    fn edit_area_detector(&mut self, id: u64, edit: impl FnOnce(&mut Detector3)) -> bool {
+        let Some(i) = self
+            .detectors
+            .iter()
+            .position(|d| d.common.id.0 == id && d.geometry.has_area())
+        else {
+            return false;
+        };
+        let was = self.detectors[i].clone();
+        edit(&mut self.detectors[i]);
+        if self.validate().is_err() {
+            self.detectors[i] = was;
+            return false;
+        }
+        true
     }
 
     /// The default authoring scene: one biconvex singlet at the origin, a

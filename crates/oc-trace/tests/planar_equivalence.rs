@@ -545,6 +545,7 @@ fn an_area_detector_is_refused() {
         bins: [16, 16],
         response: DetectorResponse::Unity,
         termination: DetectorTermination::Terminate,
+        measure: oc_core::scene3::DetectorMeasure::Power,
     });
     match reduce_to_planar(&s, &Plane3::XY) {
         Err(ReductionIssue::AreaDetector { .. }) => {}

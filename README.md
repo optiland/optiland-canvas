@@ -23,7 +23,7 @@ Optiland Canvas is a tool for the *ideation* phase of optical design, the part b
 - Per-ray dispersion: closed-form Cauchy from an `(n_d, V_d)` point, or full Sellmeier for catalog glasses. Chromatic spread is a first-class output, not a post-process.
 - Spectral rendering: rays colored by wavelength. Toggle the ghost layer and TIR highlight live.
 - The Abbe glass map is the material picker: hover to reassign glass and watch the focus re-converge. The obtainable region is bounded, so you can't paint with glass that doesn't exist.
-- Live detectors: irradiance histogram, flux-weighted centroid, optical path length.
+- Live detectors: a flux histogram over the face, read as power, irradiance or radiant intensity ([what a detector measures](docs/detectors.md)), with a flux-weighted centroid and optical path length.
 
 **Interaction**
 - Two views over one scene: a meridional cross-section and an orbitable 3D model. Elements drag, tilt and snap to the grid in either, and the rays retrace while you drag.
@@ -40,7 +40,7 @@ Optiland Canvas is a tool for the *ideation* phase of optical design, the part b
 
 The M4 workflow panels (layers with onion-skinning, the non-linear undo tree, the variation gallery, the wavefront scrub) were built against the 2D scene and were retired from the UI when the canvas became a view over the 3D one. Their code is still in the tree; re-exposing them over `Scene3` has not been done. The freehand fit (`oc-fit`: stroke to `line → arc → conic → asphere → spline` with a complexity slider) is in the same position, engine present and drawing tool not currently wired.
 
-What the app carries today: the detector dock (irradiance heatmap or spot diagram, with hits, flux, centroid and OPL) and the Abbe glass map as the material picker.
+What the app carries today: the detector dock (a heatmap of the face, its polar map when the detector measures intensity, or a spot diagram, with hits, flux, centroid and OPL) and the Abbe glass map as the material picker.
 
 **Under the hood**
 - Two-tier tracer: a fast f32 path draws the picture, an exact f64 reference computes every displayed *number*, and numbers never come from the fast path. The f32 path has a `wgpu` compute backend and a CPU mirror; in the browser the WebGPU backend takes over from about 5,000 segments a frame, where it becomes the faster of the two.

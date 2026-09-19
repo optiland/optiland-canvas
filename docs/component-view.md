@@ -28,7 +28,7 @@ No file format changed. Aspheric faces and tabulated reflectance and transmittan
 | A singlet | Its profile, with handles and fields (the lens editor) |
 | A flat surface: mirror, splitter, dichroic, clear plate, absorber | Its reflectance and transmittance across the visible band, with handles (the coating editor) |
 | An aperture | The mask face on, with rings for the opening and a central stop |
-| A detector | The cells of the last exact trace, face on. The numbers stay in the detector dock, which follows the selection. |
+| A detector | What it measures, and the picture that measure makes: the face cells of the last exact trace for power and irradiance, the polar map of arrival directions for intensity. The numbers stay in the detector dock, which follows the selection. See [what a detector measures](detectors.md). |
 | A light source (3D view only) | Its spectral lines |
 | A prism or another body | A summary: kind, position, glass |
 
@@ -186,7 +186,7 @@ The `oc-gpu` work turned up differences between the f32 preview and the f64 trac
 - **Control points:** there are four per face, at fixed fractions of the semi-aperture.
 - **Paraxial numbers:** they are for the lens alone, on its own axis, at the d line.
 - **Coatings:** the `film` kind is a real thin-film stack and depends on the angle of incidence; every other kind is scalar and does not. All are zero-thickness and applied to both faces by the kind buttons. A mirror's reflectivity is shown but not editable in the window. See [coatings](coatings.md).
-- **Detector view:** it is a picture of the last exact trace.
+- **Detector view:** it is a picture of the last exact trace. The measure is the detector's own, stored in the scene rather than a setting of the window, and the cone is read only when the measure is intensity. The number of bins, on the face or across the cone, is not editable here.
 - **Source view:** it shows spectral lines only for the first source, the one the source panel edits.
 - **Other bodies:** prisms and analytic solids get a summary, not an editor.
 

@@ -16,6 +16,8 @@
 import type { Canvas } from "../../pkg/oc_wasm.js";
 import { heatRgb } from "../heat";
 import type { SceneObject } from "../render3d/cards3d";
+import { bringToFront } from "../cards";
+import { drawPolarMap } from "../polarmap";
 import { parseDetectorMaps } from "../render3d/types";
 import { createCoatingEditor } from "./coating-editor";
 import type { InsetContent } from "./inset";
@@ -26,6 +28,7 @@ import {
   fmt,
   hitHandle,
   numberField,
+  segmented,
   type DragPhase,
   type Editor,
   type EditorContext,
@@ -178,7 +181,15 @@ export function createComponentView(opts: {
     }
     readObjects();
     const kind = kindFor(id);
-    if (id !== shownId || kind !== shownKind) build(id, kind);
+    if (id !== shownId || kind !== shownKind) {
+      build(id, kind);
+      // Selecting an object opens its inspector card, which joins the same
+      // floating stack and would land on top of this window. The window the
+      // user is about to edit in comes back to the front; clicking a card
+      // still puts that card above it.
+      const frame = opts.body.closest(".inset");
+      if (frame) bringToFront(frame as HTMLElement);
+    }
     editor?.refresh();
     shownRev = rev;
     opts.setSubtitle(subtitle(id, kind));
@@ -373,16 +384,130 @@ function apertureView(ctx: EditorContext, objectOf: () => SceneObject | undefine
   };
 }
 
-/** A detector, face on, with the incident-flux cells of the last exact trace.
- *  The numbers stay in the detector dock, which follows the selection. */
+/** A detector: what it measures, and the picture that measure makes.
+ *
+ *  Power and irradiance are the same face histogram with different divisors,
+ *  so both draw the face. Intensity is a different histogram entirely, binned
+ *  by the direction light arrived from, so it draws the polar map instead.
+ *  The dock carries the same numbers and follows the same selection. */
 function detectorView(ctx: EditorContext): Editor {
   const { scene, id } = ctx;
-  return {
-    hint: "face on · the cells of the last exact trace; the numbers are in the detector dock",
-    refresh() {
-      ctx.read.textContent = "";
+
+  type Measure = "power" | "irradiance" | "intensity";
+  type Info = {
+    measure: Measure;
+    unit: string;
+    bins: [number, number];
+    coneDeg: number | null;
+    coneBins: [number, number];
+    cells: number[];
+    outsideCone: number;
+    peak: number | null;
+    totalIncident: number;
+    hits: number;
+  };
+  let info: Info | null = null;
+
+  const pick = segmented<Measure>(
+    ctx.bar,
+    [
+      { value: "power", text: "power", title: "flux landing in each cell of the face" },
+      { value: "irradiance", text: "irradiance", title: "that flux over the cell's area, per mm²" },
+      {
+        value: "intensity",
+        text: "intensity",
+        title: "flux per steradian, binned by the direction light arrived from",
+      },
+    ],
+    (m) => {
+      if (!scene.setDetectorMeasure(id, m, info?.coneDeg ?? 30)) {
+        ctx.note("this detector cannot measure that", true);
+        return;
+      }
+      ctx.note("");
+      reread();
+      ctx.edited(true);
     },
+  );
+
+  const cone = numberField(ctx.fields, "cone", "°", {
+    name: "cone",
+    step: 5,
+    digits: 1,
+    title: "the half angle the histogram spans, from the face normal",
+    commit: (v) => {
+      if (!scene.setDetectorMeasure(id, "intensity", v)) {
+        ctx.note("a cone has to be inside (0, 90] degrees", true);
+        return;
+      }
+      ctx.note("");
+      reread();
+      ctx.edited(true);
+    },
+  });
+
+  /** Only intensity has a cone; the rest of the time the field is noise. */
+  function showConeField(on: boolean) {
+    (cone.input.closest(".cv-field") as HTMLElement | null)?.toggleAttribute("hidden", !on);
+  }
+
+  function reread() {
+    const raw = JSON.parse(scene.detectorResultJSON(id));
+    info = raw && typeof raw === "object" ? (raw as Info) : null;
+    pick.set(info?.measure ?? null);
+    showConeField(info?.measure === "intensity");
+    if (info?.coneDeg != null) cone.set(info.coneDeg);
+    writeReadout();
+  }
+
+  function writeReadout() {
+    ctx.read.replaceChildren();
+    if (!info) return;
+    const line = document.createElement("div");
+    if (info.hits === 0) {
+      line.textContent = "no rays on this detector yet";
+    } else if (info.measure === "intensity") {
+      const [rings, sectors] = info.coneBins;
+      const share = info.totalIncident > 0 ? info.outsideCone / info.totalIncident : 0;
+      const past =
+        share > 1e-9
+          ? `, and ${(share * 100).toFixed(1)}% of the flux arrived past it`
+          : ", and everything arrived inside it";
+      line.textContent =
+        `peak ${fmt(info.peak ?? 0, 4)} ${info.unit} over ${rings} ring${rings === 1 ? "" : "s"}` +
+        ` × ${sectors} sector${sectors === 1 ? "" : "s"} out to ${fmt(info.coneDeg ?? 0, 0)}°${past}`;
+    } else {
+      line.textContent = `peak ${fmt(info.peak ?? 0, 4)} ${info.unit} across ${info.bins[0]} × ${info.bins[1]} cells`;
+    }
+    ctx.read.appendChild(line);
+
+    const note = document.createElement("div");
+    note.textContent =
+      info.measure === "intensity"
+        ? "radius is the angle off the normal, not its sine; one sector is the I(θ) curve"
+        : "flux is relative to the source's, so the unit is per mm² of that and not W/mm²";
+    ctx.read.appendChild(note);
+  }
+
+  reread();
+
+  return {
+    hint: "face on · what the detector measures, and the picture that measure makes",
+    refresh: reread,
     draw(c, w, h) {
+      if (info?.measure === "intensity") {
+        drawPolarMap(
+          c,
+          {
+            cells: info.cells,
+            rings: info.coneBins[0],
+            sectors: info.coneBins[1],
+            coneDeg: info.coneDeg ?? 0,
+          },
+          { x: 0, y: 0, w, h },
+        );
+        return;
+      }
       const map = parseDetectorMaps(scene.lastDetectorMapsF32()).find((m) => m.id === id);
       if (!map) {
         c.fillStyle = "rgba(205,214,228,0.45)";
@@ -411,7 +536,6 @@ function detectorView(ctx: EditorContext): Editor {
       }
       c.strokeStyle = "rgba(127,214,255,0.45)";
       c.strokeRect(x0 + 0.5, y0 + 0.5, fw - 1, fh - 1);
-      ctx.read.textContent = `${map.nu} × ${map.nv} cells, scaled to this detector's brightest cell`;
     },
     handles: () => [],
     drag: () => {},

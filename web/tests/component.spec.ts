@@ -615,3 +615,95 @@ test.describe("component view — polarizing elements", () => {
     await expect(page.locator('#componentInset input[data-name="extinction"]')).toHaveCount(0);
   });
 });
+
+test.describe("component view — what a detector measures", () => {
+  /** Add a detector through its own button, which selects it. */
+  async function addDetector(page: Page) {
+    await page.locator("#addDetector").click();
+    await expect(page.locator("#stat")).toContainText("segs");
+    const view = await insetView(page);
+    expect(view.kind).toBe("detector");
+    return view.id;
+  }
+
+  const result = (page: Page, id: number) =>
+    page.evaluate(
+      (i) => JSON.parse((window as unknown as { __ocDebug: any }).__ocDebug.scene.detectorResultJSON(i)),
+      id,
+    );
+
+  test("a detector starts on power and the cone field is not in the way", async ({ page }) => {
+    await freshApp(page);
+    await openInset(page);
+    const id = await addDetector(page);
+
+    const bar = page.locator("#componentInset .cv-bar");
+    for (const name of ["power", "irradiance", "intensity"]) {
+      await expect(bar.getByText(name, { exact: true })).toBeVisible();
+    }
+    await expect(bar.getByText("power", { exact: true })).toHaveClass(/active/);
+    // Only intensity has a cone, so nothing else shows the field.
+    await expect(page.locator('#componentInset input[data-name="cone"]')).toBeHidden();
+    expect((await result(page, id)).measure).toBe("power");
+  });
+
+  test("irradiance is the same light divided by the cell, and says so", async ({ page }) => {
+    await freshApp(page);
+    await openInset(page);
+    const id = await addDetector(page);
+    const before = await result(page, id);
+    expect(before.hits).toBeGreaterThan(0);
+
+    await page.locator("#componentInset .cv-bar").getByText("irradiance", { exact: true }).click();
+    await expect(page.locator("#stat")).toContainText("segs");
+
+    const after = await result(page, id);
+    expect(after.measure).toBe("irradiance");
+    expect(after.unit).toBe("flux/mm²");
+    // Same flux, same cells, one division between the two readings.
+    expect(after.totalIncident).toBeCloseTo(before.totalIncident, 12);
+    expect(after.peak).toBeCloseTo(before.peak / before.cellArea, 9);
+    await expect(page.locator("#componentInset .cv-read")).toContainText("flux/mm²");
+    // And the dock agrees, which is the number a user actually reads.
+    await expect(page.locator("#dockNums")).toContainText("flux/mm²");
+  });
+
+  test("intensity bins the arrival directions and reports per steradian", async ({ page }) => {
+    await freshApp(page);
+    await openInset(page);
+    const id = await addDetector(page);
+
+    await page.locator("#componentInset .cv-bar").getByText("intensity", { exact: true }).click();
+    await expect(page.locator("#stat")).toContainText("segs");
+
+    const info = await result(page, id);
+    expect(info.measure).toBe("intensity");
+    expect(info.unit).toBe("flux/sr");
+    // Its own grid, not the face's 64 by 64.
+    expect(info.coneBins).toEqual([24, 1]);
+    expect(info.bins).toEqual([64, 64]);
+    expect(info.cells.length).toBe(24);
+    // The solid angles partition the cone exactly, which is the property the
+    // whole measure rests on.
+    const cap = 2 * Math.PI * (1 - Math.cos((info.coneDeg * Math.PI) / 180));
+    const sum = (info.solidAngle as number[]).reduce((a: number, b: number) => a + b, 0);
+    expect(sum).toBeCloseTo(cap, 12);
+    // Every ray is either in the cone or counted as being outside it.
+    const binned = (info.cells as number[]).reduce(
+      (a: number, v: number, i: number) => a + v * info.solidAngle[i],
+      0,
+    );
+    expect(binned + info.outsideCone).toBeCloseTo(info.totalIncident, 9);
+
+    // The cone field is now the one that matters, and it holds a real cone.
+    const cone = page.locator('#componentInset input[data-name="cone"]');
+    await expect(cone).toBeVisible();
+    await cone.fill("15");
+    await expect(page.locator("#stat")).toContainText("segs");
+    expect((await result(page, id)).coneDeg).toBeCloseTo(15, 9);
+
+    // And the dock stops calling the picture a heatmap, because it is not one.
+    await expect(page.locator("#detHead")).toContainText("polar");
+    await expect(page.locator("#componentInset .cv-read")).toContainText("ring");
+  });
+});

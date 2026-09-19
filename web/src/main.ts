@@ -15,6 +15,7 @@ import { initInset } from "./inset/inset";
 import { createComponentView, type ComponentView } from "./inset/component-view";
 import { initOpenUc2 } from "./features/openuc2/OpenUc2Page";
 import { heatRgb } from "./heat";
+import { drawPolarMap } from "./polarmap";
 
 const SCALE = 6.5; // px per mm
 type V2 = { x: number; y: number };
@@ -428,6 +429,27 @@ async function main() {
     return `rgb(${r},${g},${b})`;
   }
 
+  // The angular histogram, when the detector measures intensity. A different
+  // histogram from the face one, so a different picture: polar angle outward
+  // from the middle rather than millimetres across a face.
+  function drawPolar(info: {
+    cells: number[];
+    coneBins: [number, number];
+    coneDeg: number;
+  }) {
+    const { s, ox, oy } = detSquare();
+    drawPolarMap(
+      hctx,
+      {
+        cells: info.cells,
+        rings: info.coneBins[0],
+        sectors: info.coneBins[1],
+        coneDeg: info.coneDeg,
+      },
+      { x: ox, y: oy, w: s, h: s },
+    );
+  }
+
   // 2D binning: paint the nu×nv incident-flux grid as a heatmap. Detector v
   // increases upward, canvas y downward, so the rows are flipped.
   function drawHeatmap(info: { bins: [number, number]; incident: number[] }) {
@@ -487,8 +509,16 @@ async function main() {
       dockNums.textContent = info ? "no rays on detector" : "no detector";
       return;
     }
-    if (detMode === "spot") drawSpot(detId);
-    else drawHeatmap(info);
+    if (detMode === "spot") {
+      drawSpot(detId);
+    } else if (info.measure === "intensity") {
+      // Not a heatmap of anything on the face, so the label stops saying so.
+      detHead.textContent = "detector — intensity, polar (f64)";
+      drawPolar(info);
+    } else {
+      detHead.textContent = "detector — heatmap (f64)";
+      drawHeatmap(info);
+    }
     const c = info.centroid ? `(${info.centroid[0].toFixed(2)}, ${info.centroid[1].toFixed(2)})` : "—";
     const opl = info.meanOpl == null ? "—" : Number(info.meanOpl).toFixed(2);
     const tag = detId >= 0 ? `#${detId} · ` : "";
@@ -507,7 +537,18 @@ async function main() {
       const spread = Number.isFinite(tilt) && tilt > 5 ? ` (±${tilt.toFixed(0)}° cone)` : "";
       pol = ` · pol ${(dop * 100).toFixed(1)}% ${kind}${spread}`;
     }
-    dockNums.textContent = `${tag}hits ${info.hits} · flux ${Number(info.totalIncident).toFixed(3)} · centroid ${c} mm · OPL ${opl} mm${pol}`;
+    // What the detector measures, next to the flux it collected. Power says
+    // nothing extra, because the peak of a flux histogram in flux is the
+    // number already there under another name.
+    let reads = "";
+    if (info.measure === "irradiance") {
+      reads = ` · peak ${Number(info.peak).toPrecision(3)} ${info.unit}`;
+    } else if (info.measure === "intensity") {
+      const share = Number(info.totalIncident) > 0 ? Number(info.outsideCone) / Number(info.totalIncident) : 0;
+      const past = share > 1e-9 ? `, ${(share * 100).toFixed(0)}% past ${Number(info.coneDeg).toFixed(0)}°` : "";
+      reads = ` · peak ${Number(info.peak).toPrecision(3)} ${info.unit}${past}`;
+    }
+    dockNums.textContent = `${tag}hits ${info.hits} · flux ${Number(info.totalIncident).toFixed(3)}${reads} · centroid ${c} mm · OPL ${opl} mm${pol}`;
   }
 
   // Detector analysis-mode toggle (heatmap ⇄ spot).

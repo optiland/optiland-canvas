@@ -252,6 +252,30 @@ fn interact_body(
             w.medium_n,
             scene.ambient,
         );
+        // Past the critical angle nothing gets through whatever the stack, and
+        // the grid cannot say so: it is baked from outside and saturates at
+        // grazing. So total internal reflection is taken the way bare glass
+        // takes it below, the whole ray and a primary path, which is what the
+        // reference's transfer matrix returns for a lossless coating.
+        let Some(td) = refract(w.d, n, n1, n2) else {
+            let dir = reflect(w.d, n);
+            push(
+                stack,
+                Work {
+                    o: point + dir * EPS,
+                    d: dir,
+                    flux: flux_end,
+                    depth: w.depth + 1,
+                    gdepth: w.gdepth,
+                    medium_n: w.medium_n,
+                    medium_alpha: w.medium_alpha,
+                    flags: w.flags | SEG_TIR,
+                },
+                max_depth,
+                min_flux,
+            );
+            return;
+        };
         // An AR coat's reflection is a ghost, exactly as bare glass's is below:
         // followed only with ghosts on, and within the ghost budget. Any other
         // stack's reflection is the path it was designed for.
@@ -280,25 +304,22 @@ fn interact_body(
             );
         }
         if t > 0.0 {
-            // Snell across the boundary; total internal reflection ends the
-            // transmitted branch, as it does for any other interface.
-            if let Some(dir) = refract(w.d, n, n1, n2) {
-                push(
-                    stack,
-                    Work {
-                        o: point + dir * EPS,
-                        d: dir,
-                        flux: flux_end * t,
-                        depth: w.depth + 1,
-                        gdepth: w.gdepth,
-                        medium_n: n2,
-                        medium_alpha: a2,
-                        flags: w.flags & !SEG_TIR,
-                    },
-                    max_depth,
-                    min_flux,
-                );
-            }
+            // Snell across the boundary, already solved above.
+            push(
+                stack,
+                Work {
+                    o: point + td * EPS,
+                    d: td,
+                    flux: flux_end * t,
+                    depth: w.depth + 1,
+                    gdepth: w.gdepth,
+                    medium_n: n2,
+                    medium_alpha: a2,
+                    flags: w.flags & !SEG_TIR,
+                },
+                max_depth,
+                min_flux,
+            );
         }
         return;
     }

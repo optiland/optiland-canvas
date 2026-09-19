@@ -820,9 +820,14 @@ fn an_ar_coat_reflects_ghosts_like_cpu() {
                 .map(move |l| (Vec3::new(-30.0, y, 0.5), Vec3::X, l))
         })
         .collect();
-    for scene in [&lens, &window] {
+    // The lens also gets one ray inside the glass past the critical angle,
+    // where the coated face reflects totally and the reflection is the ray.
+    let t = 60f64.to_radians();
+    let mut lens_rays = rays.clone();
+    lens_rays.push((Vec3::ZERO, Vec3::new(t.cos(), t.sin(), 0.0), 0.55));
+    for (scene, rays) in [(&lens, &lens_rays), (&window, &rays)] {
         for ghosts in [false, true] {
-            assert_gpu_matches_cpu_at(&tracer, scene, &rays, ghost_opts(ghosts));
+            assert_gpu_matches_cpu_at(&tracer, scene, rays, ghost_opts(ghosts));
         }
     }
 }

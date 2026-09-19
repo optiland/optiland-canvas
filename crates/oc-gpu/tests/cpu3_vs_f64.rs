@@ -1330,6 +1330,16 @@ fn an_ar_coated_lens_reflects_ghosts_like_f64() {
                 "and the primary path is the same either way"
             );
         }
+
+        // A ray inside the glass past the critical angle: total internal
+        // reflection at a coated face is the ray itself, a primary path in
+        // both tiers with the switch either way, never a stray reflection.
+        let t = 60f64.to_radians();
+        let inside = (Vec3::ZERO, Vec3::new(t.cos(), t.sin(), 0.0), lambda_um);
+        for ghosts in [false, true] {
+            let segs = assert_tree_geometry_matches(&scene, inside, ghosts);
+            assert!(segs[1].is_tir() && !segs[1].is_ghost(), "{segs:?}");
+        }
     }
 }
 

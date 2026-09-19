@@ -503,3 +503,87 @@ fn a_broadband_ar_beats_a_single_layer_on_the_way_out_too() {
     // bare glass loses eight.
     assert!(three > 0.98, "{three}");
 }
+
+/// Past the critical angle a coated face reflects everything, and that is the
+/// ray, not a ghost.
+///
+/// The stray rule is about what a coating fails to suppress while light gets
+/// through. Past the critical angle nothing gets through, whatever the stack:
+/// the air carries only an evanescent wave, and a lossless coating reflects
+/// all of it. So a ray inside a coated lens is totally internally reflected
+/// exactly as it is inside a bare one, a primary path with the ghost layer
+/// off. The first version of the stray rule got this wrong and dropped the
+/// whole ray.
+#[test]
+fn total_internal_reflection_at_a_coated_face_is_still_the_ray() {
+    use oc_core::build3::{BodyFace, SingletGeom};
+    use oc_core::material::LAMBDA_D;
+    use oc_core::vec3::Ray3;
+    use oc_core::thinfilm::DesignKind;
+    use oc_trace::trace3;
+
+    let lens = |kind: Option<DesignKind>| {
+        let mut s = Scene3::new();
+        let id = s.add_singlet(Vec3::ZERO, SingletGeom::biconvex(), 1.5168, 64.17);
+        if let Some(kind) = kind {
+            let d = CoatingDesign {
+                kind,
+                lambda_nm: 550.0,
+                aoi_deg: 0.0,
+                periods: 1,
+                n_high: 2.35,
+                n_low: 1.38,
+            };
+            for face in [BodyFace::Front, BodyFace::Back] {
+                assert!(s.set_body_face_coating(id.0, face, Some(d)));
+            }
+        }
+        s.validate().expect("valid");
+        s
+    };
+    // From the middle of the glass at 60 degrees: the back face is met at
+    // about 56 degrees, past the 41 degree critical angle of crown in air.
+    let t = 60f64.to_radians();
+    let ray = [launch(
+        Ray3::new(Vec3::ZERO, Vec3::new(t.cos(), t.sin(), 0.0)).unwrap(),
+        LAMBDA_D,
+        1.0,
+    )];
+
+    let bare = trace3(&lens(None), &ray, &no_ghosts());
+    assert!(bare.segments[1].flags.tir, "the bare lens reflects it totally");
+
+    for kind in [DesignKind::SingleLayerAr, DesignKind::BroadbandAr] {
+        let coated = trace3(&lens(Some(kind)), &ray, &no_ghosts());
+        assert_eq!(
+            coated.segments.len(),
+            bare.segments.len(),
+            "{kind:?}: the same path as the bare lens, with ghosts off"
+        );
+        for (i, (c, b)) in coated.segments.iter().zip(&bare.segments).enumerate() {
+            assert_eq!(c.flags.tir, b.flags.tir, "{kind:?} segment {i}: TIR flag");
+            assert!(!c.flags.ghost, "{kind:?} segment {i}: not a ghost");
+            assert!(
+                (c.b - c.a).normalize().distance((b.b - b.a).normalize()) < 1e-12,
+                "{kind:?} segment {i}: the coating does not steer the ray"
+            );
+            // Every totally reflected bounce keeps all of the light.
+            if c.flags.tir {
+                assert!(
+                    (c.flux_start - 1.0).abs() < 1e-12,
+                    "{kind:?} segment {i}: {}",
+                    c.flux_start
+                );
+            }
+        }
+        // And where the ray finally gets out, the coating lets more of it.
+        let out = |r: &oc_trace::TraceResult3| r.segments.last().unwrap().flux_start;
+        assert!(
+            out(&coated) > out(&bare),
+            "{kind:?}: {} vs {}",
+            out(&coated),
+            out(&bare)
+        );
+        assert!(coated.ledger.residual() < 1e-12);
+    }
+}

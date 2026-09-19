@@ -268,6 +268,18 @@ from inside at the conjugate angle, which a lossless stack allows because it
 reflects and transmits the same from either side; that is the property the
 test holds the two walks to, to 1e-12.
 
+**Past the critical angle the reflection is the ray.** Whether a reflection is
+stray is a question only while light gets through. A ray inside the glass past
+the critical angle cannot get out whatever the coating, because the air
+carries only an evanescent wave, so a coated face reflects it totally, exactly
+as bare glass does: a primary path, flagged as total internal reflection, and
+never a ghost. The transfer matrix gives R = 1 there for a lossless stack, and
+the test holds every such bounce to that. The preview cannot read this off its
+grid, which is baked from outside and saturates at grazing, so it takes R = 1
+outright. That is exact for every coating the app makes; a hand-written
+absorbing stack would reflect a little less in the reference than in the
+preview.
+
 A coated lens is still a lens. What separates a plate from a lens is curvature,
 not the film, so the object list and the component view keep calling it one and
 it keeps the lens editor. That was not free: the view used to ask "does this

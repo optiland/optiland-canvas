@@ -1106,6 +1106,16 @@ fn interact_body(w: Work, ev: Event, point: vec3<f32>, flux_end: f32, lambda: f3
     if (b.kind == OBJ_REVOLVE && ev.face < b.face_count) {
         let f = faces[b.face_start + ev.face];
         if (f.has_resp == 1u && f.resp.kind == RESP_COATING) {
+            // Past the critical angle nothing gets through whatever the stack,
+            // and the grid saturates at grazing rather than saying so: total
+            // internal reflection is the whole ray and a primary path, as at
+            // bare glass below. Mirrors cpu3::interact_body.
+            let resc = refract3(w.d, n, n1, n2);
+            if (resc.w < 0.5) {
+                let dir = reflect3(w.d, n);
+                push(Work(point + dir * EPS, dir, flux_end, w.depth + 1u, w.gdepth, w.medium_n, w.medium_alpha, w.flags | SEG_TIR), min_flux);
+                return;
+            }
             let cos_ic = clamp(-dot(n, w.d), 0.0, 1.0);
             let rt = sample_coating(f.resp, lambda, cos_ic, w.medium_n);
             let rc = clamp(rt.x, 0.0, 1.0);
@@ -1122,11 +1132,8 @@ fn interact_body(w: Work, ev: Event, point: vec3<f32>, flux_end: f32, lambda: f3
                 }
             }
             if (tc > 0.0) {
-                let resc = refract3(w.d, n, n1, n2);
-                if (resc.w >= 0.5) {
-                    let td2 = resc.xyz;
-                    push(Work(point + td2 * EPS, td2, flux_end * tc, w.depth + 1u, w.gdepth, n2, m2.y, w.flags & ~SEG_TIR), min_flux);
-                }
+                let td2 = resc.xyz;
+                push(Work(point + td2 * EPS, td2, flux_end * tc, w.depth + 1u, w.gdepth, n2, m2.y, w.flags & ~SEG_TIR), min_flux);
             }
             return;
         }

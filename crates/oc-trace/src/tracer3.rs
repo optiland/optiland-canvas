@@ -1009,15 +1009,31 @@ fn interact_surface(
         let frame_x = projected.normalize();
 
         let (layer, feature) = match response {
-            SurfaceResponse::Polarizer { extinction, .. } => (
-                // Amplitude on the blocked axis is the square root of the power
-                // that leaks: extinction is quoted as a power ratio.
-                Mueller::from_diagonal_jones(
-                    oc_core::thinfilm::Cx::real(1.0),
-                    oc_core::thinfilm::Cx::real(extinction.clamp(0.0, 1.0).sqrt()),
-                ),
-                PhysicsFeature::Polarizer,
-            ),
+            SurfaceResponse::Polarizer { extinction, .. } => {
+                // A datasheet's contrast curve is read at this ray's own angle
+                // of incidence. One number is the ideal layer, which holds its
+                // contrast wherever it is used, and no real polarizer does.
+                let Some(leak) = extinction.sample(cos_i.acos().to_degrees()) else {
+                    // The curve does not reach this angle and its policy says
+                    // to refuse, so there is no contrast to apply.
+                    r.report.reject(CapabilityIssue::UnsupportedSurfaceResponse {
+                        surface: surface_ref,
+                    });
+                    r.ledger.numerical_loss += flux_at;
+                    r.terminations.record(TerminationReason::UnsupportedPhysics);
+                    push_event(r, cfg, w, point, opl_at, interact_ev(Vec::new()));
+                    return;
+                };
+                (
+                    // Amplitude on the blocked axis is the square root of the
+                    // power that leaks: extinction is quoted as a power ratio.
+                    Mueller::from_diagonal_jones(
+                        oc_core::thinfilm::Cx::real(1.0),
+                        oc_core::thinfilm::Cx::real(leak.clamp(0.0, 1.0).sqrt()),
+                    ),
+                    PhysicsFeature::Polarizer,
+                )
+            }
             SurfaceResponse::Retarder {
                 retardance_deg,
                 crystal,

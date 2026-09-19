@@ -2145,10 +2145,20 @@ impl Canvas {
                 extinction,
                 substrate_index,
             } => format!(
-                "{{\"kind\":\"polarizer\",\"axisDeg\":{},\"extinction\":{},\"retardanceDeg\":null,\"substrateIndex\":{},\"crystal\":null}}",
+                "{{\"kind\":\"polarizer\",\"axisDeg\":{},\"extinction\":{},\"retardanceDeg\":null,\"substrateIndex\":{},\"crystal\":null,\"extinctionTable\":{}}}",
                 json_num(*axis_deg),
-                json_num(*extinction),
-                json_num(*substrate_index)
+                json_num(extinction.on_axis()),
+                json_num(*substrate_index),
+                match extinction {
+                    oc_core::scene3::AngularScalar::Constant(_) => "null".to_string(),
+                    oc_core::scene3::AngularScalar::Tabulated {
+                        aoi_deg, values, ..
+                    } => format!(
+                        "{{\"aoiDeg\":[{}],\"extinction\":[{}]}}",
+                        aoi_deg.iter().map(|v| json_num(*v)).collect::<Vec<_>>().join(","),
+                        values.iter().map(|v| json_num(*v)).collect::<Vec<_>>().join(",")
+                    ),
+                }
             ),
             SurfaceResponse::Retarder {
                 axis_deg,
@@ -2173,6 +2183,35 @@ impl Canvas {
                 }
             ),
             _ => "null".into(),
+        }
+    }
+
+    /// Set a polarizer's extinction from a datasheet: the power fraction that
+    /// leaks past the blocked axis, against angle of incidence in degrees.
+    ///
+    /// The arrays must be the same length, at least two long, with angles
+    /// strictly increasing in `[0, 90)` and values in `[0, 1]`. Outside the
+    /// measured range the curve holds its endpoint, so the range somebody
+    /// measured is the range to trust: a real polarizer is worse out there,
+    /// not the same.
+    ///
+    /// `setPolarizerExtinction` puts it back to one number, which is an ideal
+    /// layer holding its contrast at every angle.
+    #[wasm_bindgen(js_name = setPolarizerExtinctionTable)]
+    pub fn set_polarizer_extinction_table(
+        &mut self,
+        id: f64,
+        aoi_deg: &[f64],
+        extinction: &[f64],
+    ) -> bool {
+        let Some(scene) = self.scene3.as_mut() else {
+            return false;
+        };
+        if scene.set_polarizer_extinction_table(id as u64, aoi_deg, extinction) {
+            self.revision += 1;
+            true
+        } else {
+            false
         }
     }
 

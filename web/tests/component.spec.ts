@@ -519,6 +519,56 @@ test.describe("component view — polarizing elements", () => {
     await expect(page.locator('#componentInset input[data-name="order"]')).toBeHidden();
   });
 
+  test("a polarizer's contrast can come off a datasheet and the plot says so", async ({ page }) => {
+    await freshApp(page);
+    await openInset(page);
+    await addAndSelect(page, "addPolarizer");
+    const id = (await insetView(page)).id;
+
+    // Ideal to begin with: one number, and the readout says it holds anywhere.
+    await expect(page.locator("#componentInset .cv-read")).toContainText("at every angle");
+
+    const ok = await page.evaluate(
+      (i) =>
+        (window as unknown as { __ocDebug: any }).__ocDebug.scene.setPolarizerExtinctionTable(
+          i,
+          new Float64Array([0, 10, 25, 40]),
+          new Float64Array([1e-4, 3e-4, 5e-3, 8e-2]),
+        ),
+      id,
+    );
+    expect(ok).toBe(true);
+    await expect(page.locator("#stat")).toContainText("segs");
+    // A table is set from script, not from the panel, so nudge the inset the
+    // way reopening it would.
+    await page.evaluate(() => {
+      const d = (window as unknown as { __ocDebug: any }).__ocDebug;
+      d.inset.close();
+      d.inset.open();
+    });
+
+    // The readout names the range somebody measured rather than implying the
+    // number holds everywhere.
+    await expect(page.locator("#componentInset .cv-read")).toContainText("measured out to 40°");
+    const table = await page.evaluate(
+      (i) => JSON.parse((window as unknown as { __ocDebug: any }).__ocDebug.scene.surfacePolarizationJSON(i)).extinctionTable,
+      id,
+    );
+    expect(table.aoiDeg).toEqual([0, 10, 25, 40]);
+    // The field still shows the on-axis contrast, which is the headline number.
+    await expect(page.locator('#componentInset input[data-name="extinction"]')).toHaveValue("1.000e-4");
+
+    // Typing one number puts it back to an ideal layer.
+    await page.locator('#componentInset input[data-name="extinction"]').fill("1e-5");
+    await expect(page.locator("#componentInset .cv-read")).toContainText("at every angle");
+    expect(
+      await page.evaluate(
+        (i) => JSON.parse((window as unknown as { __ocDebug: any }).__ocDebug.scene.surfacePolarizationJSON(i)).extinctionTable,
+        id,
+      ),
+    ).toBeNull();
+  });
+
   test("the extinction field is there on a polarizer and not on a waveplate", async ({ page }) => {
     await freshApp(page);
     await openInset(page);

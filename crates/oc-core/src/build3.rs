@@ -31,7 +31,8 @@ use crate::thinfilm::{
     film_coating, plate_coating, Coating, CoatingDesign, DesignKind, ExitFace, Incidence,
 };
 use crate::scene3::{
-    AbsorptionModel, AngularDistribution3, Aperture3, ApertureInteraction, ApertureShape3, Body3,
+    AbsorptionModel, AngularDistribution3, AngularScalar, Aperture3, ApertureInteraction,
+    ApertureShape3, Body3,
     Detector3, DetectorGeometry3, DetectorResponse, DetectorTermination, Interpolation,
     ObjectCommon, OutOfRangePolicy, PatchResponseOverride, PlanarShape2, SamplingSequence, Scene3,
     SolidGeometry3, Source3, SourceSampling, SpatialDistribution3, SpectralScalar,
@@ -627,7 +628,7 @@ impl Scene3 {
         }
         let r = SurfaceResponse::Polarizer {
             axis_deg,
-            extinction,
+            extinction: AngularScalar::Constant(extinction),
             substrate_index: 1.0,
         };
         Some(self.add_planar_element(pos, radius_mm, tilt_deg, r.clone(), r))
@@ -713,11 +714,62 @@ impl Scene3 {
         let mut touched = false;
         let ok = self.map_polarizing(id, &mut |r| {
             if let SurfaceResponse::Polarizer { extinction: e, .. } = r {
-                *e = v;
+                *e = AngularScalar::Constant(v);
                 touched = true;
             }
         });
         ok && touched
+    }
+
+    /// Set a polarizer's extinction from a datasheet: the power fraction that
+    /// leaks past the blocked axis, against angle of incidence in degrees.
+    ///
+    /// This is the only way to say where a polarizer stops working. A wire
+    /// grid loses contrast off axis, a thin-film polarizer or a MacNeille cube
+    /// is built around a Brewster match at one angle and gives up a couple of
+    /// degrees away from it, and a Glan prism has a hard acceptance cone. None
+    /// of that follows from anything the kernel can compute about an ideal
+    /// layer, so it comes from measurement or not at all.
+    ///
+    /// Outside the angles given, the table holds its endpoint. A real
+    /// polarizer is worse out there, not the same, so the range it was
+    /// measured over is the range to trust.
+    ///
+    /// False for an element that is not a polarizer, or for a table that is
+    /// not two or more strictly increasing angles in `[0, 90)` with values in
+    /// `[0, 1]`.
+    pub fn set_polarizer_extinction_table(
+        &mut self,
+        id: u64,
+        aoi_deg: &[f64],
+        extinction: &[f64],
+    ) -> bool {
+        let table = AngularScalar::Tabulated {
+            aoi_deg: aoi_deg.to_vec(),
+            values: extinction.to_vec(),
+            interpolation: Interpolation::Linear,
+            out_of_range: OutOfRangePolicy::Clamp,
+        };
+        if table.validate("extinction").is_err() || !table.is_unit_fraction() {
+            return false;
+        }
+        let mut touched = false;
+        let ok = self.map_polarizing(id, &mut |r| {
+            if let SurfaceResponse::Polarizer { extinction: e, .. } = r {
+                *e = table.clone();
+                touched = true;
+            }
+        });
+        ok && touched
+    }
+
+    /// A polarizer's extinction curve, if `id` is one.
+    pub fn polarizer_extinction(&self, id: u64) -> Option<&AngularScalar> {
+        let s = self.surfaces.iter().find(|s| s.common.id.0 == id)?;
+        match &s.response_front {
+            SurfaceResponse::Polarizer { extinction, .. } => Some(extinction),
+            _ => None,
+        }
     }
 
     /// Set a retarder's retardance in degrees: 90 is a quarter wave, 180 a half

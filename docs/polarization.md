@@ -50,7 +50,7 @@ and does not change it.
 | Mirror | One number. Treated as an ideal reflector: equal for s and p, no retardance. |
 | `ExplicitRt` | Two numbers. Treated as an ideal grey attenuator, polarization-blind and phase-neutral. |
 | Ideal thin lens | No polarization action. |
-| Polarizer | Passes the field on its transmission axis, absorbs the perpendicular component, leaks its stated extinction. Optionally laminated in glass, whose two faces then do real Fresnel. |
+| Polarizer | Passes the field on its transmission axis, absorbs the perpendicular component, leaks its stated extinction, which is one number or a measured curve against angle. Optionally laminated in glass, whose two faces then do real Fresnel. |
 | Retarder | Adds a phase to its slow axis. Either a number, or a real slab of uniaxial crystal, which moves with wavelength and angle. Lossless, unless it is laminated, when its faces reflect. |
 
 **Power data cannot supply a phase.** `Rs`, `Rp`, `Ts` and `Tp` fix the
@@ -137,6 +137,34 @@ whenever an element has a substrate.
 
 What the faces reflect is a ghost like any other: followed when ghosts are on,
 named in the ledger when they are off, and absorbed in neither case.
+
+## Where a polarizer stops working
+
+Everything above gives the polarizing layer itself one contrast, held at every
+angle. No real one does. A wire grid loses contrast off axis; a thin-film
+polarizer or a MacNeille cube is built around a Brewster match at one angle and
+gives up a couple of degrees away from it; a Glan prism has a hard acceptance
+cone past which its ordinary ray stops being totally reflected.
+
+None of that follows from anything the kernel can compute. A coating's angle
+dependence falls out of its own stack, and an ideal layer has no stack. So the
+extinction is either one number or **a curve against angle of incidence**,
+which is how a datasheet gives it and the only honest way to say where a
+polarizer stops being one:
+
+```js
+scene.setPolarizerExtinctionTable(id, [0, 10, 25, 40], [1e-4, 3e-4, 5e-3, 8e-2]);
+```
+
+Outside the angles measured the curve holds its endpoint. That is a known
+understatement, not a model: a real polarizer is worse out there, not the same,
+so the range somebody measured is the range to trust. The component view plots
+the curve on a log scale with the samples marked, because it is data and a
+reader should see where the measurements are and where the line is a guess
+between them.
+
+Typing a number into the extinction field puts it back to one value at every
+angle, which is the ideal layer.
 
 ## A waveplate made of something
 
@@ -287,11 +315,9 @@ before.
   by side. One ray goes in here and one comes out.
 - **Depolarization.** Nothing here depolarizes. Scatter and roughness would, and
   neither is modelled.
-- **The polarizing layer's own acceptance angle.** The faces are modelled and
-  the layer is not: a wire grid loses contrast off axis, a thin-film polarizer
-  or a MacNeille cube is built around a Brewster match at one angle and stops
-  working a couple of degrees away from it, and a Glan-Taylor has a hard
-  acceptance cone. Extinction here is one number at every angle.
+- **Where an acceptance angle comes from.** The contrast curve is data, not a
+  model. The kernel will not derive a wire grid's angular response, and nothing
+  it can compute about an ideal layer would.
 - **Thickness.** A substrate is an index and not a plate: no displacement of a
   beam through a tilted element, no optical path, and no bounce between the two
   faces.

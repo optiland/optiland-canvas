@@ -45,10 +45,13 @@ type Crystal = {
 type Pol = {
   kind: "polarizer" | "retarder";
   axisDeg: number;
+  /** On axis. When a table is present this is its first sample. */
   extinction: number | null;
   retardanceDeg: number | null;
   substrateIndex: number;
   crystal: Crystal | null;
+  /** A measured contrast curve, or null for an ideal layer. */
+  extinctionTable: { aoiDeg: number[]; extinction: number[] } | null;
 };
 
 /** The crystals a waveplate is usually cut from, at the sodium D line.
@@ -199,7 +202,8 @@ export function createPolarizationEditor(ctx: EditorContext): Editor {
       digits: 6,
       exponent: true,
       name: "extinction",
-      title: "the power fraction of the blocked component that still gets through: 0 is perfect, 1e-4 an ordinary sheet",
+      title:
+        "the power fraction of the blocked component that still gets through: 0 is perfect, 1e-4 an ordinary sheet. Typing here makes it one number at every angle; a measured curve is set through setPolarizerExtinctionTable",
     });
   } else {
     valueField = numberField(ctx.fields, "retardance", "°", {
@@ -279,8 +283,12 @@ export function createPolarizationEditor(ctx: EditorContext): Editor {
       const e = pol.extinction ?? 0;
       // What a real sheet is quoted as: the ratio of the two crossed states.
       const ratio = e > 0 ? `1 : ${fmt(1 / e, 0)}` : "perfect";
+      const t = pol.extinctionTable;
+      const where = t
+        ? ` on axis, measured out to ${fmt(t.aoiDeg[t.aoiDeg.length - 1], 0)}°`
+        : " at every angle";
       line.textContent =
-        `polarizer · axis ${fmt(pol.axisDeg, 1)}° · extinction ${ratio}` +
+        `polarizer · axis ${fmt(pol.axisDeg, 1)}° · extinction ${ratio}${where}` +
         ` · unpolarized light loses half its flux here`;
     } else {
       const d = pol.retardanceDeg ?? 0;
@@ -328,8 +336,9 @@ export function createPolarizationEditor(ctx: EditorContext): Editor {
     plot.h = Math.max(24, h - plot.t - 24);
 
     drawFace(c);
-    if (pol.kind === "polarizer") drawMalus(c);
-    else drawEllipse(c);
+    if (pol.kind === "retarder") drawEllipse(c);
+    else if (pol.extinctionTable) drawContrast(c);
+    else drawMalus(c);
   }
 
   /** The plate seen along the beam, with its axis across it. */
@@ -416,6 +425,55 @@ export function createPolarizationEditor(ctx: EditorContext): Editor {
     c.fillText("unpolarized", X(4), Y(0.5 * (1 + e)) - 4);
     c.textAlign = "center";
     c.fillText("linear in", plot.l + plot.w / 2, plot.t + plot.h + 15);
+  }
+
+  /** A measured contrast curve: what leaks past the blocked axis, against the
+   *  angle the polarizer is used at.
+   *
+   *  Malus' law is not what is interesting once there is measured data. Every
+   *  polarizer obeys Malus; what tells one apart from another is where it
+   *  stops obeying it, and that is this curve. Drawn on a log scale, because
+   *  an extinction table spans decades and a linear axis would show a flat
+   *  line and then a cliff. */
+  function drawContrast(c: CanvasRenderingContext2D) {
+    const t = pol.extinctionTable!;
+    const maxDeg = Math.max(10, t.aoiDeg[t.aoiDeg.length - 1]);
+    // Decades from the best contrast measured down to a tenth, rounded out.
+    const lo = Math.log10(Math.max(1e-8, Math.min(...t.extinction)));
+    const hi = Math.log10(Math.max(1e-7, Math.max(...t.extinction)));
+    const top = Math.ceil(hi);
+    const bottom = Math.min(top - 1, Math.floor(lo));
+    const X = (deg: number) => plot.l + (deg / maxDeg) * plot.w;
+    const Y = (v: number) =>
+      plot.t + (1 - (Math.log10(Math.max(1e-12, v)) - bottom) / (top - bottom)) * plot.h;
+
+    axes(c, "0°", `${fmt(maxDeg, 0)}°`, `1e${top}`);
+
+    c.beginPath();
+    t.aoiDeg.forEach((deg, i) => {
+      const x = X(deg), y = Y(t.extinction[i]);
+      if (i === 0) c.moveTo(x, y); else c.lineTo(x, y);
+    });
+    c.strokeStyle = CURVE_COLOR;
+    c.lineWidth = 1.5;
+    c.stroke();
+
+    // The samples themselves, because this is data and not a model: a reader
+    // should see where the measurements are and where the line is a guess
+    // between them.
+    c.fillStyle = CURVE_COLOR;
+    t.aoiDeg.forEach((deg, i) => {
+      c.beginPath();
+      c.arc(X(deg), Y(t.extinction[i]), 2, 0, Math.PI * 2);
+      c.fill();
+    });
+
+    c.fillStyle = "rgba(180,196,220,0.65)";
+    c.font = "9px ui-monospace, monospace";
+    c.textAlign = "center";
+    c.fillText("angle of incidence", plot.l + plot.w / 2, plot.t + plot.h + 15);
+    c.textAlign = "left";
+    c.fillText(`1e${bottom}`, plot.l + 2, plot.t + plot.h - 3);
   }
 
   /** The ellipse linear light at 45° to the fast axis comes out as. */

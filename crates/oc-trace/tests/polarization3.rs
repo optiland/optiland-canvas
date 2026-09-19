@@ -662,6 +662,17 @@ fn add_pol_in_glass(s: &mut Scene3, x: f64, axis_deg: f64, n_sub: f64) {
     assert!(s.set_polarizing_substrate(id, n_sub), "substrate");
 }
 
+/// A polarizer whose contrast came off a datasheet: a curve against angle.
+fn add_pol_table(s: &mut Scene3, x: f64, axis_deg: f64, aoi: &[f64], leak: &[f64]) {
+    let id = s
+        .add_polarizer(Vec3::new(x, 0.0, 0.0), 15.0, 0.0, axis_deg, 0.0)
+        .expect("polarizer");
+    assert!(
+        s.set_polarizer_extinction_table(id, aoi, leak),
+        "the table is well formed"
+    );
+}
+
 /// The power reflectances `(s, p)` of one air-to-glass face, straight from
 /// Fresnel and not from the kernel, so a test that uses it is an oracle and not
 /// a mirror.
@@ -852,7 +863,7 @@ fn a_polarizer_on_a_solid_is_refused() {
     let b = s.bodies.last_mut().unwrap();
     let r = oc_core::scene3::SurfaceResponse::Polarizer {
         axis_deg: 0.0,
-        extinction: 0.0,
+        extinction: oc_core::scene3::AngularScalar::Constant(0.0),
         substrate_index: 1.0,
     };
     b.surface.default.from_outside = r.clone();
@@ -1203,4 +1214,105 @@ fn a_multi_order_plate_slips_off_axis_where_a_zero_order_one_holds() {
     });
     assert!(zero.dolp() < 0.05, "zero order holds: {}", zero.dolp());
     assert!(tenth.dolp() > 0.5, "tenth order does not: {}", tenth.dolp());
+}
+
+
+// ---------------------------------------------------------------------------
+// Contrast off a datasheet
+// ---------------------------------------------------------------------------
+
+/// A polarizer can be told where it stops working, because nothing the kernel
+/// computes about an ideal layer will ever say so.
+///
+/// A wire grid loses contrast off axis, a thin-film polarizer gives up a couple
+/// of degrees from its design angle, and a Glan prism has a hard acceptance
+/// cone. None of that follows from a stack, so it comes from measurement. The
+/// light launched here is already linear along the axis the polarizer blocks,
+/// so what arrives *is* the leak and nothing else.
+#[test]
+fn a_polarizer_can_lose_its_contrast_off_axis() {
+    // Four angles off a plausible wire-grid datasheet.
+    let aoi = [0.0f64, 10.0, 25.0, 40.0];
+    let leak = [1e-4f64, 3e-4, 5e-3, 8e-2];
+    let blocked = oc_core::polarization::Stokes::linear(1.0, std::f64::consts::FRAC_PI_2);
+
+    for (deg, want) in aoi.iter().zip(leak) {
+        let dir = skew_dir(*deg, 0.0);
+        let st = skew_state_bench(*deg, 0.0, blocked, seen_axis(0.0, dir), |s| {
+            add_pol_table(s, 0.0, 0.0, &aoi, &leak);
+        });
+        assert!(
+            (st.s0 - want).abs() < 1e-12,
+            "at {deg} degrees the datasheet says {want} and the trace says {}",
+            st.s0
+        );
+    }
+
+    // Between samples the curve is interpolated, not stepped.
+    let dir = skew_dir(17.5, 0.0);
+    let st = skew_state_bench(17.5, 0.0, blocked, seen_axis(0.0, dir), |s| {
+        add_pol_table(s, 0.0, 0.0, &aoi, &leak);
+    });
+    let want = 3e-4 + (5e-3 - 3e-4) * (17.5 - 10.0) / (25.0 - 10.0);
+    assert!((st.s0 - want).abs() < 1e-12, "at 17.5: {} vs {want}", st.s0);
+
+    // Past the last measurement the curve holds its endpoint, which is the
+    // honest thing to do with a range nobody measured.
+    let dir = skew_dir(55.0, 0.0);
+    let st = skew_state_bench(55.0, 0.0, blocked, seen_axis(0.0, dir), |s| {
+        add_pol_table(s, 0.0, 0.0, &aoi, &leak);
+    });
+    assert!((st.s0 - 8e-2).abs() < 1e-12, "past the table: {}", st.s0);
+
+    // And an ideal layer keeps its contrast wherever it is used, which is the
+    // thing a datasheet disagrees with.
+    for deg in [0.0f64, 25.0, 55.0] {
+        let dir = skew_dir(deg, 0.0);
+        let st = skew_state_bench(deg, 0.0, blocked, seen_axis(0.0, dir), |s| {
+            add_pol(s, 0.0, 0.0, 1e-4);
+        });
+        assert!((st.s0 - 1e-4).abs() < 1e-15, "ideal at {deg}: {}", st.s0);
+    }
+}
+
+/// A contrast curve that could not have come from a measurement is refused
+/// rather than repaired.
+#[test]
+fn a_contrast_curve_has_to_be_a_curve() {
+    let mut s = Scene3::new();
+    let id = s
+        .add_polarizer(Vec3::ZERO, 15.0, 0.0, 0.0, 0.0)
+        .expect("polarizer");
+
+    let bad: [(&[f64], &[f64], &str); 5] = [
+        (&[0.0], &[1e-4], "one sample interpolates nothing"),
+        (&[0.0, 10.0], &[1e-4], "the arrays disagree in length"),
+        (&[10.0, 0.0], &[1e-4, 1e-3], "the angles run backwards"),
+        (&[0.0, 90.0], &[1e-4, 1e-3], "90 degrees is grazing, not an angle of use"),
+        (&[0.0, 10.0], &[1e-4, 1.5], "an extinction above 1 is more light than arrived"),
+    ];
+    for (aoi, leak, why) in bad {
+        assert!(
+            !s.set_polarizer_extinction_table(id, aoi, leak),
+            "refused: {why}"
+        );
+    }
+    // And the element still has the contrast it started with.
+    assert!(matches!(
+        s.polarizer_extinction(id),
+        Some(oc_core::scene3::AngularScalar::Constant(v)) if *v == 0.0
+    ));
+    assert!(s.set_polarizer_extinction_table(id, &[0.0, 10.0], &[1e-4, 1e-3]));
+    assert!(matches!(
+        s.polarizer_extinction(id),
+        Some(oc_core::scene3::AngularScalar::Tabulated { .. })
+    ));
+    s.validate().expect("a measured polarizer is a valid scene");
+
+    // Setting one number again puts it back to an ideal layer.
+    assert!(s.set_polarizer_extinction(id, 1e-4));
+    assert!(matches!(
+        s.polarizer_extinction(id),
+        Some(oc_core::scene3::AngularScalar::Constant(_))
+    ));
 }

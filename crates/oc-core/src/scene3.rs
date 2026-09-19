@@ -273,6 +273,105 @@ impl SpectralScalar {
 
 /// A wavelength table is a function: strictly increasing, at least two samples,
 /// matched lengths, all finite.
+/// A quantity that varies with the angle a ray arrives at, in degrees from the
+/// element's normal.
+///
+/// [`SpectralScalar`] in the other variable. A coating needs nothing like this:
+/// its angle dependence falls out of its own stack, computed at each ray's own
+/// angle. This is here for the one thing no stack can supply, an ideal
+/// polarizing layer's contrast, which either comes off a datasheet or is not
+/// known at all.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum AngularScalar {
+    Constant(f64),
+    Tabulated {
+        aoi_deg: Vec<f64>,
+        values: Vec<f64>,
+        interpolation: Interpolation,
+        out_of_range: OutOfRangePolicy,
+    },
+}
+
+impl AngularScalar {
+    /// The value at an angle of incidence, or `None` where the table has no
+    /// answer and its policy says to refuse rather than invent one.
+    pub fn sample(&self, aoi_deg: f64) -> Option<f64> {
+        match self {
+            Self::Constant(v) => Some(*v),
+            Self::Tabulated {
+                aoi_deg: xs,
+                values,
+                out_of_range,
+                ..
+            } => interp_table(xs, values, aoi_deg, *out_of_range),
+        }
+    }
+
+    /// The value on axis, which is the one number anything without an angle
+    /// has to use: the f32 preview, and a datasheet headline.
+    pub fn on_axis(&self) -> f64 {
+        self.sample(0.0).unwrap_or_else(|| match self {
+            Self::Constant(v) => *v,
+            Self::Tabulated { values, .. } => values.first().copied().unwrap_or(0.0),
+        })
+    }
+
+    fn values(&self) -> &[f64] {
+        match self {
+            Self::Constant(v) => std::slice::from_ref(v),
+            Self::Tabulated { values, .. } => values,
+        }
+    }
+
+    /// Is every sample within `[0, 1]`? Used where the quantity is a fraction.
+    pub fn is_unit_fraction(&self) -> bool {
+        self.values().iter().all(|v| (0.0..=1.0).contains(v))
+    }
+
+    pub(crate) fn validate(&self, field: &str) -> Result<(), SceneError> {
+        match self {
+            Self::Constant(v) => {
+                if !v.is_finite() {
+                    return Err(SceneError::NonFinite {
+                        object: None,
+                        field: field.to_string(),
+                    });
+                }
+                Ok(())
+            }
+            Self::Tabulated {
+                aoi_deg, values, ..
+            } => validate_angle_table(field, aoi_deg, values),
+        }
+    }
+}
+
+/// The angle version of [`validate_table`]. Same rules, except that zero is the
+/// most important sample rather than an illegal one, and nothing past grazing
+/// means anything.
+fn validate_angle_table(field: &str, aoi_deg: &[f64], values: &[f64]) -> Result<(), SceneError> {
+    let bad = |reason: &str| SceneError::InvalidTable {
+        field: field.to_string(),
+        reason: reason.to_string(),
+    };
+    if aoi_deg.len() != values.len() {
+        return Err(bad("angle and value arrays have different lengths"));
+    }
+    if aoi_deg.len() < 2 {
+        return Err(bad("a table needs at least two samples to interpolate"));
+    }
+    if aoi_deg.iter().chain(values).any(|v| !v.is_finite()) {
+        return Err(bad("a sample is not finite"));
+    }
+    if aoi_deg.iter().any(|a| !(0.0..90.0).contains(a)) {
+        return Err(bad("angle of incidence must be in [0, 90)"));
+    }
+    if aoi_deg.windows(2).any(|w| w[1] <= w[0]) {
+        return Err(bad("angles must be strictly increasing"));
+    }
+    Ok(())
+}
+
 fn validate_table(field: &str, lambda_um: &[f64], values: &[f64]) -> Result<(), SceneError> {
     let bad = |reason: &str| SceneError::InvalidTable {
         field: field.to_string(),
@@ -504,12 +603,19 @@ pub enum SurfaceResponse {
     ///
     /// `extinction` is the **power** fraction of the blocked component that
     /// still gets through, so 0 is perfect and 1e-4 is an ordinary sheet
-    /// polarizer. Only meaningful on a standalone planar surface, whose local
-    /// `+X` the axis is measured from; a body patch authoring one is rejected.
+    /// polarizer. One number is an ideal layer that holds its contrast at every
+    /// angle; a table against angle of incidence is a real one, and is the only
+    /// way to say where a wire grid, a thin-film polarizer or a Glan prism
+    /// stops working, because no stack the kernel can compute will tell it.
+    ///
+    /// Only meaningful on a standalone planar surface, whose local `+X` the
+    /// axis is measured from; a body patch authoring one is rejected.
     Polarizer {
         /// Transmission axis, degrees from the surface's local `+X`.
         axis_deg: f64,
-        extinction: f64,
+        /// The power fraction of the blocked component that still gets
+        /// through, either one number or a datasheet's curve against angle.
+        extinction: AngularScalar,
         /// Index of the glass the polarizing layer is carried in. See
         /// [`bare_element`].
         #[serde(default = "bare_element")]
@@ -689,7 +795,8 @@ impl SurfaceResponse {
                 if !axis_deg.is_finite() {
                     return Err(range("axis_deg", "must be finite"));
                 }
-                if !extinction.is_finite() || !(0.0..=1.0).contains(extinction) {
+                extinction.validate(&format!("{field}.extinction"))?;
+                if !extinction.is_unit_fraction() {
                     return Err(range("extinction", "is outside [0, 1]"));
                 }
                 if !substrate_index.is_finite() || *substrate_index < 1.0 {

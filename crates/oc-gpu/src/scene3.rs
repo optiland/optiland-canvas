@@ -1173,7 +1173,7 @@ fn compile_response(
         } => GpuResponse::ExplicitRt {
             r: spectral(&SpectralScalar::Constant(face_reflectance(*substrate_index)))?,
             t: spectral(&SpectralScalar::Constant(
-                two_faces(*substrate_index) * 0.5 * (1.0 + extinction.clamp(0.0, 1.0)),
+                two_faces(*substrate_index) * 0.5 * (1.0 + extinction.on_axis().clamp(0.0, 1.0)),
             ))?,
         },
         SurfaceResponse::Retarder {

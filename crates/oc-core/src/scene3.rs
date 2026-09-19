@@ -1196,12 +1196,30 @@ pub enum ApertureInteraction {
     Absorb,
 }
 
+/// The most cells a detector's grid may hold, on its face or across its
+/// directions: a 1024 × 1024 sensor.
+///
+/// A readout keeps two numbers per face cell and the tracer one readout per
+/// worker, so a count nobody bounded is an allocation nobody asked for. And a
+/// million pixels needs tens of millions of rays before any one pixel's
+/// reading rests on more than a few of them.
+pub const MAX_DETECTOR_CELLS: usize = 1 << 20;
+
+/// Does a `[a, b]` grid stay within [`MAX_DETECTOR_CELLS`]? Checked so that a
+/// count read from a file cannot overflow on the way.
+pub fn grid_fits(bins: [usize; 2]) -> bool {
+    bins[0]
+        .checked_mul(bins[1])
+        .is_some_and(|n| n <= MAX_DETECTOR_CELLS)
+}
+
 /// An area detector.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Detector3 {
     pub common: ObjectCommon,
     pub geometry: DetectorGeometry3,
-    /// Cell counts across the two local axes.
+    /// Pixel counts across the two local axes, `[along u, along v]`. The grid
+    /// spans the face's bounding box, so the pitch is that extent over these.
     pub bins: [usize; 2],
     pub response: DetectorResponse,
     pub termination: DetectorTermination,
@@ -1216,27 +1234,76 @@ impl Detector3 {
         DetectorId(self.common.id.0)
     }
 
-    /// The area of one cell of the face grid, `mm²`, or `None` for a line
-    /// probe with no area.
+    /// The full extent the face grid spans, `[width, height]` in mm, or `None`
+    /// for a line probe with no area.
     ///
     /// The grid is the shape's **bounding box**, which for a rectangle is the
-    /// shape and for a disc or annulus is not: a cell there is a square of the
-    /// box, and a cell at the rim has part of itself outside the shape and
-    /// reads the average over the whole square. Dividing the disc's own area
-    /// by the cell count instead would put every reading 4/π high, which is
-    /// what this did until the measure needed a unit.
-    pub fn cell_area_mm2(&self) -> Option<f64> {
-        let (nu, nv) = (self.bins[0].max(1), self.bins[1].max(1));
-        let (w, h) = match self.geometry {
+    /// shape and for a disc or annulus is the square around it.
+    pub fn grid_extent_mm(&self) -> Option<[f64; 2]> {
+        match self.geometry {
             DetectorGeometry3::Rectangle {
                 half_width_mm,
                 half_height_mm,
-            } => (2.0 * half_width_mm, 2.0 * half_height_mm),
-            DetectorGeometry3::Disc { radius_mm } => (2.0 * radius_mm, 2.0 * radius_mm),
-            DetectorGeometry3::Annulus { outer_mm, .. } => (2.0 * outer_mm, 2.0 * outer_mm),
-            DetectorGeometry3::LineProbeLegacy { .. } => return None,
-        };
-        Some(w * h / (nu * nv) as f64)
+            } => Some([2.0 * half_width_mm, 2.0 * half_height_mm]),
+            DetectorGeometry3::Disc { radius_mm } => Some([2.0 * radius_mm; 2]),
+            DetectorGeometry3::Annulus { outer_mm, .. } => Some([2.0 * outer_mm; 2]),
+            DetectorGeometry3::LineProbeLegacy { .. } => None,
+        }
+    }
+
+    /// The pixel pitch along the local `u` and `v` axes, mm: the grid's extent
+    /// over its cell count. Pixels are square only when the two agree.
+    pub fn pixel_pitch_mm(&self) -> Option<[f64; 2]> {
+        let [w, h] = self.grid_extent_mm()?;
+        Some([w / self.bins[0].max(1) as f64, h / self.bins[1].max(1) as f64])
+    }
+
+    /// The area of one whole pixel, `mm²`, or `None` for a line probe.
+    ///
+    /// A pixel is a square of the bounding box, so on a disc or annulus a
+    /// pixel at the rim has part of itself off the face. What it collected
+    /// came through the part on the face, which is
+    /// [`Self::covered_cell_areas_mm2`]; this is the whole square, the
+    /// camera's pixel. Dividing the disc's own area by the pixel count instead
+    /// would put every reading 4/π high, which is what this did until the
+    /// measure needed a unit.
+    pub fn pixel_area_mm2(&self) -> Option<f64> {
+        let [pu, pv] = self.pixel_pitch_mm()?;
+        Some(pu * pv)
+    }
+
+    /// The sensitive area of the whole face, `mm²`, or `None` for a line
+    /// probe.
+    pub fn face_area_mm2(&self) -> Option<f64> {
+        use std::f64::consts::PI;
+        match self.geometry {
+            DetectorGeometry3::Rectangle {
+                half_width_mm,
+                half_height_mm,
+            } => Some(4.0 * half_width_mm * half_height_mm),
+            DetectorGeometry3::Disc { radius_mm } => Some(PI * radius_mm * radius_mm),
+            DetectorGeometry3::Annulus { inner_mm, outer_mm } => {
+                Some(PI * (outer_mm * outer_mm - inner_mm * inner_mm))
+            }
+            DetectorGeometry3::LineProbeLegacy { .. } => None,
+        }
+    }
+
+    /// How much of each pixel lies on the face, `mm²`, row-major over `bins`
+    /// like the face histogram, or `None` for a line probe.
+    ///
+    /// Every pixel of a rectangle is whole. On a disc or annulus a pixel at
+    /// the rim is only partly on the face, and one in a corner of the box or
+    /// in an annulus's hole not at all. Flux reaches a pixel only through the
+    /// part on the face, so that part is what irradiance divides by: a rim
+    /// pixel under uniform light then reads the same as a whole one, and the
+    /// readings times these areas sum back to the flux collected (A12). The
+    /// areas are exact, from [`disc_rect_overlap_area`], and sum to
+    /// [`Self::face_area_mm2`].
+    ///
+    /// [`disc_rect_overlap_area`]: crate::geom3::primitives::disc_rect_overlap_area
+    pub fn covered_cell_areas_mm2(&self) -> Option<Vec<f64>> {
+        self.geometry.covered_cell_areas_mm2(self.bins)
     }
 
     /// The direction cell an arriving ray falls in, row-major over the
@@ -1280,6 +1347,44 @@ impl Detector3 {
         for sector in 0..sectors {
             for ring in 0..rings {
                 out[sector * rings + ring] = dphi * (ring_cos[ring] - ring_cos[ring + 1]);
+            }
+        }
+        Some(out)
+    }
+}
+
+impl DetectorGeometry3 {
+    /// [`Detector3::covered_cell_areas_mm2`] for this face cut into `bins`,
+    /// for a caller that holds the face and the counts but not the detector.
+    pub fn covered_cell_areas_mm2(&self, bins: [usize; 2]) -> Option<Vec<f64>> {
+        use crate::geom3::primitives::disc_rect_overlap_area as disc;
+        let [w, h] = match *self {
+            DetectorGeometry3::Rectangle {
+                half_width_mm,
+                half_height_mm,
+            } => [2.0 * half_width_mm, 2.0 * half_height_mm],
+            DetectorGeometry3::Disc { radius_mm } => [2.0 * radius_mm; 2],
+            DetectorGeometry3::Annulus { outer_mm, .. } => [2.0 * outer_mm; 2],
+            DetectorGeometry3::LineProbeLegacy { .. } => return None,
+        };
+        let (nu, nv) = (bins[0].max(1), bins[1].max(1));
+        // The edges `detector_cell` bins by: `floor((u + w/2) / w * nu)`.
+        let u_edge = |i: usize| -0.5 * w + w * i as f64 / nu as f64;
+        let v_edge = |j: usize| -0.5 * h + h * j as f64 / nv as f64;
+        let mut out = Vec::with_capacity(nu * nv);
+        for j in 0..nv {
+            let (y0, y1) = (v_edge(j), v_edge(j + 1));
+            for i in 0..nu {
+                let (x0, x1) = (u_edge(i), u_edge(i + 1));
+                out.push(match *self {
+                    DetectorGeometry3::Rectangle { .. } => (x1 - x0) * (y1 - y0),
+                    DetectorGeometry3::Disc { radius_mm } => disc(radius_mm, x0, x1, y0, y1),
+                    DetectorGeometry3::Annulus { inner_mm, outer_mm } => {
+                        (disc(outer_mm, x0, x1, y0, y1) - disc(inner_mm, x0, x1, y0, y1))
+                            .max(0.0)
+                    }
+                    DetectorGeometry3::LineProbeLegacy { .. } => return None,
+                });
             }
         }
         Some(out)
@@ -1354,7 +1459,9 @@ pub enum DetectorMeasure {
     #[default]
     Power,
 
-    /// Flux over the cell's area, per `mm²`.
+    /// Flux over the area it was collected on, per `mm²`: a pixel's flux over
+    /// the part of that pixel on the face, which is the whole pixel except at
+    /// a round face's rim ([`Detector3::covered_cell_areas_mm2`]).
     ///
     /// The area is the face's, not the beam's cross-section. A beam arriving
     /// at a slant spreads across more cells and each one reads less, so the
@@ -2209,6 +2316,9 @@ impl Scene3 {
             if d.geometry.has_area() && (d.bins[0] == 0 || d.bins[1] == 0) {
                 return Err(range("bins", "is zero on an axis"));
             }
+            if d.geometry.has_area() && !grid_fits(d.bins) {
+                return Err(range("bins", "holds more cells than a detector may"));
+            }
             match d.measure {
                 DetectorMeasure::Power => {}
                 DetectorMeasure::Irradiance => {
@@ -2234,6 +2344,12 @@ impl Scene3 {
                     }
                     if bins[0] == 0 || bins[1] == 0 {
                         return Err(range("measure.bins", "has no rings or no sectors"));
+                    }
+                    if !grid_fits(bins) {
+                        return Err(range(
+                            "measure.bins",
+                            "holds more cells than a detector may",
+                        ));
                     }
                 }
             }

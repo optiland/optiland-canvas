@@ -130,7 +130,8 @@ fn detector_json(d: &DetectorResult3, cells: bool, records: bool) -> Value {
     let mut o = json!({
         "detector": d.detector.raw(),
         "bins": d.bins,
-        "cell_area_mm2": d.cell_area_mm2,
+        "pixel_area_mm2": d.pixel_area_mm2,
+        "face_area_mm2": d.face_area_mm2,
         "hits": d.hits,
         "total_incident": d.total_incident,
         "total_signal": d.total_signal,
@@ -140,6 +141,7 @@ fn detector_json(d: &DetectorResult3, cells: bool, records: bool) -> Value {
     if cells {
         o["incident_flux"] = json!(d.incident_flux);
         o["detected_signal"] = json!(d.detected_signal);
+        o["covered_area_mm2"] = json!(d.covered_area_mm2);
     }
     if records {
         o["records"] = Value::Array(

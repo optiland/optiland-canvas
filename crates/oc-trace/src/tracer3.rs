@@ -158,8 +158,11 @@ pub fn trace3(scene: &Scene3, launch: &[LaunchRay3], cfg: &TraceConfig3) -> Trac
         }
     }
 
+    // Each detector's empty readout, built once: the exact rim areas in it are
+    // worth computing once per trace, not once per worker.
+    let blank: Vec<DetectorResult3> = scene.detectors.iter().map(DetectorResult3::new).collect();
     let identity = || Local {
-        result: LocalResult::new(scene, cfg, base_report.clone()),
+        result: LocalResult::new(blank.clone(), base_report.clone()),
     };
 
     #[cfg(feature = "parallel")]
@@ -216,12 +219,7 @@ struct LocalResult {
 }
 
 impl LocalResult {
-    fn new(scene: &Scene3, _cfg: &TraceConfig3, report: CapabilityReport) -> Self {
-        let detectors = scene
-            .detectors
-            .iter()
-            .map(DetectorResult3::new)
-            .collect();
+    fn new(detectors: Vec<DetectorResult3>, report: CapabilityReport) -> Self {
         Self {
             segments: Vec::new(),
             detectors,

@@ -53,7 +53,8 @@ impl SegOut3 {
 pub struct DetReadout3 {
     pub object: u64,
     pub bins: [usize; 2],
-    pub cell_area_mm2: f32,
+    /// The face in physical millimetres, for [`DetReadout3::density`].
+    pub geometry: oc_core::scene3::DetectorGeometry3,
     /// Incident flux per cell, row-major over `bins`.
     pub incident: Vec<f32>,
     pub hits: u64,
@@ -69,11 +70,18 @@ pub struct DetReadout3 {
 }
 
 impl DetReadout3 {
-    /// Relative flux density per cell (`flux / area`).
+    /// Relative flux density per pixel: its flux over the part of it on the
+    /// face, and 0 for a pixel wholly off it. The areas are the scene model's
+    /// own, so the preview and the reference cannot drift on what a pixel is.
     pub fn density(&self) -> Vec<f32> {
+        let covered = self
+            .geometry
+            .covered_cell_areas_mm2(self.bins)
+            .unwrap_or_default();
         self.incident
             .iter()
-            .map(|f| f / self.cell_area_mm2)
+            .zip(&covered)
+            .map(|(f, a)| if *a > 0.0 { (*f as f64 / a) as f32 } else { 0.0 })
             .collect()
     }
 
@@ -133,7 +141,7 @@ pub fn trace(scene: &GpuScene3, max_depth: u32) -> Cpu3Result {
         .map(|d| DetReadout3 {
             object: d.object,
             bins: d.bins,
-            cell_area_mm2: d.cell_area_mm2,
+            geometry: d.geometry.clone(),
             incident: vec![0.0; d.bins[0].max(1) * d.bins[1].max(1)],
             hits: 0,
             total: 0.0,

@@ -346,8 +346,8 @@ fn irradiance_is_power_divided_by_the_cell() {
 
     // A 16 mm face binned eight ways has cells 2 mm square, so the two
     // readings differ by the four square millimetres between them.
-    let area = d.cell_area_mm2.unwrap();
-    assert!((area - 4.0).abs() < 1e-12, "cell area {area}");
+    let area = d.pixel_area_mm2.unwrap();
+    assert!((area - 4.0).abs() < 1e-12, "pixel area {area}");
     for (p, e) in power.iter().zip(&irradiance) {
         assert!((p / area - e).abs() < 1e-12);
     }

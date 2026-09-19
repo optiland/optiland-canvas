@@ -1384,8 +1384,11 @@ pub struct GpuDetector3 {
     pub shape: DetShape,
     pub bins: [usize; 2],
     pub terminate: bool,
-    /// Cell area in `mm²` (physical, not normalized), for flux density.
-    pub cell_area_mm2: f32,
+    /// The face in physical millimetres, as the scene has it. What a flux
+    /// density divides by is computed from this on demand, not on every
+    /// compile: the preview recompiles every frame of a drag, and a round
+    /// face's exact rim areas are a cost nothing in that loop reads.
+    pub geometry: DetectorGeometry3,
     /// What the readout means, mirrored so the preview reports the quantity
     /// the reference reports.
     pub measure: DetectorMeasure,
@@ -1431,9 +1434,7 @@ fn compile_detector(d: &Detector3, norm: &Norm) -> Result<GpuDetector3, String> 
         shape,
         bins: d.bins,
         terminate: matches!(d.termination, DetectorTermination::Terminate),
-        // The scene model owns the cell geometry, so the preview and the
-        // reference cannot drift on what a cell is.
-        cell_area_mm2: d.cell_area_mm2().unwrap_or(0.0) as f32,
+        geometry: d.geometry.clone(),
         measure: d.measure,
         solid_angle_sr: d
             .direction_cell_solid_angles()

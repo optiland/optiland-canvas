@@ -662,7 +662,7 @@ test.describe("component view — what a detector measures", () => {
     expect(after.unit).toBe("flux/mm²");
     // Same flux, same cells, one division between the two readings.
     expect(after.totalIncident).toBeCloseTo(before.totalIncident, 12);
-    expect(after.peak).toBeCloseTo(before.peak / before.cellArea, 9);
+    expect(after.peak).toBeCloseTo(before.peak / before.pixelArea, 9);
     await expect(page.locator("#componentInset .cv-read")).toContainText("flux/mm²");
     // And the dock agrees, which is the number a user actually reads.
     await expect(page.locator("#dockNums")).toContainText("flux/mm²");
@@ -705,5 +705,120 @@ test.describe("component view — what a detector measures", () => {
     // And the dock stops calling the picture a heatmap, because it is not one.
     await expect(page.locator("#detHead")).toContainText("polar");
     await expect(page.locator("#componentInset .cv-read")).toContainText("ring");
+
+    // Its resolution is its own to set: rings out to the cone, sectors round.
+    await page.locator('#componentInset input[data-name="detRings"]').fill("12");
+    await expect.poll(async () => (await result(page, id)).coneBins).toEqual([12, 1]);
+    await page.locator('#componentInset input[data-name="detSectors"]').fill("4");
+    await expect.poll(async () => (await result(page, id)).coneBins).toEqual([12, 4]);
+    expect((await result(page, id)).bins).toEqual([64, 64]);
+  });
+});
+
+test.describe("component view — a detector's face", () => {
+  const result = (page: Page, id: number) =>
+    page.evaluate(
+      (i) => JSON.parse((window as unknown as { __ocDebug: any }).__ocDebug.scene.detectorResultJSON(i)),
+      id,
+    );
+  const face = (page: Page, id: number) =>
+    page.evaluate(
+      (i) => JSON.parse((window as unknown as { __ocDebug: any }).__ocDebug.scene.detectorFaceJSON(i)),
+      id,
+    );
+  /** The flux the inset quotes first, and the flux the dock quotes. */
+  const quoted = async (page: Page) => ({
+    inset: (await page.locator("#componentInset .cv-read b").first().textContent()) ?? "",
+    dock: /flux ([^ ]+)/.exec((await page.locator("#dockNums").textContent()) ?? "")?.[1] ?? "",
+  });
+
+  test("the inset and the dock quote the same flux on both arms of a splitter", async ({ page }) => {
+    await freshApp(page);
+    await openInset(page);
+    // The default beam, a splitter folding half of it up, a detector on the
+    // folded arm, and the default detector behind the lens on the other.
+    await page.locator("#addSplitter").click();
+    const up = await addUpDetector(page);
+    const detectors: number[] = await page.evaluate(() =>
+      JSON.parse((window as unknown as { __ocDebug: any }).__ocDebug.scene.sceneObjectsJSON())
+        .filter((o: { kind: string }) => o.kind === "detector")
+        .map((o: { id: number }) => o.id),
+    );
+    expect(detectors).toContain(up);
+    expect(detectors.length).toBe(2);
+
+    const select = (id: number) =>
+      page.evaluate((i) => (window as unknown as { __ocDebug: any }).__ocDebug.select(i), id);
+    for (const id of detectors) {
+      await select(id);
+      await expect.poll(async () => (await insetView(page)).id).toBe(id);
+      const total = (await result(page, id)).totalIncident as number;
+      expect(total).toBeGreaterThan(0);
+      const q = await quoted(page);
+      expect(q.inset, `detector ${id}`).toBe(q.dock);
+      expect(Number(q.inset)).toBeCloseTo(total, 3);
+    }
+
+    // The ghost layer changes the trace without moving the scene revision.
+    // The inset used to keep the old numbers while the dock moved on.
+    const through = detectors.find((d) => d !== up)!;
+    await select(through);
+    await expect.poll(async () => (await insetView(page)).id).toBe(through);
+    const before = (await result(page, through)).totalIncident as number;
+    await page.locator("#ghosts").click();
+    await expect.poll(async () => (await result(page, through)).totalIncident).not.toBe(before);
+    await expect.poll(async () => {
+      const q = await quoted(page);
+      return q.inset === q.dock && q.inset !== "";
+    }).toBe(true);
+    const after = (await result(page, through)).totalIncident as number;
+    expect(Number((await quoted(page)).inset)).toBeCloseTo(after, 3);
+  });
+
+  test("a detector's size and pixels are set in the inset", async ({ page }) => {
+    await freshApp(page);
+    await openInset(page);
+    await page.locator("#addDetector").click();
+    await expect(page.locator("#stat")).toContainText("segs");
+    const id = (await insetView(page)).id;
+    expect((await face(page, id)).shape).toBe("rectangle");
+
+    const field = (name: string) => page.locator(`#componentInset input[data-name="${name}"]`);
+    await field("detWidth").fill("12");
+    await field("detHeight").fill("4");
+    await expect.poll(async () => [(await face(page, id)).width, (await face(page, id)).height]).toEqual([12, 4]);
+
+    await field("detPixelsU").fill("24");
+    await field("detPixelsV").fill("8");
+    await expect.poll(async () => (await face(page, id)).pixels).toEqual([24, 8]);
+    const f = await face(page, id);
+    expect(f.pitch).toEqual([0.5, 0.5]);
+    expect(f.pixelArea).toBeCloseTo(0.25, 15);
+    expect(f.faceArea).toBeCloseTo(48, 12);
+    // The trace bins into the grid the face now has.
+    expect((await result(page, id)).bins).toEqual([24, 8]);
+    await expect(page.locator("#componentInset .cv-read")).toContainText("24 × 8 px of 500 µm");
+
+    // A count of zero is refused, said so, and changes nothing.
+    await field("detPixelsU").fill("0");
+    await expect(page.locator("#componentInset .cv-note")).toContainText("pixel counts start at 1");
+    expect((await face(page, id)).pixels).toEqual([24, 8]);
+
+    // A round face: the largest disc inside the rectangle, the same counts.
+    await page.locator("#componentInset .cv-bar").getByText("disc", { exact: true }).click();
+    await expect.poll(async () => (await face(page, id)).shape).toBe("disc");
+    expect((await face(page, id)).width).toBe(4);
+    await expect(field("detDiameter")).toBeVisible();
+    await expect(field("detWidth")).toBeHidden();
+    await expect(page.locator("#componentInset .cv-read")).toContainText("rim pixels");
+
+    // And the corner of a rectangle drags its size.
+    await page.locator("#componentInset .cv-bar").getByText("rect", { exact: true }).click();
+    await expect.poll(async () => (await face(page, id)).shape).toBe("rectangle");
+    const w0 = (await face(page, id)).width;
+    await dragBy(page, await handle(page, "corner"), 20, -10);
+    await expect.poll(async () => (await face(page, id)).width).toBeGreaterThan(w0);
+    const q = await quoted(page);
+    expect(q.inset).toBe(q.dock);
   });
 });

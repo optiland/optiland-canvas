@@ -732,6 +732,66 @@ fn assert_detector_matches(scene: &Scene3, det: ObjectId, origins_dirs: &[(Vec3,
     }
 }
 
+/// A round face's pixels read the same irradiance in both tiers, rim pixels
+/// included.
+///
+/// The preview divides by the covered areas the scene model computes, not by
+/// a copy of the geometry of its own, and computes them only when asked. So
+/// the thing to hold is that asking gives the reference's numbers: a grid of
+/// rays across a disc, kept off the pixel edges so neither tier's rounding
+/// picks the pixel, lands in whole pixels and in pixels the rim cuts.
+#[test]
+fn a_round_face_reads_the_same_irradiance_in_both_tiers() {
+    let mut scene = Scene3::new();
+    let det = add_rect_detector(&mut scene, Vec3::new(20.0, 0.0, 0.0), -Vec3::X, 3.0, 3.0, [6, 6]);
+    scene.detectors[0].geometry = DetectorGeometry3::Disc { radius_mm: 3.0 };
+    scene.validate().expect("valid");
+
+    let offsets: Vec<f64> = (0..6).map(|i| i as f64 + 0.37 - 3.0).collect();
+    let origins_dirs: Vec<(Vec3, Vec3)> = offsets
+        .iter()
+        .flat_map(|&y| offsets.iter().map(move |&z| (y, z)))
+        .filter(|(y, z)| y * y + z * z < 8.5)
+        .map(|(y, z)| (Vec3::new(0.0, y, z), Vec3::X))
+        .collect();
+    let (emitted, launch) = rays(&origins_dirs);
+
+    let reference = trace3(&scene, &launch, &cfg());
+    let f64_det = reference
+        .detectors
+        .iter()
+        .find(|d| d.detector.0 == det.0)
+        .expect("f64 detector");
+    let gpu = GpuScene3::build_with_rays(
+        &scene,
+        &emitted,
+        BuildOpts {
+            ghosts: false,
+            flux_eps: 1e-9,
+            max_ghost: 0,
+        },
+    );
+    let preview = cpu3::trace(&gpu, 32);
+    let f32_det = preview.detector(det.0).expect("f32 detector");
+
+    let e64 = f64_det.irradiance().expect("an area detector");
+    let e32 = f32_det.density();
+    assert_eq!(e64.len(), e32.len());
+    let rim = f64_det
+        .covered_area_mm2
+        .iter()
+        .zip(&e64)
+        .filter(|(a, e)| **e > 0.0 && **a < 0.999)
+        .count();
+    assert!(rim >= 4, "rays reach rim pixels: {rim}");
+    for (i, (a, b)) in e64.iter().zip(&e32).enumerate() {
+        assert!(
+            (*a as f32 - *b).abs() <= 1e-5 * a.abs().max(1.0) as f32,
+            "pixel {i}: f64 {a} vs f32 {b}"
+        );
+    }
+}
+
 /// The preview bins directions the same way the reference does.
 ///
 /// Irradiance and power come off the same face histogram the two tiers have

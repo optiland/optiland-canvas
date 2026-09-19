@@ -604,6 +604,124 @@ impl Scene3 {
         Some(self.add_planar_element(pos, radius_mm, tilt_deg, r.clone(), r))
     }
 
+    /// Add a polarizing beam splitter: a cube of glass with a coated diagonal,
+    /// which is what a real one is.
+    ///
+    /// Everything else in the canvas that polarizes does it by absorbing. This
+    /// does it by reflecting, and it is the one polarizing part here whose
+    /// behaviour is derived rather than declared: the stack is a plain
+    /// quarter-wave mirror, and what makes it polarizing is that it is used at
+    /// the Brewster angle between its own layers, where every p reflection
+    /// inside it vanishes. So its angle dependence, its wavelength dependence
+    /// and its contrast all come out of the transfer matrix at each ray's own
+    /// angle, with nothing declared and nothing tabulated.
+    ///
+    /// The cube glass is **not a free choice**: it is
+    /// [`macneille_glass`] of the coating pair, 1.754 for titania on silica,
+    /// which is why a polarizing cube is dense flint. Its outer faces carry
+    /// the scalar AR stand-in, which is not an approximation where they are
+    /// used: at normal incidence s and p are the same thing and one number is
+    /// the whole truth.
+    ///
+    /// Returns `(cube, diagonal)`. They are two objects, because a solid with
+    /// an interface inside it is not something the scene model can say yet;
+    /// they share a label so the object list at least calls them one part, and
+    /// moving one moves only that one.
+    ///
+    /// `None` for a cube smaller than a millimetre across or a design that
+    /// does not sanitize.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_polarizing_beam_splitter(
+        &mut self,
+        pos: Vec3,
+        half_mm: f64,
+        tilt_deg: f64,
+        lambda_nm: f64,
+        periods: u32,
+        n_high: f64,
+        n_low: f64,
+    ) -> Option<(u64, u64)> {
+        if !half_mm.is_finite() || half_mm < 0.5 || !tilt_deg.is_finite() {
+            return None;
+        }
+        let n0 = crate::thinfilm::macneille_glass(n_high, n_low);
+        if !n0.is_finite() || n0 < 1.05 {
+            return None;
+        }
+        let design = CoatingDesign {
+            kind: DesignKind::Polarizing,
+            lambda_nm,
+            aoi_deg: 45.0,
+            periods,
+            n_high,
+            n_low,
+        }
+        .sanitized()?;
+        let coating = film_coating(design, n0, n0);
+
+        // The whole part turns together: at the standard 135 degrees the cube
+        // is axis aligned and an axial beam meets its face square on, and any
+        // other tilt is that rigid assembly rotated.
+        let spin = glam::DQuat::from_rotation_z((tilt_deg - 135.0).to_radians());
+        let cube = self.alloc_object_id();
+        let mut common = ObjectCommon::new(cube, LayerId(0));
+        common.transform =
+            Isometry3::new(pos, [spin.x, spin.y, spin.z, spin.w]).unwrap_or_else(|_| Isometry3::from_pos(pos));
+        common.label = PBS_LABEL.to_string();
+        self.bodies.push(Body3 {
+            common,
+            geometry: SolidGeometry3::Box {
+                half_extents_mm: Vec3::new(half_mm, half_mm, half_mm),
+            },
+            material: Material::AbbePoint {
+                nd: n0,
+                vd: PBS_VD,
+            },
+            absorption: AbsorptionModel::None,
+            surface: SurfaceProps3 {
+                default: TwoSidedSurfaceResponse {
+                    from_outside: SurfaceResponse::DielectricFresnel {
+                        ar_residual: SpectralScalar::Constant(PBS_FACE_AR),
+                    },
+                    from_inside: SurfaceResponse::DielectricFresnel {
+                        ar_residual: SpectralScalar::Constant(PBS_FACE_AR),
+                    },
+                },
+                overrides: Vec::new(),
+            },
+            priority: 0,
+        });
+
+        // The diagonal, built with its own frame rather than by `facing`: the
+        // rectangle has to lie along the cube's diagonal and its edge, and the
+        // shortest rotation onto the normal puts neither there.
+        let (sin_t, cos_t) = tilt_deg.to_radians().sin_cos();
+        let cols = glam::DMat3::from_cols(
+            glam::DVec3::new(-sin_t, cos_t, 0.0),
+            glam::DVec3::Z,
+            glam::DVec3::new(cos_t, sin_t, 0.0),
+        );
+        let dq = glam::DQuat::from_mat3(&cols);
+        let diagonal = self.alloc_object_id();
+        let mut dc = ObjectCommon::new(diagonal, LayerId(0));
+        dc.transform =
+            Isometry3::new(pos, [dq.x, dq.y, dq.z, dq.w]).unwrap_or_else(|_| Isometry3::from_pos(pos));
+        dc.label = PBS_LABEL.to_string();
+        let film = SurfaceResponse::Coating { coating };
+        self.surfaces.push(SurfaceObject3 {
+            common: dc,
+            geometry: SurfaceGeometry3::Plane {
+                shape: PlanarShape2::Rectangle {
+                    half_width_mm: half_mm * std::f64::consts::SQRT_2,
+                    half_height_mm: half_mm,
+                },
+            },
+            response_front: film.clone(),
+            response_back: film,
+        });
+        Some((cube.0, diagonal.0))
+    }
+
     /// Add an ideal linear polarizer: a round plate at `pos`, tilted
     /// `tilt_deg`, passing the field along `axis_deg` from the plate's own
     /// local `+X` and absorbing the rest.
@@ -2006,6 +2124,21 @@ fn response_from_kind(kind: &str) -> Option<SurfaceResponse> {
         _ => return None,
     })
 }
+
+/// What the object list calls both halves of a polarizing beam splitter, so it
+/// reads as one part even though the scene holds it as two objects.
+const PBS_LABEL: &str = "polarizing beam splitter";
+
+/// A dense flint of index 1.754 has an Abbe number around here. The cube's
+/// glass index is fixed by the coating pair; its dispersion is not, and this
+/// is a plausible glass rather than a measured one.
+const PBS_VD: f64 = 27.5;
+
+/// What is left of a cube face's Fresnel reflection after a good broadband AR:
+/// about half a percent a face, against 7.5% bare. `ar_residual` is one number
+/// and not a coating model, and at normal incidence that costs nothing,
+/// because there s and p are the same thing.
+const PBS_FACE_AR: f64 = 0.07;
 
 /// The substrate a plate is made of: N-BK7, the ordinary choice.
 pub const PLATE_ND: f64 = 1.5168;

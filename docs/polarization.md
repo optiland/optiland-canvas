@@ -51,6 +51,7 @@ and does not change it.
 | `ExplicitRt` | Two numbers. Treated as an ideal grey attenuator, polarization-blind and phase-neutral. |
 | Ideal thin lens | No polarization action. |
 | Polarizer | Passes the field on its transmission axis, absorbs the perpendicular component, leaks its stated extinction, which is one number or a measured curve against angle. Optionally laminated in glass, whose two faces then do real Fresnel. |
+| Polarizing cube | A quarter-wave stack cemented in the glass the Brewster condition demands, at 45 degrees. Transmits p, reflects s, and gets its contrast and its acceptance angle from the transfer matrix. |
 | Retarder | Adds a phase to its slow axis. Either a number, or a real slab of uniaxial crystal, which moves with wavelength and angle. Lossless, unless it is laminated, when its faces reflect. |
 
 **Power data cannot supply a phase.** `Rs`, `Rp`, `Ts` and `Tp` fix the
@@ -137,6 +138,69 @@ whenever an element has a substrate.
 
 What the faces reflect is a ghost like any other: followed when ghosts are on,
 named in the ledger when they are off, and absorbed in neither case.
+
+## A polarizing beam splitter
+
+Everything else here that polarizes does it by absorbing, and does it because
+somebody said so. The cube does it by reflecting, and it is the only polarizing
+part in the canvas whose behaviour is **derived**.
+
+Its stack is a plain quarter-wave mirror. What makes it a polarizer is where it
+is used: at the Brewster angle between its own layers, where the p reflectance
+of every interface inside it is exactly zero. So p passes and s is reflected,
+and neither number was typed in anywhere.
+
+That condition fixes the glass. Brewster puts the angle in the high-index layer
+at `tan θ_H = n_L/n_H`, and Snell carries that back out to whatever the stack is
+cemented in. At 45 degrees, which is what a cube is:
+
+```text
+n₀ = √2 · n_H · n_L / √(n_H² + n_L²)
+```
+
+For titania on silica that is **1.754**, which is why a polarizing cube is made
+of dense flint and not of crown. The builder takes the coating pair and makes
+the cube out of the glass they demand; there is no glass argument, because
+there is no choice. Cement the same twelve periods in ordinary crown and it
+stops being a beam splitter and becomes a mirror, which a test checks.
+
+Twelve periods, on axis, one unpolarized ray in:
+
+| | flux | degree of polarization |
+|---|---|---|
+| transmitted | 0.4946 | 1.000000 |
+| reflected | 0.4949 | 0.9995 |
+
+The transmitted beam is the cleaner one, which is what a real cube's datasheet
+says too: what keeps s out of it is every layer in the stack, while the
+reflection carries a little p because the stack's outer interfaces are not at
+Brewster even when its inner ones are.
+
+**It has an acceptance angle nobody told it.** Launch light that is already s,
+which the cube should reflect entirely, and measure what gets past it:
+
+| off axis | s leaking through |
+|---|---|
+| 0° | below 1e-9 |
+| 1° | 9.7e-5 |
+| 2° | 3.9e-4 |
+| 5° | 2.4e-3 |
+| 10° | 9.4e-3 |
+
+Quadratic in the angle, and it comes out of the transfer matrix rather than out
+of a table. This is the difference between this part and the ideal polarizer
+above, which needs a measured curve to have an acceptance angle at all.
+
+The cube's outer faces carry `ar_residual`, the scalar antireflection
+stand-in. That is not an approximation where they are used: at normal incidence
+s and p are the same thing, and one number is the whole truth.
+
+The cube and its diagonal are two objects. A solid with an interface inside it
+is not something the scene model can hold, and two touching solids would put
+two faces in the same place, which the tracer resolves by distance and cannot
+tell apart. A surface strictly inside one solid has neither problem: media
+resolve by containment, so the stack sees glass on both sides at 45 degrees,
+which is exactly what a cube is.
 
 ## Where a polarizer stops working
 
@@ -299,10 +363,9 @@ before.
 
 ## Still missing
 
-- **A polarizing beam splitter** as a part. The physics is there (a coating with
-  very different s and p, in a cube), but nothing builds one, and a real PBS
-  needs its prism geometry and an internal splitting response rather than a
-  zero-thickness plate.
+- **One part, one object.** A polarizing cube is a body and a surface, because
+  the scene model cannot hold an interface inside a solid. They share a label
+  so the object list calls them one thing, and moving one moves only that one.
 - **Source polarization.** The tracer accepts a state on a launch ray and the
   tests use it, but no source in a scene declares one. Every scene starts
   unpolarized and has to pass through a polarizer to become anything else.

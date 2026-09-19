@@ -54,6 +54,24 @@ test.describe("polarization", () => {
     expect(after).toContain("linear");
   });
 
+  test("a polarizing cube sorts the beam instead of absorbing half of it", async ({ page }) => {
+    await page.goto("/");
+    await expect(page.locator("#stat")).toContainText("segs");
+    const before = fluxOf(await readout(page));
+
+    await page.locator("#addPbs").click();
+    await expect(page.locator("#stat")).toContainText("segs");
+    const after = await readout(page);
+
+    // A polarizer would take half the light and keep it. A cube takes half and
+    // sends it somewhere else, and what carries on is polarized just the same.
+    const flux = fluxOf(after);
+    expect(flux).toBeGreaterThan(before * 0.35);
+    expect(flux).toBeLessThan(before * 0.6);
+    expect(dopOf(after)).toBeGreaterThan(90);
+
+  });
+
   test("a waveplate changes the state and not the flux", async ({ page }) => {
     await page.goto("/");
     await expect(page.locator("#stat")).toContainText("segs");

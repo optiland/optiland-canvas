@@ -364,6 +364,12 @@ pub enum DesignKind {
     /// The same, placed so the short-wavelength edge falls at the requested
     /// edge: long wavelengths reflect, short ones pass.
     ShortPass,
+    /// `(HL)^N H` again, but used at the angle where the pair's own interfaces
+    /// sit at Brewster: p reflects nothing anywhere in the stack, so the stack
+    /// passes p and reflects s. This is the polarizing beam splitter, and it
+    /// only works cemented in glass of the index the condition demands. See
+    /// [`macneille_glass`].
+    Polarizing,
     /// A single quarter wave of a low index: the classic single-layer AR.
     SingleLayerAr,
     /// Quarter-half-quarter, the broadband three-layer AR.
@@ -916,6 +922,29 @@ impl CoatingDesign {
     }
 }
 
+/// The index of the glass a polarizing beam splitter's stack has to be
+/// cemented in, for a layer pair and a 45 degree cube.
+///
+/// A polarizing stack works by sitting at the Brewster angle **between its own
+/// layers**: there the p reflectance of every interface in the stack is
+/// exactly zero, so p passes and only s is reflected. Brewster fixes the angle
+/// inside the high-index layer at `tan θ_H = n_L / n_H`, and Snell carries
+/// that back out through the stack to the medium it is cemented in. At 45
+/// degrees, which is what a cube is,
+///
+/// ```text
+///   n₀ = √2 · n_H · n_L / √(n_H² + n_L²)
+/// ```
+///
+/// For titania and silica that is 1.754. This is why a polarizing cube is made
+/// of dense flint rather than crown: the glass is not a free choice, it is
+/// what the coating pair demands, and getting it wrong is the difference
+/// between a beam splitter that polarizes and one that does not.
+pub fn macneille_glass(n_high: f64, n_low: f64) -> f64 {
+    let (h, l) = (n_high.abs(), n_low.abs());
+    std::f64::consts::SQRT_2 * h * l / (h * h + l * l).sqrt()
+}
+
 /// `(HL)^N H`, the quarter-wave mirror, tilted for `aoi_deg` in `n_incident`.
 fn quarter_wave_pairs(
     d: &CoatingDesign,
@@ -1002,7 +1031,13 @@ pub fn design_layers_for(
         None => return Vec::new(),
     };
     match d.kind {
-        DesignKind::QuarterWaveStack => quarter_wave_pairs(&d, d.lambda_nm, n_incident, d.periods),
+        // A polarizing stack is the same `(HL)^N H`. What makes it polarizing
+        // is not the layers but where it is used: at the Brewster angle
+        // between them, which the glass it is cemented in has to be chosen to
+        // deliver.
+        DesignKind::QuarterWaveStack | DesignKind::Polarizing => {
+            quarter_wave_pairs(&d, d.lambda_nm, n_incident, d.periods)
+        }
         DesignKind::LongPass | DesignKind::ShortPass => {
             let side = BandSide::of(d.kind == DesignKind::LongPass);
             // Where the edge is asked to sit is not where a stack built at that
@@ -1221,6 +1256,48 @@ pub fn crossing_nm(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_cube_glass_is_not_a_free_choice() {
+        // Titania and silica, the usual pair.
+        let (nh, nl) = (2.35f64, 1.46f64);
+        let right = macneille_glass(nh, nl);
+        assert!(
+            (right - 1.7538).abs() < 1e-3,
+            "a dense flint, not a crown: {right}"
+        );
+
+        let stack = |n0: f64| {
+            let d = CoatingDesign {
+                kind: DesignKind::Polarizing,
+                lambda_nm: 550.0,
+                aoi_deg: 45.0,
+                periods: 12,
+                n_high: nh,
+                n_low: nl,
+            };
+            let c = film_coating(d, n0, n0);
+            coating_rt_at(&c, n0, n0, 0.55, 45f64.to_radians().cos()).unwrap()
+        };
+
+        // In the glass the pair demands, the stack is a polarizer: s is
+        // reflected entirely and p goes through almost untouched.
+        let ok = stack(right);
+        assert!(ok.r_s > 0.999_999, "s reflects: {}", ok.r_s);
+        assert!(ok.t_p > 0.98, "p passes: {}", ok.t_p);
+        assert!(ok.t_s < 1e-9, "and s does not: {:.3e}", ok.t_s);
+
+        // Cement the same stack in ordinary crown and it is a mirror instead:
+        // p is reflected too, and nothing useful gets through either way. The
+        // glass is part of the design, and this is the whole reason a
+        // polarizing cube is made of expensive glass.
+        let wrong = stack(1.52);
+        assert!(
+            wrong.t_p < 0.2,
+            "in the wrong glass p stops passing: {}",
+            wrong.t_p
+        );
+    }
+
     use super::*;
 
     fn approx(a: f64, b: f64, tol: f64, what: &str) {

@@ -1316,3 +1316,207 @@ fn a_contrast_curve_has_to_be_a_curve() {
         Some(oc_core::scene3::AngularScalar::Constant(_))
     ));
 }
+
+
+// ---------------------------------------------------------------------------
+// The one polarizing part whose behaviour is derived rather than declared
+// ---------------------------------------------------------------------------
+
+/// Build a polarizing cube at the origin, with a detector past it and another
+/// above it, and trace one unpolarized ray in along `+X`.
+fn pbs_bench(periods: u32) -> (oc_core::polarization::Stokes, oc_core::polarization::Stokes) {
+    let mut s = Scene3::new();
+    s.add_polarizing_beam_splitter(Vec3::ZERO, 8.0, 135.0, 550.0, periods, 2.35, 1.46)
+        .expect("a cube");
+    let through = add_rect_detector(
+        &mut s,
+        Vec3::new(60.0, 0.0, 0.0),
+        -Vec3::X,
+        20.0,
+        20.0,
+        [4, 4],
+    );
+    let up = add_rect_detector(
+        &mut s,
+        Vec3::new(0.0, 60.0, 0.0),
+        -Vec3::Y,
+        20.0,
+        20.0,
+        [4, 4],
+    );
+    s.validate().expect("valid");
+    let launch = vec![launch(
+        Ray3::new(Vec3::new(-60.0, 0.0, 0.0), Vec3::X).unwrap(),
+        0.55,
+        1.0,
+    )];
+    let res = trace3(
+        &s,
+        &launch,
+        &TraceConfig3 {
+            ghosts: true,
+            ..cfg()
+        },
+    );
+    (
+        detector_named(&res, through).stokes_local,
+        detector_named(&res, up).stokes_local,
+    )
+}
+
+/// The cube and its diagonal are two objects that say they are one part.
+///
+/// A solid with an interface inside it is not something the scene model can
+/// hold yet, so the part is a body and a surface. They share a label, so the
+/// object list calls them one thing, and moving one moves only that one.
+#[test]
+fn a_polarizing_cube_is_two_objects_with_one_name() {
+    let mut s = Scene3::new();
+    let (cube, diagonal) = s
+        .add_polarizing_beam_splitter(Vec3::ZERO, 8.0, 135.0, 550.0, 12, 2.35, 1.46)
+        .expect("a cube");
+    assert_ne!(cube, diagonal);
+    let label = |id: u64| -> String {
+        s.bodies
+            .iter()
+            .map(|b| &b.common)
+            .chain(s.surfaces.iter().map(|x| &x.common))
+            .find(|c| c.id.0 == id)
+            .map(|c| c.label.clone())
+            .unwrap_or_default()
+    };
+    assert_eq!(label(cube), label(diagonal));
+    assert!(label(cube).contains("polarizing"), "{}", label(cube));
+
+    // A cube smaller than a millimetre across is not a part, and neither is
+    // one whose coating pair cannot make a glass.
+    assert!(s
+        .add_polarizing_beam_splitter(Vec3::ZERO, 0.1, 135.0, 550.0, 12, 2.35, 1.46)
+        .is_none());
+    assert!(s
+        .add_polarizing_beam_splitter(Vec3::ZERO, 8.0, f64::NAN, 550.0, 12, 2.35, 1.46)
+        .is_none());
+}
+
+/// A polarizing cube sorts unpolarized light into two beams that are polarized
+/// the opposite ways, and it does it by reflecting rather than by absorbing.
+///
+/// Nothing about this is declared. The stack is a plain quarter-wave mirror;
+/// what makes it a polarizer is that it sits at the Brewster angle between its
+/// own layers, where every p reflection inside it vanishes. The contrast comes
+/// out of the transfer matrix at the ray's own angle, which is why this part
+/// has an angular acceptance and the ideal polarizer needs a datasheet to have
+/// one.
+#[test]
+fn a_polarizing_cube_sorts_the_light_by_polarization() {
+    let (through, up) = pbs_bench(12);
+
+    // Both beams get out, and between them they carry nearly everything: the
+    // cube's faces are AR coated and the stack absorbs nothing.
+    assert!(
+        through.s0 > 0.45 && up.s0 > 0.45,
+        "a fair split: {} and {}",
+        through.s0,
+        up.s0
+    );
+    assert!(
+        through.s0 + up.s0 > 0.95,
+        "and almost all of it arrives: {}",
+        through.s0 + up.s0
+    );
+
+    // The transmitted beam is the cleaner one, which is what a real cube's
+    // datasheet says too: p passes almost perfectly, and what keeps s out of
+    // it is every layer in the stack. The reflection is behind it because the
+    // stack's outer interfaces are not at Brewster even when its inner ones
+    // are, so a little p comes back with the s.
+    assert!(
+        through.dop() > 0.9999,
+        "what goes through is pure: {}",
+        through.dop()
+    );
+    assert!(up.dop() > 0.99, "the reflection nearly is: {}", up.dop());
+    assert!(
+        through.dop() > up.dop(),
+        "transmission beats reflection: {} vs {}",
+        through.dop(),
+        up.dop()
+    );
+
+    // Both are linear. A dielectric stack away from total internal reflection
+    // has no circular component to give.
+    for st in [through, up] {
+        assert!(st.s3.abs() / st.s0 < 1e-6, "linear: {}", st.s3 / st.s0);
+    }
+}
+
+/// Thin the stack and the transmitted beam stops being pure, because what
+/// keeps s out of it is the number of layers.
+#[test]
+fn a_polarizing_cube_needs_its_layers() {
+    let thin = pbs_bench(1).0;
+    let thick = pbs_bench(12).0;
+    assert!(
+        thin.dop() < thick.dop(),
+        "one period is not a polarizer: {} against {}",
+        thin.dop(),
+        thick.dop()
+    );
+    assert!(thick.dop() - thin.dop() > 0.05, "and the gap is not noise");
+}
+
+
+/// The cube has an angular acceptance, and nobody typed it in.
+///
+/// This is the difference between a part whose behaviour is derived and one
+/// whose behaviour is declared. An ideal polarizer holds its contrast at every
+/// angle until a datasheet says otherwise; this one gives it up on its own,
+/// because the Brewster match its layers rely on only holds at the angle it
+/// was cut for.
+///
+/// The light launched here is already s, which the cube is supposed to reflect
+/// entirely, so whatever reaches the detector past it is the extinction.
+#[test]
+fn a_polarizing_cube_has_an_acceptance_angle_it_was_never_told() {
+    let leak = |deg: f64| -> f64 {
+        let t = deg.to_radians();
+        let dir = Vec3::new(t.cos(), 0.0, -t.sin()).normalize();
+        let mut sc = Scene3::new();
+        sc.add_polarizing_beam_splitter(Vec3::ZERO, 8.0, 135.0, 550.0, 12, 2.35, 1.46)
+            .expect("a cube");
+        let det = add_rect_detector(&mut sc, dir * 60.0, -dir, 20.0, 20.0, [4, 4]);
+        sc.validate().expect("valid");
+        // s is perpendicular to the plane of incidence, which for a diagonal
+        // standing in the X-Y plane means s lies along Z.
+        let launch = vec![launch_polarized(
+            Ray3::new(dir * -60.0, dir).unwrap(),
+            0.55,
+            oc_core::polarization::Stokes::linear(1.0, 0.0),
+            Vec3::Z,
+        )];
+        let res = trace3(
+            &sc,
+            &launch,
+            &TraceConfig3 {
+                ghosts: true,
+                ..cfg()
+            },
+        );
+        detector_named(&res, det).total_incident
+    };
+
+    assert!(leak(0.0) < 1e-9, "on axis nothing gets through: {}", leak(0.0));
+
+    // And off axis the leak grows as the square of the angle, which is what a
+    // stack coming off its design condition does.
+    let (a, b, c, d) = (leak(1.0), leak(2.0), leak(5.0), leak(10.0));
+    assert!(a > 1e-5, "one degree already leaks: {a:.3e}");
+    assert!(d > 5e-3, "ten degrees is not a polarizer any more: {d:.3e}");
+    for (lo, hi, at) in [(a, b, "1 to 2"), (c, d, "5 to 10")] {
+        let ratio = hi / lo;
+        assert!(
+            (ratio - 4.0).abs() < 0.4,
+            "doubling the angle quadruples the leak, {at} degrees: {ratio:.3}"
+        );
+    }
+}

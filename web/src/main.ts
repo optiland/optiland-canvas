@@ -918,6 +918,15 @@ async function main() {
   // knows what they do.
   document.getElementById("addPolarizer")!.onclick = () => addAndFocus(scene.addPolarizer(freeX(-25, 0), 0, 12, 0, 0, 0));
   document.getElementById("addRetarder")!.onclick = () => addAndFocus(scene.addRetarder(freeX(-15, 0), 0, 12, 0, 45, 90));
+  // The polarizing cube is the odd one out: it is the only polarizing part
+  // here whose behaviour is computed rather than declared. The stack is a
+  // plain quarter-wave mirror, and what makes it polarizing is that it sits at
+  // the Brewster angle between its own layers, which is why the cube's glass
+  // is not an argument: the coating pair fixes it at 1.754, dense flint. So it
+  // has a real angular acceptance and a real passband, and nobody typed
+  // either.
+  document.getElementById("addPbs")!.onclick = () =>
+    addAndFocus(scene.addPolarizingBeamSplitter(freeX(-35, 0), 0, 0, 12, 135, 550, 12, 2.35, 1.46));
 
   // --- save .ocanvas — the Optiland handoff (§6) --------------------------
   // Save downloads the canonical 3D scene (the one the user actually edits) as a

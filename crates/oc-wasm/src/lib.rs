@@ -2520,6 +2520,7 @@ impl Canvas {
                 "{{\"kind\":\"{}\",\"lambdaNm\":{},\"aoiDeg\":{},\"periods\":{},\"nHigh\":{},\"nLow\":{}}}",
                 match d.kind {
                     DesignKind::QuarterWaveStack => "mirror",
+                    DesignKind::Polarizing => "polarizing",
                     DesignKind::LongPass => "long-pass",
                     DesignKind::ShortPass => "short-pass",
                     DesignKind::SingleLayerAr => "ar-1",
@@ -2709,6 +2710,7 @@ impl Canvas {
                         Some(DesignKind::SingleLayerAr) => "ar-1",
                         Some(DesignKind::BroadbandAr) => "ar-3",
                         Some(DesignKind::QuarterWaveStack) => "mirror",
+                        Some(DesignKind::Polarizing) => "polarizing",
                         Some(DesignKind::LongPass) => "long-pass",
                         Some(DesignKind::ShortPass) => "short-pass",
                         None => "film",
@@ -2747,6 +2749,50 @@ impl Canvas {
     /// transmitted beam leaves displaced sideways, carrying the glass in its
     /// optical path, and the far face returns its own reflection. Returns the
     /// new object id, or -1.
+    /// Add a polarizing beam splitter: a cube of glass with a coated diagonal.
+    ///
+    /// Returns the diagonal's id, which is the object worth selecting, or -1.
+    /// The cube is a second object with the same label; the scene model cannot
+    /// yet hold an interface inside a solid, so moving one moves only that one.
+    ///
+    /// The cube's glass is not an argument, because it is not a choice: the
+    /// Brewster condition the coating pair relies on fixes it at
+    /// `√2·n_H·n_L/√(n_H²+n_L²)`, 1.754 for titania on silica, which is why a
+    /// real polarizing cube is dense flint.
+    #[wasm_bindgen(js_name = addPolarizingBeamSplitter)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_polarizing_beam_splitter(
+        &mut self,
+        x: f64,
+        y: f64,
+        z: f64,
+        half_mm: f64,
+        tilt_deg: f64,
+        lambda_nm: f64,
+        periods: u32,
+        n_high: f64,
+        n_low: f64,
+    ) -> f64 {
+        let Some(scene) = self.scene3.as_mut() else {
+            return -1.0;
+        };
+        match scene.add_polarizing_beam_splitter(
+            oc_core::vec3::Vec3::new(x, y, z),
+            half_mm,
+            tilt_deg,
+            lambda_nm,
+            periods,
+            n_high,
+            n_low,
+        ) {
+            Some((_cube, diagonal)) => {
+                self.revision += 1;
+                diagonal as f64
+            }
+            None => -1.0,
+        }
+    }
+
     #[wasm_bindgen(js_name = addPlateDichroic)]
     #[allow(clippy::too_many_arguments)]
     pub fn add_plate_dichroic(

@@ -247,6 +247,15 @@ plates carried films.
 coated, is still on every uncoated face. It is not a coating model and its own
 doc comment says so.
 
+## Checked against published data
+
+The angle shift of an edge is the one relationship every filter vendor
+publishes, and it can be checked without knowing anybody's stack: one effective
+index, fitted once at 45 degrees, predicts this synthesis's edge to within 0.06
+nm from 10 to 50 degrees. See [`validation.md`](validation.md), which also says
+where a vendor curve is an oracle and where reproducing one would only be a
+test of guessing their design.
+
 ## What is still missing
 
 - **Polarization** is no longer missing. It has its own page,

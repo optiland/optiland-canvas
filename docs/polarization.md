@@ -372,8 +372,14 @@ before.
 - **Birefringence.** A ray splitting into ordinary and extraordinary is a
   different feature, and a large one. It is Optiland's to have, not the canvas's.
 - **Dispersion of the birefringence.** A crystal waveplate's retardance moves
-  as `1/λ`, which is most of it, but `n_o` and `n_e` are each held constant. A
-  real plate's birefringence moves with wavelength too.
+  as `1/λ`, which is most of it, but `n_o` and `n_e` are each held constant,
+  and real quartz is more birefringent toward the blue. Measured against the
+  published dispersion equation in
+  [`validation.md`](validation.md): under three degrees across the visible for
+  a zero-order quarter wave, and over a hundred for a tenth-order one at 450
+  nm, because the error is a share of the whole retardance. Fine for a
+  zero-order plate, no use to a multi-order one away from its design
+  wavelength.
 - **Walk-off.** The ordinary and extraordinary waves leave a real crystal side
   by side. One ray goes in here and one comes out.
 - **Depolarization.** Nothing here depolarizes. Scatter and roughness would, and

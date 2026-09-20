@@ -61,7 +61,7 @@ impl SeqMaterial {
     /// The neutral material for a canvas bulk [`Material`] (needs the catalog to
     /// resolve a [`Material::Catalog`] id back to its glass name). Absorber/GRIN
     /// have no sequential analogue and return `None` (the caller notes it).
-    fn from_material(m: &Material, catalog: &GlassCatalog) -> Option<Self> {
+    pub fn from_material(m: &Material, catalog: &GlassCatalog) -> Option<Self> {
         match m {
             Material::AbbePoint { nd, vd } => Some(SeqMaterial::Abbe { nd: *nd, vd: *vd }),
             Material::Catalog(id) => catalog
@@ -205,9 +205,16 @@ pub enum FieldType {
 pub struct SeqSystem {
     /// Optical surfaces, front (object side) to back (image side).
     pub surfaces: Vec<SeqSurface>,
-    /// Index of the aperture-stop surface.
+    /// Index of the aperture-stop surface, when the design declares one.
+    ///
+    /// `None` means nothing named a stop: a v1 scene has no apertures to name
+    /// one with, and a v2 scene may simply not have declared it. Choosing one
+    /// then is the caller's decision to make out loud (`to_optic`'s `stop=`,
+    /// or its labelled inference), never a silent surface zero. Stop semantics
+    /// and clear-aperture clipping are different things, so a surface that
+    /// vignettes is not thereby the stop.
     #[serde(default)]
-    pub stop: usize,
+    pub stop: Option<usize>,
     /// System aperture.
     pub aperture: SeqAperture,
     /// Field points (interpreted per [`SeqSystem::field_type`]).
@@ -463,7 +470,9 @@ impl Scene {
 
         SeqSystem {
             surfaces,
-            stop: 0,
+            // A v1 scene has no aperture objects, so nothing in it can name a
+            // stop. Reporting none is the honest answer; the export decides.
+            stop: None,
             aperture,
             fields,
             field_type,
@@ -623,7 +632,7 @@ mod tests {
     fn corpus() -> Vec<(&'static str, SeqSystem)> {
         let base = |surfaces, fields| SeqSystem {
             surfaces,
-            stop: 0,
+            stop: Some(0),
             aperture: SeqAperture::Epd { value: 20.0 },
             fields,
             field_type: FieldType::Angle,

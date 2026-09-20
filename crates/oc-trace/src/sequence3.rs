@@ -107,8 +107,9 @@ pub fn axial_launch(source: &Source3) -> Result<LaunchRay3, SequenceError> {
     let (lambda, _) = samples
         .iter()
         .copied()
-        // Highest weight wins; ties resolve to the earliest authored line, so
-        // the choice is deterministic.
+        // Highest weight wins. `max_by` returns the last of equal maxima, so a
+        // tie resolves to the latest authored line: deterministic, if not the
+        // line a designer would call primary.
         .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
         .ok_or_else(|| SequenceError::DegenerateSource {
             source: source.id,

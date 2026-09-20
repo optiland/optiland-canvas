@@ -18,6 +18,17 @@ Typical use::
 
 The pure-format helpers (``scene_to_seq``, ``seq_to_scene``, ``validate``) work
 without Optiland installed; ``to_optic`` / ``from_optic`` require it.
+
+Every function that takes a scene reads version 1 and version 2 documents (the
+browser saves version 2). A document that cannot be read raises one of three
+errors, all ``ValueError`` subclasses under :class:`OcanvasError`:
+
+- :class:`NotADocumentError`: not JSON, or not an ``.ocanvas`` document;
+- :class:`UnsupportedVersionError`: a version this build does not read;
+- :class:`InvalidSceneError`: a readable version whose scene does not hold up.
+
+A scene that reads fine but has no sequential form raises
+:class:`NotExportableError` from the export functions.
 """
 
 from __future__ import annotations
@@ -44,11 +55,26 @@ __all__ = [
     "save",
     "OCANVAS_VERSION",
     "OCANVAS_FORMAT",
+    "READABLE_VERSIONS",
     "FidelityWarning",
+    "OcanvasError",
+    "NotADocumentError",
+    "UnsupportedVersionError",
+    "InvalidSceneError",
+    "NotExportableError",
 ]
 
+#: The version :func:`seq_to_scene` writes. The browser writes version 2.
 OCANVAS_VERSION: int = _native.OCANVAS_VERSION
 OCANVAS_FORMAT: str = _native.OCANVAS_FORMAT
+#: Every document version this build reads.
+READABLE_VERSIONS: tuple = tuple(_native.READABLE_VERSIONS)
+
+OcanvasError = _native.OcanvasError
+NotADocumentError = _native.NotADocumentError
+UnsupportedVersionError = _native.UnsupportedVersionError
+InvalidSceneError = _native.InvalidSceneError
+NotExportableError = _native.NotExportableError
 
 
 class FidelityWarning(UserWarning):
@@ -58,13 +84,25 @@ class FidelityWarning(UserWarning):
 # --------------------------------------------------------------------------- #
 # Native, Optiland-free helpers                                               #
 # --------------------------------------------------------------------------- #
-def scene_to_seq(scene: Any) -> dict:
+def scene_to_seq(
+    scene: Any, *, source_id: int | None = None, detector_id: int | None = None
+) -> dict:
     """Sequential prescription (a dict) extracted from an ``.ocanvas`` scene.
 
     ``scene`` may be a path to a ``.ocanvas`` file, a JSON string, or a scene
-    ``dict``. The returned dict's ``notes`` list is the fidelity report.
+    ``dict``. The returned dict's ``notes`` list is the fidelity report, and its
+    ``stop`` is the declared aperture stop's surface index, or ``None`` when
+    nothing declares one.
+
+    A version 2 scene exports the path from ``source_id`` to ``detector_id``,
+    in the order its axial ray meets the surfaces. Leave both out for a scene
+    with one declared path, or one source and one area detector. Raises
+    :class:`NotExportableError` with every reason when the path has content a
+    sequential system cannot hold.
     """
-    return json.loads(_native.scene_to_seq(_as_ocanvas_json(scene)))
+    return json.loads(
+        _native.scene_to_seq(_as_ocanvas_json(scene), source_id, detector_id)
+    )
 
 
 def seq_to_scene(seq: dict | str) -> str:
@@ -95,12 +133,16 @@ def scene3_sequence_for_intent(scene: Any, intent_id: int, revision: int = 0) ->
 
 
 def validate(scene: Any) -> int:
-    """Parse and version-check a scene; return its version or raise ``ValueError``."""
+    """Read and validate a scene of any readable version, and return that version.
+
+    Raises :class:`NotADocumentError`, :class:`UnsupportedVersionError` or
+    :class:`InvalidSceneError` when it cannot be read.
+    """
     return _native.validate(_as_ocanvas_json(scene))
 
 
 def load(path: str) -> str:
-    """Read, validate, and return the ``.ocanvas`` JSON at ``path``."""
+    """Read, validate, and return the ``.ocanvas`` JSON at ``path``, any version."""
     with open(path, "r", encoding="utf-8") as fh:
         text = fh.read()
     validate(text)
@@ -108,7 +150,7 @@ def load(path: str) -> str:
 
 
 def save(scene: Any, path: str) -> None:
-    """Normalize a scene (stamping the format header) and write it to ``path``."""
+    """Normalize a scene and write it to ``path``, in the version it was read in."""
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(_native.normalize(_as_ocanvas_json(scene)))
 
@@ -116,16 +158,56 @@ def save(scene: Any, path: str) -> None:
 # --------------------------------------------------------------------------- #
 # Export: scene -> Optiland Optic                                             #
 # --------------------------------------------------------------------------- #
-def to_optic(scene: Any, *, strict: bool = False):
+def to_optic(
+    scene: Any,
+    *,
+    strict: bool = False,
+    stop: int | None = None,
+    source_id: int | None = None,
+    detector_id: int | None = None,
+):
     """Build an Optiland ``Optic`` from an ``.ocanvas`` scene (spec §6 export).
 
     Exact for the rotationally-symmetric refractive subset. Anything that cannot
-    be represented is reported: as a :class:`FidelityWarning` by default, or —
-    with ``strict=True`` — as a ``ValueError``.
+    be represented is reported: as a :class:`FidelityWarning` by default, or,
+    with ``strict=True``, as a :class:`NotExportableError`.
+
+    The aperture stop is the one the scene declares. ``stop`` names a surface
+    index for a scene that declares none (a version 1 scene never can). With
+    neither, the first surface is used and the warning says so; ``strict``
+    refuses instead, because an inferred stop moves the pupils.
+    ``source_id``/``detector_id`` pick the path, as for :func:`scene_to_seq`.
     """
-    seq = scene_to_seq(scene)
+    seq = scene_to_seq(scene, source_id=source_id, detector_id=detector_id)
+    seq = _settle_stop(seq, stop, strict)
     _report(seq.get("notes", []), strict)
     return optic_from_seq(seq)
+
+
+def _settle_stop(seq: dict, stop: int | None, strict: bool) -> dict:
+    """The prescription with its stop decided: declared, named, or inferred aloud."""
+    declared = seq.get("stop")
+    n = len(seq["surfaces"])
+    if stop is not None:
+        if not 0 <= stop < n:
+            raise ValueError(f"stop={stop} is not a surface index (0 to {n - 1})")
+        if declared is not None and declared != stop:
+            raise ValueError(
+                f"the scene declares surface {declared} as the stop, and stop={stop} contradicts it"
+            )
+        return dict(seq, stop=stop)
+    if declared is not None:
+        return seq
+    if strict:
+        raise NotExportableError(
+            "no aperture stop is declared: declare one on an aperture in the scene, "
+            "or pass stop=<surface index>"
+        )
+    inferred = (
+        "no aperture stop is declared, so the first surface is used as the stop (inferred); "
+        "declare one on an aperture, or pass stop=<surface index>"
+    )
+    return dict(seq, stop=0, notes=[*seq.get("notes", []), inferred])
 
 
 def optic_from_seq(seq: dict):
@@ -135,7 +217,11 @@ def optic_from_seq(seq: dict):
     optic = Optic()
     surfaces = seq["surfaces"]
     n = len(surfaces)
-    stop = int(seq.get("stop", 0))
+    if seq.get("stop") is None:
+        raise NotExportableError(
+            "the prescription names no aperture stop; to_optic decides one, or set seq['stop']"
+        )
+    stop = int(seq["stop"])
 
     # Object surface. `object_distance = None` means an object at infinity, which
     # Optiland spells as a genuinely infinite thickness (as its own sample systems
@@ -374,5 +460,5 @@ def _report(notes: list, strict: bool) -> None:
         return
     msg = "; ".join(notes)
     if strict:
-        raise ValueError(f"scene cannot be represented exactly: {msg}")
+        raise NotExportableError(f"scene cannot be represented exactly: {msg}")
     warnings.warn(msg, FidelityWarning, stacklevel=3)

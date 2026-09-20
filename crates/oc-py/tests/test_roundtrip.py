@@ -115,6 +115,15 @@ def _close(a, b, tol=1e-6):
     return abs(a - b) <= tol + tol * abs(b)
 
 
+def _same_material(expect: dict, got: dict) -> bool:
+    """The same medium. A glass read back from Optiland also carries the
+    catalog it is from and its published formula, which a prescription
+    written by name leaves out; the name is what identifies it."""
+    if expect.get("kind") == "glass":
+        return got.get("kind") == "glass" and got.get("name") == expect.get("name")
+    return expect == got
+
+
 def _assert_systems_equal(name, expect, got):
     assert len(got["surfaces"]) == len(expect["surfaces"]), f"{name}: surface count"
     for i, (a, b) in enumerate(zip(expect["surfaces"], got["surfaces"])):
@@ -123,7 +132,9 @@ def _assert_systems_equal(name, expect, got):
         assert _close(a["conic"], b["conic"]), f"{where}: conic"
         assert _close(a["thickness"], b["thickness"]), f"{where}: thickness"
         assert _close(a["semi_aperture"], b["semi_aperture"]), f"{where}: semi_aperture"
-        assert a["material"] == b["material"], f"{where}: material {a['material']} vs {b['material']}"
+        assert _same_material(a["material"], b["material"]), (
+            f"{where}: material {a['material']} vs {b['material']}"
+        )
         ca, cb = a["coefficients"], b["coefficients"]
         assert len(ca) == len(cb), f"{where}: n coeffs {ca} vs {cb}"
         for x, y in zip(ca, cb):

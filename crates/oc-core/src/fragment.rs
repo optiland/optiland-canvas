@@ -413,6 +413,8 @@ impl SceneFragment {
                 Some("Sellmeier coefficients are not finite")
             } else if !glass.nd.is_finite() || !glass.vd.is_finite() {
                 Some("cached nd/vd are not finite")
+            } else if glass.formula.as_ref().is_some_and(|f| f.check().is_err()) {
+                Some("the dispersion formula cannot be evaluated")
             } else {
                 None
             };
@@ -737,12 +739,7 @@ mod tests {
             b: [1.05, 0.22, 1.01],
             c: [0.006, 0.02, 103.0],
         };
-        Glass {
-            name: name.to_string(),
-            nd: sell.index(crate::material::LAMBDA_D),
-            vd: abbe_number(&sell),
-            sell,
-        }
+        Glass::sellmeier(name, sell)
     }
 
     // --- The reason id remapping exists ------------------------------------
@@ -1019,6 +1016,8 @@ mod tests {
             nd: flat.index(LAMBDA_D),
             vd,
             sell: flat,
+            reference: None,
+            formula: None,
         };
         let mut scene = Scene::new();
         assert!(matches!(

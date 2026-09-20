@@ -7,7 +7,8 @@
 //!
 //! The exchanges crossing this boundary are all JSON strings:
 //! - [`scene_to_seq`] `.ocanvas` → sequential-prescription JSON (+ fidelity notes)
-//! - [`seq_to_scene`] sequential-prescription JSON → `.ocanvas`
+//! - [`seq_to_scene`] sequential-prescription JSON → `.ocanvas` (version 1)
+//! - [`seq_to_scene3`] sequential-prescription JSON → `.ocanvas` (version 2)
 //! - [`validate`] parse-and-version-check an `.ocanvas` document
 //! - [`scene3_sequence`] `.ocanvas` (v1 or v2) → `oc-seq3` axial-ray sequence
 //!   prescription for one source/detector pair — the 3D, trace-derived sibling
@@ -56,6 +57,12 @@ create_exception!(
     OcanvasError,
     "A valid scene with optical content the sequential export cannot represent."
 );
+create_exception!(
+    _native,
+    NotImportableError,
+    OcanvasError,
+    "A sequential prescription with content a canvas scene cannot be built from:      a mirror, a virtual image, a glass with no data."
+);
 
 /// The exception a document failure raises: which of the three it was.
 fn doc_err(e: DocumentError) -> PyErr {
@@ -98,9 +105,7 @@ fn scene_to_seq(
         }
         Document::V2(scene) => {
             let (source, detector) = match (source_id, detector_id) {
-                (Some(s), Some(d)) => {
-                    (oc_core::id::SourceId(s), oc_core::id::DetectorId(d))
-                }
+                (Some(s), Some(d)) => (oc_core::id::SourceId(s), oc_core::id::DetectorId(d)),
                 (None, None) => oc_trace::default_path(&scene).map_err(export_err)?,
                 _ => {
                     return Err(PyValueError::new_err(
@@ -124,6 +129,29 @@ fn export_err(e: oc_trace::ExportError) -> PyErr {
 fn seq_to_scene(seq_json: &str) -> PyResult<String> {
     let sys = SeqSystem::from_json(seq_json).map_err(to_py_err)?;
     Ok(sys.to_scene().to_json())
+}
+
+/// Build a version 2 `.ocanvas` document from a sequential-prescription JSON
+/// string: the lens as revolved bodies, the stop as a declared aperture, one
+/// source per field and a detector on the image plane (see
+/// `oc_core::seq_import`). Returns the document and the notes on what it
+/// holds only approximately. Raises `NotImportableError`, with every reason,
+/// for a prescription it cannot build.
+#[pyfunction]
+#[pyo3(signature = (seq_json, rays_per_field = 64, pixels = 64))]
+fn seq_to_scene3(
+    seq_json: &str,
+    rays_per_field: u32,
+    pixels: usize,
+) -> PyResult<(String, Vec<String>)> {
+    let sys = SeqSystem::from_json(seq_json).map_err(to_py_err)?;
+    let opts = oc_core::seq_import::ImportOptions {
+        rays_per_field,
+        pixels,
+    };
+    let built = oc_core::seq_import::import_seq(&sys, &opts)
+        .map_err(|e| NotImportableError::new_err(e.to_string()))?;
+    Ok((built.scene.to_json(), built.notes))
 }
 
 /// Round-trip an `.ocanvas` document through the scene model (parse + re-emit),
@@ -339,6 +367,7 @@ fn to_py_err<E: std::fmt::Display>(e: E) -> PyErr {
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(scene_to_seq, m)?)?;
     m.add_function(wrap_pyfunction!(seq_to_scene, m)?)?;
+    m.add_function(wrap_pyfunction!(seq_to_scene3, m)?)?;
     m.add_function(wrap_pyfunction!(scene3_sequence, m)?)?;
     m.add_function(wrap_pyfunction!(scene3_sequence_for_intent, m)?)?;
     m.add_function(wrap_pyfunction!(thinfilm_rt, m)?)?;
@@ -353,8 +382,12 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = m.py();
     m.add("OcanvasError", py.get_type::<OcanvasError>())?;
     m.add("NotADocumentError", py.get_type::<NotADocumentError>())?;
-    m.add("UnsupportedVersionError", py.get_type::<UnsupportedVersionError>())?;
+    m.add(
+        "UnsupportedVersionError",
+        py.get_type::<UnsupportedVersionError>(),
+    )?;
     m.add("InvalidSceneError", py.get_type::<InvalidSceneError>())?;
     m.add("NotExportableError", py.get_type::<NotExportableError>())?;
+    m.add("NotImportableError", py.get_type::<NotImportableError>())?;
     Ok(())
 }

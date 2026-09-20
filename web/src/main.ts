@@ -16,6 +16,7 @@ import { createComponentView, type ComponentView } from "./inset/component-view"
 import { initOpenUc2 } from "./features/openuc2/OpenUc2Page";
 import { drawFacePixels, faceBox, facePath, formatFlux, type DetectorFace, type DetectorReadout } from "./detector-face";
 import { drawPolarMap } from "./polarmap";
+import { initGallery } from "./gallery";
 import { createReference, type ReferenceBundle } from "./reference";
 
 const SCALE = 6.5; // px per mm
@@ -159,6 +160,21 @@ async function main() {
   }
   const panBy = (dxScreen: number, dyScreen: number) => { panX += dxScreen; panY += dyScreen; };
   const resetView = () => { scale = SCALE; panX = 0; panY = 0; };
+
+  // Frame the 2D section on the loaded scene, its sources included, in the
+  // part of the window the side panels leave clear.
+  function fitView() {
+    const e = slice3d?.extent();
+    if (!e) return;
+    const [x0, y0, x1, y1] = e;
+    const left = 270, right = 280, top = 64, bottom = 32;
+    const aw = Math.max(160, w() - left - right);
+    const ah = Math.max(120, h() - top - bottom);
+    const dx = Math.max(x1 - x0, 1e-6), dy = Math.max(y1 - y0, 1e-6);
+    scale = Math.min(400, Math.max(0.4, 0.9 * Math.min(aw / dx, ah / dy)));
+    panX = left + aw / 2 - w() / 2 - ((x0 + x1) / 2) * scale;
+    panY = top + ah / 2 - h() / 2 + ((y0 + y1) / 2) * scale;
+  }
 
   function resize() {
     const dpr = window.devicePixelRatio || 1;
@@ -1195,6 +1211,32 @@ async function main() {
     URL.revokeObjectURL(url);
     flash(`saved ${a.download} · ${(json.length / 1024).toFixed(1)} kB`);
   });
+
+  // --- the gallery: ready-made designs (web/src/gallery.ts) ---------------
+  // A design opens the way a file does, then the view frames it and the panels
+  // follow it: the source picker reads its first field, the readout its image.
+  const gallery = initGallery({
+    load: (name, text) => slice3d!.openText(name, text),
+    frame: () => {
+      if (in3dModel()) viewport3d!.resetView();
+      else fitView();
+      refreshActive3d();
+      syncSourcePicker();
+      drawAbbe();
+      renderView();
+      refreshReference();
+    },
+    opened: (d) => {
+      const approx = d.notes?.length ? ` Approximate: ${d.notes.join("; ")}.` : "";
+      flash(`${d.name}, from Optiland's samples (${d.source}).${approx}`);
+    },
+  });
+  // `?gallery` opens the gallery; `?gallery=<id>` opens that design.
+  if (params.has("gallery")) {
+    const id = params.get("gallery");
+    if (id) void gallery.open(id);
+    else void gallery.show();
+  }
 
   drawAbbe();
   renderView();

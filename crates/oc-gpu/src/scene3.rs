@@ -382,7 +382,7 @@ fn body_index_at(
 ) -> Option<f64> {
     match m {
         Material::AbbePoint { nd, vd } => Some(Cauchy::from_abbe(*nd, *vd).index(lambda_um)),
-        Material::Catalog(id) => catalog.get(*id).map(|g| g.sell.index(lambda_um)),
+        Material::Catalog(id) => catalog.get(*id).map(|g| g.index(lambda_um)),
         Material::Grin(f) => Some(f.base_index),
         Material::Mirror { .. } | Material::Absorber => Some(1.0),
     }

@@ -29,6 +29,7 @@
 //! coating the prescription has no field for) goes in the notes, which
 //! `strict` export refuses and default export warns about.
 
+use oc_core::geom3::{Containment, Intersect3, ToleranceContext};
 use oc_core::id::{ApertureId, DetectorId, ObjectId, SourceId};
 use oc_core::profile2::{Curve2, ProfileConstruction3};
 use oc_core::scene3::{
@@ -137,8 +138,11 @@ pub fn export_seq(
     let mut reasons: Vec<String> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
     let mut stations: Vec<Station> = Vec::new();
-    // The bodies the path is inside, for the medium behind each surface.
-    let mut inside: Vec<&Body3> = Vec::new();
+    // Media are read the way the tracer reads them, by what contains a point
+    // just past each surface (§9.4), so the step is the tracer's.
+    let tol = ToleranceContext::for_scene_scale(axial(chain.terminal.point).abs());
+    let step = 8.0 * tol.medium_abs_mm;
+    let mut noted_absorption: Vec<ObjectId> = Vec::new();
     let ambient = ambient_material(scene);
 
     for hit in &chain.hits {
@@ -211,24 +215,25 @@ pub fn export_seq(
         let c = sigma * face.c;
         let coefficients = trim(face.coeffs.iter().map(|a| sigma * a).collect());
 
-        // The medium behind the surface: entering a body puts the path in
-        // it, leaving one returns it to whatever surrounds it.
-        let entering = match inside.iter().position(|b| b.common.id == body.common.id) {
-            Some(i) => {
-                inside.remove(i);
-                false
-            }
-            None => true,
-        };
-        if entering {
-            inside.push(body);
-            if !matches!(body.absorption, AbsorptionModel::None) {
+        // The medium behind the surface: the body that holds the path just
+        // past it. A cemented face is one surface between two bodies, and the
+        // trace meets it once, on either body's face; what lies past it is
+        // the other body either way.
+        let past = hit.point + d * step;
+        let entering =
+            body.geometry.contains(past, &body.common.transform, &tol) == Containment::Inside;
+        let behind = medium_body(scene, past, &tol);
+        if let Some(b) = behind {
+            if !matches!(b.absorption, AbsorptionModel::None)
+                && !noted_absorption.contains(&b.common.id)
+            {
+                noted_absorption.push(b.common.id);
                 notes.push(format!(
-                    "{who}: its bulk absorption is not carried; the sequential glass is clear"
+                    "{}: its bulk absorption is not carried; the sequential glass is clear",
+                    describe(scene, b.common.id)
                 ));
             }
         }
-        let behind = inside.iter().max_by_key(|b| b.priority).copied();
         let (material, n_behind) = match behind {
             None => ambient.clone(),
             Some(b) => match SeqMaterial::from_material(&b.material, &scene.catalog) {
@@ -366,6 +371,24 @@ pub fn export_seq(
     // own; the apertures fall between them. An aperture sits in whatever the
     // surface before it left the path in.
     stations.sort_by(|x, y| x.s.total_cmp(&y.s));
+    // A stop on a lens face's vertex ties with the face, and goes on the
+    // face's air side: in front of a front face, behind a back face, where a
+    // stop drawn on a lens is. The sort left it behind the face.
+    let tie = 1e-9 * s_image.abs().max(1.0);
+    for i in 1..stations.len() {
+        let (face, stop) = (&stations[i - 1], &stations[i]);
+        if stop.aperture.is_none() || face.aperture.is_some() || (stop.s - face.s).abs() > tie {
+            continue;
+        }
+        let before = stations[..i - 1]
+            .iter()
+            .rev()
+            .find(|st| st.aperture.is_none())
+            .map_or(&ambient.0, |st| &st.surface.material);
+        if *before == ambient.0 {
+            stations.swap(i - 1, i);
+        }
+    }
     let mut current = ambient.0.clone();
     for st in &mut stations {
         if st.aperture.is_some() {
@@ -424,9 +447,23 @@ pub fn export_seq(
         fields,
         field_type,
         object_distance,
+        object_space_telecentric: false,
+        image_semi_aperture: None,
+        aimed_beams: Vec::new(),
         wavelengths: wavelengths(scene, source),
         notes,
     })
+}
+
+/// The body whose material fills `point`: the highest priority containing it,
+/// ties to the highest id, the rule the tracer resolves media by (§9.4).
+fn medium_body<'a>(scene: &'a Scene3, point: Vec3, tol: &ToleranceContext) -> Option<&'a Body3> {
+    scene
+        .bodies
+        .iter()
+        .filter(|b| b.is_3d())
+        .filter(|b| b.geometry.contains(point, &b.common.transform, tol) == Containment::Inside)
+        .max_by_key(|b| (b.priority, b.common.id.0))
 }
 
 /// The aperture the scene declares as the stop of this path, if it declares

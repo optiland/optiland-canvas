@@ -35,8 +35,8 @@ import optiland_canvas as oc
 optic = oc.to_optic("design.ocanvas")
 optic.draw()
 
-# Import: Optiland Optic  ->  .ocanvas scene
-open("out.ocanvas", "w").write(oc.from_optic(optic))
+# Import: Optiland Optic  ->  .ocanvas scene (the 3D scene the browser edits)
+open("out.ocanvas", "w").write(oc.from_optic(optic, version=2))
 ```
 
 ### Fidelity is reported, never faked
@@ -59,6 +59,7 @@ These work without Optiland installed (pure `.ocanvas` ⇄ prescription):
 |---|---|
 | `scene_to_seq(scene)` | scene → sequential-prescription dict (with `notes`) |
 | `seq_to_scene(seq)` | prescription → `.ocanvas` JSON (version 1) |
+| `seq_to_scene3(seq)` | prescription → `.ocanvas` JSON (version 2), and its notes |
 | `validate(scene)` | read and validate a document of any version, return the version |
 | `load(path)` / `save(scene, path)` | read / normalize-and-write a `.ocanvas` file, keeping its version |
 
@@ -80,8 +81,10 @@ tell a wrong file from a newer tool from a broken scene:
 | `InvalidSceneError` | a readable version whose scene does not hold up (a field of the wrong type, a detector with no pixels, a dangling reference) |
 
 A scene that reads fine but has no sequential form raises `NotExportableError`
-from the export functions. All four are `OcanvasError`, which is a
-`ValueError`, so code written against the old `ValueError` still catches them.
+from the export functions, and a design with no scene form (a mirror, a
+virtual image) raises `NotImportableError` from the import functions. All five
+are `OcanvasError`, which is a `ValueError`, so code written against the old
+`ValueError` still catches them.
 
 ### Exporting a version 2 scene
 
@@ -123,6 +126,48 @@ optic = oc.to_optic(scene, strict=True)     # NotExportableError: declare a stop
 
 An inferred stop moves the entrance and exit pupils, and with them every
 off-axis ray, which is why it is announced or refused rather than assumed.
+
+### Importing an Optic as a 3D scene
+
+`from_optic(optic, version=2)` builds the scene the browser edits: each lens
+element a revolved body, the stop an aperture the scene declares, one source
+per field filling the entrance pupil the way Optiland launches its rays, and a
+detector on the image plane. The default, `version=1`, writes the older 2D
+document for existing callers; it has no apertures and so cannot hold the
+stop.
+
+```python
+scene = oc.from_optic(optic, version=2)              # warns about anything approximate
+scene = oc.from_optic(optic, version=2, strict=True) # NotImportableError instead
+scene, notes = oc.seq_to_scene3(oc.seq_from_optic(optic))
+```
+
+Reading the `Optic` (`seq_from_optic`) keeps what the canvas needs to trace
+the same design:
+
+- each surface's clear aperture: its physical aperture, or else the widest
+  real ray over every field, wavelength and pupil edge, 1% wider;
+- each glass's catalog and published dispersion formula, so the exact
+  tracer's indices are Optiland's; a glass whose formula is not a three-term
+  Sellmeier curve also carries a fitted one for the GPU preview;
+- the primary wavelength first, object-height fields, mirrors, object-space
+  telecentricity, and, for a design that aims its rays through the real stop,
+  each field's real pupil.
+
+What it cannot carry is reported in `notes`: an `r²` aspheric term (refitted
+as `A4` to `A18`, with the largest sag difference), a curved image surface, a
+tilted or decentred surface, a surface type other than a conic or an even
+asphere.
+
+### The gallery
+
+`python -m optiland_canvas.gallery web/public/gallery` builds every design in
+`optiland.samples` this way and writes the browser's gallery: one `.ocanvas`
+per design, `index.json` for the cards, and `checks.json`, rays Optiland
+traced through each design with where they land. `oc-trace/tests/gallery3.rs`
+traces the committed scenes with the canvas's reference tracer and holds them
+to those rays; `tests/test_gallery.py` round-trips every sample through
+`to_optic`. See [the gallery](../../docs/gallery.md).
 
 The tests in `tests/test_documents.py` read files the browser actually saved
 (`tests/data/browser-*.ocanvas`). `web/tests/save.spec.ts` saves the same

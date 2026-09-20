@@ -841,9 +841,40 @@ fn is_mirror_symmetric_y(profile: &ClosedProfile2, scale: f64) -> bool {
 /// Does the closed profile cross itself? Sampled into a polygon, then tested for
 /// a proper intersection between non-adjacent segments.
 fn profile_self_intersects(profile: &ClosedProfile2) -> bool {
+    // A conic is sampled from `-half_ap` to `+half_ap` whichever way the loop
+    // runs through it, so each curve is turned to run on from where the loop
+    // has got to. Unturned, a face running against the loop joins it by a
+    // chord straight across the body, and a meniscus whose back rim sits
+    // within its front face's depth reads as crossing itself.
+    let samples: Vec<Vec<Vec2>> = profile
+        .edges
+        .iter()
+        .map(|e| sample_curve(&e.curve, 12))
+        .collect();
+    let dist = |a: Vec2, b: Vec2| (a - b).length();
     let mut poly: Vec<Vec2> = Vec::new();
-    for e in &profile.edges {
-        let s = sample_curve(&e.curve, 12);
+    for s in &samples {
+        let mut s = s.clone();
+        let (Some(&first), Some(&end)) = (s.first(), s.last()) else {
+            continue;
+        };
+        let reverse = match poly.last() {
+            Some(&last) => dist(last, end) < dist(last, first),
+            // The first curve runs toward whichever end the next one starts
+            // from.
+            None => samples
+                .get(1)
+                .is_some_and(|next| match (next.first(), next.last()) {
+                    (Some(&a), Some(&b)) => {
+                        let near = |p: Vec2| dist(p, a).min(dist(p, b));
+                        near(first) < near(end)
+                    }
+                    _ => false,
+                }),
+        };
+        if reverse {
+            s.reverse();
+        }
         // Drop the shared endpoint with the previous edge to avoid a false
         // adjacency crossing at the seam.
         let start = if poly.last().is_some_and(|last| {

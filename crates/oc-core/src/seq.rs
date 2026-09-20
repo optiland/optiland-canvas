@@ -22,7 +22,7 @@
 //! parameter-stable; the tests at the bottom and in `oc-py` lock that down.
 
 use crate::geom::{ConicParams, Edge};
-use crate::material::{GlassCatalog, Material};
+use crate::material::{DispersionFormula, Glass, GlassCatalog, Material, Sellmeier};
 use crate::scene::{
     Detector, Element, Environment, Region, Scene, Source, SourceKind, Spectrum, SurfaceSpec,
 };
@@ -51,44 +51,130 @@ pub enum SeqMaterial {
     Ideal { n: f64 },
     /// A point on the Abbe map (canvas `AbbePoint`, Optiland `AbbeMaterial`).
     Abbe { nd: f64, vd: f64 },
-    /// A named catalog glass (canvas `Catalog`, Optiland `Material(name)`).
-    Glass { name: String },
+    /// A named catalog glass (canvas `Catalog`, Optiland `Material(name,
+    /// reference)`), with its dispersion data when the name alone would not
+    /// find it: a glass outside the built-in catalog carries its formula, and
+    /// the Sellmeier curve the f32 preview uses for it when the formula is not
+    /// one.
+    Glass {
+        name: String,
+        /// The catalog the name is from ("schott", "hikari").
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reference: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        formula: Option<DispersionFormula>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sellmeier: Option<Sellmeier>,
+    },
     /// A reflective body (canvas `Mirror`, Optiland `"mirror"`).
     Mirror,
 }
 
 impl SeqMaterial {
+    /// A catalog glass known by its name alone.
+    pub fn glass(name: impl Into<String>) -> Self {
+        SeqMaterial::Glass {
+            name: name.into(),
+            reference: None,
+            formula: None,
+            sellmeier: None,
+        }
+    }
+
     /// The neutral material for a canvas bulk [`Material`] (needs the catalog to
-    /// resolve a [`Material::Catalog`] id back to its glass name). Absorber/GRIN
+    /// resolve a [`Material::Catalog`] id back to its glass). Absorber/GRIN
     /// have no sequential analogue and return `None` (the caller notes it).
+    ///
+    /// A catalog glass keeps its data, so a scene built from the result holds
+    /// the same glass; a glass with no dispersion is the ideal material it
+    /// stands for.
     pub fn from_material(m: &Material, catalog: &GlassCatalog) -> Option<Self> {
         match m {
             Material::AbbePoint { nd, vd } => Some(SeqMaterial::Abbe { nd: *nd, vd: *vd }),
-            Material::Catalog(id) => catalog
-                .get(*id)
-                .map(|g| SeqMaterial::Glass { name: g.name.clone() }),
+            Material::Catalog(id) => catalog.get(*id).map(|g| match &g.formula {
+                Some(DispersionFormula::Constant { n }) => SeqMaterial::Ideal { n: *n },
+                formula => SeqMaterial::Glass {
+                    name: g.name.clone(),
+                    reference: g.reference.clone(),
+                    formula: formula.clone(),
+                    sellmeier: Some(g.sell),
+                },
+            }),
             Material::Mirror { .. } => Some(SeqMaterial::Mirror),
             Material::Absorber | Material::Grin(_) => None,
         }
     }
 
-    /// The canvas bulk [`Material`] for this medium, resolving a glass name via
-    /// the catalog. Returns `None` for [`SeqMaterial::Air`] (no element bulk).
-    fn to_material(&self, catalog: &GlassCatalog) -> Option<Material> {
+    /// The catalog glass this medium stands for, from its own data: an ideal
+    /// medium is a glass with no dispersion, and a named glass with a formula
+    /// is that formula. `None` for air, a mirror, an Abbe point, and a glass
+    /// known only by name (which a catalog has to find); `Err` for data that
+    /// does not make a glass.
+    pub fn to_glass(&self) -> Result<Option<Glass>, String> {
+        match self {
+            SeqMaterial::Ideal { n } => {
+                let formula = DispersionFormula::Constant { n: *n };
+                formula.check()?;
+                Ok(Glass::with_formula(format!("n = {n}"), formula, None))
+            }
+            SeqMaterial::Glass {
+                name,
+                reference,
+                formula,
+                sellmeier,
+            } => {
+                let glass = match (formula, sellmeier) {
+                    (Some(f), stand_in) => {
+                        f.check().map_err(|why| format!("glass {name}: {why}"))?;
+                        let unfitted = || {
+                            format!(
+                                "glass {name}: its formula is not a three-term Sellmeier curve, \
+                                 and no fitted one was given for the preview"
+                            )
+                        };
+                        Glass::with_formula(name.clone(), f.clone(), *stand_in)
+                            .ok_or_else(unfitted)?
+                    }
+                    (None, Some(s)) => Glass::sellmeier(name.clone(), *s),
+                    (None, None) => return Ok(None),
+                };
+                let sell = &glass.sell;
+                if sell.b.iter().chain(&sell.c).any(|v| !v.is_finite()) {
+                    let why = "a Sellmeier coefficient is not finite";
+                    return Err(format!("glass {name}: {why}"));
+                }
+                Ok(Some(Glass {
+                    reference: reference.clone(),
+                    ..glass
+                }))
+            }
+            SeqMaterial::Air | SeqMaterial::Abbe { .. } | SeqMaterial::Mirror => Ok(None),
+        }
+    }
+
+    /// The canvas bulk [`Material`] for this medium, putting its glass in
+    /// the catalog, or finding a glass known only by name there. Returns
+    /// `None` for [`SeqMaterial::Air`] (no element bulk).
+    ///
+    /// The prescription is the authority for its own glasses: one that
+    /// carries data replaces a same-named glass of the scene's starting
+    /// catalog rather than quietly becoming it.
+    fn to_material(&self, catalog: &mut GlassCatalog) -> Option<Material> {
         match self {
             SeqMaterial::Air => None,
-            // Non-dispersive: a huge Abbe number flattens the Cauchy fit to a
-            // constant `n = nd` (canvas has no dedicated ideal-glass variant).
-            SeqMaterial::Ideal { n } => Some(Material::AbbePoint {
-                nd: *n,
-                vd: 1.0e9,
-            }),
             SeqMaterial::Abbe { nd, vd } => Some(Material::AbbePoint { nd: *nd, vd: *vd }),
-            SeqMaterial::Glass { name } => catalog
-                .find(name)
-                .map(Material::Catalog)
-                .or(Some(Material::AbbePoint { nd: 1.5, vd: 50.0 })),
             SeqMaterial::Mirror => Some(Material::Mirror { reflectivity: 1.0 }),
+            SeqMaterial::Ideal { .. } | SeqMaterial::Glass { .. } => match self.to_glass() {
+                Ok(Some(g)) => Some(Material::Catalog(
+                    catalog.intern(&g).unwrap_or_else(|| catalog.put(&g)),
+                )),
+                Ok(None) => match self {
+                    SeqMaterial::Glass { name, .. } => catalog.find(name).map(Material::Catalog),
+                    _ => None,
+                },
+                Err(_) => None,
+            }
+            .or(Some(Material::AbbePoint { nd: 1.5, vd: 50.0 })),
         }
     }
 
@@ -199,6 +285,22 @@ pub enum FieldType {
     ObjectHeight,
 }
 
+/// A collimated field's beam when rays are aimed through the real stop: the
+/// rectangle, square to the beam, that covers the field's real entrance
+/// pupil. At a wide field the real pupil moves off the paraxial one and
+/// narrows across the meridian, so neither the paraxial pupil's place nor its
+/// size stands in for it.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct AimedBeam {
+    /// Where the rectangle's centre line crosses the plane of the first
+    /// surface's vertex, `[y, z]` in mm.
+    pub centre_mm: [f64; 2],
+    /// Half its extent in the meridional plane, square to the beam, mm.
+    pub half_width_mm: f64,
+    /// Half its extent out of the meridional plane, mm.
+    pub half_height_mm: f64,
+}
+
 /// A rotationally-symmetric sequential system — the neutral prescription that
 /// maps 1:1 onto an Optiland `Optic`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -228,6 +330,21 @@ pub struct SeqSystem {
     /// null so the JSON never has to encode an infinity.
     #[serde(default)]
     pub object_distance: Option<f64>,
+    /// Chief rays parallel to the axis in object space, so the entrance pupil
+    /// is at infinity (Optiland's `obj_space_telecentric`). Only meaningful for
+    /// an object at a finite distance.
+    #[serde(default)]
+    pub object_space_telecentric: bool,
+    /// The image's semi-diameter (mm), when known: how far from the axis light
+    /// lands on the image plane. `None` leaves it to be estimated.
+    #[serde(default)]
+    pub image_semi_aperture: Option<f64>,
+    /// One per field when the design aims its rays through the real stop
+    /// rather than the paraxial entrance pupil (Optiland's ray aiming): the
+    /// beam that covers each field's real pupil. Empty for a design traced
+    /// from the paraxial pupil.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aimed_beams: Vec<AimedBeam>,
     /// Wavelengths (µm); the first is primary.
     pub wavelengths: Vec<f64>,
     /// Human-readable fidelity report: what could not be represented exactly.
@@ -256,7 +373,6 @@ impl SeqSystem {
     /// plane. Uses the built-in glass catalog to resolve named glasses.
     pub fn to_scene(&self) -> Scene {
         let mut scene = Scene::new();
-        let catalog = scene.catalog.clone();
 
         // Absolute axial position of each surface vertex (first at x = 0).
         let mut xs = Vec::with_capacity(self.surfaces.len());
@@ -275,7 +391,7 @@ impl SeqSystem {
             if !surf.material.is_glassy() || i + 1 >= self.surfaces.len() {
                 continue;
             }
-            let Some(bulk) = surf.material.to_material(&catalog) else {
+            let Some(bulk) = surf.material.to_material(&mut scene.catalog) else {
                 continue;
             };
             let front = &self.surfaces[i];
@@ -477,6 +593,9 @@ impl Scene {
             fields,
             field_type,
             object_distance,
+            object_space_telecentric: false,
+            image_semi_aperture: None,
+            aimed_beams: Vec::new(),
             wavelengths,
             notes,
         }
@@ -637,6 +756,9 @@ mod tests {
             fields,
             field_type: FieldType::Angle,
             object_distance: None, // collimated ⇒ object at infinity
+            object_space_telecentric: false,
+            image_semi_aperture: None,
+            aimed_beams: Vec::new(),
             wavelengths: vec![0.58756],
             notes: vec![],
         };
@@ -876,14 +998,18 @@ mod tests {
     #[test]
     fn catalog_glass_survives_roundtrip() {
         let mut sys = corpus().into_iter().next().unwrap().1;
-        sys.surfaces[0].material = SeqMaterial::Glass {
-            name: "N-BK7".into(),
-        };
+        sys.surfaces[0].material = SeqMaterial::glass("N-BK7");
         let back = sys.to_scene().to_seq();
+        let cat = GlassCatalog::builtin();
+        let nbk7 = cat.get(cat.find("N-BK7").unwrap()).unwrap();
+        // The glass comes back with its data, so it no longer needs finding.
         assert_eq!(
             back.surfaces[0].material,
             SeqMaterial::Glass {
-                name: "N-BK7".into()
+                name: "N-BK7".into(),
+                reference: None,
+                formula: None,
+                sellmeier: Some(nbk7.sell),
             }
         );
     }

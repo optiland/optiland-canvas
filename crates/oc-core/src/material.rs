@@ -5,8 +5,9 @@
 //! Two dispersion models:
 //! - [`Material::AbbePoint`] uses a two-term Cauchy fit with a **closed form**
 //!   from `(n_d, V_d)` (§3.1) — no solver, cheap enough to be a brush.
-//! - [`Material::Catalog`] uses the full three-term Sellmeier equation and is
-//!   treated as exact.
+//! - [`Material::Catalog`] uses the glass's published data: the three-term
+//!   Sellmeier equation, or, for a glass published in another form, that
+//!   form ([`DispersionFormula`]), which the f64 reference evaluates exactly.
 
 use serde::{Deserialize, Serialize};
 
@@ -92,15 +93,204 @@ impl Sellmeier {
     }
 }
 
+/// A dispersion formula as the refractiveindex.info database publishes it,
+/// which is the form the catalogs behind Optiland's glasses come in. Numbered
+/// as the database numbers them; wavelengths in µm.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DispersionFormula {
+    /// Formula 1: `n² − 1 = c₀ + Σ cᵢ λ² / (λ² − cᵢ₊₁²)`.
+    Sellmeier { coefficients: Vec<f64> },
+    /// Formula 2: `n² − 1 = c₀ + Σ cᵢ λ² / (λ² − cᵢ₊₁)`.
+    Sellmeier2 { coefficients: Vec<f64> },
+    /// Formula 3: `n² = c₀ + Σ cᵢ λ^cᵢ₊₁`.
+    Polynomial { coefficients: Vec<f64> },
+    /// No dispersion: `n` at every wavelength (Optiland's `IdealMaterial`).
+    Constant { n: f64 },
+}
+
+impl DispersionFormula {
+    /// The refractive index at `lambda_um`, summed in the order the database's
+    /// definition (and Optiland) sums it.
+    pub fn index(&self, lambda_um: f64) -> f64 {
+        let l2 = lambda_um * lambda_um;
+        match self {
+            Self::Sellmeier { coefficients: c } => {
+                let mut n2 = 1.0 + c[0];
+                for k in (1..c.len()).step_by(2) {
+                    n2 += c[k] * l2 / (l2 - c[k + 1] * c[k + 1]);
+                }
+                n2.sqrt()
+            }
+            Self::Sellmeier2 { coefficients: c } => {
+                let mut n2 = 1.0 + c[0];
+                for k in (1..c.len()).step_by(2) {
+                    n2 += c[k] * l2 / (l2 - c[k + 1]);
+                }
+                n2.sqrt()
+            }
+            Self::Polynomial { coefficients: c } => {
+                let mut n2 = c[0];
+                for k in (1..c.len()).step_by(2) {
+                    n2 += c[k] * lambda_um.powf(c[k + 1]);
+                }
+                n2.sqrt()
+            }
+            Self::Constant { n } => *n,
+        }
+    }
+
+    /// Why the formula cannot be evaluated, if it cannot: a coefficient that
+    /// is not finite, or a count that is not a constant plus whole pairs.
+    pub fn check(&self) -> Result<(), String> {
+        let c = match self {
+            Self::Constant { n } => {
+                return if n.is_finite() && *n > 0.0 {
+                    Ok(())
+                } else {
+                    Err(format!("a constant index of {n}"))
+                };
+            }
+            Self::Sellmeier { coefficients }
+            | Self::Sellmeier2 { coefficients }
+            | Self::Polynomial { coefficients } => coefficients,
+        };
+        if c.iter().any(|v| !v.is_finite()) {
+            return Err("a coefficient that is not finite".into());
+        }
+        if c.len() % 2 != 1 {
+            return Err(format!(
+                "{} coefficients, where a constant and whole pairs make an odd count",
+                c.len()
+            ));
+        }
+        Ok(())
+    }
+
+    /// The same curve as a three-term [`Sellmeier`], when it is one exactly.
+    ///
+    /// Formulas 1 and 2 are Sellmeier sums; one with at most three terms fits,
+    /// and so does a nonzero constant `c₀` beside at most two, as a term with
+    /// its pole at zero (`b λ² / (λ² − 0) = b`). A constant index is the
+    /// constant term alone. A polynomial, or a longer sum, is not a Sellmeier
+    /// curve, and a Sellmeier stand-in for it can only be fitted.
+    pub fn as_sellmeier(&self) -> Option<Sellmeier> {
+        let (c, squared) = match self {
+            Self::Constant { n } => {
+                return Some(Sellmeier {
+                    b: [n * n - 1.0, 0.0, 0.0],
+                    c: [0.0; 3],
+                })
+            }
+            Self::Sellmeier { coefficients } => (coefficients, true),
+            Self::Sellmeier2 { coefficients } => (coefficients, false),
+            Self::Polynomial { .. } => return None,
+        };
+        let mut terms: Vec<(f64, f64)> = c[1..]
+            .chunks(2)
+            .map(|p| (p[0], if squared { p[1] * p[1] } else { p[1] }))
+            .collect();
+        if c[0] != 0.0 {
+            terms.push((c[0], 0.0));
+        }
+        if terms.len() > 3 {
+            return None;
+        }
+        let mut s = Sellmeier {
+            b: [0.0; 3],
+            c: [0.0; 3],
+        };
+        for (i, (b, pole)) in terms.into_iter().enumerate() {
+            s.b[i] = b;
+            s.c[i] = pole;
+        }
+        Some(s)
+    }
+}
+
 /// A catalog glass entry.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Glass {
     pub name: String,
+    /// The three-term Sellmeier curve. The glass's own data when it is
+    /// published in that form; otherwise a stand-in fitted to [`Glass::formula`],
+    /// for the f32 preview, whose shader evaluates this form and no other.
     pub sell: Sellmeier,
     /// Cached refractive index at the d line.
     pub nd: f64,
-    /// Cached Abbe number.
+    /// Cached Abbe number; 0 for a glass with no dispersion, whose Abbe
+    /// number is infinite (the convention Zemax's model glass uses).
     pub vd: f64,
+    /// The catalog the name is from ("schott", "hikari"): two makers sell
+    /// different glasses under one name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference: Option<String>,
+    /// The published formula, when it is not [`Glass::sell`] itself. The f64
+    /// reference evaluates this, so its indices are the catalog's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub formula: Option<DispersionFormula>,
+}
+
+impl Glass {
+    /// A glass published as a three-term Sellmeier curve.
+    pub fn sellmeier(name: impl Into<String>, sell: Sellmeier) -> Self {
+        let mut g = Self {
+            name: name.into(),
+            sell,
+            nd: 0.0,
+            vd: 0.0,
+            reference: None,
+            formula: None,
+        };
+        g.recache();
+        g
+    }
+
+    /// A glass published in another form, with the Sellmeier curve the f32
+    /// preview uses in its place: the formula's own when it is one
+    /// ([`DispersionFormula::as_sellmeier`]), else `stand_in`. `None` when
+    /// neither is given.
+    pub fn with_formula(
+        name: impl Into<String>,
+        formula: DispersionFormula,
+        stand_in: Option<Sellmeier>,
+    ) -> Option<Self> {
+        let sell = formula.as_sellmeier().or(stand_in)?;
+        let mut g = Self {
+            name: name.into(),
+            sell,
+            nd: 0.0,
+            vd: 0.0,
+            reference: None,
+            formula: Some(formula),
+        };
+        g.recache();
+        Some(g)
+    }
+
+    /// The refractive index at `lambda_um`: the published formula when there
+    /// is one, else the Sellmeier curve.
+    pub fn index(&self, lambda_um: f64) -> f64 {
+        match &self.formula {
+            Some(f) => f.index(lambda_um),
+            None => self.sell.index(lambda_um),
+        }
+    }
+
+    /// Does the index stay the same at every wavelength?
+    pub fn is_dispersionless(&self) -> bool {
+        matches!(self.formula, Some(DispersionFormula::Constant { .. }))
+    }
+
+    fn recache(&mut self) {
+        self.nd = self.index(LAMBDA_D);
+        let spread = self.index(LAMBDA_F) - self.index(LAMBDA_C);
+        self.vd = if spread == 0.0 {
+            0.0
+        } else {
+            (self.nd - 1.0) / spread
+        };
+    }
 }
 
 /// A glass catalog, indexed by [`GlassId`].
@@ -139,15 +329,7 @@ impl GlassCatalog {
 
         let mut glasses: Vec<Glass> = raw
             .iter()
-            .map(|(name, b, c)| {
-                let sell = Sellmeier { b: *b, c: *c };
-                Glass {
-                    name: (*name).to_string(),
-                    nd: sell.index(LAMBDA_D),
-                    vd: abbe_number(&sell),
-                    sell,
-                }
-            })
+            .map(|(name, b, c)| Glass::sellmeier(*name, Sellmeier { b: *b, c: *c }))
             .collect();
 
         // Fused silica (Malitson): the C constants are given un-squared.
@@ -160,12 +342,7 @@ impl GlassCatalog {
                 fs_c_raw[2] * fs_c_raw[2],
             ],
         };
-        glasses.push(Glass {
-            name: "FusedSilica".to_string(),
-            nd: fs.index(LAMBDA_D),
-            vd: abbe_number(&fs),
-            sell: fs,
-        });
+        glasses.push(Glass::sellmeier("FusedSilica", fs));
 
         Self { glasses }
     }
@@ -198,14 +375,37 @@ impl GlassCatalog {
     /// unrelated glass in the other.
     pub fn intern(&mut self, glass: &Glass) -> Option<GlassId> {
         match self.find(&glass.name) {
-            // `nd`/`vd` are caches derived from `sell`, so dispersion identity is
-            // decided by the Sellmeier coefficients alone.
-            Some(id) if self.glasses[id.0 as usize].sell == glass.sell => Some(id),
+            // `nd`/`vd` are caches derived from the dispersion data, so
+            // identity is decided by the Sellmeier curve and the formula.
+            Some(id) if same_dispersion(&self.glasses[id.0 as usize], glass) => Some(id),
             Some(_) => None,
             None => {
                 let id = GlassId(self.glasses.len() as u32);
                 self.glasses.push(glass.clone());
                 Some(id)
+            }
+        }
+    }
+
+    /// Put `glass` in this catalog under its name, replacing a glass of that
+    /// name with different data in place, and return its id.
+    ///
+    /// For a catalog no scene object refers to yet, such as a scene being
+    /// built from a prescription whose glass data is the authority: the
+    /// built-in "F2" gives way to the catalog's own F2 rather than the scene
+    /// refusing to hold both. Replacing a glass a body already uses would
+    /// change that body's optics, which is what [`GlassCatalog::intern`]
+    /// refuses to do.
+    pub fn put(&mut self, glass: &Glass) -> GlassId {
+        match self.find(&glass.name) {
+            Some(id) => {
+                self.glasses[id.0 as usize] = glass.clone();
+                id
+            }
+            None => {
+                let id = GlassId(self.glasses.len() as u32);
+                self.glasses.push(glass.clone());
+                id
             }
         }
     }
@@ -224,6 +424,10 @@ impl GlassCatalog {
             .enumerate()
             .map(|(i, g)| (GlassId(i as u32), g))
     }
+}
+
+fn same_dispersion(a: &Glass, b: &Glass) -> bool {
+    a.sell == b.sell && a.formula == b.formula
 }
 
 /// Abbe number `V_d = (n_d − 1) / (n_F − n_C)` for a dispersion model.
@@ -332,17 +536,21 @@ impl Material {
     /// (mirror/absorber), which the tracer handles by surface behaviour.
     pub fn index_at(&self, lambda_um: f64, catalog: &GlassCatalog) -> Option<f64> {
         match self {
-            Material::Catalog(id) => catalog.get(*id).map(|g| g.sell.index(lambda_um)),
+            Material::Catalog(id) => catalog.get(*id).map(|g| g.index(lambda_um)),
             Material::AbbePoint { nd, vd } => Some(Cauchy::from_abbe(*nd, *vd).index(lambda_um)),
             Material::Grin(f) => Some(f.base_index),
             Material::Mirror { .. } | Material::Absorber => None,
         }
     }
 
-    /// `(n_d, V_d)` for placement on the Abbe map, if defined.
+    /// `(n_d, V_d)` for placement on the Abbe map, if defined. A glass with no
+    /// dispersion has no finite Abbe number and no place on the map.
     pub fn abbe(&self, catalog: &GlassCatalog) -> Option<(f64, f64)> {
         match self {
-            Material::Catalog(id) => catalog.get(*id).map(|g| (g.nd, g.vd)),
+            Material::Catalog(id) => catalog
+                .get(*id)
+                .filter(|g| !g.is_dispersionless())
+                .map(|g| (g.nd, g.vd)),
             Material::AbbePoint { nd, vd } => Some((*nd, *vd)),
             _ => None,
         }
@@ -354,16 +562,137 @@ mod tests {
     use super::*;
 
     fn glass(name: &str, b0: f64) -> Glass {
-        let sell = Sellmeier {
-            b: [b0, 0.2, 1.0],
-            c: [0.006, 0.02, 103.0],
-        };
-        Glass {
-            name: name.to_string(),
-            nd: sell.index(LAMBDA_D),
-            vd: abbe_number(&sell),
-            sell,
+        Glass::sellmeier(
+            name,
+            Sellmeier {
+                b: [b0, 0.2, 1.0],
+                c: [0.006, 0.02, 103.0],
+            },
+        )
+    }
+
+    /// Schott N-BK7 as refractiveindex.info publishes it (formula 2), and the
+    /// index Schott's datasheet gives at the d line.
+    fn nbk7_formula2() -> DispersionFormula {
+        DispersionFormula::Sellmeier2 {
+            coefficients: vec![
+                0.0,
+                1.039_612_12,
+                0.006_000_698_67,
+                0.231_792_344,
+                0.020_017_914_4,
+                1.010_469_45,
+                103.560_653,
+            ],
         }
+    }
+
+    #[test]
+    fn a_three_term_sellmeier_formula_is_the_sellmeier_curve() {
+        let f = nbk7_formula2();
+        let s = f.as_sellmeier().expect("three terms fit");
+        for lambda in [0.36, 0.48613, 0.58756, 0.65627, 1.064, 2.3] {
+            assert_eq!(f.index(lambda), s.index(lambda), "at {lambda} µm");
+        }
+        assert!((f.index(LAMBDA_D) - 1.516_8).abs() < 1e-4);
+        // Formula 1 squares its poles; the same glass written that way agrees.
+        let DispersionFormula::Sellmeier2 { coefficients: c } = &f else {
+            unreachable!()
+        };
+        let mut squared = c.clone();
+        for k in (2..squared.len()).step_by(2) {
+            squared[k] = squared[k].sqrt();
+        }
+        let f1 = DispersionFormula::Sellmeier {
+            coefficients: squared,
+        };
+        assert!((f1.index(0.5) - f.index(0.5)).abs() < 1e-15);
+    }
+
+    #[test]
+    fn a_constant_term_rides_as_a_pole_at_zero() {
+        // n² − 1 = 0.3 + 1.2 λ²/(λ² − 0.01): two terms and a constant.
+        let f = DispersionFormula::Sellmeier2 {
+            coefficients: vec![0.3, 1.2, 0.01, 0.0, 0.0],
+        };
+        let s = f.as_sellmeier().unwrap();
+        for lambda in [0.4, 0.6, 1.5] {
+            assert!((f.index(lambda) - s.index(lambda)).abs() < 1e-15);
+        }
+        // A fourth term does not fit, and neither does a polynomial.
+        let four = DispersionFormula::Sellmeier2 {
+            coefficients: vec![0.0, 1.0, 0.01, 0.2, 0.02, 1.0, 100.0, 0.5, 200.0],
+        };
+        assert!(four.as_sellmeier().is_none());
+        let poly = DispersionFormula::Polynomial {
+            coefficients: vec![2.3, -0.01, 2.0, 0.01, -2.0],
+        };
+        assert!(poly.as_sellmeier().is_none());
+    }
+
+    #[test]
+    fn a_polynomial_glass_is_evaluated_as_published() {
+        // n² = c0 + c1 λ^e1 + c2 λ^e2, at a point worked by hand.
+        let f = DispersionFormula::Polynomial {
+            coefficients: vec![2.5, -0.01, 2.0, 0.012, -2.0],
+        };
+        let lambda: f64 = 0.5;
+        let by_hand = (2.5 - 0.01 * 0.25 + 0.012 * 4.0_f64).sqrt();
+        assert_eq!(f.index(lambda), by_hand);
+        // The glass uses the formula, and the Sellmeier only stands in for it.
+        let stand_in = Sellmeier {
+            b: [1.5, 0.0, 0.0],
+            c: [0.0; 3],
+        };
+        let g = Glass::with_formula("POLY", f.clone(), Some(stand_in)).unwrap();
+        assert_eq!(g.index(lambda), by_hand);
+        assert_eq!(g.sell, stand_in);
+        assert!(
+            Glass::with_formula("POLY", f, None).is_none(),
+            "no stand-in, no glass"
+        );
+    }
+
+    #[test]
+    fn a_constant_glass_has_one_index_and_no_place_on_the_abbe_map() {
+        let g = Glass::with_formula("n = 4.002", DispersionFormula::Constant { n: 4.002 }, None)
+            .unwrap();
+        for lambda in [0.25, 0.5876, 4.2, 10.6] {
+            assert_eq!(g.index(lambda), 4.002);
+            // The preview's Sellmeier stand-in is exact too.
+            assert!((g.sell.index(lambda) - 4.002).abs() < 1e-15);
+        }
+        assert_eq!((g.nd, g.vd), (4.002, 0.0));
+        let mut cat = GlassCatalog::builtin();
+        let id = cat.put(&g);
+        assert_eq!(Material::Catalog(id).abbe(&cat), None);
+        assert_eq!(Material::Catalog(id).index_at(10.6, &cat), Some(4.002));
+    }
+
+    #[test]
+    fn put_replaces_a_glass_of_the_same_name_in_place() {
+        let mut cat = GlassCatalog::builtin();
+        let before = cat.len();
+        let f2 = cat.find("F2").unwrap();
+        let other = glass("F2", 1.3);
+        assert_eq!(cat.intern(&other), None, "intern refuses the clash");
+        assert_eq!(cat.put(&other), f2, "put keeps the id");
+        assert_eq!(cat.get(f2).unwrap().sell, other.sell);
+        assert_eq!(cat.len(), before);
+    }
+
+    #[test]
+    fn a_formula_survives_the_document_and_old_glasses_read_as_before() {
+        let g = Glass::with_formula("X", nbk7_formula2(), None).unwrap();
+        let mut g = g;
+        g.reference = Some("schott".into());
+        let json = serde_json::to_string(&g).unwrap();
+        assert_eq!(serde_json::from_str::<Glass>(&json).unwrap(), g);
+        // A glass written before the two fields existed has neither.
+        let old = r#"{"name":"OLD","sell":{"b":[1.0,0.2,1.0],"c":[0.006,0.02,103.0]},"nd":1.5,"vd":60.0}"#;
+        let read: Glass = serde_json::from_str(old).unwrap();
+        assert!(read.formula.is_none() && read.reference.is_none());
+        assert!(!serde_json::to_string(&read).unwrap().contains("formula"));
     }
 
     #[test]

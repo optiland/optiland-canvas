@@ -1346,7 +1346,7 @@ impl Scene3 {
                     Some(crate::material::Cauchy::from_abbe(*nd, *vd).index(lambda_um))
                 }
                 Material::Catalog(gid) => {
-                    self.catalog.get(*gid).map(|g| g.sell.index(lambda_um))
+                    self.catalog.get(*gid).map(|g| g.index(lambda_um))
                 }
                 _ => None,
             })

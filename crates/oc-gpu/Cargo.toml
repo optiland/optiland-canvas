@@ -51,3 +51,8 @@ required-features = ["gpu"]
 [[example]]
 name = "drag"
 required-features = ["gpu"]
+
+# What a gallery scene costs the f64 reference and the f32 CPU preview.
+[[example]]
+name = "bench_gallery"
+required-features = ["gpu3"]

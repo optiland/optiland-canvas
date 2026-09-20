@@ -21,8 +21,9 @@ trace3 = ["oc-core/scene3"]
 oc-core.workspace = true
 glam.workspace = true
 rayon = { workspace = true, optional = true }
-
-[dev-dependencies]
+# A block of a split reference trace carries its capability report to the
+# worker that adds the blocks up as JSON (`TracePart3::encode`).
+serde.workspace = true
 serde_json.workspace = true
 
 # CV-A: the headless Scene3 trace runner (§16). Needs the 3D reference tracer, so

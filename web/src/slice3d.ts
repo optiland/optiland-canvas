@@ -14,6 +14,8 @@
 import type { Canvas } from "../pkg/oc_wasm.js";
 import { createCardManager, type CardSource } from "./cards";
 import type { FastPreview } from "./fastpreview";
+import type { Reference, StandIn } from "./reference";
+import type { RayLayout } from "./rays";
 
 type V2 = { x: number; y: number };
 
@@ -22,14 +24,29 @@ export type Slice3d = {
   active: () => boolean;
   /** Draw the element cross-sections and inspector cards for the current view. */
   overlay: (ctx: CanvasRenderingContext2D, toScreen: (p: V2) => V2) => void;
-  /** The projected ray paths in RayLayer's `[ax,ay,bx,by,r,g,b,flux,flags]`
-   *  layout (slab-clipped), so 3D rays render through the same HDR renderer as v1. */
-  raySegments: () => Float32Array;
+  /** The projected ray paths and how RayLayer reads them in place: each
+   *  segment's first nine floats are its `[ax,ay,bx,by,r,g,b,flux,flags]`,
+   *  clipped to the slab as it is drawn, so 3D rays render through the same
+   *  HDR renderer as v1. */
+  rayPicture: () => { segs: Float32Array; layout: RayLayout };
   /** Re-trace (f64) and refresh geometry/inspector after an external scene edit
    *  (a glass change, a density change). Does not repaint — the caller renders. */
   refresh: () => void;
   /** The id of the selected/last-inspected body, or -1. */
   selectedBody: () => number;
+  /** The picture's version, after bringing it up to date: it changes
+   *  whenever the rays `rayPicture` draws would, so a painter can keep its
+   *  raster while it does not. */
+  picture: () => number;
+  /** Load a scene document (any readable version) into the canonical 3D
+   *  scene. False, with the reason shown, when it does not load. */
+  openText: (name: string, text: string) => boolean;
+  /** Counts the documents loaded: a view whose picture was drawn before the
+   *  count moved is showing another design. */
+  loads: () => number;
+  /** The section's extent in the view plane, `[xmin, ymin, xmax, ymax]` mm,
+   *  or null with nothing loaded. */
+  extent: () => [number, number, number, number] | null;
   /** Boot the canonical 3D scene into the default authoring scene (a singlet,
    *  a collimated beam, an area detector) so the app opens straight into 3D. */
   bootDefault: () => void;
@@ -64,6 +81,9 @@ export function initSlice3d(opts: {
   /** The interactive f32 picture, on WebGPU or the CPU mirror. Without it the
    *  view calls the CPU mirror directly. */
   fast?: FastPreview;
+  /** The f64 reference, traced off this thread. Without it the view traces
+   *  the reference itself, blocking the page while it does. */
+  reference?: Reference;
 }): Slice3d {
   const { scene, view, toScreen, toWorld, render } = opts;
   const owns = () => opts.owns?.() ?? true;
@@ -89,6 +109,9 @@ export function initSlice3d(opts: {
   let tracedRevision = -1;
   // Slice half-thickness in mm; 0 = show everything projected.
   let slice = 0;
+  // Bumped whenever the projected rays or the slab change, so a painter can
+  // tell the picture is the one it last rasterized.
+  let pictureVersion = 0;
 
   // The bodies, cached with their world position and a coarse radius, for
   // pointer hit-testing. Refreshed whenever the scene changes.
@@ -157,25 +180,65 @@ export function initSlice3d(opts: {
   // (WebGPU), so it is drawn only when it is newer than the picture on screen,
   // and never over an exact frame of the same scene.
   let shownExact = false;
+  // The workers' stand-in on screen, when the picture is one.
+  let shownStandIn: StandIn | null = null;
   function retrace(fast = false) {
+    if (!fast && opts.reference) {
+      // The reference of the scene as it is, when it has arrived; until then
+      // the fast picture stands in, and the reference is asked for.
+      const b = opts.reference.current();
+      if (b) {
+        opts.fast?.settled();
+        segs = b.projected;
+        pictureVersion++;
+        tracedRevision = b.key.revision;
+        shownExact = true;
+        shownStandIn = null;
+        return;
+      }
+      opts.reference.request();
+      // What is on screen is not the reference of this scene (it may be of
+      // the same revision under other trace settings, as after toggling the
+      // ghost layer), so a fast frame may replace it.
+      shownExact = false;
+      // Where tracing that frame here would stall the page, the workers trace
+      // it; the picture on screen holds until one lands. During a drag that
+      // may be the frame of an earlier position, newer than the one shown.
+      const s = opts.reference.standIn(shownStandIn);
+      if (s === "coming") return;
+      if (s !== "here") {
+        segs = s.segs;
+        pictureVersion++;
+        tracedRevision = s.revision;
+        shownStandIn = s;
+        return;
+      }
+      fast = true;
+    }
     if (!fast) {
       opts.fast?.settled();
       segs = scene.traceProjected3D();
+      pictureVersion++;
       tracedRevision = scene.sceneRevision();
       shownExact = true;
+      shownStandIn = null;
       return;
     }
     if (!opts.fast) {
       segs = scene.traceProjected3DFast();
+      pictureVersion++;
       tracedRevision = scene.sceneRevision();
       shownExact = false;
+      shownStandIn = null;
       return;
     }
     opts.fast.requestProjected(scene, (f) => {
       if (f.revision < tracedRevision || (f.revision === tracedRevision && shownExact)) return;
       segs = f.segs;
+      pictureVersion++;
       tracedRevision = f.revision;
       shownExact = false;
+      shownStandIn = null;
       if (f.late) render();
     });
   }
@@ -206,10 +269,23 @@ export function initSlice3d(opts: {
     }
   }
 
-  async function open(file: File) {
+  // Load a scene document into the canonical 3D scene: a file the user opens,
+  // or a design from the gallery. False, with the reason flashed, when it does
+  // not load.
+  let loadCount = 0;
+  function openText(name: string, text: string): boolean {
     try {
-      const report = JSON.parse(scene.loadScene3JSON(await file.text()));
+      const report = JSON.parse(scene.loadScene3JSON(text));
       loaded = true;
+      // Nothing of the last design stays on screen while this one's first
+      // picture is traced.
+      loadCount++;
+      opts.fast?.forget();
+      segs = new Float32Array(0);
+      pictureVersion++;
+      tracedRevision = -1;
+      shownExact = false;
+      shownStandIn = null;
       sliceRow.style.display = "";
       refreshBadge();
       refreshInspector();
@@ -218,11 +294,30 @@ export function initSlice3d(opts: {
       const note = report.migratedFromV1
         ? `migrated from v1 (2D-only bodies are not traced in full 3D)`
         : `v2 · dimension ${report.dimension}`;
-      flash(`opened ${file.name} · ${note}`);
+      flash(`opened ${name} · ${note}`);
       render();
+      return true;
     } catch (err) {
-      flash(`could not open ${file.name}: ${err}`, false);
+      flash(`could not open ${name}: ${err}`, false);
+      return false;
     }
+  }
+
+  async function open(file: File) {
+    openText(file.name, await file.text());
+  }
+
+  // The section's extent in the view plane, `[xmin, ymin, xmax, ymax]` in mm:
+  // every element's outline and every source's position, so framing it shows
+  // the beams arriving as well as the lens. Null with nothing to frame.
+  function extent(): [number, number, number, number] | null {
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    const take = (x: number, y: number) => {
+      x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x); y1 = Math.max(y1, y);
+    };
+    for (const l of xsec) for (let i = 0; i + 1 < l.pts.length; i += 2) take(l.pts[i], l.pts[i + 1]);
+    for (const s of JSON.parse(scene.sourceObjectsJSON()) as { pos: number[] }[]) take(s.pos[0], s.pos[1]);
+    return Number.isFinite(x0) ? [x0, y0, x1, y1] : null;
   }
 
   openBtn.addEventListener("click", () => openFile.click());
@@ -234,6 +329,7 @@ export function initSlice3d(opts: {
 
   sliceInput.addEventListener("input", () => {
     slice = Number(sliceInput.value);
+    pictureVersion++;
     sliceLabel.textContent = slice === 0 ? "∞" : slice.toFixed(1);
     // A slice change is a filter, not a retrace: reuse the cached projection.
     render();
@@ -594,25 +690,18 @@ export function initSlice3d(opts: {
   // layout, each segment clipped to the active slab. The main renderer feeds this
   // to the same HDR RayLayer as v1, so 3D rays get the identical spectral colour,
   // tonemap, ghost layer, and TIR handling.
-  function raySegments(): Float32Array {
-    // A stale picture is retraced exactly, unless a GPU frame for a newer
-    // revision is already on its way (then the old picture holds until it lands).
+  // A stale picture is retraced exactly, unless a GPU frame for a newer
+  // revision is already on its way (then the old picture holds until it lands).
+  function freshen() {
     if (scene.sceneRevision() !== tracedRevision && !opts.fast?.pending()) retrace();
-    const out: number[] = [];
-    for (let i = 0; i + STRIDE <= segs.length; i += STRIDE) {
-      const range = slabRange(segs[i + 9], segs[i + 10]);
-      if (!range) continue;
-      const [t0, t1] = range;
-      const au = segs[i], av = segs[i + 1], bu = segs[i + 2], bv = segs[i + 3];
-      out.push(
-        au + (bu - au) * t0, av + (bv - av) * t0,
-        au + (bu - au) * t1, av + (bv - av) * t1,
-        segs[i + 4], segs[i + 5], segs[i + 6], // linear r,g,b
-        segs[i + 7], // flux
-        segs[i + 8], // flags (bit1 TIR, bit2 ghost)
-      );
-    }
-    return new Float32Array(out);
+  }
+
+  // The picture is read in place: its first nine floats are RayLayer's, and
+  // the last two, the ends' distances from the plane, clip it to the slab. A
+  // ghost-lit lens has millions of segments, too many to copy per picture.
+  function rayPicture(): { segs: Float32Array; layout: RayLayout } {
+    freshen();
+    return { segs: segs as Float32Array, layout: { stride: STRIDE, clip: slice === 0 ? null : slabRange } };
   }
 
   // Re-trace (f64) and refresh derived state after an external edit (a glass or
@@ -700,6 +789,13 @@ export function initSlice3d(opts: {
 
   return {
     active: () => loaded,
+    picture: () => {
+      freshen();
+      return pictureVersion;
+    },
+    openText,
+    loads: () => loadCount,
+    extent,
     bootDefault,
     standDown,
     setSelected,
@@ -710,12 +806,12 @@ export function initSlice3d(opts: {
       refreshInspector();
       cardMgr.renderAll();
     },
-    raySegments,
+    rayPicture,
     refresh,
     selectedBody: () => selected,
     // The element cross-sections, the selection/rotation handle, and the
     // inspector cards; the rays themselves go through the shared RayLayer (see
-    // `raySegments`), drawn by the main renderer.
+    // `rayPicture`), drawn by the main renderer.
     overlay(ctx, toScreen) {
       if (!loaded) return;
       // Cards follow their body under any pan/zoom/drag: reposition every frame.

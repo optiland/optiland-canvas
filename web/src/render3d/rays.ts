@@ -1,4 +1,9 @@
-// The ray bundle on the GPU: every traced segment in one draw call.
+// The ray bundle on the GPU: every traced segment, in one draw call per
+// CHUNK_SEGS segments. WebGPU caps a buffer at 256 MB unless the device asks
+// for more, and a ghost-lit lens traces millions of segments, so the picture
+// is held in chunks, one buffer and one object each. A picture of more than
+// one chunk is written and uploaded a chunk per frame, so the page does not
+// stop while tens of millions of vertices go to the GPU.
 //
 // The segments are the tracer's, unchanged: the f32 preview during a drag, the
 // exact f64 trace otherwise (view3d.ts decides). Nothing is retraced or
@@ -65,6 +70,32 @@ const FLAG_TIR = 2;
 const FLAG_GHOST = 4;
 /** The widest line offered, CSS px. */
 export const MAX_RAY_WIDTH = 6;
+/** Room a buffer grows by, so a drag that adds a few segments per frame does
+ *  not reallocate every frame; a picture past `GROW_UP_TO` segments gets the
+ *  room it needs and no more (a ghost-lit lens has millions). */
+const GROWTH = 1.5;
+const GROW_UP_TO = 1_000_000;
+
+// The ray objects are never culled, and nothing else transparent shares their
+// render order, so their bounding sphere decides nothing. Given one, three.js
+// does not compute it over every vertex of a new buffer: seconds for a
+// picture of millions of segments.
+const EVERYWHERE = new THREE.Sphere(new THREE.Vector3(), Infinity);
+const room = (n: number) => (n > GROW_UP_TO ? n : Math.ceil(n * GROWTH));
+/** Segments per GPU buffer: 32 MB of lines, 22 MB of strips. */
+const CHUNK_SEGS = 500_000;
+/** Whole chunks written per frame while a large picture is uploaded, at most,
+ *  and the arrays on this side they are written into, in turn. */
+const CHUNKS_PER_FRAME = 2;
+/** Time a frame spends writing chunks, at most, ms. */
+const FILL_MS = 12;
+
+/** One buffer of the picture and the object that draws it. */
+type Chunk = {
+  buffer: THREE.InterleavedBuffer;
+  capacity: number;
+  object: THREE.LineSegments | THREE.Mesh;
+};
 
 export type RayVisibility = "through" | "occluded";
 
@@ -77,14 +108,25 @@ export type RayUpload = {
 };
 
 export class RayBuffer {
-  /** The 1 px picture: GPU lines. */
-  readonly object: THREE.LineSegments;
-  /** The wide picture: one screen-facing quad per segment. */
-  readonly strips: THREE.Mesh;
-  private buffer: THREE.InterleavedBuffer;
-  private capacity = 0;
-  private stripBuffer: THREE.InstancedInterleavedBuffer;
-  private stripCapacity = 0;
+  /** The 1 px picture: GPU lines, an object per chunk. */
+  readonly lines = new THREE.Group();
+  /** The wide picture: one screen-facing quad per segment, chunked alike. */
+  readonly wide = new THREE.Group();
+  private lineChunks: Chunk[] = [];
+  private stripChunks: Chunk[] = [];
+  /** A picture of more than one chunk being written, a chunk per `step`:
+   *  its segments, their brightness scale, the next segment to write, and
+   *  the next chunk to write it into. */
+  private filling: { segs: Float32Array; maxFlux: number; src: number; at: number; wide: boolean } | null = null;
+  private tir: RayUpload["tir"] = [];
+  // Whole chunks share CHUNKS_PER_FRAME arrays per kind on this side, in
+  // turn: a chunk is written into one, the next render uploads it, and the
+  // array is written again only after that (`uploaded`). A picture of
+  // millions of segments then holds a few chunks of vertices here instead of
+  // all of them, next to its copy on the GPU.
+  private shared: { lines: Float32Array[]; strips: Float32Array[] } = { lines: [], strips: [] };
+  // Chunks written into a shared array and not uploaded yet.
+  private awaiting: Chunk[] = [];
   private readonly ghostGain = uniform(3.6);
   private readonly rayGain = uniform(1.4);
   private readonly halfWidth = uniform(0.5);
@@ -107,52 +149,96 @@ export class RayBuffer {
   uploads = 0;
 
   constructor() {
-    this.buffer = this.allocate(1024);
-    this.stripBuffer = this.allocateStrips(1024);
     this.additive = this.makeAdditive();
     this.stripMaterial = this.makeStrip();
     this.inkOverlay = this.makeInkOverlay();
-    this.object = new THREE.LineSegments(this.geometryFor(this.buffer), this.additive);
-    this.object.name = "rays";
-    this.strips = new THREE.Mesh(this.stripGeometryFor(this.stripBuffer), this.stripMaterial);
-    this.strips.name = "rays-wide";
-    for (const o of [this.object, this.strips]) {
-      o.frustumCulled = false;
-      // After the components, the glass, and the cues.
-      o.renderOrder = 40;
-      o.raycast = () => {};
-    }
-    this.strips.visible = false;
+    this.lines.name = "rays";
+    this.wide.name = "rays-wide";
+    this.lineChunks.push(this.lineChunk(1024, 0));
+    this.stripChunks.push(this.stripChunk(1024, 0));
+    this.wide.visible = false;
     this.setVisibility("through");
   }
 
   /** The objects that draw rays; add both to the scene. */
   get objects(): THREE.Object3D[] {
-    return [this.object, this.strips];
+    return [this.lines, this.wide];
   }
 
   isRayObject(o: THREE.Object3D): boolean {
-    return o === this.object || o === this.strips;
+    return o.parent === this.lines || o.parent === this.wide;
   }
 
   /** Show the active picture (lines or strips), or neither. */
   setDrawVisible(on: boolean) {
-    this.object.visible = on && this.width <= 1;
-    this.strips.visible = on && this.width > 1;
+    this.lines.visible = on && this.width <= 1;
+    this.wide.visible = on && this.width > 1;
   }
 
-  private allocate(segments: number): THREE.InterleavedBuffer {
-    this.capacity = segments;
-    const b = new THREE.InterleavedBuffer(new Float32Array(segments * 2 * VERTEX_FLOATS), VERTEX_FLOATS);
-    b.setUsage(THREE.DynamicDrawUsage);
-    return b;
+  private place(o: THREE.Object3D, group: THREE.Group) {
+    o.frustumCulled = false;
+    // After the components, the glass, and the cues.
+    o.renderOrder = 40;
+    o.raycast = () => {};
+    group.add(o);
   }
 
-  private allocateStrips(segments: number): THREE.InstancedInterleavedBuffer {
-    this.stripCapacity = segments;
-    const b = new THREE.InstancedInterleavedBuffer(new Float32Array(segments * INSTANCE_FLOATS), INSTANCE_FLOATS, 1);
-    b.setUsage(THREE.DynamicDrawUsage);
-    return b;
+  private lineChunk(capacity: number, position: number): Chunk {
+    // Static usage: three.js uploads a buffer when it is marked changed, and
+    // then only the range marked. A dynamic buffer it writes whole on every
+    // frame, which for a ghost-lit lens is hundreds of megabytes per frame.
+    const array =
+      capacity === CHUNK_SEGS
+        ? this.sharedArray(this.shared.lines, position, CHUNK_SEGS * 2 * VERTEX_FLOATS)
+        : new Float32Array(capacity * 2 * VERTEX_FLOATS);
+    const buffer = new THREE.InterleavedBuffer(array, VERTEX_FLOATS);
+    const object = new THREE.LineSegments(this.geometryFor(buffer), this.additive);
+    object.name = "rays";
+    this.place(object, this.lines);
+    return { buffer, capacity, object };
+  }
+
+  private stripChunk(capacity: number, position: number): Chunk {
+    // Static usage, as for the lines.
+    const array =
+      capacity === CHUNK_SEGS
+        ? this.sharedArray(this.shared.strips, position, CHUNK_SEGS * INSTANCE_FLOATS)
+        : new Float32Array(capacity * INSTANCE_FLOATS);
+    const buffer = new THREE.InstancedInterleavedBuffer(array, INSTANCE_FLOATS, 1);
+    const object = new THREE.Mesh(this.stripGeometryFor(buffer), this.stripMaterial);
+    object.name = "rays-wide";
+    this.place(object, this.wide);
+    return { buffer, capacity, object };
+  }
+
+  /** Enough chunks for `n` segments: the first grows, with room, up to a
+   *  whole chunk; the rest are whole chunks; and the chunks a smaller picture
+   *  does not need are freed, since a ghost-lit picture can hold gigabytes. */
+  private fit(chunks: Chunk[], n: number, make: (capacity: number, position: number) => Chunk) {
+    const need = Math.max(1, Math.ceil(n / CHUNK_SEGS));
+    const first = need > 1 ? CHUNK_SEGS : n;
+    if (first > chunks[0].capacity) {
+      const old = chunks[0];
+      chunks[0] = make(Math.min(CHUNK_SEGS, room(first)), 0);
+      this.drop(old);
+    }
+    while (chunks.length < need) chunks.push(make(CHUNK_SEGS, chunks.length));
+    while (chunks.length > need) this.drop(chunks.pop()!);
+  }
+
+  private drop(c: Chunk) {
+    c.object.removeFromParent();
+    c.object.geometry.dispose();
+  }
+
+  /** Mark the first `floats` of a chunk for upload, drawing `segments`. */
+  private close(c: Chunk, floats: number, segments: number) {
+    c.buffer.clearUpdateRanges();
+    c.buffer.addUpdateRange(0, floats);
+    c.buffer.needsUpdate = true;
+    const g = c.object.geometry;
+    if (g instanceof THREE.InstancedBufferGeometry) g.instanceCount = segments;
+    else g.setDrawRange(0, segments * 2);
   }
 
   private geometryFor(b: THREE.InterleavedBuffer): THREE.BufferGeometry {
@@ -162,6 +248,7 @@ export class RayBuffer {
     g.setAttribute("rayWeight", new THREE.InterleavedBufferAttribute(b, 1, 6));
     g.setAttribute("rayGhost", new THREE.InterleavedBufferAttribute(b, 1, 7));
     g.setDrawRange(0, 0);
+    g.boundingSphere = EVERYWHERE.clone();
     return g;
   }
 
@@ -177,6 +264,7 @@ export class RayBuffer {
     g.setAttribute("rayWeight", new THREE.InterleavedBufferAttribute(b, 1, 9));
     g.setAttribute("rayGhost", new THREE.InterleavedBufferAttribute(b, 1, 10));
     g.instanceCount = 0;
+    g.boundingSphere = EVERYWHERE.clone();
     return g;
   }
 
@@ -296,78 +384,130 @@ export class RayBuffer {
     return this.width;
   }
 
-  /** Upload a projected trace into the active picture. */
+  /** Upload a projected trace into the active picture. A picture that fits
+   *  one chunk is written now. A larger one is written a chunk now and a
+   *  chunk per later `step` while `pending`; the chunks not yet rewritten
+   *  keep the last picture's segments until then, which is a frame or two of
+   *  a drag, and the view drops the picture outright when a new design loads. */
   update(segs: Float32Array): RayUpload {
     const t0 = performance.now();
     this.last = segs;
     let maxFlux = 1e-9;
     for (let i = 7; i < segs.length; i += SRC_STRIDE) if (segs[i] > maxFlux) maxFlux = segs[i];
-    const tir: RayUpload["tir"] = [];
-    const count = this.width > 1 ? this.fillStrips(segs, maxFlux, tir) : this.fillLines(segs, maxFlux, tir);
-    this.count = count;
+    const wide = this.width > 1;
+    const chunks = wide ? this.stripChunks : this.lineChunks;
+    const n = Math.floor(segs.length / SRC_STRIDE);
+    this.count = 0;
+    this.tir = [];
     this.uploads++;
-    return { count, tir, ms: performance.now() - t0 };
+    this.filling = null;
+    // A chunk of the last picture still waiting for its upload would upload
+    // whatever is written next into the array it shares: it is hidden until
+    // this picture rewrites or frees it.
+    for (const c of this.awaiting) this.hide(c);
+    this.awaiting = [];
+    if (n <= CHUNK_SEGS) {
+      this.fit(chunks, n, (c, at) => this.make(wide, c, at));
+      this.fill(chunks[0], segs, 0, maxFlux, wide);
+      return { count: this.count, tir: this.tir, ms: performance.now() - t0 };
+    }
+    if (chunks[0].capacity < CHUNK_SEGS) {
+      const old = chunks[0];
+      chunks[0] = this.make(wide, CHUNK_SEGS, 0);
+      this.drop(old);
+    }
+    this.filling = { segs, maxFlux, src: 0, at: 0, wide };
+    const up = this.step(t0);
+    return { ...up, ms: performance.now() - t0 };
   }
 
-  private fillLines(segs: Float32Array, maxFlux: number, tir: RayUpload["tir"]): number {
-    const n = Math.floor(segs.length / SRC_STRIDE);
-    if (n > this.capacity) {
-      const old = this.object.geometry;
-      this.buffer = this.allocate(Math.ceil(n * 1.5));
-      this.object.geometry = this.geometryFor(this.buffer);
-      old.dispose();
+  /** A large picture is still being written. */
+  get pending(): boolean {
+    return this.filling !== null;
+  }
+
+  /** Write the next chunks of the picture `update` began, for the next
+   *  render to upload: at least one, more while the frame's FILL_MS (from
+   *  `since`) last, and none while the shared arrays wait for an upload. */
+  step(since = performance.now()): RayUpload {
+    const t0 = performance.now();
+    const f = this.filling;
+    const chunks = f ? (f.wide ? this.stripChunks : this.lineChunks) : [];
+    let wrote = 0;
+    while (
+      f && this.filling && this.awaiting.length < CHUNKS_PER_FRAME &&
+      (wrote === 0 || performance.now() - since < FILL_MS)
+    ) {
+      wrote++;
+      if (f.at >= chunks.length) chunks.push(this.make(f.wide, CHUNK_SEGS, f.at));
+      f.src = this.fill(chunks[f.at], f.segs, f.src, f.maxFlux, f.wide);
+      f.at++;
+      if (f.src >= Math.floor(f.segs.length / SRC_STRIDE)) {
+        // Written: the chunks the last picture needed beyond these are freed.
+        while (chunks.length > f.at) this.drop(chunks.pop()!);
+        this.filling = null;
+      }
     }
-    const out = this.buffer.array as Float32Array;
+    return { count: this.count, tir: this.tir, ms: performance.now() - t0 };
+  }
+
+  /** The render has uploaded what was written: the shared arrays are free. */
+  uploaded() {
+    this.awaiting = [];
+  }
+
+  /** The shared array a whole chunk at position `index` is written into. */
+  private sharedArray(pool: Float32Array[], index: number, floats: number): Float32Array {
+    const slot = index % CHUNKS_PER_FRAME;
+    return (pool[slot] ??= new Float32Array(floats));
+  }
+
+  private hide(c: Chunk) {
+    const g = c.object.geometry;
+    if (g instanceof THREE.InstancedBufferGeometry) g.instanceCount = 0;
+    else g.setDrawRange(0, 0);
+  }
+
+  private make(wide: boolean, capacity: number, position: number): Chunk {
+    return wide ? this.stripChunk(capacity, position) : this.lineChunk(capacity, position);
+  }
+
+  /** Write segments into a chunk from segment `from` until it is full or the
+   *  picture ends, and mark them for upload. Returns the next segment. */
+  private fill(c: Chunk, segs: Float32Array, from: number, maxFlux: number, wide: boolean): number {
+    const out = c.buffer.array as Float32Array;
+    if (this.shared.lines.includes(out) || this.shared.strips.includes(out)) this.awaiting.push(c);
+    const tir = this.tir;
+    const n = Math.floor(segs.length / SRC_STRIDE);
     let k = 0;
-    let count = 0;
-    for (let i = 0; i + SRC_STRIDE <= segs.length; i += SRC_STRIDE) {
+    let held = 0;
+    let s = from;
+    for (; s < n; s++) {
+      const i = s * SRC_STRIDE;
       const frac = Math.min(1, segs[i + 7] / maxFlux);
       if (frac < FLUX_FLOOR) continue;
+      if (held === c.capacity) break;
+      held++;
       const flags = Math.round(segs[i + 8]);
       const ghost = (flags & FLAG_GHOST) !== 0 ? 1 : 0;
-      const r = segs[i + 4], g = segs[i + 5], b = segs[i + 6];
-      out[k++] = segs[i]; out[k++] = segs[i + 1]; out[k++] = segs[i + 9];
-      out[k++] = r; out[k++] = g; out[k++] = b; out[k++] = frac; out[k++] = ghost;
-      out[k++] = segs[i + 2]; out[k++] = segs[i + 3]; out[k++] = segs[i + 10];
-      out[k++] = r; out[k++] = g; out[k++] = b; out[k++] = frac; out[k++] = ghost;
+      if (wide) {
+        out[k++] = segs[i]; out[k++] = segs[i + 1]; out[k++] = segs[i + 9];
+        out[k++] = segs[i + 2]; out[k++] = segs[i + 3]; out[k++] = segs[i + 10];
+        out[k++] = segs[i + 4]; out[k++] = segs[i + 5]; out[k++] = segs[i + 6];
+        out[k++] = frac;
+        out[k++] = ghost;
+      } else {
+        const r = segs[i + 4], g = segs[i + 5], b = segs[i + 6];
+        out[k++] = segs[i]; out[k++] = segs[i + 1]; out[k++] = segs[i + 9];
+        out[k++] = r; out[k++] = g; out[k++] = b; out[k++] = frac; out[k++] = ghost;
+        out[k++] = segs[i + 2]; out[k++] = segs[i + 3]; out[k++] = segs[i + 10];
+        out[k++] = r; out[k++] = g; out[k++] = b; out[k++] = frac; out[k++] = ghost;
+      }
       if ((flags & FLAG_TIR) !== 0 && tir.length < 4096) tir.push({ x: segs[i + 2], y: segs[i + 3], z: segs[i + 10] });
-      count++;
     }
-    this.buffer.clearUpdateRanges();
-    this.buffer.addUpdateRange(0, k);
-    this.buffer.needsUpdate = true;
-    this.object.geometry.setDrawRange(0, count * 2);
-    return count;
-  }
-
-  private fillStrips(segs: Float32Array, maxFlux: number, tir: RayUpload["tir"]): number {
-    const n = Math.floor(segs.length / SRC_STRIDE);
-    if (n > this.stripCapacity) {
-      const old = this.strips.geometry;
-      this.stripBuffer = this.allocateStrips(Math.ceil(n * 1.5));
-      this.strips.geometry = this.stripGeometryFor(this.stripBuffer);
-      old.dispose();
-    }
-    const out = this.stripBuffer.array as Float32Array;
-    let k = 0;
-    let count = 0;
-    for (let i = 0; i + SRC_STRIDE <= segs.length; i += SRC_STRIDE) {
-      const frac = Math.min(1, segs[i + 7] / maxFlux);
-      if (frac < FLUX_FLOOR) continue;
-      const flags = Math.round(segs[i + 8]);
-      out[k++] = segs[i]; out[k++] = segs[i + 1]; out[k++] = segs[i + 9];
-      out[k++] = segs[i + 2]; out[k++] = segs[i + 3]; out[k++] = segs[i + 10];
-      out[k++] = segs[i + 4]; out[k++] = segs[i + 5]; out[k++] = segs[i + 6];
-      out[k++] = frac;
-      out[k++] = (flags & FLAG_GHOST) !== 0 ? 1 : 0;
-      if ((flags & FLAG_TIR) !== 0 && tir.length < 4096) tir.push({ x: segs[i + 2], y: segs[i + 3], z: segs[i + 10] });
-      count++;
-    }
-    this.stripBuffer.clearUpdateRanges();
-    this.stripBuffer.addUpdateRange(0, k);
-    this.stripBuffer.needsUpdate = true;
-    (this.strips.geometry as THREE.InstancedBufferGeometry).instanceCount = count;
-    return count;
+    this.close(c, k, held);
+    this.count += held;
+    return s;
   }
 
   /** The 2D view's ghost-opacity control, mapped the same way (x8). */
@@ -396,8 +536,7 @@ export class RayBuffer {
   }
 
   dispose() {
-    this.object.geometry.dispose();
-    this.strips.geometry.dispose();
+    for (const c of [...this.lineChunks, ...this.stripChunks]) c.object.geometry.dispose();
     this.additive.dispose();
     this.stripMaterial.dispose();
     this.inkTarget.dispose();

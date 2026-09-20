@@ -33,6 +33,9 @@ export type EditorContext = {
   bar: HTMLElement;
   fields: HTMLElement;
   read: HTMLElement;
+  /** A detector's f64 readout (`detectorResultJSON`), or null while the
+   *  reference is being traced. */
+  readout: (id: number) => string | null;
 };
 
 export interface Editor {

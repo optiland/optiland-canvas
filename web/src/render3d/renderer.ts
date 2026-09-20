@@ -180,9 +180,20 @@ export class OpticalRenderer3D {
     this.relayout();
   }
 
-  /** Upload the traced segments (the 11-float projected layout). */
+  /** Upload the traced segments (the 11-float projected layout). A large
+   *  picture goes up a chunk per frame: call `stepRays` while `raysPending`. */
   updateRays(segs: Float32Array): RayUpload {
     const up = this.rays.update(segs);
+    this.lastRayUploadMs = up.ms;
+    return up;
+  }
+
+  raysPending(): boolean {
+    return this.rays.pending;
+  }
+
+  stepRays(): RayUpload {
+    const up = this.rays.step();
     this.lastRayUploadMs = up.ms;
     return up;
   }
@@ -320,6 +331,7 @@ export class OpticalRenderer3D {
     if (this.rays.inkMode) this.renderInkPass(cam);
     this.rays.setDrawVisible(!this.rays.inkMode);
     this.renderer.render(this.scene, cam);
+    this.rays.uploaded();
     this.rays.setDrawVisible(true);
     this.frames++;
     this.lastRenderMs = performance.now() - t0;

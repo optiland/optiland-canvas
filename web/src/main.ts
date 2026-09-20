@@ -7,7 +7,7 @@
 
 import init, { Canvas } from "../pkg/oc_wasm.js";
 import { initM3 } from "./m3";
-import { RayLayer } from "./rays";
+import { PLAIN_RAYS, RayLayer, type RayDrawOpts, type RayLayout } from "./rays";
 import { initSlice3d, type Slice3d } from "./slice3d";
 import { initView3dThree, type FrameReport, type View3dThree } from "./render3d/view3d";
 import { createFastPreview } from "./fastpreview";
@@ -16,6 +16,7 @@ import { createComponentView, type ComponentView } from "./inset/component-view"
 import { initOpenUc2 } from "./features/openuc2/OpenUc2Page";
 import { drawFacePixels, faceBox, facePath, formatFlux, type DetectorFace, type DetectorReadout } from "./detector-face";
 import { drawPolarMap } from "./polarmap";
+import { createReference, type ReferenceBundle } from "./reference";
 
 const SCALE = 6.5; // px per mm
 type V2 = { x: number; y: number };
@@ -64,6 +65,33 @@ async function main() {
   // unlimited; this just bounds the stray-light explosion. 2 catches the classic
   // two-surface ghost image.
   scene.setMaxGhostBounces(Number(ghostBounces.value) || 2);
+  // Stand-in pictures the workers have delivered (for `?debug`).
+  let standIns = 0;
+  // The f64 reference, traced in a worker (reference.ts). When a trace lands,
+  // the view showing the scene takes its picture and the panels its numbers;
+  // while one runs, the status line says how far it has got.
+  const reference = createReference(
+    scene,
+    () => ({ revision: scene.sceneRevision(), ghosts: scene.ghostsEnabled(), maxGhost: scene.maxGhostBounces() }),
+    (why) => {
+      if (why === "result" && slice3d?.active()) {
+        refreshActive3d();
+        renderView();
+        refresh3dDetector();
+      } else if (why === "standIn" && slice3d?.active()) {
+        standIns++;
+        refreshActive3d();
+        renderView();
+      } else {
+        writeReferenceStatus();
+      }
+    },
+    () => fast.costly(scene),
+    (ghosts, ms) => fast.noteCpuCost(ghosts, ms),
+  );
+  // A frame the page cannot afford (the GPU declined a ghost-lit lens, or a
+  // drag on the CPU mirror) is traced by the reference's workers instead.
+  fast.whenCostly(() => reference.requestStandIn());
   const committed: Glass = { name: "N-BK7", nd: 1.5168, vd: 64.17 };
   const lensId = scene.addSinglet(0, 0, 50, 4, 12, committed.nd, committed.vd);
   // Spectral count only affects dispersion smoothness (in the collimated beam
@@ -114,6 +142,13 @@ async function main() {
   let panX = 0, panY = 0;   // screen-px offset of the world origin from centre
   const toScreen = (p: V2): V2 => ({ x: w() / 2 + panX + p.x * scale, y: h() / 2 + panY - p.y * scale });
   const toWorld = (px: number, py: number): V2 => ({ x: (px - w() / 2 - panX) / scale, y: (h() / 2 + panY - py) / scale });
+  // `toScreen` for the view as it is now, for rasterizing millions of points:
+  // the same arithmetic in the same order, without reading the window's size
+  // twice per point.
+  const screenMap = (): ((p: V2) => V2) => {
+    const cx = w() / 2 + panX, cy = h() / 2 + panY, k = scale;
+    return (p) => ({ x: cx + p.x * k, y: cy - p.y * k });
+  };
 
   // Zoom about a screen point, keeping the world point under it fixed.
   function zoomAt(clientX: number, clientY: number, factor: number) {
@@ -183,6 +218,93 @@ async function main() {
   }
 
   // --- interactive view -------------------------------------------------
+  // The ray layer is drawn a slice per animation frame and shown when a
+  // present lands, so a picture of millions of segments never stops the page.
+  // `shown` is what the layer's canvas holds and the picture and view it was
+  // drawn for; `work` is the raster being drawn. Until the next raster is
+  // shown, the last one stays on screen, moved to the view as it is now: a
+  // repaint with the same picture and view (a hover, a card) reuses it, an
+  // edit shows the last picture until the next is whole, and a pan or zoom of
+  // a picture that was slow to draw moves and scales it, and draws it again
+  // once the view has been still for RASTER_SETTLE_MS. The rays are the same
+  // either way; this only decides when they are drawn.
+  type RasterKey = {
+    version: number; scale: number; panX: number; panY: number;
+    W: number; H: number; dpr: number; gOpacity: number;
+  };
+  type Shown = RasterKey & { count: number; ms: number };
+  type Work = RasterKey & {
+    segs: Float32Array; layout: RayLayout; o: RayDrawOpts; map: (p: V2) => V2;
+    next: number; started: number; shownAt: number; hold: boolean;
+    /// A present of it is in progress, showing this many segments.
+    presenting: boolean; presentCount: number;
+  };
+  let shown: Shown | null = null;
+  let work: Work | null = null;
+  let settleTimer = 0;
+  let redrawNow = false;
+  const SLOW_RASTER_MS = 30;
+  const RASTER_SETTLE_MS = 150;
+  // Every picture is rasterized RASTER_SLICE_MS at a time: a ghost-lit lens's
+  // segments cross the whole lens, and a few tens of thousands of them are
+  // already a hundred milliseconds of drawing. A light picture is done, and
+  // shown, in the first slice.
+  const RASTER_SLICE_MS = 12;
+  // Segments between checks of the slice's clock: a ghost segment can cross
+  // the whole lens, a thousand pixels of line.
+  const RASTER_CHUNK = 500;
+  // A raster being drawn shows its progress this often, once the picture it
+  // replaces has held for RASTER_HOLD_MS; tonemapping the lit region is work
+  // too, so not per slice.
+  const RASTER_SHOW_MS = 120;
+  const RASTER_HOLD_MS = 250;
+  let rasterFrame = 0;
+
+  const samePicture = (a: RasterKey, b: RasterKey) =>
+    a.version === b.version && a.W === b.W && a.H === b.H && a.dpr === b.dpr && a.gOpacity === b.gOpacity;
+  const sameView = (a: RasterKey, b: RasterKey) => a.scale === b.scale && a.panX === b.panX && a.panY === b.panY;
+  const keyOf = (k: RasterKey): RasterKey => ({
+    version: k.version, scale: k.scale, panX: k.panX, panY: k.panY,
+    W: k.W, H: k.H, dpr: k.dpr, gOpacity: k.gOpacity,
+  });
+
+  // Draw `w` for up to a slice: its segments, then its present, a band of
+  // rows at a time. Says whether a present landed and whether `w` is whole.
+  function rasterSlice(w: Work): { landed: boolean; whole: boolean } {
+    const t = performance.now();
+    const total = w.segs.length / w.layout.stride;
+    if (!w.presenting) {
+      while (w.next < total && performance.now() - t < RASTER_SLICE_MS) {
+        rays.add(w.segs, w.next, w.next + RASTER_CHUNK, w.map, w.o, w.layout);
+        w.next += RASTER_CHUNK;
+      }
+      const done = w.next >= total;
+      const progress = !w.hold || t - w.started >= RASTER_HOLD_MS;
+      if (done || (progress && t - w.shownAt >= RASTER_SHOW_MS)) {
+        w.presentCount = rays.presentBegin().count;
+        w.presenting = true;
+      }
+    }
+    if (!w.presenting || !rays.presentRows(Math.max(1, RASTER_SLICE_MS - (performance.now() - t)))) {
+      return { landed: false, whole: false };
+    }
+    w.presenting = false;
+    w.shownAt = t;
+    const whole = w.next >= total;
+    shown = { ...keyOf(w), count: w.presentCount, ms: whole ? performance.now() - w.started : Infinity };
+    return { landed: true, whole };
+  }
+
+  function continueRaster() {
+    rasterFrame = 0;
+    const w = work;
+    if (!w) return;
+    const { landed, whole } = rasterSlice(w);
+    if (whole) work = null;
+    else rasterFrame = requestAnimationFrame(continueRaster);
+    if (landed) renderView();
+  }
+
   function renderView() {
     // The GPU 3D view paints on its own animation frame; ask it for one.
     if (in3dModel()) {
@@ -194,40 +316,77 @@ async function main() {
     const dpr = window.devicePixelRatio || 1;
     const gOpacity = Number(ghostOpacity.value) / 100;
     const showTir = tirBox.checked;
+    const o: RayDrawOpts = { ghostOpacity: gOpacity, exposure: EXPOSURE, dpr, width: W, height: H };
 
     // Ray segments (9 floats: ax ay bx by r g b flux flags) in meridional-plane
     // coordinates, mapped world→screen by `toScreen`.
-    const segs = slice3d?.active() ? slice3d.raySegments() : scene.traceColored();
-    const traceMs = performance.now() - t0;
-    const { count, tirDots } = rays.draw(segs, toScreen, {
-      ghostOpacity: gOpacity,
-      exposure: EXPOSURE,
-      dpr,
-      width: W,
-      height: H,
-    });
+    const version = slice3d?.active() ? slice3d.picture() : -1;
+    const want: RasterKey = { version, scale, panX, panY, W, H, dpr, gOpacity };
+    let traceMs = 0;
+    if (version < 0) {
+      // A v1 scene: light, and drawn at once.
+      const t1 = performance.now();
+      const segs = scene.traceColored();
+      traceMs = performance.now() - t1;
+      shown = { ...want, count: rays.draw(segs, screenMap(), o, PLAIN_RAYS).count, ms: 0 };
+      work = null;
+    } else {
+      if (work && !(samePicture(work, want) && sameView(work, want))) {
+        // The picture or the view changed under a raster being drawn.
+        cancelAnimationFrame(rasterFrame);
+        rasterFrame = 0;
+        work = null;
+      }
+      const upToDate = shown !== null && samePicture(shown, want) && sameView(shown, want);
+      if (!work && !upToDate) {
+        const moving = shown !== null && samePicture(shown, want) && shown.ms > SLOW_RASTER_MS;
+        if (moving && !redrawNow) {
+          clearTimeout(settleTimer);
+          settleTimer = window.setTimeout(() => {
+            redrawNow = true;
+            renderView();
+          }, RASTER_SETTLE_MS);
+        } else {
+          redrawNow = false;
+          const t1 = performance.now();
+          const { segs, layout } = slice3d!.rayPicture();
+          traceMs = performance.now() - t1;
+          const next: Work = {
+            ...want, segs, layout, o, map: screenMap(),
+            next: 0, started: t1, shownAt: -Infinity,
+            hold: shown !== null && shown.dpr === dpr,
+            presenting: false, presentCount: 0,
+          };
+          rays.begin(segs, o, layout);
+          work = next;
+          if (rasterSlice(next).whole) work = null;
+          else rasterFrame = requestAnimationFrame(continueRaster);
+        }
+      }
+    }
+    const count = shown?.count ?? 0;
 
-    // Compose: dark background, the grid, then add the ray layer.
+    // Compose: dark background, the grid, then add the ray layer as last
+    // shown, at device resolution and moved from the view it was drawn for to
+    // this one.
     ctx.fillStyle = "#06080d";
     ctx.fillRect(0, 0, W, H);
     draw2dGrid(W, H);
-
-    // Add the device-resolution ray layer 1:1 (bypass the dpr transform).
-    ctx.save();
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.globalCompositeOperation = "lighter";
-    ctx.drawImage(rays.canvas, 0, 0);
-    ctx.restore();
-
-    // TIR highlight: a ring where a surface is in total internal reflection.
-    if (showTir) {
-      ctx.lineWidth = 1.5;
-      ctx.strokeStyle = "rgba(255,120,80,0.9)";
-      for (const p of tirDots) {
-        ctx.beginPath();
-        ctx.arc(p.x, p.y, 4, 0, Math.PI * 2);
-        ctx.stroke();
+    if (shown && shown.dpr === dpr) {
+      const k = scale / shown.scale;
+      const ox = W / 2 + panX - k * (shown.W / 2 + shown.panX);
+      const oy = H / 2 + panY - k * (shown.H / 2 + shown.panY);
+      ctx.save();
+      ctx.setTransform(k, 0, 0, k, ox * dpr, oy * dpr);
+      ctx.globalCompositeOperation = "lighter";
+      ctx.drawImage(rays.canvas, 0, 0);
+      // TIR highlight: a ring where a surface is in total internal reflection.
+      // The ray layer draws the rings with the rays, so they move with them.
+      if (showTir) {
+        ctx.globalCompositeOperation = "source-over";
+        ctx.drawImage(rays.rings, 0, 0);
       }
+      ctx.restore();
     }
 
     // Overlays: element cross-sections, selection handles, cards.
@@ -463,8 +622,7 @@ async function main() {
 
   // Spot diagram: the actual ray-detector hits on the face, to scale, coloured
   // by wavelength (the linear-light rgb the tracer records, normalized to a dot).
-  function drawSpot(detId: number, face: DetectorFace) {
-    const a = detId >= 0 ? scene.detectorHitsF32(detId) : scene.firstDetectorHitsF32();
+  function drawSpot(a: Float32Array, face: DetectorFace) {
     const b = faceBox(face, { x: 0, y: 0, w: hist.width, h: hist.height });
     hctx.fillStyle = "#04060a";
     facePath(hctx, face, b);
@@ -492,24 +650,56 @@ async function main() {
     }
   }
 
+  // What the dock's numbers are: the reference of the scene as it is, the
+  // previous scene's while the new one is traced, or nothing yet.
+  const refStatus = document.getElementById("refStatus")!;
+  const dockPanel = document.getElementById("dock")!;
+  function writeReferenceStatus() {
+    const st = reference.status();
+    const secs = (ms: number) => (ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(1)} s`);
+    const pct = (f: number) => `${Math.round(f * 100)}%`;
+    let text = "";
+    if (st.state === "current") text = `reference current · ${st.bundle.rays} rays in ${secs(st.bundle.elapsedMs)}`;
+    else if (st.state === "stale") text = `updating ${pct(st.fraction)} · numbers are the previous scene's`;
+    else if (st.state === "updating") text = `tracing the reference ${pct(st.fraction)}`;
+    refStatus.textContent = text;
+    refStatus.classList.toggle("stale", st.state === "stale" || st.state === "updating");
+    dockPanel.classList.toggle("stale", st.state === "stale");
+  }
+
+  /** The reference the panels read: this scene's, else the newest there is. */
+  const shownReference = (): ReferenceBundle | null => {
+    const now = reference.current();
+    if (!now) reference.request();
+    return now ?? reference.latest();
+  };
+
   function refresh3dDetector() {
     // Whatever made the dock re-read (an edit settling, a trace setting such
     // as the ghost layer that moves no scene revision) makes the component
     // inset re-read too, so the two never quote different traces.
     componentView?.retraced();
     hctx.clearRect(0, 0, hist.width, hist.height);
+    const b = shownReference();
+    writeReferenceStatus();
+    if (!b) {
+      dockNums.textContent = "tracing…";
+      return;
+    }
     // Show the selected detector if one is selected, else the first — so a scene
     // with several detectors reports whichever the user is inspecting.
     const sel = selectedBody3d();
-    const selInfo = sel >= 0 ? JSON.parse(scene.detectorResultJSON(sel)) : null;
-    const detId = selInfo ? sel : -1;
-    const info = (selInfo ?? JSON.parse(scene.firstDetectorResultJSON())) as DetectorReadout | null;
+    const selRaw = sel >= 0 ? b.readouts.get(sel) : undefined;
+    const selInfo = selRaw ? (JSON.parse(selRaw) as DetectorReadout | null) : null;
+    const detId = selInfo ? sel : (b.firstDetector ?? -1);
+    const firstRaw = b.firstDetector != null ? b.readouts.get(b.firstDetector) : undefined;
+    const info = (selInfo ?? (firstRaw ? JSON.parse(firstRaw) : null)) as DetectorReadout | null;
     if (!info || info.hits === 0) {
       dockNums.textContent = info ? "no rays on detector" : "no detector";
       return;
     }
     if (detMode === "spot") {
-      if (info.face) drawSpot(detId, info.face);
+      if (info.face) drawSpot(b.hits.get(detId) ?? new Float32Array(0), info.face);
     } else if (info.measure === "intensity") {
       // Not a heatmap of anything on the face, so the label stops saying so.
       detHead.textContent = "detector — intensity, polar (f64)";
@@ -520,7 +710,7 @@ async function main() {
     }
     const c = info.centroid ? `(${info.centroid[0].toFixed(2)}, ${info.centroid[1].toFixed(2)})` : "—";
     const opl = info.meanOpl == null ? "—" : Number(info.meanOpl).toFixed(2);
-    const tag = detId >= 0 ? `#${detId} · ` : "";
+    const tag = selInfo ? `#${detId} · ` : "";
     // Polarization, when there is any. An unpolarized beam says nothing here
     // rather than printing a zero the reader has to interpret. The tilt is the
     // caveat on the numbers: the summed state is written in the detector's own
@@ -763,7 +953,7 @@ async function main() {
   // interaction. `owns` gates each view's pointer/keyboard handlers so only the
   // visible one edits the scene.
   slice3d = initSlice3d({
-    scene, view, toScreen, toWorld, render: renderView, fast,
+    scene, view, toScreen, toWorld, render: renderView, fast, reference,
     owns: () => !in3dModel(),
     // When a 3D body is selected, aim the Abbe picker at its glass; the readout
     // dock follows the selected detector when a scene has more than one.
@@ -779,6 +969,8 @@ async function main() {
     owns: () => in3dModel(),
     onSelect: onSelect3d,
     detectorRefresh: refreshReference,
+    reference,
+    loads: () => slice3d?.loads() ?? 0,
     rayOptions: () => ({
       ghostOpacity: Number(ghostOpacity.value) / 100,
       showTir: tirBox.checked,
@@ -802,6 +994,8 @@ async function main() {
   });
   componentView = createComponentView({
     scene,
+    // The readout the dock shows: this scene's reference, else the newest.
+    readout: (id) => shownReference()?.readouts.get(id) ?? null,
     body: inset.body,
     setSubtitle: inset.setSubtitle,
     selected: () => selectedBody3d(),
@@ -839,7 +1033,7 @@ async function main() {
       ready: fast.ready,
       cpuProjected: () => scene.traceProjected3DFast(),
       // Through the app's own backend choice, as a drag would ask.
-      fastProjected: () => new Promise((resolve) => fast.requestProjected(scene, resolve)),
+      fastProjected: () => new Promise((resolve) => fast.requestProjected(scene, resolve, true)),
       gpuProjected: () => fast.gpu()?.traceProjected3D(scene) ?? Promise.resolve(null),
       exactProjected: () => scene.traceProjected3D(),
       // The GPU 3D view's camera, statistics, and pixel probe (tests).
@@ -855,6 +1049,15 @@ async function main() {
       selectedBody3d: () => selectedBody3d(),
       // Select an object in the cross-section view, as a click on it would.
       select: (id: number) => { slice3d!.setSelected(id); renderView(); },
+      // Is the f64 reference of the scene as it is in? (The dock re-reads in
+      // the task that accepts it, so its numbers are this scene's once true.)
+      referenceCurrent: () => reference.current() !== null,
+      // How many workers share the reference, and what its status line says.
+      referenceWorkers: () => reference.workers(),
+      referenceSegments: () => (reference.current()?.projected.length ?? 0) / 11,
+      standIns: () => standIns,
+      // The 2D view's zoom and pan, and the section's extent it frames.
+      view2d: () => ({ scale, panX, panY, extent: slice3d?.extent() ?? null }),
       // The component view's inset window.
       inset: {
         open: () => inset.open(),

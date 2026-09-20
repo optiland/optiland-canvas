@@ -163,15 +163,6 @@ test.describe("WebGPU preview", () => {
       if (!r.ok) expect(r.reason).toContain("truncated");
       else expectParity(r);
     }
-    // The app's own choice: a heavy scene moves the picture to the GPU.
-    const label = await page.evaluate(async () => {
-      const d = (window as unknown as { __ocDebug: any }).__ocDebug;
-      await d.fastProjected(); // a big frame marks the scene heavy
-      await d.fastProjected(); // so this one runs on the GPU
-      return d.fast.label() as string;
-    });
-    expect(label).toContain("preview GPU");
-
     await page.evaluate(() => {
       const s = (window as unknown as { __ocDebug: any }).__ocDebug.scene;
       s.setGhosts(false);
@@ -179,5 +170,16 @@ test.describe("WebGPU preview", () => {
     });
     expectParity(await measure("7 lenses, no ghosts, 240 samples"));
     console.log(rows.join("\n"));
+
+    // The app's own choice: a heavy scene the GPU draws quickly moves the
+    // picture to the GPU. (A ghost-lit scene whose GPU frames are slow goes
+    // to the reference's workers instead; see fastpreview.ts.)
+    const label = await page.evaluate(async () => {
+      const d = (window as unknown as { __ocDebug: any }).__ocDebug;
+      await d.fastProjected(); // a big frame marks the scene heavy
+      await d.fastProjected(); // so this one runs on the GPU
+      return d.fast.label() as string;
+    });
+    expect(label).toContain("preview GPU");
   });
 });

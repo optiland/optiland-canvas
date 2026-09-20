@@ -412,14 +412,18 @@ test.describe("GPU 3D view", () => {
       for (let i = 7; i < a.length; i += 11) if (Math.min(1, a[i] / max) >= 1e-5) n++;
       return n;
     });
+    // The exact picture arrives from the reference worker; the fast one
+    // stands in until it does.
+    const want0 = await expected();
+    await expect.poll(async () => (await renderNow(page)).raySegments).toBe(want0);
     const s0 = await renderNow(page);
-    expect(s0.raySegments).toBe(await expected());
 
     // A ghost-heavy picture: many more segments, the same meshes, a few draws.
     await page.locator("#ghosts").check();
-    await expect.poll(async () => (await renderNow(page)).raySegments).toBeGreaterThan(s0.raySegments);
+    const want1 = await expected();
+    expect(want1).toBeGreaterThan(s0.raySegments);
+    await expect.poll(async () => (await renderNow(page)).raySegments).toBe(want1);
     const s1 = await renderNow(page);
-    expect(s1.raySegments).toBe(await expected());
     expect(s1.meshBuilds).toBe(s0.meshBuilds);
     expect(s1.drawCalls).toBeLessThan(60);
 

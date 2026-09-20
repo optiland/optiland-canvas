@@ -1,14 +1,24 @@
-// The interactive 3D picture (§4.1: f32 draws, f64 settles), traced on WebGPU or
-// on the CPU f32 mirror, whichever is faster for the scene.
+// The interactive 3D picture (§4.1: f32 draws, f64 settles), traced on WebGPU,
+// on the CPU f32 mirror on this thread, or by the reference's workers,
+// whichever is fastest for the scene.
 //
 // Both views ask for the fast projected trace through here. The CPU mirror
 // answers before `requestProjected` returns. The GPU answers later, so GPU
 // requests are single-flight: while one runs, a newer request replaces any
 // queued one, and the queued one runs next. Every frame carries the scene
 // revision it was traced at, and the views decide whether it is still worth
-// drawing.
+// drawing. A frame this thread cannot afford goes to the workers
+// (`whenCostly`), and the views draw it when it lands.
 //
-// No displayed number comes from here, on either backend.
+// The GPU is not always the fastest. A ghost-lit lens's ray trees are deep
+// and uneven, and measured in Chromium (docs/performance.md) an RTX 5070 took
+// 244 ms for a frame of the 60x objective that the CPU mirror traced in 286 ms
+// on one thread, and a Radeon iGPU took 540 ms; eight workers share the CPU
+// frame. A GPU frame also holds the GPU for as long as it runs. So a ghost
+// setting whose GPU frames are slow, or whose ray trees the GPU cannot hold,
+// is drawn by the workers until another design loads.
+//
+// No displayed number comes from here, on any backend.
 
 import { createGpuPreview3, type Canvas, type GpuPreview3 } from "../pkg/oc_wasm.js";
 
@@ -20,20 +30,40 @@ export type FastFrame = {
   late: boolean;
 };
 
-type Request = { scene: Canvas; deliver: (f: FastFrame) => void };
+type Request = { scene: Canvas; deliver: (f: FastFrame) => void; anyCost: boolean };
+
+/** The ghost layer off or on: the two costs the preview keeps apart. */
+type Setting = "plain" | "ghosts";
+const settingOf = (scene: Canvas): Setting => (scene.ghostsEnabled() ? "ghosts" : "plain");
 
 export type FastPreview = {
   /** Resolves once the GPU is ready or refused. */
   ready: Promise<void>;
   /** The backend that draws, and why, for the status line. */
   label: () => string;
-  /** Ask for the projected fast trace of `scene` at its current revision. */
-  requestProjected: (scene: Canvas, deliver: (f: FastFrame) => void) => void;
+  /** Ask for the projected fast trace of `scene` at its current revision. A
+   *  frame this thread cannot afford is handed to `whenCostly` and not
+   *  delivered here, unless `anyCost` (a test or a debug hook) asks for it
+   *  on this thread whatever it costs. */
+  requestProjected: (scene: Canvas, deliver: (f: FastFrame) => void, anyCost?: boolean) => void;
   /** A GPU trace is running or queued, so a newer frame is on its way. */
   pending: () => boolean;
-  /** The exact trace just replaced the picture: drop the queued request, and
-   *  give the GPU another chance if it declined the last scene. */
+  /** The exact trace just replaced the picture: drop the queued request. */
   settled: () => void;
+  /** A new design: what was learned about the last one's costs is dropped. */
+  forget: () => void;
+  /** Should the workers trace this scene's frame rather than this thread?
+   *  Yes when a CPU frame would stall the page (its last cost with the same
+   *  ghost setting, or with ghosts on and no cost known yet, since a
+   *  ghost-lit lens can take seconds) and the GPU has not shown it draws the
+   *  setting quickly. */
+  costly: (scene: Canvas) => boolean;
+  /** Who draws a frame this thread cannot afford: a frame asked for while
+   *  the CPU mirror is costly, or one the GPU declined, is not traced here
+   *  but handed to `f` (the reference's workers trace it). */
+  whenCostly: (f: () => void) => void;
+  /** What a CPU frame of the scene costs, as the workers measured it. */
+  noteCpuCost: (ghosts: boolean, ms: number) => void;
   /** The GPU handle, for the `?debug` hooks. `null` on the CPU mirror. */
   gpu: () => GpuPreview3 | null;
 };
@@ -47,6 +77,22 @@ const STRIDE = 11;
 // count picks the backend, with a gap so a scene near the line does not flap.
 const GPU_FROM_SEGS = 5000;
 const CPU_BELOW_SEGS = 3000;
+
+// A CPU frame slower than this, on the page's thread, is a stall a user feels
+// (a long task, in the browser's terms).
+const COSTLY_MS = 50;
+
+// A GPU frame slower than this, twice running, hands the setting to the
+// workers. The first frame of a setting also finds its segment budget, so one
+// slow frame alone says little.
+const GPU_SLOW_MS = 100;
+const GPU_SLOW_FRAMES = 2;
+
+// A ghost-lit frame that costs the CPU mirror more than this is not tried on
+// the GPU at all. Every such gallery design measured was slower on the GPU or
+// did not fit it (UV projection lens: 1.8 s on an RTX 5070 before it gave
+// up), and the attempt holds the GPU all that time.
+const GPU_TRY_MAX_GHOST_MS = 400;
 
 // Just enough of the WebGPU types for this file, without a types dependency.
 type DeviceRequest = { requiredLimits?: Record<string, number> } & Record<string, unknown>;
@@ -92,11 +138,22 @@ export function createFastPreview(): FastPreview {
   let queued: Request | null = null;
   // The last frame was big enough that the GPU is the faster backend.
   let heavy = false;
-  // The GPU could not hold the last scene's ray trees. Until the next settled
-  // trace, go straight to the CPU instead of paying for a GPU attempt per frame.
-  let declined = false;
+  // Per ghost setting, since the last design loaded: why the GPU no longer
+  // draws it ("declined": its ray trees do not fit; "slow": its frames took
+  // longer than GPU_SLOW_MS), how many slow frames in a row it has drawn, and
+  // whether its last frame was quick.
+  const blank = <T>(v: T): Record<Setting, T> => ({ plain: v, ghosts: v });
+  let refused = blank<"" | "declined" | "slow">("");
+  let slowFrames = blank(0);
+  let quick = blank(false);
+  // The setting of the last scene asked about, for the status line.
+  let lastSetting: Setting = "plain";
 
-  const useGpu = () => gpu !== null && heavy && !declined;
+  // What a CPU frame last cost, with the ghost layer off and on.
+  const cpuMs = blank(NaN);
+  const useGpu = (s: Setting) =>
+    gpu !== null && heavy && refused[s] === "" && !(s === "ghosts" && cpuMs.ghosts > GPU_TRY_MAX_GHOST_MS);
+  let costlyFallback: () => void = () => {};
 
   function deliver(req: Request, frame: FastFrame) {
     const segments = frame.segs.length / STRIDE;
@@ -105,33 +162,43 @@ export function createFastPreview(): FastPreview {
     req.deliver(frame);
   }
 
-  const cpuFrame = (scene: Canvas, late: boolean): FastFrame => ({
-    segs: scene.traceProjected3DFast(),
-    revision: scene.sceneRevision(),
-    late,
-  });
+  const cpuCostly = (scene: Canvas) => {
+    const ms = cpuMs[settingOf(scene)];
+    return Number.isNaN(ms) ? scene.ghostsEnabled() : ms > COSTLY_MS;
+  };
+  const cpuFrame = (scene: Canvas, late: boolean): FastFrame => {
+    const t0 = performance.now();
+    const segs = scene.traceProjected3DFast();
+    cpuMs[settingOf(scene)] = performance.now() - t0;
+    return { segs, revision: scene.sceneRevision(), late };
+  };
 
   async function run(req: Request, device: GpuPreview3) {
     inFlight = true;
     const revision = req.scene.sceneRevision();
+    const setting = settingOf(req.scene);
     const t0 = performance.now();
     try {
       const out = await device.traceProjected3D(req.scene);
       if (out instanceof Float32Array) {
         lastMs = performance.now() - t0;
+        slowFrames[setting] = lastMs > GPU_SLOW_MS ? slowFrames[setting] + 1 : 0;
+        quick[setting] = lastMs <= GPU_SLOW_MS;
+        if (slowFrames[setting] >= GPU_SLOW_FRAMES) refused[setting] = "slow";
         deliver(req, { segs: out, revision, late: true });
       } else if (out === "truncated") {
         // Some ray tree does not fit on the GPU: draw the CPU picture, never a
-        // thinner one.
-        declined = true;
-        deliver(req, cpuFrame(req.scene, true));
+        // thinner one, on this thread when it can afford it.
+        refused[setting] = "declined";
+        quick[setting] = false;
+        cpuOrElsewhere(req, true);
       }
       // "busy" cannot happen: this module is the only caller, and it waits.
     } catch (e) {
       console.warn("WebGPU preview failed; staying on the CPU mirror.", e);
       gpu = null;
       unavailable = "GPU failed";
-      deliver(req, cpuFrame(req.scene, true));
+      cpuOrElsewhere(req, true);
     } finally {
       inFlight = false;
       const next = queued;
@@ -140,9 +207,14 @@ export function createFastPreview(): FastPreview {
     }
   }
 
-  function dispatch(req: Request, late: boolean) {
-    if (useGpu()) void run(req, gpu!);
+  function cpuOrElsewhere(req: Request, late: boolean) {
+    if (cpuCostly(req.scene) && !req.anyCost) costlyFallback();
     else deliver(req, cpuFrame(req.scene, late));
+  }
+
+  function dispatch(req: Request, late: boolean) {
+    if (useGpu(settingOf(req.scene))) void run(req, gpu!);
+    else cpuOrElsewhere(req, late);
   }
 
   const ready = (async () => {
@@ -172,24 +244,44 @@ export function createFastPreview(): FastPreview {
     ready,
     label: () => {
       if (!gpu) return unavailable ? `preview CPU (${unavailable})` : "preview CPU";
-      if (declined) return "preview CPU (ray trees too large for the GPU)";
+      if (refused[lastSetting] === "declined") return "preview CPU (ray trees too large for the GPU)";
+      const deep = lastSetting === "ghosts" && cpuMs.ghosts > GPU_TRY_MAX_GHOST_MS;
+      if (refused[lastSetting] === "slow" || deep) return "preview CPU (faster than the GPU for this scene)";
       const name = adapterName ? ` (${adapterName})` : "";
       if (!heavy) return `preview CPU (light scene; GPU${name} ready)`;
       const timing = Number.isNaN(lastMs) ? "" : ` ${lastMs.toFixed(1)} ms`;
       return `preview GPU${name}${timing}`;
     },
-    requestProjected: (scene, deliverTo) => {
-      const req = { scene, deliver: deliverTo };
-      if (useGpu() && inFlight) {
+    requestProjected: (scene, deliverTo, anyCost = false) => {
+      const req = { scene, deliver: deliverTo, anyCost };
+      lastSetting = settingOf(scene);
+      if (useGpu(lastSetting) && inFlight) {
         queued = req;
         return;
       }
       dispatch(req, false);
     },
     pending: () => inFlight || queued !== null,
+    costly: (scene) => {
+      const s = settingOf(scene);
+      lastSetting = s;
+      return cpuCostly(scene) && !(useGpu(s) && quick[s]);
+    },
+    whenCostly: (f) => {
+      costlyFallback = f;
+    },
+    noteCpuCost: (ghosts, ms) => {
+      cpuMs[ghosts ? "ghosts" : "plain"] = ms;
+    },
     settled: () => {
       queued = null;
-      declined = false;
+    },
+    forget: () => {
+      refused = blank("");
+      slowFrames = blank(0);
+      quick = blank(false);
+      cpuMs.plain = NaN;
+      cpuMs.ghosts = NaN;
     },
     gpu: () => gpu,
   };

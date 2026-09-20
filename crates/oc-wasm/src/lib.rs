@@ -30,7 +30,7 @@ use oc_core::planar_reduce::{preview_mode, PreviewMode};
 use oc_core::profile2::ProfileConstruction3;
 use oc_core::scene3::Scene3;
 use oc_core::vec3::{Isometry3, Plane3, Vec3};
-use oc_trace::{trace_scene3, TraceConfig3};
+use oc_trace::TraceConfig3;
 
 /// The openUC2 mode (§15.2). The freeform Canvas above does not know it exists.
 pub mod openuc2;
@@ -153,6 +153,46 @@ pub struct Canvas {
     /// The area detectors' flux maps from the most recent
     /// [`Canvas::trace_projected_3d`] (see [`Canvas::last_detector_maps_f32`]).
     detector_maps: std::cell::RefCell<Vec<f32>>,
+    /// The f64 reference trace of the scene as it is, kept until the scene or
+    /// the trace settings change (see [`Canvas::reference3`]).
+    reference: std::cell::RefCell<Option<Reference3>>,
+    /// A reference being traced a batch at a time ([`Canvas::reference_step`]),
+    /// and what it is for.
+    reference_job: std::cell::RefCell<Option<(ReferenceKey, oc_trace::TraceJob3)>>,
+    /// This worker's share of a reference a pool of workers traces
+    /// ([`Canvas::pool_prepare`]).
+    pool: std::cell::RefCell<Option<Pool3>>,
+}
+
+/// One f64 reference trace, and what it was traced for.
+struct Reference3 {
+    key: ReferenceKey,
+    result: std::rc::Rc<oc_trace::TraceResult3>,
+    /// Whether it holds its segments. A reference a pool added up holds only
+    /// its numbers: each block's segments stayed with the worker that traced
+    /// them, which drew them into the picture.
+    pictured: bool,
+}
+
+/// One worker's share of a reference traced by a pool of workers: the scene
+/// prepared once, the block in hand, and, in the worker that adds the blocks
+/// up, the merge so far.
+struct Pool3 {
+    key: ReferenceKey,
+    blocks: oc_trace::TraceBlocks3,
+    part: Option<oc_trace::TracePart3>,
+    /// The capability report of the block in hand, from its last encoding.
+    report: String,
+    merge: Option<oc_trace::TraceMerge3>,
+}
+
+/// What a reference trace depends on besides the scene's revision: the ghost
+/// settings, which move no revision when toggled.
+#[derive(Clone, Copy, PartialEq)]
+struct ReferenceKey {
+    revision: u64,
+    ghosts: bool,
+    max_ghost: u32,
 }
 
 #[wasm_bindgen]
@@ -178,6 +218,9 @@ impl Canvas {
             revision: 0,
             render_tracker: render_view::RenderTracker::default(),
             detector_maps: std::cell::RefCell::new(Vec::new()),
+            reference: std::cell::RefCell::new(None),
+            reference_job: std::cell::RefCell::new(None),
+            pool: std::cell::RefCell::new(None),
         }
     }
 
@@ -201,6 +244,244 @@ impl Canvas {
     #[wasm_bindgen(js_name = setGhosts)]
     pub fn set_ghosts(&mut self, on: bool) {
         self.ghosts = on;
+    }
+
+    /// Is the ghost layer on?
+    #[wasm_bindgen(js_name = ghostsEnabled)]
+    pub fn ghosts_enabled(&self) -> bool {
+        self.ghosts
+    }
+
+    /// Begin the f64 reference of the 3D scene as it is, to be traced a batch
+    /// of launch rays at a time by [`Canvas::reference_step`], so a worker can
+    /// return to its event loop between batches and drop the trace when a
+    /// newer scene arrives. Returns the number of launch rays; 0 with no 3D
+    /// scene, or when the reference of this scene is already traced.
+    #[wasm_bindgen(js_name = referenceBegin)]
+    pub fn reference_begin(&self) -> u32 {
+        let Some(scene) = &self.scene3 else {
+            return 0;
+        };
+        let key = self.reference_key();
+        if self
+            .reference
+            .borrow()
+            .as_ref()
+            .is_some_and(|r| r.key == key)
+        {
+            return 0;
+        }
+        let job = oc_trace::TraceJob3::new(scene.clone(), self.reference_cfg());
+        let rays = job.progress().1 as u32;
+        *self.reference_job.borrow_mut() = Some((key, job));
+        rays
+    }
+
+    /// Trace up to `rays` more launch rays of the reference
+    /// [`Canvas::reference_begin`] began. Returns the fraction traced. At 1
+    /// the reference is complete, and every f64 reading
+    /// ([`Canvas::trace_projected_3d`], [`Canvas::detector_result_json`], the
+    /// hits, the maps) is read from it without tracing again. A job begun for
+    /// a scene that has changed since is dropped, and 0 returned.
+    #[wasm_bindgen(js_name = referenceStep)]
+    pub fn reference_step(&self, rays: u32) -> f64 {
+        let key = self.reference_key();
+        let mut slot = self.reference_job.borrow_mut();
+        let Some((job_key, job)) = slot.as_mut() else {
+            return if self
+                .reference
+                .borrow()
+                .as_ref()
+                .is_some_and(|r| r.key == key)
+            {
+                1.0
+            } else {
+                0.0
+            };
+        };
+        if *job_key != key {
+            *slot = None;
+            return 0.0;
+        }
+        let done = job.step(rays as usize);
+        let (traced, all) = job.progress();
+        if !done {
+            return traced as f64 / all.max(1) as f64;
+        }
+        let (key, job) = slot.take().expect("a job was stepped");
+        *self.reference.borrow_mut() = Some(Reference3 {
+            key,
+            result: std::rc::Rc::new(job.finish()),
+            pictured: true,
+        });
+        1.0
+    }
+
+    /// Prepare this worker's share of a reference traced by a pool of
+    /// workers, for the 3D scene as it is: each worker traces the blocks of
+    /// launch rays it is handed ([`Canvas::pool_begin`]), and one adds their
+    /// numbers up in block order ([`Canvas::pool_merge`]). The result is the
+    /// reference [`Canvas::reference_step`] gives, to the bit. Returns the
+    /// number of blocks; 0 with no 3D scene.
+    #[wasm_bindgen(js_name = poolPrepare)]
+    pub fn pool_prepare(&self) -> u32 {
+        let Some(scene) = &self.scene3 else {
+            *self.pool.borrow_mut() = None;
+            return 0;
+        };
+        let key = self.reference_key();
+        let mut pool = self.pool.borrow_mut();
+        if !matches!(pool.as_ref(), Some(p) if p.key == key) {
+            *pool = Some(Pool3 {
+                key,
+                blocks: oc_trace::TraceBlocks3::new(scene.clone(), self.reference_cfg()),
+                part: None,
+                report: String::new(),
+                merge: None,
+            });
+        }
+        pool.as_ref().map_or(0, |p| p.blocks.blocks() as u32)
+    }
+
+    /// The launch rays of the reference [`Canvas::pool_prepare`] prepared,
+    /// in all blocks.
+    #[wasm_bindgen(js_name = poolRays)]
+    pub fn pool_rays(&self) -> u32 {
+        self.pool
+            .borrow()
+            .as_ref()
+            .map_or(0, |p| p.blocks.rays() as u32)
+    }
+
+    /// Begin block `block` of the pool's reference. `recordHits` is false for
+    /// a block whose per-hit records no merge would keep: one after a block
+    /// that filled every detector's by itself ([`Canvas::pool_records_full`]).
+    #[wasm_bindgen(js_name = poolBegin)]
+    pub fn pool_begin(&self, block: u32, record_hits: bool) -> Result<(), JsError> {
+        let mut pool = self.pool.borrow_mut();
+        let p = pool
+            .as_mut()
+            .filter(|p| p.key == self.reference_key())
+            .ok_or_else(|| JsError::new("no pool trace prepared for this scene"))?;
+        if block as usize >= p.blocks.blocks() {
+            return Err(JsError::new(&format!("no block {block}")));
+        }
+        p.part = Some(p.blocks.part(block as usize, record_hits));
+        Ok(())
+    }
+
+    /// Trace up to `rays` more launch rays of the block in hand. Returns the
+    /// fraction of the block traced; 0 when the scene has changed since.
+    #[wasm_bindgen(js_name = poolStep)]
+    pub fn pool_step(&self, rays: u32) -> f64 {
+        let mut pool = self.pool.borrow_mut();
+        let Some(p) = pool.as_mut().filter(|p| p.key == self.reference_key()) else {
+            return 0.0;
+        };
+        let Some(part) = p.part.as_mut() else {
+            return 0.0;
+        };
+        p.blocks.step(part, rays as usize);
+        let (traced, all) = part.progress();
+        if all == 0 {
+            1.0
+        } else {
+            traced as f64 / all as f64
+        }
+    }
+
+    /// The block in hand's share of the picture, in the
+    /// [`Canvas::trace_projected_3d`] layout. The pool's picture is the
+    /// blocks' shares in block order, the segments the whole reference holds
+    /// in the order it holds them: the tracer's floor ([`PICTURE_FLOOR`] of
+    /// the brightest launch ray) already leaves out every segment the whole
+    /// picture would.
+    #[wasm_bindgen(js_name = poolPicture)]
+    pub fn pool_picture(&self) -> Vec<f32> {
+        let pool = self.pool.borrow();
+        let Some(part) = pool.as_ref().and_then(|p| p.part.as_ref()) else {
+            return Vec::new();
+        };
+        pack_projected_segments(part.segments(), &self.view_plane)
+    }
+
+    /// The block in hand's numbers, to post to the worker that adds the
+    /// blocks up ([`oc_trace::TracePart3::encode`]). Its capability report is
+    /// read next, with [`Canvas::pool_report`].
+    #[wasm_bindgen(js_name = poolNumbers)]
+    pub fn pool_numbers(&self) -> Vec<f64> {
+        let mut pool = self.pool.borrow_mut();
+        let Some(p) = pool.as_mut() else {
+            return Vec::new();
+        };
+        let Some(part) = p.part.as_ref() else {
+            return Vec::new();
+        };
+        let enc = part.encode();
+        p.report = enc.report;
+        enc.numbers
+    }
+
+    /// The capability report of the block [`Canvas::pool_numbers`] encoded.
+    #[wasm_bindgen(js_name = poolReport)]
+    pub fn pool_report(&self) -> String {
+        self.pool
+            .borrow()
+            .as_ref()
+            .map_or_else(String::new, |p| p.report.clone())
+    }
+
+    /// Whether the block in hand recorded as many hits as the reference keeps
+    /// on every detector, by itself.
+    #[wasm_bindgen(js_name = poolRecordsFull)]
+    pub fn pool_records_full(&self) -> bool {
+        let cap = self.reference_cfg().max_records;
+        self.pool
+            .borrow()
+            .as_ref()
+            .and_then(|p| p.part.as_ref())
+            .is_some_and(|part| part.records_full(cap))
+    }
+
+    /// Add the next block's numbers, as [`Canvas::pool_numbers`] and
+    /// [`Canvas::pool_report`] gave them in whichever worker traced it, to
+    /// the reference this worker adds up. Blocks must come in order. True
+    /// once every block is in: the reference of the scene is then this
+    /// Canvas's, and every f64 reading takes its numbers from it without
+    /// tracing again. The picture is the blocks' ([`Canvas::pool_picture`]).
+    #[wasm_bindgen(js_name = poolMerge)]
+    pub fn pool_merge(&self, numbers: Vec<f64>, report: String) -> Result<bool, JsError> {
+        self.pool_prepare();
+        let mut pool = self.pool.borrow_mut();
+        let p = pool
+            .as_mut()
+            .ok_or_else(|| JsError::new("no 3D scene to add a reference up for"))?;
+        let merge = p
+            .merge
+            .get_or_insert_with(|| oc_trace::TraceMerge3::new(&p.blocks));
+        merge
+            .add_encoded(&oc_trace::EncodedPart3 { numbers, report })
+            .map_err(|e| JsError::new(&e))?;
+        if !merge.done() {
+            return Ok(false);
+        }
+        let merged = p.merge.take().expect("the merge is in hand").finish();
+        *self.reference.borrow_mut() = Some(Reference3 {
+            key: p.key,
+            result: std::rc::Rc::new(merged),
+            pictured: false,
+        });
+        Ok(true)
+    }
+
+    /// The area detectors' flux maps from the reference, in the
+    /// [`Canvas::last_detector_maps_f32`] layout, without drawing the picture.
+    #[wasm_bindgen(js_name = referenceMapsF32)]
+    pub fn reference_maps_f32(&self) -> Vec<f32> {
+        let Some(scene) = &self.scene3 else {
+            return Vec::new();
+        };
+        pack_detector_maps(scene, &self.reference3(scene))
     }
 
     // --- scene construction ------------------------------------------------
@@ -1491,7 +1772,7 @@ impl Canvas {
         let Some(scene) = &self.scene3 else {
             return "null".into();
         };
-        let res = trace_scene3(scene, &self.cfg3());
+        let res = self.reference3(scene);
         let cap = &res.capability_report;
         let arr = |v: &[String]| format!("[{}]", v.join(","));
         let supported: Vec<String> = cap
@@ -1615,30 +1896,11 @@ impl Canvas {
             self.detector_maps.borrow_mut().clear();
             return Vec::new();
         };
-        let res = trace_scene3(scene, &self.cfg3());
+        let res = self.reference3_pictured(scene);
         *self.detector_maps.borrow_mut() = pack_detector_maps(scene, &res);
-        let plane = &self.view_plane;
-        let mut out = Vec::with_capacity(res.segments.len() * 11);
-        for s in &res.segments {
-            let a = plane.to_local(s.a);
-            let b = plane.to_local(s.b);
-            let flags = (s.flags.tir as u32) * 2 + (s.flags.ghost as u32) * 4;
-            let [r, g, b_] = wavelength_um_to_linear(s.lambda_um as f32);
-            out.extend_from_slice(&[
-                a.x as f32,
-                a.y as f32,
-                b.x as f32,
-                b.y as f32,
-                r,
-                g,
-                b_,
-                s.flux_end as f32,
-                flags as f32,
-                plane.signed_distance(s.a) as f32,
-                plane.signed_distance(s.b) as f32,
-            ]);
-        }
-        out
+        let floor = picture_floor(&res.segments);
+        let kept = res.segments.iter().filter(|s| s.flux_end >= floor);
+        pack_projected_segments(kept, &self.view_plane)
     }
 
     /// The incident-flux maps of the area detectors, from the most recent
@@ -1663,7 +1925,22 @@ impl Canvas {
         let Some(job) = self.fast_scene() else {
             return Vec::new();
         };
-        let per_ray = oc_gpu::cpu3::trace_segments(&job, FAST_DEPTH);
+        let per_ray = oc_gpu::cpu3::trace_segments(&job, self.depth3());
+        pack_projected(&per_ray, &self.view_plane)
+    }
+
+    /// Share `share` of `shares` of [`Canvas::trace_projected_3d_fast`]: the
+    /// launch rays of that share, traced alone. The shares one after another
+    /// are the whole frame, segment for segment, so a pool of workers can
+    /// trace a heavy frame together.
+    #[wasm_bindgen(js_name = traceProjected3DFastShare)]
+    pub fn trace_projected_3d_fast_share(&self, share: u32, shares: u32) -> Vec<f32> {
+        let Some(job) = self.fast_scene() else {
+            return Vec::new();
+        };
+        let (i, n, rays) = (share as usize, shares.max(1) as usize, job.rays.len());
+        let range = (i * rays / n).min(rays)..((i + 1) * rays / n).min(rays);
+        let per_ray = oc_gpu::cpu3::trace_segments_range(&job, self.depth3(), range);
         pack_projected(&per_ray, &self.view_plane)
     }
 
@@ -1681,9 +1958,10 @@ impl Canvas {
         let Some(scene) = &self.scene3 else {
             return Vec::new();
         };
-        let res = trace_scene3(scene, &self.cfg3());
+        let res = self.reference3_pictured(scene);
+        let floor = picture_floor(&res.segments);
         let mut out = Vec::with_capacity(res.segments.len() * 11);
-        for s in &res.segments {
+        for s in res.segments.iter().filter(|s| s.flux_end >= floor) {
             let flags = (s.flags.tir as u32) * 2 + (s.flags.ghost as u32) * 4;
             let [r, g, b] = wavelength_um_to_linear(s.lambda_um as f32);
             out.extend_from_slice(&[
@@ -1713,7 +1991,7 @@ impl Canvas {
         let Some(job) = self.fast_scene() else {
             return Vec::new();
         };
-        pack_world(&oc_gpu::cpu3::trace_segments(&job, FAST_DEPTH))
+        pack_world(&oc_gpu::cpu3::trace_segments(&job, self.depth3()))
     }
 
     /// CV-C: rigidly move a batch of loaded-scene objects by one delta —
@@ -3182,7 +3460,7 @@ impl Canvas {
         let Some(scene) = &self.scene3 else {
             return "null".into();
         };
-        let res = trace_scene3(scene, &self.cfg3());
+        let res = self.reference3(scene);
         let Some(d) = res
             .detectors
             .iter()
@@ -3321,12 +3599,7 @@ impl Canvas {
             return Vec::new();
         };
         let (hw, hh) = detector_half_extents(det);
-        let cfg = TraceConfig3 {
-            record_detector_hits: true,
-            max_records: 8192,
-            ..self.cfg3()
-        };
-        let res = trace_scene3(scene, &cfg);
+        let res = self.reference3(scene);
         let Some(d) = res.detectors.iter().find(|d| d.detector.0 == did) else {
             return Vec::new();
         };
@@ -3383,6 +3656,15 @@ impl Canvas {
     /// position. JSON array `[{id,kind,construction,is3d,pos:[x,y,z]}]`; empty if
     /// no scene is loaded. This is where "construction and missing depth are
     /// visible" (§13).
+    /// The 3D scene's detector ids, in the scene's order (the first is the one
+    /// [`Canvas::first_detector_result_json`] reads). Empty with no 3D scene.
+    #[wasm_bindgen(js_name = detectorIds)]
+    pub fn detector_ids(&self) -> Vec<f64> {
+        self.scene3.as_ref().map_or_else(Vec::new, |s| {
+            s.detectors.iter().map(|d| d.common.id.0 as f64).collect()
+        })
+    }
+
     #[wasm_bindgen(js_name = sceneObjectsJSON)]
     pub fn scene_objects_json(&self) -> String {
         let Some(scene) = &self.scene3 else {
@@ -3887,10 +4169,6 @@ impl Canvas {
     }
 }
 
-/// Interaction depth of the interactive f32 trace, on the CPU mirror or the GPU
-/// (§4.1). One constant, so the two pictures cannot drift apart.
-pub(crate) const FAST_DEPTH: u32 = 32;
-
 /// Pack a trace's area-detector maps into the layout of
 /// [`Canvas::last_detector_maps_f32`]. A legacy line probe has no area and is
 /// left out.
@@ -3927,26 +4205,32 @@ fn pack_detector_maps(scene: &Scene3, res: &oc_trace::TraceResult3) -> Vec<f32> 
 /// Pack f32 segments into the projected 11-float layout of
 /// [`Canvas::trace_projected_3d`].
 pub(crate) fn pack_projected(per_ray: &[Vec<oc_gpu::cpu3::SegOut3>], plane: &Plane3) -> Vec<f32> {
-    let mut out = Vec::new();
-    for segs in per_ray {
-        for s in segs {
-            let a = plane.to_local(s.a);
-            let b = plane.to_local(s.b);
-            let [r, g, b_] = wavelength_um_to_linear(s.lambda_um);
-            out.extend_from_slice(&[
-                a.x as f32,
-                a.y as f32,
-                b.x as f32,
-                b.y as f32,
-                r,
-                g,
-                b_,
-                s.flux,
-                s.flags as f32,
-                plane.signed_distance(s.a) as f32,
-                plane.signed_distance(s.b) as f32,
-            ]);
-        }
+    pack_projected_iter(&mut per_ray.iter().flatten().copied(), plane)
+}
+
+/// [`pack_projected`] of segments in the order they come.
+pub(crate) fn pack_projected_iter(
+    segs: &mut dyn Iterator<Item = oc_gpu::cpu3::SegOut3>,
+    plane: &Plane3,
+) -> Vec<f32> {
+    let mut out = Vec::with_capacity(segs.size_hint().0 * 11);
+    for s in segs {
+        let a = plane.to_local(s.a);
+        let b = plane.to_local(s.b);
+        let [r, g, b_] = wavelength_um_to_linear(s.lambda_um);
+        out.extend_from_slice(&[
+            a.x as f32,
+            a.y as f32,
+            b.x as f32,
+            b.y as f32,
+            r,
+            g,
+            b_,
+            s.flux,
+            s.flags as f32,
+            plane.signed_distance(s.a) as f32,
+            plane.signed_distance(s.b) as f32,
+        ]);
     }
     out
 }
@@ -3954,24 +4238,27 @@ pub(crate) fn pack_projected(per_ray: &[Vec<oc_gpu::cpu3::SegOut3>], plane: &Pla
 /// Pack f32 segments into the world-frame 11-float layout of
 /// [`Canvas::trace_world_3d`].
 pub(crate) fn pack_world(per_ray: &[Vec<oc_gpu::cpu3::SegOut3>]) -> Vec<f32> {
-    let mut out = Vec::new();
-    for segs in per_ray {
-        for s in segs {
-            let [r, g, b] = wavelength_um_to_linear(s.lambda_um);
-            out.extend_from_slice(&[
-                s.a.x as f32,
-                s.a.y as f32,
-                s.a.z as f32,
-                s.b.x as f32,
-                s.b.y as f32,
-                s.b.z as f32,
-                r,
-                g,
-                b,
-                s.flux,
-                s.flags as f32,
-            ]);
-        }
+    pack_world_iter(&mut per_ray.iter().flatten().copied())
+}
+
+/// [`pack_world`] of segments in the order they come.
+pub(crate) fn pack_world_iter(segs: &mut dyn Iterator<Item = oc_gpu::cpu3::SegOut3>) -> Vec<f32> {
+    let mut out = Vec::with_capacity(segs.size_hint().0 * 11);
+    for s in segs {
+        let [r, g, b] = wavelength_um_to_linear(s.lambda_um);
+        out.extend_from_slice(&[
+            s.a.x as f32,
+            s.a.y as f32,
+            s.a.z as f32,
+            s.b.x as f32,
+            s.b.y as f32,
+            s.b.z as f32,
+            r,
+            g,
+            b,
+            s.flux,
+            s.flags as f32,
+        ]);
     }
     out
 }
@@ -4066,9 +4353,81 @@ impl Canvas {
         TraceConfig3 {
             ghosts: self.ghosts,
             max_ghost_bounces: self.max_ghost,
+            max_depth: self.depth3(),
             revision: self.revision,
             ..TraceConfig3::default()
         }
+    }
+
+    /// The f64 reference trace of `scene`, the scene as it is: traced once per
+    /// scene revision and ghost setting, and shared by everything that reads
+    /// it. The 2D picture, the detector dock, the component view, the spot
+    /// diagram and the capability report used to trace the same scene once
+    /// each after every edit.
+    ///
+    /// It records each detector's hits (up to 8192), which the spot diagram
+    /// reads; recording them changes no other number.
+    ///
+    /// Traced whole here, it is cut into the same blocks a pool of workers
+    /// shares out and added up in the same order, so it gives the same bits.
+    fn reference3(&self, scene: &Scene3) -> std::rc::Rc<oc_trace::TraceResult3> {
+        self.reference3_with(scene, false)
+    }
+
+    /// [`Canvas::reference3`] for a reader of its segments: a reference a
+    /// pool added up holds none, and is traced again, whole, for this.
+    fn reference3_pictured(&self, scene: &Scene3) -> std::rc::Rc<oc_trace::TraceResult3> {
+        self.reference3_with(scene, true)
+    }
+
+    fn reference3_with(
+        &self,
+        scene: &Scene3,
+        picture: bool,
+    ) -> std::rc::Rc<oc_trace::TraceResult3> {
+        let key = self.reference_key();
+        if let Some(r) = self.reference.borrow().as_ref() {
+            if r.key == key && (r.pictured || !picture) {
+                return std::rc::Rc::clone(&r.result);
+            }
+        }
+        let mut job = oc_trace::TraceJob3::new(scene.clone(), self.reference_cfg());
+        while !job.step(usize::MAX) {}
+        let result = std::rc::Rc::new(job.finish());
+        *self.reference.borrow_mut() = Some(Reference3 {
+            key,
+            result: std::rc::Rc::clone(&result),
+            pictured: true,
+        });
+        result
+    }
+
+    fn reference_key(&self) -> ReferenceKey {
+        ReferenceKey {
+            revision: self.revision,
+            ghosts: self.ghosts,
+            max_ghost: self.max_ghost,
+        }
+    }
+
+    /// The reference trace's settings: the scene's, recording each
+    /// detector's hits (up to 8192) for the spot diagram, and the segments the
+    /// picture can show ([`PICTURE_FLOOR`]). Every number counts every branch.
+    fn reference_cfg(&self) -> TraceConfig3 {
+        TraceConfig3 {
+            record_detector_hits: true,
+            max_records: 8192,
+            segment_floor: PICTURE_FLOOR,
+            ..self.cfg3()
+        }
+    }
+
+    /// The interaction depth the 3D scene needs, for the f64 reference and the
+    /// f32 preview alike, so a long lens is traced to its end in both.
+    pub(crate) fn depth3(&self) -> u32 {
+        self.scene3.as_ref().map_or(32, |s| {
+            oc_trace::depth_for_scene3(s, self.ghosts, self.max_ghost)
+        })
     }
 
     /// Build the load-report JSON from a [`LoadReport`].
@@ -4206,6 +4565,50 @@ impl Default for Canvas {
 }
 
 // --- free helpers ----------------------------------------------------------
+
+/// Segments dimmer than this, relative to the brightest, are left out of the
+/// exact picture. No view draws them: the 3D view drops them before upload
+/// (`FLUX_FLOOR` in web/src/render3d/rays.ts), and the 2D layer draws a ghost
+/// only once its share, boosted at most eightfold by the ghost-opacity
+/// control, reaches 1e-4, a share of 1.25e-5 at the least. They are faint
+/// ghosts, and a ghost-lit lens has millions of them: the picture of a Double
+/// Gauss with ghosts on holds 2.0 million segments, 543 thousand of them at
+/// this floor or above. Every number is read from the whole trace.
+const PICTURE_FLOOR: f64 = 1e-5;
+
+/// Segments on the view plane, in the [`Canvas::trace_projected_3d`] layout.
+fn pack_projected_segments<'a>(
+    segments: impl IntoIterator<Item = &'a oc_trace::Segment3>,
+    plane: &Plane3,
+) -> Vec<f32> {
+    let segments = segments.into_iter();
+    let mut out = Vec::with_capacity(segments.size_hint().0 * 11);
+    for s in segments {
+        let a = plane.to_local(s.a);
+        let b = plane.to_local(s.b);
+        let flags = (s.flags.tir as u32) * 2 + (s.flags.ghost as u32) * 4;
+        let [r, g, b_] = wavelength_um_to_linear(s.lambda_um as f32);
+        out.extend_from_slice(&[
+            a.x as f32,
+            a.y as f32,
+            b.x as f32,
+            b.y as f32,
+            r,
+            g,
+            b_,
+            s.flux_end as f32,
+            flags as f32,
+            plane.signed_distance(s.a) as f32,
+            plane.signed_distance(s.b) as f32,
+        ]);
+    }
+    out
+}
+
+/// The flux below which a segment is left out of the exact picture.
+fn picture_floor(segments: &[oc_trace::Segment3]) -> f64 {
+    PICTURE_FLOOR * segments.iter().map(|s| s.flux_end).fold(0.0, f64::max)
+}
 
 /// The interaction depth cap `D`, auto-sized to the scene. A primary transmitted
 /// ray crosses each surface once, so its path length is just the scene's surface

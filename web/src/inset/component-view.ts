@@ -62,6 +62,9 @@ export function createComponentView(opts: {
   /** The selected object id in the active view, or -1. */
   selected: () => number;
   edited: (settled: boolean) => void;
+  /** A detector's f64 readout (`detectorResultJSON`) from the reference the
+   *  dock shows, or null while none is traced. Without it the view traces. */
+  readout?: (id: number) => string | null;
 }): ComponentView {
   const { scene, body } = opts;
   const canvas = document.createElement("canvas");
@@ -142,6 +145,7 @@ export function createComponentView(opts: {
       bar,
       fields,
       read,
+      readout: opts.readout ?? ((d) => scene.detectorResultJSON(d)),
     };
   }
 
@@ -610,7 +614,10 @@ function detectorView(ctx: EditorContext): Editor {
   /** The face and a fresh f64 readout of it. */
   function reread() {
     readFace();
-    const raw = JSON.parse(scene.detectorResultJSON(id));
+    const text = ctx.readout(id);
+    // No reference traced yet: the last readout stays until one is.
+    if (text === null) return;
+    const raw = JSON.parse(text);
     info = raw && typeof raw === "object" ? (raw as DetectorReadout) : null;
     pick.set(info?.measure ?? null);
     show(cone, info?.measure === "intensity");

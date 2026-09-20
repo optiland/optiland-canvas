@@ -18,14 +18,15 @@ use std::rc::Rc;
 use js_sys::{Float32Array, Promise};
 use oc_gpu::buffers3::Seg3Buf;
 use oc_gpu::cpu3::SegOut3;
-use oc_gpu::gpu3::{Gpu3Error, Gpu3InitError, Gpu3Tracer};
+use oc_gpu::gpu3::{Gpu3Error, Gpu3InitError, Gpu3Tracer, RawTrace};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
-use crate::{pack_projected, pack_world, Canvas, FAST_DEPTH};
+use crate::{pack_projected_iter, pack_world_iter, Canvas};
 
-/// The starting per-ray segment budget. A ghost-free ray is a single path of at
-/// most `FAST_DEPTH + 1` segments, so it fits with room to spare.
+/// The starting per-ray segment budget. A ghost-free ray is a single path, one
+/// segment per face it crosses, so a lens of up to about 30 elements fits; a
+/// longer one doubles the budget until its rays do.
 const MIN_SEGS: u32 = 64;
 /// The shader stops a ray after 4096 branches, so no budget needs more.
 const MAX_SEGS: u32 = 4096;
@@ -89,14 +90,14 @@ impl GpuPreview3 {
     #[wasm_bindgen(js_name = traceProjected3D)]
     pub fn trace_projected_3d(&self, canvas: &Canvas) -> Promise {
         let plane = canvas.view_plane_copy();
-        self.run(canvas, move |segs| pack_projected(segs, &plane))
+        self.run(canvas, move |segs| pack_projected_iter(segs, &plane))
     }
 
     /// The GPU counterpart of `Canvas::traceWorld3DFast`: the same 11-float
     /// world-frame layout.
     #[wasm_bindgen(js_name = traceWorld3D)]
     pub fn trace_world_3d(&self, canvas: &Canvas) -> Promise {
-        self.run(canvas, pack_world)
+        self.run(canvas, pack_world_iter)
     }
 }
 
@@ -106,13 +107,16 @@ impl GpuPreview3 {
     fn run(
         &self,
         canvas: &Canvas,
-        pack: impl Fn(&[Vec<SegOut3>]) -> Vec<f32> + 'static,
+        pack: impl Fn(&mut dyn Iterator<Item = SegOut3>) -> Vec<f32> + 'static,
     ) -> Promise {
         let Some(job) = canvas.fast_scene() else {
             let empty: JsValue = Float32Array::new_with_length(0).into();
             return Promise::resolve(&empty);
         };
         let ghosts = (job.ghosts, job.max_ghost);
+        // The same depth the CPU mirror and the f64 reference use, so the
+        // three pictures of one scene cannot drift apart.
+        let depth = canvas.depth3();
         let cap = budget_cap(job.rays.len());
         let tracer = Rc::clone(&self.tracer);
         let budget = Rc::clone(&self.budget);
@@ -125,19 +129,27 @@ impl GpuPreview3 {
             };
             let mut segs = start.min(cap);
             loop {
-                let trace = match tracer.trace_async(&job, FAST_DEPTH, segs).await {
+                // A complete trace is packed straight from the read-back.
+                let read = |raw: RawTrace<'_>| match raw.truncated() {
+                    (0, 0) => Ok(pack(&mut raw.segments())),
+                    (_, stack) => Err(stack),
+                };
+                let trace = match tracer.trace_async_with(&job, depth, segs, read).await {
                     Ok(trace) => trace,
                     Err(Gpu3Error::Busy) => return Ok(JsValue::from_str("busy")),
                     Err(e) => {
                         return Err(JsError::new(&format!("3D GPU preview failed: {e:?}")).into())
                     }
                 };
-                if trace.is_complete() {
-                    budget.set(Budget { segs, ghosts });
-                    return Ok(Float32Array::from(&pack(&trace.segments)[..]).into());
-                }
+                let stack_truncated = match trace {
+                    Ok(packed) => {
+                        budget.set(Budget { segs, ghosts });
+                        return Ok(Float32Array::from(&packed[..]).into());
+                    }
+                    Err(stack) => stack,
+                };
                 let wider = segs.saturating_mul(2).min(cap);
-                if trace.stack_truncated > 0 || wider <= segs {
+                if stack_truncated > 0 || wider <= segs {
                     budget.set(Budget { segs, ghosts });
                     return Ok(JsValue::from_str("truncated"));
                 }

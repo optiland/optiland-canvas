@@ -212,30 +212,29 @@ def test_the_committed_gallery_is_what_the_generator_writes(tmp_path):
         kept = json.loads((GALLERY / name).read_text(encoding="utf-8"))
         _assert_same(fresh, kept, name)
 
-    # The fitted curves are compared loosely (see _assert_same), so hold them
-    # to what the gallery claims of them instead: no preview glass strays
-    # further than 1e-4 in index over the band it is fitted on.
-    fresh_index = json.loads((tmp_path / "index.json").read_text(encoding="utf-8"))
-    for d in fresh_index["designs"]:
-        for fit in d.get("preview", []):
-            assert fit["max_index_error"] <= 1e-4, (d["file"], fit)
 
-
-#: A fitted Sellmeier curve is compared to this, not to the bit: scipy's
-#: least_squares stops in slightly different places on different platforms and
-#: versions, and the difference is the fourth digit of a curve that only draws
-#: the f32 preview (every number comes from the glass's published formula). A
-#: regenerated fit that differs by more than a percent is a changed fit, not
-#: the optimizer landing elsewhere.
-FIT_TOL = 1e-2
+# A glass published in a form the f32 preview cannot evaluate carries a
+# three-term Sellmeier curve fitted to it with scipy's least_squares, which
+# lands in a slightly different place on another platform or another scipy.
+# The coefficients are therefore not compared: the curve they draw is, to
+# CURVE_TOL in index, and the error the fit reports is held to the bound the
+# gallery claims rather than to the digit (below 1e-8 it is noise, and its
+# third digit moves between platforms). Nothing here is a number the app
+# reports: every index comes from the glass's own published formula.
+CURVE_TOL = 1e-6
+FIT_BOUND = 1e-4
 
 
 def _assert_same(a, b, where, tol=1e-9):
     if isinstance(a, dict):
         assert isinstance(b, dict) and a.keys() == b.keys(), where
         for k in a:
-            fitted = (k == "sell" and _is_fitted(a)) or k == "max_index_error"
-            _assert_same(a[k], b[k], f"{where}.{k}", FIT_TOL if fitted else tol)
+            if k == "sell" and _is_fitted(a):
+                _assert_same_curve(a[k], b[k], f"{where}.{k}")
+            elif k == "max_index_error":
+                assert a[k] <= FIT_BOUND and b[k] <= FIT_BOUND, f"{where}.{k}: {a[k]} vs {b[k]}"
+            else:
+                _assert_same(a[k], b[k], f"{where}.{k}", tol)
     elif isinstance(a, list):
         assert isinstance(b, list) and len(a) == len(b), where
         for i, (x, y) in enumerate(zip(a, b)):
@@ -244,6 +243,16 @@ def _assert_same(a, b, where, tol=1e-9):
         assert math.isclose(a, b, rel_tol=tol, abs_tol=1e-12), f"{where}: {a} vs {b}"
     else:
         assert a == b, f"{where}: {a!r} vs {b!r}"
+
+
+def _assert_same_curve(a: dict, b: dict, where):
+    """Two fitted Sellmeier curves draw the same index over the canvas's
+    band."""
+    import numpy as np
+
+    lam = np.linspace(*oc._FIT_BAND_UM, 400)
+    worst = float(np.max(np.abs(oc._sellmeier_n(a, lam) - oc._sellmeier_n(b, lam))))
+    assert worst <= CURVE_TOL, f"{where}: the fitted curves differ by {worst:.2g} in index"
 
 
 def _is_fitted(glass: dict) -> bool:

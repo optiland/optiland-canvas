@@ -257,6 +257,7 @@ test.describe("GPU 3D view", () => {
     // End-on, the detector face fills the view; occluded rays stay behind it.
     await page.locator("#v3dSide").click();
     await page.selectOption("#v3dRays", "occluded");
+    await page.waitForFunction(() => (window as any).__ocDebug.referenceCurrent());
     await expect.poll(() => warmPixels(page)).toBeGreaterThan(0);
 
     // A drag shows the interactive preview; the map of the last exact trace
@@ -268,6 +269,10 @@ test.describe("GPU 3D view", () => {
     await page.mouse.move(at.x + 8, at.y, { steps: 2 });
     expect(await warmPixels(page)).toBe(0);
     await page.mouse.up();
+    // The map comes back with the exact trace, which the reference workers
+    // deliver: on a slow machine (SwiftShader in CI) that outlasts a poll's
+    // five seconds, so wait for the reference itself first.
+    await page.waitForFunction(() => (window as any).__ocDebug.referenceCurrent());
     await expect.poll(() => warmPixels(page)).toBeGreaterThan(0);
 
     // The toggle hides the maps; it changes nothing optical.

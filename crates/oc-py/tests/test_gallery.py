@@ -212,17 +212,46 @@ def test_the_committed_gallery_is_what_the_generator_writes(tmp_path):
         kept = json.loads((GALLERY / name).read_text(encoding="utf-8"))
         _assert_same(fresh, kept, name)
 
+    # The fitted curves are compared loosely (see _assert_same), so hold them
+    # to what the gallery claims of them instead: no preview glass strays
+    # further than 1e-4 in index over the band it is fitted on.
+    fresh_index = json.loads((tmp_path / "index.json").read_text(encoding="utf-8"))
+    for d in fresh_index["designs"]:
+        for fit in d.get("preview", []):
+            assert fit["max_index_error"] <= 1e-4, (d["file"], fit)
 
-def _assert_same(a, b, where):
+
+#: A fitted Sellmeier curve is compared to this, not to the bit: scipy's
+#: least_squares stops in slightly different places on different platforms and
+#: versions, and the difference is the fourth digit of a curve that only draws
+#: the f32 preview (every number comes from the glass's published formula). A
+#: regenerated fit that differs by more than a percent is a changed fit, not
+#: the optimizer landing elsewhere.
+FIT_TOL = 1e-2
+
+
+def _assert_same(a, b, where, tol=1e-9):
     if isinstance(a, dict):
         assert isinstance(b, dict) and a.keys() == b.keys(), where
         for k in a:
-            _assert_same(a[k], b[k], f"{where}.{k}")
+            fitted = (k == "sell" and _is_fitted(a)) or k == "max_index_error"
+            _assert_same(a[k], b[k], f"{where}.{k}", FIT_TOL if fitted else tol)
     elif isinstance(a, list):
         assert isinstance(b, list) and len(a) == len(b), where
         for i, (x, y) in enumerate(zip(a, b)):
-            _assert_same(x, y, f"{where}[{i}]")
+            _assert_same(x, y, f"{where}[{i}]", tol)
     elif isinstance(a, float) and isinstance(b, (int, float)):
-        assert math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-12), f"{where}: {a} vs {b}"
+        assert math.isclose(a, b, rel_tol=tol, abs_tol=1e-12), f"{where}: {a} vs {b}"
     else:
         assert a == b, f"{where}: {a!r} vs {b!r}"
+
+
+def _is_fitted(glass: dict) -> bool:
+    """Is this glass's ``sell`` a fit, rather than the curve it is published
+    as? A glass with no formula, or with one the preview evaluates itself,
+    carries the published curve and is compared to the bit."""
+    formula = glass.get("formula")
+    if not isinstance(formula, dict) or "coefficients" not in formula:
+        # No formula, or a constant index, whose curve is not fitted either.
+        return False
+    return not oc._is_three_term(formula["kind"], formula["coefficients"])

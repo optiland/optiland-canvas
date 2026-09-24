@@ -118,6 +118,14 @@ pub fn depth_for_scene3(scene: &Scene3, ghosts: bool, max_ghost_bounces: u32) ->
         .iter()
         .map(|b| match &b.geometry {
             SolidGeometry3::Profile(p) => p.profile.edges.len(),
+            // A light pipe is walked by reflection, not crossed: a ray at
+            // 80 degrees to its axis meets the bore about six times per bore
+            // diameter of length, so that is what it is budgeted.
+            SolidGeometry3::Tube {
+                inner_radius_mm,
+                half_length_mm,
+                ..
+            } => 4 + (6.0 * half_length_mm / inner_radius_mm).ceil().min(1024.0) as usize,
             _ => 6,
         })
         .sum::<usize>()
@@ -130,6 +138,43 @@ pub fn depth_for_scene3(scene: &Scene3, ghosts: bool, max_ghost_bounces: u32) ->
         .saturating_mul(generations.saturating_add(1))
         .saturating_add(16)
         .clamp(32, 1024)
+}
+
+/// How far a ray may fly between events, sized to the scene rather than fixed.
+///
+/// A ray that meets nothing within this is an escape, so it has to reach
+/// across the whole scene: the 10 m default is a bench, and a heliostat field
+/// is tens of metres with its target at the far end. Four scene diagonals, and
+/// never less than the default, so a ray leaving the scene at its far corner
+/// still draws as leaving it.
+pub fn bounds_for_scene3(scene: &Scene3) -> f64 {
+    use oc_core::geom3::Intersect3;
+    let mut bb = oc_core::vec3::Aabb3::EMPTY;
+    for b in &scene.bodies {
+        let w = b.geometry.aabb_world(&b.common.transform);
+        if w.min.is_finite() && w.max.is_finite() {
+            bb.expand(w.min);
+            bb.expand(w.max);
+        }
+    }
+    let placed = scene
+        .surfaces
+        .iter()
+        .map(|s| s.common.transform.pos)
+        .chain(scene.apertures.iter().map(|a| a.common.transform.pos))
+        .chain(scene.detectors.iter().map(|d| d.common.transform.pos))
+        .chain(scene.sources.iter().map(|s| s.transform.pos));
+    for p in placed {
+        if p.is_finite() {
+            bb.expand(p);
+        }
+    }
+    let diagonal = if bb.min.is_finite() && bb.max.is_finite() {
+        (bb.max - bb.min).length()
+    } else {
+        0.0
+    };
+    (4.0 * diagonal).max(TraceConfig3::default().bounds_mm)
 }
 
 /// The launch rays a single source emits, as the tracer's [`LaunchRay3`].

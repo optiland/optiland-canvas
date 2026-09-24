@@ -18,6 +18,7 @@ import { drawFacePixels, faceBox, facePath, formatFlux, type DetectorFace, type 
 import { drawPolarMap } from "./polarmap";
 import { initGallery } from "./gallery";
 import { createReference, type ReferenceBundle } from "./reference";
+import { initSunPanel } from "./sun-panel";
 
 const SCALE = 6.5; // px per mm
 type V2 = { x: number; y: number };
@@ -79,6 +80,8 @@ async function main() {
         refreshActive3d();
         renderView();
         refresh3dDetector();
+        // A load, an undo or an edit elsewhere may have moved the sun.
+        sunPanel.sync();
       } else if (why === "standIn" && slice3d?.active()) {
         standIns++;
         refreshActive3d();
@@ -1188,6 +1191,30 @@ async function main() {
   // either.
   document.getElementById("addPbs")!.onclick = () =>
     addAndFocus(scene.addPolarizingBeamSplitter(freeX(-35, 0), 0, 0, 12, 135, 550, 12, 2.35, 1.46));
+
+  // Tubes, the sun and heliostats. A tube is black outside with a protected
+  // silver bore, the light pipe. The sun is placed from the site and the
+  // clock; a heliostat follows it onto its target: the selected object, else
+  // the first detector, else a point down the axis.
+  const sunPanel = initSunPanel({
+    scene,
+    edited: (live) => {
+      refreshActive3d();
+      renderView();
+      if (!live) refreshReference();
+    },
+  });
+  document.getElementById("addTube")!.onclick = () =>
+    addAndFocus(scene.addTube(freeX(10, 0), 0, 0, 20, 24, 80, "silver-protected", 0.95));
+  document.getElementById("addSun")!.onclick = () => sunPanel.ensureSun();
+  document.getElementById("addHeliostat")!.onclick = () => {
+    const objs = JSON.parse(scene.sceneObjectsJSON()) as { id: number; kind: string }[];
+    const picked = selectedBody3d();
+    const target = picked >= 0 ? picked : (objs.find((o) => o.kind === "detector")?.id ?? -1);
+    sunPanel.ensureSun();
+    addAndFocus(scene.addHeliostat(-60, -40, 0, 30, 30, 0.95, target, 60, 0, 0));
+    sunPanel.sync();
+  };
 
   // --- save .ocanvas — the Optiland handoff (§6) --------------------------
   // Save downloads the canonical 3D scene (the one the user actually edits) as a

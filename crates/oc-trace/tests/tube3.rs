@@ -219,3 +219,31 @@ fn a_tube_round_trips_its_dimensions_and_finish() {
     back.validate().expect("the reloaded pipe validates");
     assert_eq!(back.tube_info(tube), s.tube_info(tube));
 }
+
+/// A long pipe is walked to its end: a steep ray down a 3 m, 50 mm bore
+/// meets the wall sixty times, past the 32 events a bench scene is given,
+/// and the depth the scene asks for has to cover it.
+#[test]
+fn a_long_pipe_is_walked_to_its_end() {
+    let (ri, hl, r) = (25.0, 1500.0, 0.98);
+    let (s, _, det) = pipe(ri, hl, BoreFinish::Mirror { reflectivity: r });
+    let theta = 45f64.to_radians();
+    let start = Vec3::new(-hl - 1.0, 0.0, 0.0);
+    let rise = (hl - start.x) * theta.tan();
+    let bounces = (0..).take_while(|k| ri * (2 * k + 1) as f64 <= rise).count();
+    assert_eq!(bounces, 60, "the geometry the test was written for");
+    let cfg = TraceConfig3 {
+        max_depth: oc_trace::depth_for_scene3(&s, false, 0),
+        bounds_mm: oc_trace::bounds_for_scene3(&s),
+        ..cfg()
+    };
+    let res = trace3(
+        &s,
+        &[launch(ray(start, Vec3::new(theta.cos(), theta.sin(), 0.0)), LAMBDA, 1.0)],
+        &cfg,
+    );
+    assert_eq!(res.ledger.truncated_flux, 0.0, "{:?}", res.ledger);
+    let got = detector_named(&res, det).total_incident;
+    let want = r.powi(bounces as i32);
+    assert!((got - want).abs() < 1e-12, "R^{bounces} = {want}, got {got}");
+}

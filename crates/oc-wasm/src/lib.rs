@@ -40,6 +40,9 @@ pub mod gpu_preview;
 /// Cross-section of the 3D scene with the view plane (§10.4), for drawing the
 /// optical elements in the 2D layout.
 mod xsection;
+// Tubes, the sun and heliostats: the editor's side of `oc_core::tube` and
+// `oc_core::heliostat`.
+mod solar_ui;
 
 /// Render descriptors and display meshes for the GPU 3D view.
 pub mod render_view;
@@ -1722,7 +1725,7 @@ impl Canvas {
     pub fn load_scene3_json(&mut self, json: &str) -> Result<String, JsError> {
         let (scene, report) = load_any(json).map_err(|e| JsError::new(&format!("{e:?}")))?;
         self.scene3 = Some(scene);
-        self.revision += 1;
+        self.bump();
         Ok(self.load_report_json(&report))
     }
 
@@ -2023,7 +2026,7 @@ impl Canvas {
         if scene.transform_objects(&raw, iso).is_err() {
             return false;
         }
-        self.revision += 1;
+        self.bump();
         true
     }
 
@@ -2080,7 +2083,7 @@ impl Canvas {
             _ => false,
         };
         if ok {
-            self.revision += 1;
+            self.bump();
         }
         ok
     }
@@ -2120,7 +2123,7 @@ impl Canvas {
             .map(|(i, w)| (w / 1000.0, if use_weights { weights[i] } else { 1.0 }))
             .collect();
         if scene.set_first_source_spectrum(&lines) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -2175,7 +2178,7 @@ impl Canvas {
             reflectivity,
         ) {
             Some(id) => {
-                self.revision += 1;
+                self.bump();
                 id as f64
             }
             None => -1.0,
@@ -2200,7 +2203,7 @@ impl Canvas {
             transmittance: SpectralScalar::Constant(1.0),
         };
         let id = scene.add_planar_element(Vec3::new(x, y, 0.0), radius.max(0.5), tilt_deg, front, back);
-        self.revision += 1;
+        self.bump();
         id as f64
     }
 
@@ -2237,7 +2240,7 @@ impl Canvas {
             extinction,
         ) {
             Some(id) => {
-                self.revision += 1;
+                self.bump();
                 id as f64
             }
             None => -1.0,
@@ -2274,7 +2277,7 @@ impl Canvas {
             retardance_deg,
         ) {
             Some(id) => {
-                self.revision += 1;
+                self.bump();
                 id as f64
             }
             None => -1.0,
@@ -2307,7 +2310,7 @@ impl Canvas {
             transmittance,
         ) {
             Some(id) => {
-                self.revision += 1;
+                self.bump();
                 id as f64
             }
             None => -1.0,
@@ -2343,7 +2346,7 @@ impl Canvas {
         };
         match scene.add_dichroic(Vec3::new(x, y, 0.0), radius.max(0.5), tilt_deg, spec) {
             Some(id) => {
-                self.revision += 1;
+                self.bump();
                 id as f64
             }
             None => -1.0,
@@ -2358,7 +2361,7 @@ impl Canvas {
             return false;
         };
         if scene.set_surface_split(id as u64, reflectance, transmittance) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -2390,7 +2393,7 @@ impl Canvas {
             t_max,
         };
         if scene.set_surface_dichroic(id as u64, spec) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -2486,7 +2489,7 @@ impl Canvas {
             return false;
         };
         if scene.set_polarizer_extinction_table(id as u64, aoi_deg, extinction) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -2521,7 +2524,7 @@ impl Canvas {
             design_lambda_um,
         };
         if scene.set_retarder_crystal(id as u64, Some(c)) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -2536,7 +2539,7 @@ impl Canvas {
             return false;
         };
         if scene.set_retarder_crystal(id as u64, None) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -2556,7 +2559,7 @@ impl Canvas {
             return false;
         };
         if scene.set_polarizing_substrate(id as u64, index) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -2571,7 +2574,7 @@ impl Canvas {
             return false;
         };
         if scene.set_polarization_axis(id as u64, axis_deg) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -2586,7 +2589,7 @@ impl Canvas {
             return false;
         };
         if scene.set_polarizer_extinction(id as u64, extinction) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -2601,7 +2604,7 @@ impl Canvas {
             return false;
         };
         if scene.set_retarder_retardance(id as u64, retardance_deg) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -2901,7 +2904,7 @@ impl Canvas {
             return false;
         };
         if scene.set_object_coating_design(id as u64, design) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -2962,7 +2965,7 @@ impl Canvas {
             return false;
         };
         if scene.set_body_face_coating(id as u64, face, design) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -3012,7 +3015,7 @@ impl Canvas {
             return false;
         };
         if scene.set_object_layer_thickness(id as u64, index, nm) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -3064,7 +3067,7 @@ impl Canvas {
             n_low,
         ) {
             Some((_cube, diagonal)) => {
-                self.revision += 1;
+                self.bump();
                 diagonal as f64
             }
             None => -1.0,
@@ -3096,7 +3099,7 @@ impl Canvas {
             long_pass,
         ) {
             Some(id) => {
-                self.revision += 1;
+                self.bump();
                 id.0 as f64
             }
             None => -1.0,
@@ -3131,7 +3134,7 @@ impl Canvas {
             long_pass,
         ) {
             Some(id) => {
-                self.revision += 1;
+                self.bump();
                 id as f64
             }
             None => -1.0,
@@ -3148,7 +3151,7 @@ impl Canvas {
             return false;
         };
         if scene.set_surface_response(id as u64, front, back) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -3178,7 +3181,7 @@ impl Canvas {
             return -1.0;
         };
         let id = scene.add_aperture(Vec3::new(x, y, 0.0), opening.max(0.2), tilt_deg);
-        self.revision += 1;
+        self.bump();
         id as f64
     }
 
@@ -3194,7 +3197,7 @@ impl Canvas {
         let normal = Vec3::new(phi.cos(), phi.sin(), 0.0);
         let h = half.max(0.5);
         let id = scene.add_area_detector(Vec3::new(x, y, 0.0), normal, h, h, [64, 64]);
-        self.revision += 1;
+        self.bump();
         id.0 as f64
     }
 
@@ -3249,7 +3252,7 @@ impl Canvas {
                 .measure = was;
             return false;
         }
-        self.revision += 1;
+        self.bump();
         true
     }
 
@@ -3317,7 +3320,7 @@ impl Canvas {
         if !scene.set_detector_pixels(id as u64, [nu, nv]) {
             return false;
         }
-        self.revision += 1;
+        self.bump();
         true
     }
 
@@ -3337,7 +3340,7 @@ impl Canvas {
         if !scene.set_detector_direction_bins(id as u64, r, s) {
             return false;
         }
-        self.revision += 1;
+        self.bump();
         true
     }
 
@@ -3367,7 +3370,7 @@ impl Canvas {
             return false;
         };
         if scene.set_aperture_opening(id as u64, inner, outer) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -3383,7 +3386,7 @@ impl Canvas {
             return -1.0;
         };
         let id = scene.add_prism(Vec3::new(x, y, 0.0), side, tilt_deg, nd, vd);
-        self.revision += 1;
+        self.bump();
         id as f64
     }
 
@@ -3395,7 +3398,7 @@ impl Canvas {
             return false;
         };
         if scene.set_surface_tilt_z_deg(id as u64, deg) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -3412,7 +3415,7 @@ impl Canvas {
         match scene.sources.first_mut() {
             Some(src) => {
                 src.samples.spatial_samples = samples.max(1);
-                self.revision += 1;
+                self.bump();
                 true
             }
             None => false,
@@ -3435,7 +3438,7 @@ impl Canvas {
             return false;
         };
         body.common.transform.pos = Vec3::new(x, y, z);
-        self.revision += 1;
+        self.bump();
         true
     }
 
@@ -3497,6 +3500,14 @@ impl Canvas {
         // reader that wants the histogram itself is not made to undo a
         // division.
         let (readings, unit) = d.readings();
+        // Under the sun and nothing else, flux is watts: the sun is the one
+        // calibrated source. Any other source makes the sum relative again.
+        let calibrated = scene.solar.is_some() && scene.sources.len() == 1;
+        let unit = if calibrated {
+            unit.replacen("flux", "W", 1)
+        } else {
+            unit.to_string()
+        };
         let cells: Vec<String> = readings.iter().map(|v| format!("{v}")).collect();
         let (measure, cone) = match d.measure {
             oc_core::scene3::DetectorMeasure::Power => ("power", "null".to_string()),
@@ -3820,7 +3831,7 @@ impl Canvas {
         let scene = Scene3::default_scene();
         let body_id = scene.bodies.first().map_or(0, |b| b.common.id.0);
         self.scene3 = Some(scene);
-        self.revision += 1;
+        self.bump();
         body_id as f64
     }
 
@@ -3832,7 +3843,7 @@ impl Canvas {
             return false;
         };
         if scene.set_object_position(id as u64, Vec3::new(x, y, z)) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -3847,7 +3858,7 @@ impl Canvas {
             return false;
         };
         if scene.set_object_rotation_z_deg(id as u64, deg) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -3924,7 +3935,7 @@ impl Canvas {
             conic2,
         };
         if scene.set_singlet_geom(id as u64, g) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -4073,7 +4084,7 @@ impl Canvas {
             conic2,
         };
         if scene.set_singlet_shape(id as u64, g, SingletAspheres { front, back }) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -4091,7 +4102,7 @@ impl Canvas {
             return false;
         };
         if scene.bend_singlet_face(id as u64, back, rim_sag) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -4115,7 +4126,7 @@ impl Canvas {
         }
         let pts: Vec<(f64, f64)> = heights.iter().copied().zip(sags.iter().copied()).collect();
         if scene.fit_singlet_face(id as u64, back, &pts) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -4130,7 +4141,7 @@ impl Canvas {
             return false;
         };
         if scene.set_body_glass_abbe(id as u64, nd, vd) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -4145,7 +4156,7 @@ impl Canvas {
             return false;
         };
         if scene.delete_object(id as u64) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -4161,7 +4172,7 @@ impl Canvas {
         };
         match scene.clone_body(id as u64, Vec3::new(dx, dy, dz)) {
             Some(new_id) => {
-                self.revision += 1;
+                self.bump();
                 new_id.0 as f64
             }
             None => -1.0,
@@ -4316,6 +4327,18 @@ fn detector_face_json(d: &oc_core::scene3::Detector3) -> Option<String> {
 }
 
 impl Canvas {
+    /// Every edit to the 3D scene ends here: the revision moves, so a result
+    /// traced before the edit is recognised as stale, and a sun rig is
+    /// re-resolved, so a heliostat follows a target that was just dragged and
+    /// the sun beam follows the heliostat. Resolving is a few dozen flops per
+    /// heliostat, cheaper than deciding which edits could have mattered.
+    fn bump(&mut self) {
+        self.revision += 1;
+        if let Some(scene) = self.scene3.as_mut() {
+            scene.resolve_solar();
+        }
+    }
+
     /// The compiled f32 scene the interactive preview traces, on the CPU mirror
     /// or the GPU. `None` until a 3D scene is loaded.
     pub(crate) fn fast_scene(&self) -> Option<oc_gpu::scene3::GpuScene3> {
@@ -4345,7 +4368,7 @@ impl Canvas {
         if !scene.set_detector_geometry(id as u64, g) {
             return false;
         }
-        self.revision += 1;
+        self.bump();
         true
     }
 
@@ -4354,6 +4377,10 @@ impl Canvas {
             ghosts: self.ghosts,
             max_ghost_bounces: self.max_ghost,
             max_depth: self.depth3(),
+            bounds_mm: self
+                .scene3
+                .as_ref()
+                .map_or(TraceConfig3::default().bounds_mm, oc_trace::bounds_for_scene3),
             revision: self.revision,
             ..TraceConfig3::default()
         }

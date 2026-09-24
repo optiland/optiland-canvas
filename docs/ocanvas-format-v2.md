@@ -131,6 +131,14 @@ default is the old behaviour, never a new one:
 | field | on | absent means | added |
 |---|---|---|---|
 | `measure` | detector | `Power`, flux per cell, which is what a detector read before there was a choice | [what a detector measures](detectors.md) |
+| `solar` | scene | no sun, and the key is left out on save | [the sun and heliostats](solar.md) |
+
+A variant added to an enum cannot default, so it only reads in a kernel that
+knows it. `Tube` (a hollow tube about local `+X`: `inner_radius_mm`,
+`outer_radius_mm`, `half_length_mm`) is one: a document containing a tube
+does not open in a kernel older than the tube. A tube's faces carry per-patch
+overrides by fixed patch ids: 0 outer wall, 1 the `+X` end ring, 2 the `-X`
+end ring, 3 the bore.
 
 ## What a document may not contain
 
@@ -141,7 +149,8 @@ Validation runs on load and refuses, rather than repairs:
   a document could have intended, and leaving it would scale the body by `|q|²`;
 - a duplicate id, anywhere in the one id space;
 - a dangling reference: a layer, patch, source, detector, aperture, or path
-  intent that is not in the document;
+  intent that is not in the document, or a sun rig naming a source, mirror or
+  target that is not in it;
 - a non-finite geometric value;
 - an ambient index that is not strictly positive;
 - a wavelength table that is not a function: fewer than two samples, mismatched

@@ -34,6 +34,8 @@ pub mod fragment;
 pub mod geom;
 #[cfg(feature = "scene3")]
 pub mod geom3;
+#[cfg(feature = "scene3")]
+pub mod heliostat;
 pub mod id;
 pub mod material;
 #[cfg(feature = "scene3")]

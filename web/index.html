@@ -140,6 +140,12 @@
       .field .u { width: 18px; opacity: 0.45; text-align: right; }
       .field select.c3-resp { flex: 1; min-width: 0; background: #0a1220; color: #e8f6ff;
         border: 1px solid #24344d; border-radius: 4px; padding: 1px 3px; font: inherit; }
+      /* The sun panel: fields wider than a card's, the same look. */
+      #sunSec .field > span:first-child { width: 58px; }
+      #sunSec .field input[type="date"] { flex: 1; min-width: 0; background: #0a1220; color: #e8f6ff;
+        border: 1px solid #24344d; border-radius: 4px; padding: 1px 4px; font: inherit; color-scheme: dark; }
+      #sunSec .field input[type="range"] { flex: 1; min-width: 0; }
+      #sunReadout { white-space: pre-wrap; opacity: 0.75; font: 10px/1.4 ui-monospace, monospace; margin: 4px 0 0; }
       button.pin { background: none; border: none; cursor: pointer; padding: 0; opacity: 0.45; font-size: 11px; }
       button.pin.pinned { opacity: 1; }
       .sub { opacity: 0.7; margin-top: 2px; min-height: 14px; font-size: 11px; }
@@ -381,6 +387,23 @@
         </div>
         <div class="m4row">
           <button class="m4btn" id="addDetector" title="add an area detector (movable/tiltable; add as many as you like)">＋ detector</button>
+          <button class="m4btn" id="addTube" title="add a tube (a light pipe, a barrel, a baffle): inner and outer diameter and length, black outside, its bore black, mirrored or lined with real silver or aluminium">＋ tube</button>
+        </div>
+        <div class="m4row">
+          <button class="m4btn" id="addSun" title="put the sun in the scene: its position from the site, date and time (NREL SPA), its disc, the ASTM G173 direct spectrum, and DNI in W/m², so detectors read watts">＋ sun</button>
+          <button class="m4btn" id="addHeliostat" title="add a heliostat: a flat mirror that follows the sun to send it onto its target (the selected object, else the first detector)">＋ heliostat</button>
+        </div>
+        <div id="sunSec" class="m4-sec" hidden>
+          <div class="field"><span>latitude</span><input type="number" id="sunLat" step="0.01" /><span class="u">°</span></div>
+          <div class="field"><span>longitude</span><input type="number" id="sunLon" step="0.01" /><span class="u">°E</span></div>
+          <div class="field"><span>elevation</span><input type="number" id="sunElev" step="10" /><span class="u">m</span></div>
+          <div class="field"><span>date</span><input type="date" id="sunDate" /></div>
+          <div class="field"><span>UTC +</span><input type="number" id="sunUtc" step="0.5" /><span class="u">h</span></div>
+          <div class="field"><span>time <b id="sunTimeLabel">12:00</b></span><input type="range" id="sunTime" min="0" max="1439" step="5" /></div>
+          <div class="field" title="compass bearing of the canvas's +X; +Y is up. 180 puts south to the right"><span>+X bearing</span><input type="number" id="sunBearing" step="5" /><span class="u">°</span></div>
+          <div class="field" title="direct normal irradiance; the ASTM G173 direct spectrum carries 900"><span>DNI</span><input type="number" id="sunDni" step="10" min="0" /><span class="u">W/m²</span></div>
+          <div class="field" title="diameter of the sun beam: enough to fill what it lights"><span>beam ⌀</span><input type="number" id="sunBeam" step="10" min="1" /><span class="u">mm</span></div>
+          <pre id="sunReadout"></pre>
         </div>
         <div id="objects3d" class="obj3d"></div>
         <div id="preview3dMsg" class="m4hint">The scientifically-correct f64 3D trace. In the 2D view its rays are projected onto the meridional Y–Z plane; the slice slider thins them to a slab about it.</div>
@@ -498,6 +521,21 @@
         <div class="c3-aperture" style="display:none">
           <div class="field"><span>min r</span><input type="number" data-name="apMin" step="0.5" min="0" /><span class="u">mm</span></div>
           <div class="field"><span>max r</span><input type="number" data-name="apMax" step="0.5" min="0" /><span class="u">mm</span></div>
+        </div>
+        <div class="c3-tube" style="display:none">
+          <div class="field"><span>⌀ in</span><input type="number" data-name="tubeInner" step="1" min="0" /><span class="u">mm</span></div>
+          <div class="field"><span>⌀ out</span><input type="number" data-name="tubeOuter" step="1" min="0" /><span class="u">mm</span></div>
+          <div class="field"><span>L</span><input type="number" data-name="tubeLength" step="5" min="0" /><span class="u">mm</span></div>
+          <div class="field"><span>bore</span><select data-name="tubeBore" class="c3-resp">
+            <option value="silver-protected">silver, protected</option><option value="silver">silver, bare</option>
+            <option value="aluminium-protected">aluminium, protected</option><option value="aluminium">aluminium, bare</option>
+            <option value="mirror">ideal mirror</option><option value="black">black</option>
+            <option value="custom" disabled>custom</option></select></div>
+          <div class="field c3-tubeR"><span>R</span><input type="number" data-name="tubeR" step="0.01" min="0" max="1" /><span class="u"></span></div>
+        </div>
+        <div class="c3-helio" style="display:none">
+          <div class="field"><span>aim</span><select data-name="helioTarget" class="c3-resp"></select></div>
+          <div class="c3-helioNote m4hint"></div>
         </div>
         <div class="c3-surface" style="display:none">
           <div class="field"><span>front</span><select data-name="front" class="c3-resp">

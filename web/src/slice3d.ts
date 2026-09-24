@@ -592,12 +592,71 @@ export function initSlice3d(opts: {
     if (JSON.parse(scene.apertureOpeningJSON(id))) {
       scene.setApertureOpening(id, num("apMin"), num("apMax")); // min/max radius; refused if invalid
     }
-    if (o && !o.body) {
-      const sel = (n: string) => (root.querySelector(`select[data-name="${n}"]`) as HTMLSelectElement)?.value;
-      const f = sel("front"), b = sel("back");
+    const pick = (n: string) => (root.querySelector(`select[data-name="${n}"]`) as HTMLSelectElement)?.value;
+    if (JSON.parse(scene.tubeJSON(id))) {
+      scene.setTubeDims(id, num("tubeInner"), num("tubeOuter"), num("tubeLength"));
+      const bore = pick("tubeBore");
+      if (bore && bore !== "custom") scene.setTubeBore(id, bore, num("tubeR"));
+    }
+    if (heliostatOf(id)) {
+      const t = pick("helioTarget");
+      if (t) scene.setHeliostatTarget(id, Number(t), 0, 0, 0);
+    }
+    if (o && !o.body && !heliostatOf(id)) {
+      const f = pick("front"), b = pick("back");
       if (f && b) scene.setSurfaceResponse(id, f, b);
     }
     afterEdit();
+  }
+
+  // The rig's record of a heliostat, if `id` is one.
+  type Helio = { mirror: number; target: { object?: number; point?: number[] } | null; incidence: number; cosine: number; tracking: boolean };
+  function heliostatOf(id: number): Helio | null {
+    const sun = JSON.parse(scene.solarJSON()) as { heliostats: Helio[] } | null;
+    return sun?.heliostats.find((h) => h.mirror === id) ?? null;
+  }
+
+  // A tube's dimensions and bore, and a heliostat's target and what it costs.
+  function renderSolarCard(id: number, root: HTMLElement) {
+    const q = (sel: string) => root.querySelector(sel) as HTMLElement;
+    const setV = (name: string, v: number) => {
+      const inp = root.querySelector(`input[data-name="${name}"]`) as HTMLInputElement;
+      if (inp && document.activeElement !== inp) inp.value = String(Number(v.toFixed(4)));
+    };
+    const tube = JSON.parse(scene.tubeJSON(id)) as
+      | { inner: number; outer: number; length: number; bore: { kind: string; reflectivity?: number } }
+      | null;
+    q(".c3-tube").style.display = tube ? "block" : "none";
+    if (tube) {
+      setV("tubeInner", tube.inner); setV("tubeOuter", tube.outer); setV("tubeLength", tube.length);
+      const sel = root.querySelector(`select[data-name="tubeBore"]`) as HTMLSelectElement;
+      if (document.activeElement !== sel) sel.value = tube.bore.kind;
+      q(".c3-tubeR").style.display = tube.bore.kind === "mirror" ? "" : "none";
+      setV("tubeR", tube.bore.reflectivity ?? 0.95);
+    }
+    const h = heliostatOf(id);
+    q(".c3-helio").style.display = h ? "block" : "none";
+    if (h) {
+      const sel = root.querySelector(`select[data-name="helioTarget"]`) as HTMLSelectElement;
+      if (document.activeElement !== sel) {
+        const want = String(h.target?.object ?? "");
+        sel.replaceChildren(
+          ...objList
+            .filter((x) => x.id !== id)
+            .map((x) => new Option(`#${x.id} · ${x.kind === "profile" ? x.construction : x.kind}`, String(x.id))),
+        );
+        if (!h.target?.object && h.target?.point) {
+          sel.prepend(new Option(`point (${h.target.point.map((v) => v.toFixed(0)).join(", ")})`, ""));
+        }
+        sel.value = want;
+      }
+      q(".c3-helioNote").textContent = h.tracking
+        ? `follows the sun · incidence ${h.incidence.toFixed(1)}° · cosine ${h.cosine.toFixed(3)} · its tilt is set by the sun`
+        : "the sun and the target are on opposite sides: it cannot reach it";
+    }
+    // A heliostat's faces are the rig's, not a free choice.
+    const surf = root.querySelector(".c3-surface") as HTMLElement | null;
+    if (surf && h) surf.style.display = "none";
   }
 
   // Show/populate the per-face response block for a surface object (hidden for
@@ -649,6 +708,7 @@ export function initSlice3d(opts: {
       q(".c3-aperture").style.display = ap ? "block" : "none";
       if (ap) { setV("apMin", ap.inner); setV("apMax", ap.outer); }
       renderSurfaceCard(id, root, o);
+      renderSolarCard(id, root);
       return true;
     },
     wire(id, root) {

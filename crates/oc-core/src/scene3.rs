@@ -1745,6 +1745,15 @@ pub struct Scene3 {
     /// is not a statement of intent, it is bookkeeping.
     #[serde(default)]
     pub next_id: u64,
+    /// The sun and the heliostats that follow it, if the scene has them.
+    ///
+    /// Authored intent, like [`SceneIntent`]: what it decides is written into
+    /// the scene's own sources and mirrors by
+    /// [`resolve_solar`](Scene3::resolve_solar), and the tracer never reads
+    /// it. Absent from a document that has no sun, so every older document
+    /// reads unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub solar: Option<Box<crate::heliostat::SolarRig>>,
 }
 
 impl Default for Scene3 {
@@ -1770,6 +1779,7 @@ impl Scene3 {
             catalog: GlassCatalog::builtin(),
             intent: SceneIntent::default(),
             next_id: 0,
+            solar: None,
         }
     }
 
@@ -1988,6 +1998,9 @@ impl Scene3 {
         self.validate_sources()?;
         self.validate_views()?;
         self.validate_intent()?;
+        if let Some(rig) = &self.solar {
+            rig.validate(self)?;
+        }
         Ok(())
     }
 

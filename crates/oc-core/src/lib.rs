@@ -52,6 +52,7 @@ pub mod seq;
 pub mod seq3;
 #[cfg(feature = "scene3")]
 pub mod seq_import;
+pub mod solar;
 #[cfg(feature = "scene3")]
 pub mod source3;
 #[cfg(feature = "scene3")]

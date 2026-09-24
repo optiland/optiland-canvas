@@ -177,6 +177,12 @@ pub fn export_seq(
             reasons.push(format!("{who} is not a body in the scene"));
             continue;
         };
+        if has_sag_segments(body) {
+            reasons.push(format!(
+                "{who} is a Fresnel lens: its facets are annular pieces of a surface, and a sequential system has one surface per face"
+            ));
+            continue;
+        }
         let Some(face) = revolved_face(body, hit.patch.0) else {
             reasons.push(format!(
                 "the path meets {who} on a patch that is not a revolved optical face"
@@ -513,6 +519,18 @@ struct Face {
     k: f64,
     half_ap: f64,
     coeffs: Vec<f64>,
+}
+
+/// Is `body` built from annular sag pieces (a Fresnel lens)?
+fn has_sag_segments(body: &Body3) -> bool {
+    match &body.geometry {
+        SolidGeometry3::Profile(p) => p
+            .profile
+            .edges
+            .iter()
+            .any(|e| matches!(e.curve, Curve2::SagSegment { .. })),
+        _ => false,
+    }
 }
 
 fn revolved_face(body: &Body3, patch: u64) -> Option<Face> {

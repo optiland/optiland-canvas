@@ -1163,6 +1163,9 @@ async function main() {
   document.getElementById("addElement")!.onclick = () => addAndFocus(scene.addPlanarElement(25, 0, 8, 45));
   document.getElementById("addAperture")!.onclick = () => addAndFocus(scene.addAperture(-20, 0, 5, 0));
   document.getElementById("addPrism")!.onclick = () => addAndFocus(scene.addPrism(-40, 0, 16, 0, 1.62, 36));
+  // A Fresnel lens on the axis, grooves facing the way the light goes, at the
+  // first free spot upstream of the singlet.
+  document.getElementById("addFresnel")!.onclick = () => addAndFocus(scene.addFresnelLens(freeX(-30, 0), 0, 0));
   document.getElementById("addDetector")!.onclick = () => addAndFocus(scene.addAreaDetector(40, 0, 8, 0));
   // Splitter and dichroic plates at 135°: the default beam meets their front
   // face and the reflected arm goes up (+Y).

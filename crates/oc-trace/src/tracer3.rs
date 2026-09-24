@@ -1097,12 +1097,7 @@ fn trace_one(
         // The medium this branch travels through: containment + priority, sampled
         // just ahead of the origin so a ray leaving a surface reads the medium it
         // is entering.
-        let here = region_at(
-            scene,
-            &objs.body_boxes,
-            w.ray.origin + medium_eps * w.ray.dir,
-            tol,
-        );
+        let here = region_at(scene, objs, w.ray.origin + medium_eps * w.ray.dir, tol);
         let n_here = region_index(scene, here, w.lambda);
         let alpha = match region_absorption(scene, here, w.lambda) {
             Ok(a) => a,
@@ -1195,23 +1190,8 @@ fn trace_one(
                 patch,
             } => {
                 interact_body(
-                    scene,
-                    &objs.body_boxes,
-                    &mut stack,
-                    r,
-                    cfg,
-                    tol,
-                    &w,
-                    body,
-                    ev.point,
-                    outward,
-                    patch,
-                    here,
-                    n_here,
-                    flux_at,
-                    opl_at,
-                    medium_eps,
-                    min_flux,
+                    scene, objs, &mut stack, r, cfg, tol, &w, body, ev.point, outward, patch, here,
+                    n_here, flux_at, opl_at, medium_eps, min_flux,
                 );
             }
         }
@@ -1420,16 +1400,19 @@ fn event_object(scene: &Scene3, kind: &EventKind) -> u64 {
 /// the one asking every body gives, found without solving every body's curves.
 fn region_at(
     scene: &Scene3,
-    body_boxes: &[Aabb3],
+    objs: &EventObjects,
     point: Vec3,
     tol: &ToleranceContext,
 ) -> Option<usize> {
     let mut best: Option<(usize, i32, u64)> = None;
     for (i, b) in scene.bodies.iter().enumerate() {
-        if !b.is_3d() || !body_boxes[i].contains_point(point) {
+        if !b.is_3d() || !objs.body_boxes[i].contains_point(point) {
             continue;
         }
-        if b.geometry.contains(point, &b.common.transform, tol) == Containment::Inside {
+        let inside =
+            b.geometry
+                .contains_prepared(&objs.body_preps[i], point, &b.common.transform, tol);
+        if inside == Containment::Inside {
             let key = (b.priority, b.common.id.0);
             if best.map_or(true, |(_, p, id)| key > (p, id)) {
                 best = Some((i, b.priority, b.common.id.0));
@@ -1473,7 +1456,7 @@ fn region_absorption(
 #[allow(clippy::too_many_arguments)]
 fn interact_body(
     scene: &Scene3,
-    body_boxes: &[Aabb3],
+    objs: &EventObjects,
     stack: &mut Vec<RayWork>,
     r: &mut LocalResult,
     cfg: &TraceConfig3,
@@ -1508,7 +1491,7 @@ fn interact_body(
 
     // The medium on the far side of the boundary (§9.4).
     let n_oppose = if entering { outward } else { -outward };
-    let far = region_at(scene, body_boxes, point - medium_eps * n_oppose, tol);
+    let far = region_at(scene, objs, point - medium_eps * n_oppose, tol);
     let n_far = region_index(scene, far, w.lambda);
     let _ = here;
 
@@ -1729,9 +1712,10 @@ fn interact_surface(
         if projected.length() < 1e-9 {
             // The ray runs along the element's own axis: there is no projection
             // and no meaningful transmission axis to apply.
-            r.report.reject(CapabilityIssue::UnsupportedSurfaceResponse {
-                surface: surface_ref,
-            });
+            r.report
+                .reject(CapabilityIssue::UnsupportedSurfaceResponse {
+                    surface: surface_ref,
+                });
             r.ledger.numerical_loss += flux_at;
             r.terminations.record(TerminationReason::UnsupportedPhysics);
             push_event(r, cfg, w, point, opl_at, interact_ev(Vec::new()));
@@ -1747,9 +1731,10 @@ fn interact_surface(
                 let Some(leak) = extinction.sample(cos_i.acos().to_degrees()) else {
                     // The curve does not reach this angle and its policy says
                     // to refuse, so there is no contrast to apply.
-                    r.report.reject(CapabilityIssue::UnsupportedSurfaceResponse {
-                        surface: surface_ref,
-                    });
+                    r.report
+                        .reject(CapabilityIssue::UnsupportedSurfaceResponse {
+                            surface: surface_ref,
+                        });
                     r.ledger.numerical_loss += flux_at;
                     r.terminations.record(TerminationReason::UnsupportedPhysics);
                     push_event(r, cfg, w, point, opl_at, interact_ev(Vec::new()));
@@ -1816,8 +1801,10 @@ fn interact_surface(
         };
         r.report.note_exact(feature);
         if n_sub > 1.0 {
-            r.report
-                .note_approx(feature, "element faces added singly: no bounce between them");
+            r.report.note_approx(
+                feature,
+                "element faces added singly: no bounce between them",
+            );
         }
         if matches!(
             response,
@@ -2217,8 +2204,7 @@ fn apply_response(
             let stray = !tir && coating.reflection_is_stray();
             if tir {
                 let dir_r = reflect3(w.ray.dir, n_oppose);
-                if let Some(id) =
-                    spawn_tir(stack, r, cfg, w, point, dir_r, pol_r, opl_at, min_flux)
+                if let Some(id) = spawn_tir(stack, r, cfg, w, point, dir_r, pol_r, opl_at, min_flux)
                 {
                     children.push((ChildRole::Tir, id));
                 }
@@ -2624,7 +2610,6 @@ fn detector_aabb(d: &Detector3) -> Option<Aabb3> {
     }
     Some(bb.padded(1e-6 * ext.max_element().max(1.0)))
 }
-
 
 /// The cell index a local `(u, v)` hit falls in, row-major over `bins`. A
 /// rectangle maps to an even grid (equal-area cells, the normalization test);

@@ -5,6 +5,7 @@
 // so an edit made anywhere shows here and an edit made here shows everywhere.
 // Each kind of element has its own editor:
 //   a singlet: its profile (lens-editor.ts);
+//   a Fresnel lens: its recipe (fresnel-editor.ts);
 //   a flat surface: its coating (coating-editor.ts);
 //   an aperture: its opening, face on;
 //   a detector: its face to scale, its pixels, and what it measured;
@@ -26,6 +27,7 @@ import {
 } from "../detector-face";
 import { drawPolarMap } from "../polarmap";
 import { createCoatingEditor } from "./coating-editor";
+import { createFresnelEditor } from "./fresnel-editor";
 import type { InsetContent } from "./inset";
 import { createLensEditor } from "./lens-editor";
 import { createPolarizationEditor } from "./polarization-editor";
@@ -53,7 +55,7 @@ export type ComponentView = InsetContent & {
   debug: () => { id: number; kind: string; note: string; handles: { key: string; x: number; y: number }[] };
 };
 
-type EditorKind = "lens" | "coating" | "polarizing" | "aperture" | "detector" | "source" | "summary" | "none";
+type EditorKind = "lens" | "fresnel" | "coating" | "polarizing" | "aperture" | "detector" | "source" | "summary" | "none";
 
 export function createComponentView(opts: {
   scene: Canvas;
@@ -110,6 +112,9 @@ export function createComponentView(opts: {
     // its R and T would be, so it has to be asked about first or it would open
     // the coating editor and show two empty curves.
     if (JSON.parse(scene.surfacePolarizationJSON(id))) return "polarizing";
+    // A Fresnel lens is a revolved glass body too, but its facets follow from
+    // a recipe, so it has an editor of its own.
+    if (JSON.parse(scene.fresnelLensJSON(id))) return "fresnel";
     // A coated plate is a glass body, so it would read as a lens by its shape,
     // and its film is the thing you came to edit. But a coated *lens* is still
     // a lens: what tells them apart is curvature, since a plate is flat on both
@@ -158,6 +163,7 @@ export function createComponentView(opts: {
     const ctx = context(id);
     switch (kind) {
       case "lens": editor = createLensEditor(ctx, () => { readObjects(); return objectOf(id); }); break;
+      case "fresnel": editor = createFresnelEditor(ctx); break;
       case "coating": editor = createCoatingEditor(ctx); break;
       case "polarizing": editor = createPolarizationEditor(ctx); break;
       case "aperture": editor = apertureView(ctx, () => { readObjects(); return objectOf(id); }); break;
@@ -175,6 +181,8 @@ export function createComponentView(opts: {
     if (!o || kind === "none") return "nothing selected";
     const what = kind === "lens"
       ? "singlet"
+      : kind === "fresnel"
+      ? "Fresnel lens"
       // "surface" says nothing a user wants; name the part.
       : kind === "polarizing"
       ? (JSON.parse(scene.surfacePolarizationJSON(id))?.kind ?? "surface")

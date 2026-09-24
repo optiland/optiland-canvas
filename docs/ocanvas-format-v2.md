@@ -140,6 +140,14 @@ does not open in a kernel older than the tube. A tube's faces carry per-patch
 overrides by fixed patch ids: 0 outer wall, 1 the `+X` end ring, 2 the `-X`
 end ring, 3 the bore.
 
+A new variant is the other way the schema grows, and an old document never
+contains one. `Curve2::SagSegment { base, coeffs, y0, y1 }` is an annular piece of
+an on-axis conic or even asphere, between signed profile heights `y0` and `y1`;
+`base.half_ap` is not read. It is what a Fresnel lens's facets are
+(`oc_core::fresnel_lens`), and a Fresnel lens stores no recipe beside its
+profile: the recipe is read back out of the edges. A reader that predates the
+variant refuses such a document rather than dropping the facets.
+
 ## What a document may not contain
 
 Validation runs on load and refuses, rather than repairs:

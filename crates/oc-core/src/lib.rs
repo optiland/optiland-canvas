@@ -31,6 +31,8 @@ pub mod display_mesh;
 #[cfg(feature = "scene3")]
 pub mod document;
 pub mod fragment;
+#[cfg(feature = "scene3")]
+pub mod fresnel_lens;
 pub mod geom;
 #[cfg(feature = "scene3")]
 pub mod geom3;

@@ -84,6 +84,22 @@ pub enum Curve2 {
     Polyline {
         points: Vec<Vec2>,
     },
+    /// A portion of an on-axis sag curve: the points `base.vertex + sag(y)·axis
+    /// + y·perp(axis)` for profile height `y` from `y0` to `y1`, with `sag` the
+    /// even asphere of `base` and `coeffs` (a conic when they are all zero).
+    ///
+    /// What a Fresnel facet is: an exact annular piece of a base surface shifted
+    /// along the axis, not a chord of it. `y0` and `y1` are signed heights in the
+    /// profile, so the facet above the axis and its mirror below are two edges,
+    /// as a lens rim is. `base.half_ap` is not read; the segment's own `y0..y1`
+    /// is its extent. Revolved, a segment above the axis is an annular surface
+    /// of revolution between radii `|y0|` and `|y1|`.
+    SagSegment {
+        base: ConicParams2,
+        coeffs: [f64; 8],
+        y0: f64,
+        y1: f64,
+    },
 }
 
 impl Curve2 {
@@ -101,6 +117,17 @@ impl Curve2 {
                 base.is_finite() && coeffs.iter().all(|c| c.is_finite())
             }
             Curve2::Polyline { points } => points.iter().all(|p| p.is_finite()),
+            Curve2::SagSegment {
+                base,
+                coeffs,
+                y0,
+                y1,
+            } => {
+                base.is_finite()
+                    && coeffs.iter().all(|c| c.is_finite())
+                    && y0.is_finite()
+                    && y1.is_finite()
+            }
         }
     }
 }

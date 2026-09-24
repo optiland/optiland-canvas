@@ -1046,3 +1046,83 @@ fn a_lined_tube_matches_cpu() {
         assert_gpu_matches_cpu_at(&tracer, &scene, &rays, opts());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Fresnel lens: annular sag faces (`inner_r > 0`) in the shader
+// ---------------------------------------------------------------------------
+
+fn fresnel_scene(lens: &oc_core::fresnel_lens::FresnelLens1) -> Scene3 {
+    let mut scene = Scene3::new();
+    let (nd, vd) = oc_core::fresnel_lens::PMMA_ND_VD;
+    scene
+        .add_fresnel_lens(Vec3::ZERO, 0.0, lens, Material::AbbePoint { nd, vd })
+        .expect("the lens builds");
+    scene
+}
+
+#[test]
+fn a_fresnel_lens_matches_cpu() {
+    let Some(tracer) = tracer_or_skip() else {
+        return;
+    };
+    let lens = oc_core::fresnel_lens::FresnelLens1::default();
+    let scene = fresnel_scene(&lens);
+    // Mid-zone rays, skew ones included: every facet the shader meets must be
+    // the CPU mirror's, clipped to the same annulus.
+    let rays: Vec<(Vec3, Vec3)> = (0..24)
+        .map(|j| {
+            let h = j as f64 + 0.5;
+            let phi = 0.9 * j as f64;
+            (
+                Vec3::new(-30.0, h * phi.cos(), h * phi.sin()),
+                Vec3::new(1.0, 0.004, -0.003).normalize(),
+            )
+        })
+        .collect();
+    assert_gpu_matches_cpu(&tracer, &scene, &rays);
+}
+
+#[test]
+fn a_filled_beam_through_a_fresnel_lens_matches_cpu() {
+    let Some(tracer) = tracer_or_skip() else {
+        return;
+    };
+    let lens = oc_core::fresnel_lens::FresnelLens1 {
+        draft_deg: 4.0,
+        ..oc_core::fresnel_lens::FresnelLens1::default()
+    };
+    let scene = fresnel_scene(&lens);
+    let n = 2000;
+    let rays: Vec<(Vec3, Vec3, f64)> = (0..n)
+        .map(|i| {
+            let r = 24.5 * ((i as f64 + 0.5) / n as f64).sqrt();
+            let phi = i as f64 * 2.399_963_229_728_653;
+            (
+                Vec3::new(-30.0, r * phi.cos(), r * phi.sin()),
+                Vec3::X,
+                oc_core::material::LAMBDA_D,
+            )
+        })
+        .collect();
+    let gpu_scene = GpuScene3::build_with_rays(&scene, &emitted_at(&rays), opts());
+    assert!(gpu_scene.rejected.is_empty(), "{:?}", gpu_scene.rejected);
+    let pos_tol = tol(gpu_scene.norm.scale);
+    let cpu = cpu3::trace_segments(&gpu_scene, MAX_DEPTH);
+    let full = tracer.trace_checked(&gpu_scene, MAX_DEPTH, MAX_SEGS);
+    let gpu = full.segments;
+    assert_eq!(cpu.len(), gpu.len());
+    let agree = cpu
+        .iter()
+        .zip(&gpu)
+        .filter(|(c, g)| {
+            c.len() == g.len()
+                && c.iter().zip(g.iter()).all(|(c, g)| {
+                    let dir = ((c.b - c.a).normalize() - (g.b - g.a).normalize()).length();
+                    (c.a - g.a).length() <= pos_tol && dir < 1e-3
+                })
+        })
+        .count() as f64
+        / n as f64;
+    eprintln!("GPU vs CPU mirror, filled beam through a Fresnel lens: {agree:.4} agree");
+    assert!(agree >= 0.99, "only {agree} of the beam agrees");
+}

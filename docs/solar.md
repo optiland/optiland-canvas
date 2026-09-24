@@ -1,7 +1,7 @@
-# The sun, heliostats and tubes
+# The sun, heliostats, tubes and Fresnel lenses
 
-Three palette buttons cover a daylighting or concentrator layout: **＋ sun**,
-**＋ heliostat** and **＋ tube**. This page says what each one models, what it
+Four palette buttons cover a daylighting or concentrator layout: **＋ sun**,
+**＋ heliostat**, **＋ tube** and **＋ Fresnel**. This page says what each one models, what it
 leaves out, and how the results were checked.
 
 ## The sun
@@ -79,6 +79,31 @@ bore come out at exactly `R^N`, with `N` from the geometry, and a 3 m pipe
 carries a ray through 60 bounces. One bounce off a metal bore matches the
 transfer matrix to 1e-9. The GPU preview matches the f64 reference: exact
 paths, and the silver coating grid drifts at most 2.5e-4 of a ray's flux.
+
+## Fresnel lenses
+
+A grooved, rotationally symmetric Fresnel lens, like OpticStudio's
+non-sequential Fresnel 1. The recipe is a base surface (radius, conic, even
+aspheric A4 to A18), a clear radius, the grooves (constant pitch or constant
+depth), the substrate under the groove valleys, which way the grooves face,
+and a draft angle for the risers. Positive R converges whichever way the
+grooves face. The component view edits the recipe and rebuilds the lens.
+
+Each facet is an exact piece of the base surface shifted along the axis, not a
+chord, so the lens bends a ray exactly as the smooth lens does at the same
+exit height: 0.0 difference in exit direction over 240 heights on three
+lenses. Risers are real surfaces. With a 5° draft they catch 2.96% of a
+collimated beam against a 2.97% area estimate; with no draft, collimated light
+from the flat side never reaches one.
+
+The default pitch is 0.73 mm. A grid source puts its rays at whole
+millimetres, and a zero-draft riser at a whole millimetre then has a ray
+running along its surface into a corner where the normal has no defined side.
+At 0.73 mm none of the default lens's risers sits on a whole millimetre. A
+real beam meets that corner with probability zero.
+
+Sequential export to Optiland refuses a Fresnel lens by name: Optiland has no
+grooved surface to receive it.
 
 ## Scale
 

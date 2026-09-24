@@ -41,6 +41,9 @@ pub mod gpu_preview;
 /// optical elements in the 2D layout.
 mod xsection;
 
+/// The Fresnel lens: add one, read its recipe, rebuild it from an edited one.
+mod fresnel;
+
 /// Render descriptors and display meshes for the GPU 3D view.
 pub mod render_view;
 

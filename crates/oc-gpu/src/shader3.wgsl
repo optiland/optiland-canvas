@@ -203,6 +203,7 @@ const OBJ_BOX: u32 = 1u;
 const OBJ_CYLINDER: u32 = 2u;
 const OBJ_EXTRUDE: u32 = 3u;
 const OBJ_REVOLVE: u32 = 4u;
+const OBJ_TUBE: u32 = 5u;
 
 // Body surface behaviour kinds.
 const SURF_DIELECTRIC: u32 = 0u;
@@ -286,6 +287,9 @@ fn body_contains(bi: u32, p: vec3<f32>) -> bool {
         return extrude_contains(b.poly_start, b.poly_count, b.z_min, b.z_max, pl);
     } else if (b.kind == OBJ_REVOLVE) {
         return revolve_contains(b.contour_start, b.contour_count, pl);
+    } else if (b.kind == OBJ_TUBE) {
+        let rho2 = pl.y * pl.y + pl.z * pl.z;
+        return abs(pl.x) <= b.params.z && rho2 >= b.params.x * b.params.x && rho2 <= b.params.y * b.params.y;
     }
     return false;
 }
@@ -410,6 +414,55 @@ fn cylinder_hit(o: vec3<f32>, d: vec3<f32>, r: f32, hl: f32) -> Hit {
                 let p = o + d * t;
                 if (p.x * p.x + p.y * p.y <= r * r) {
                     best = Hit(true, t, vec3<f32>(0.0, 0.0, nz[i]), 0u);
+                }
+            }
+        }
+    }
+    return best;
+}
+
+// A hollow tube about local +X: params (inner, outer, half_length). Faces in
+// the kernel's tube_face order (outer 0, +x end 1, -x end 2, bore 3); the bore's
+// outward normal faces the axis. Mirrors cpu3::tube_hit.
+fn tube_hit(o: vec3<f32>, d: vec3<f32>, p: vec3<f32>) -> Hit {
+    var best = no_hit();
+    let ri = p.x;
+    let ro = p.y;
+    let hl = p.z;
+    let a = d.y * d.y + d.z * d.z;
+    if (a > 1e-20) {
+        var rs = array<f32, 2>(ro, ri);
+        var sg = array<f32, 2>(1.0, -1.0);
+        var fc = array<u32, 2>(0u, 3u);
+        for (var k = 0; k < 2; k = k + 1) {
+            let r = rs[k];
+            let b = 2.0 * (o.y * d.y + o.z * d.z);
+            let c = o.y * o.y + o.z * o.z - r * r;
+            let disc = b * b - 4.0 * a * c;
+            if (disc >= 0.0) {
+                let sq = sqrt(disc);
+                var ts = array<f32, 2>((-b - sq) / (2.0 * a), (-b + sq) / (2.0 * a));
+                for (var i = 0; i < 2; i = i + 1) {
+                    let t = ts[i];
+                    let q = o + d * t;
+                    if (t > EPS && abs(q.x) <= hl && (!best.hit || t < best.t)) {
+                        best = Hit(true, t, vec3<f32>(0.0, q.y, q.z) * (sg[k] / r), fc[k]);
+                    }
+                }
+            }
+        }
+    }
+    if (abs(d.x) > 1e-20) {
+        var xc = array<f32, 2>(hl, -hl);
+        var nx = array<f32, 2>(1.0, -1.0);
+        var fe = array<u32, 2>(1u, 2u);
+        for (var i = 0; i < 2; i = i + 1) {
+            let t = (xc[i] - o.x) / d.x;
+            if (t > EPS && (!best.hit || t < best.t)) {
+                let q = o + d * t;
+                let rho2 = q.y * q.y + q.z * q.z;
+                if (rho2 >= ri * ri && rho2 <= ro * ro) {
+                    best = Hit(true, t, vec3<f32>(nx[i], 0.0, 0.0), fe[i]);
                 }
             }
         }
@@ -787,6 +840,8 @@ fn body_hit(bi: u32, o: vec3<f32>, d: vec3<f32>) -> Hit {
         h = extrude_hit(b.poly_start, b.poly_count, b.z_min, b.z_max, ol, dl);
     } else if (b.kind == OBJ_REVOLVE) {
         h = revolve_hit(b.face_start, b.face_count, b.contour_start, b.contour_count, ol, dl, EPS);
+    } else if (b.kind == OBJ_TUBE) {
+        h = tube_hit(ol, dl, b.params.xyz);
     }
     if (h.hit) {
         h.n = normalize(rot * h.n);
@@ -1089,7 +1144,14 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 fn interact_body(w: Work, ev: Event, point: vec3<f32>, flux_end: f32, lambda: f32, min_flux: f32) {
-    if (bodies[ev.idx].surface == SURF_ABSORBER) { return; }
+    // An absorbing body swallows the ray at its surface, unless the face it hit
+    // carries a response of its own: the silvered bore of a black tube.
+    let bb = bodies[ev.idx];
+    var own_face = false;
+    if (ev.face < bb.face_count) {
+        own_face = faces[bb.face_start + ev.face].has_resp == 1u;
+    }
+    if (bb.surface == SURF_ABSORBER && !own_face) { return; }
     var n = ev.n;
     if (dot(n, w.d) > 0.0) { n = -n; }
     let m1 = region_optics(point + n * EPS, lambda);
@@ -1103,8 +1165,17 @@ fn interact_body(w: Work, ev: Event, point: vec3<f32>, flux_end: f32, lambda: f3
     // still refracts, because unlike a zero-thickness plate this interface
     // really does change the medium. Mirrors cpu3::interact_body.
     let b = bodies[ev.idx];
-    if (b.kind == OBJ_REVOLVE && ev.face < b.face_count) {
+    if (ev.face < b.face_count) {
         let f = faces[b.face_start + ev.face];
+        // A mirror face reflects what its reflectivity says and absorbs the
+        // rest. Mirrors cpu3::interact_body.
+        if (f.has_resp == 1u && f.resp.kind == RESP_MIRROR) {
+            let rs = sample_spectral(f.resp.r, lambda);
+            if (rs.y < 0.5) { return; }
+            let dir = reflect3(w.d, n);
+            push(Work(point + dir * EPS, dir, flux_end * clamp(rs.x, 0.0, 1.0), w.depth + 1u, w.gdepth, w.medium_n, w.medium_alpha, w.flags & ~SEG_TIR), min_flux);
+            return;
+        }
         if (f.has_resp == 1u && f.resp.kind == RESP_COATING) {
             // Past the critical angle nothing gets through whatever the stack,
             // and the grid saturates at grazing rather than saying so: total
@@ -1138,6 +1209,7 @@ fn interact_body(w: Work, ev: Event, point: vec3<f32>, flux_end: f32, lambda: f3
             return;
         }
     }
+    if (b.surface == SURF_ABSORBER) { return; }
 
     let res = refract3(w.d, n, n1, n2);
     if (res.w < 0.5) {

@@ -1060,6 +1060,18 @@ pub enum SolidGeometry3 {
         half_length_mm: f64,
         axis_local: Vec3,
     },
+    /// A hollow circular tube about local `+X`, centred on the origin: a light
+    /// pipe, a lens barrel, a baffle. The three numbers define it completely.
+    ///
+    /// The one analytic solid whose faces can carry their own responses, by
+    /// the patch ids in [`tube_face`](crate::geom3::primitives::tube_face). A
+    /// reflective bore is a tube whose default response absorbs and whose bore
+    /// overrides it with a mirror or a metal coating.
+    Tube {
+        inner_radius_mm: f64,
+        outer_radius_mm: f64,
+        half_length_mm: f64,
+    },
     // Triangle meshes are deliberately absent. Media resolve by containment plus
     // priority, so a leaky mesh is not a rendering artefact but a wrong
     // refractive index; they arrive with a watertightness specification or not at
@@ -2182,6 +2194,34 @@ impl Scene3 {
                         });
                     }
                 }
+                SolidGeometry3::Tube {
+                    inner_radius_mm,
+                    outer_radius_mm,
+                    half_length_mm,
+                } => {
+                    if !inner_radius_mm.is_finite()
+                        || !outer_radius_mm.is_finite()
+                        || !half_length_mm.is_finite()
+                    {
+                        return Err(SceneError::NonFinite {
+                            object: oid,
+                            field: "geometry".to_string(),
+                        });
+                    }
+                    // A zero bore is a cylinder, which has its own variant; a
+                    // tube claiming one would carry a bore patch with no surface.
+                    if *inner_radius_mm <= 0.0
+                        || *outer_radius_mm <= *inner_radius_mm
+                        || *half_length_mm <= 0.0
+                    {
+                        return Err(SceneError::OutOfRange {
+                            object: oid,
+                            field: "geometry".to_string(),
+                            reason: "needs 0 < inner radius < outer radius and a positive length"
+                                .to_string(),
+                        });
+                    }
+                }
             }
             b.absorption.validate("absorption")?;
             b.surface.default.validate("surface.default")?;
@@ -2193,6 +2233,9 @@ impl Scene3 {
                 let known = match &b.geometry {
                     SolidGeometry3::Profile(p) => {
                         p.profile.edges.iter().any(|e| e.patch == o.patch)
+                    }
+                    SolidGeometry3::Tube { .. } => {
+                        o.patch.0 <= u64::from(crate::geom3::primitives::tube_face::INNER)
                     }
                     _ => false,
                 };

@@ -4668,6 +4668,11 @@ fn body_radius(b: &oc_core::scene3::Body3) -> f64 {
             half_length_mm,
             ..
         } => radius_mm.hypot(*half_length_mm),
+        SolidGeometry3::Tube {
+            outer_radius_mm,
+            half_length_mm,
+            ..
+        } => outer_radius_mm.hypot(*half_length_mm),
         SolidGeometry3::Profile(p) => {
             let r = p
                 .profile
@@ -4837,6 +4842,7 @@ fn body_kind_construction(b: &oc_core::scene3::Body3) -> (&'static str, &'static
         SolidGeometry3::Sphere { .. } => ("sphere", "analytic"),
         SolidGeometry3::Box { .. } => ("box", "analytic"),
         SolidGeometry3::Cylinder { .. } => ("cylinder", "analytic"),
+        SolidGeometry3::Tube { .. } => ("tube", "analytic"),
         // A coated plate is a revolved solid like any lens, and calling it one
         // tells you nothing about what it is for. Its film is the component.
         //

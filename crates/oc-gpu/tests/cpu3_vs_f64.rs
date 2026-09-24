@@ -1581,3 +1581,90 @@ fn a_coated_plate_body_matches_f64() {
         "the coating grid drifts further than documented: {worst}"
     );
 }
+
+/// A tube about +X, bore radius 5 in a 1 mm wall, 100 mm long, with `bore`,
+/// and a detector past its far end. Returns the detector.
+fn light_pipe(scene: &mut Scene3, bore: oc_core::tube::BoreFinish) -> ObjectId {
+    scene
+        .add_tube(
+            Vec3::ZERO,
+            0.0,
+            oc_core::tube::TubeDims {
+                inner_diameter_mm: 10.0,
+                outer_diameter_mm: 12.0,
+                length_mm: 100.0,
+            },
+            bore,
+        )
+        .expect("a tube");
+    add_rect_detector(scene, Vec3::new(70.0, 0.0, 0.0), -Vec3::X, 40.0, 40.0, [3, 3])
+}
+
+/// Rays into a light pipe: down the axis, a meridional zig-zag, two skew
+/// spirals, and one into the black end ring.
+fn pipe_rays(lambda_um: f64) -> Vec<(Vec3, Vec3, f64)> {
+    let slope = |deg: f64, z: f64| {
+        let t = deg.to_radians();
+        (Vec3::new(-60.0, 0.0, z), Vec3::new(t.cos(), t.sin(), 0.0), lambda_um)
+    };
+    vec![
+        (Vec3::new(-60.0, 0.0, 0.0), Vec3::X, lambda_um),
+        slope(15.0, 0.0),
+        slope(15.0, 3.0),
+        slope(22.0, -2.0),
+        (Vec3::new(-60.0, 5.5, 0.0), Vec3::X, lambda_um),
+    ]
+}
+
+/// A mirror-lined tube: every bounce in the preview lands where the reference
+/// puts it, and the flux out is the same `R^N`.
+#[test]
+fn a_mirror_lined_tube_matches_f64() {
+    let mut scene = Scene3::new();
+    let det = light_pipe(
+        &mut scene,
+        oc_core::tube::BoreFinish::Mirror { reflectivity: 0.9 },
+    );
+    scene.validate().unwrap();
+    for ray in pipe_rays(LAMBDA_D) {
+        assert_tree_matches(&scene, ray, false);
+    }
+    assert_detectors_match(&scene, &[det], &pipe_rays(LAMBDA_D), false);
+}
+
+/// A silver-lined tube: the paths are exact, and the flux carries only the
+/// coating grid's interpolation error, compounded over the bounces.
+#[test]
+fn a_silver_lined_tube_matches_f64_within_the_grid_tolerance() {
+    let mut scene = Scene3::new();
+    let det = light_pipe(
+        &mut scene,
+        oc_core::tube::BoreFinish::Metal {
+            metal: oc_core::tube::BoreMetal::Silver,
+            protected: true,
+        },
+    );
+    scene.validate().unwrap();
+    let mut worst: f64 = 0.0;
+    for lambda_um in [0.35, 0.45, 0.55, 0.80] {
+        let rays = pipe_rays(lambda_um);
+        for &ray in &rays {
+            assert_tree_geometry_matches(&scene, ray, false);
+        }
+        let (emitted, launch) = rays_at(&rays);
+        let f64_res = trace3(&scene, &launch, &cfg());
+        let gpu = GpuScene3::build_with_rays(&scene, &emitted, opts(false));
+        assert!(gpu.rejected.is_empty(), "rejects: {:?}", gpu.rejected);
+        let f32_res = cpu3::trace(&gpu, 32);
+        let a = f64_res
+            .detectors
+            .iter()
+            .find(|d| d.detector.0 == det.0)
+            .expect("f64 detector");
+        let b = f32_res.detector(det.0).expect("f32 detector");
+        assert_eq!(a.hits, b.hits, "hit count at {lambda_um}");
+        worst = worst.max((a.total_incident - b.total as f64).abs() / rays.len() as f64);
+    }
+    assert!(worst < 2e-3, "the silver grid drifts: {worst}");
+    eprintln!("worst per-ray flux drift through a silver pipe: {worst:.2e}");
+}

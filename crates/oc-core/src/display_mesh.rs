@@ -229,6 +229,11 @@ pub fn body_mesh(b: &Body3, tess: &Tessellation) -> DisplayMesh {
             half_length_mm,
             axis_local,
         } => cylinder(*radius_mm, *half_length_mm, *axis_local, tess),
+        SolidGeometry3::Tube {
+            inner_radius_mm,
+            outer_radius_mm,
+            half_length_mm,
+        } => tube(*inner_radius_mm, *outer_radius_mm, *half_length_mm, tess),
     }
 }
 
@@ -1065,6 +1070,50 @@ fn cylinder(r: f64, half_len: f64, axis_local: Vec3, tess: &Tessellation) -> Dis
     let mut m = Builder::new(Topology::Triangles);
     m.group(FaceGroup::Optical);
     cylinder_into(&mut m, Vec3::ZERO, r, half_len, axis_local, tess);
+    m.finish(None)
+}
+
+/// A hollow tube about `+X`: two walls and two end rings, the four rims as
+/// creases. The bore's normals face the axis, as the tracer's do.
+fn tube(ri: f64, ro: f64, half_len: f64, tess: &Tessellation) -> DisplayMesh {
+    let mut m = Builder::new(Topology::Triangles);
+    m.group(FaceGroup::Optical);
+    let segs = circle_segments(ro, tess);
+    let rim = |j: usize| {
+        let th = TAU * j as f64 / segs as f64;
+        Vec3::new(0.0, th.cos(), th.sin())
+    };
+    for (r, sign) in [(ro, 1.0), (ri, -1.0)] {
+        let wall: Vec<(u32, u32)> = (0..segs)
+            .map(|j| {
+                let d = rim(j);
+                (
+                    m.vertex(d * r - Vec3::X * half_len, d * sign),
+                    m.vertex(d * r + Vec3::X * half_len, d * sign),
+                )
+            })
+            .collect();
+        for j in 0..segs {
+            let j1 = (j + 1) % segs;
+            m.quad(wall[j].0, wall[j1].0, wall[j1].1, wall[j].1);
+        }
+    }
+    for sign in [-1.0, 1.0] {
+        let n = Vec3::X * sign;
+        let ring = |r: f64, m: &mut Builder| -> Vec<u32> {
+            (0..segs)
+                .map(|j| m.vertex(rim(j) * r + n * half_len, n))
+                .collect()
+        };
+        let outer = ring(ro, &mut m);
+        let inner = ring(ri, &mut m);
+        for j in 0..segs {
+            let j1 = (j + 1) % segs;
+            m.quad(inner[j], outer[j], outer[j1], inner[j1]);
+        }
+        m.edge_loop(&outer);
+        m.edge_loop(&inner);
+    }
     m.finish(None)
 }
 

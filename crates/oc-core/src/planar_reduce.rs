@@ -449,6 +449,13 @@ fn body_boundary(body: &Body3) -> Result<(Vec<Edge>, &'static str), ReductionIss
             kind: "cylinder (its cross-section depends on axis orientation; not yet reduced)"
                 .to_string(),
         }),
+        // Its section through the axis is two rectangles, and a v1 element is
+        // one closed boundary.
+        SolidGeometry3::Tube { .. } => Err(ReductionIssue::UnsupportedGeometry {
+            object,
+            kind: "tube (its section is two disjoint walls; a v1 element has one boundary)"
+                .to_string(),
+        }),
     }
 }
 

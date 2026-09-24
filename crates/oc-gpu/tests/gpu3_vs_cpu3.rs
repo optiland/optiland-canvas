@@ -1001,3 +1001,48 @@ fn a_coated_plate_body_matches_cpu() {
     let lambdas = [0.45, 0.50, 0.53, 0.55, 0.58, 0.62, 0.70];
     assert_gpu_matches_cpu_at(&tracer, &scene, &fold_rays(&lambdas), opts());
 }
+
+/// A tube's bore reflects in the shader as it does in the CPU mirror: a mirror
+/// bore, a silver one read from the coating grid, and a black end ring, for
+/// rays that zig-zag and rays that spiral.
+#[test]
+fn a_lined_tube_matches_cpu() {
+    let Some(tracer) = tracer_or_skip() else {
+        return;
+    };
+    for bore in [
+        oc_core::tube::BoreFinish::Mirror { reflectivity: 0.9 },
+        oc_core::tube::BoreFinish::Metal {
+            metal: oc_core::tube::BoreMetal::Silver,
+            protected: true,
+        },
+    ] {
+        let mut scene = Scene3::new();
+        scene
+            .add_tube(
+                Vec3::ZERO,
+                0.0,
+                oc_core::tube::TubeDims {
+                    inner_diameter_mm: 10.0,
+                    outer_diameter_mm: 12.0,
+                    length_mm: 100.0,
+                },
+                bore,
+            )
+            .expect("a tube");
+        add_rect_detector(&mut scene, Vec3::new(70.0, 0.0, 0.0), -Vec3::X, 40.0, 40.0, [3, 3]);
+        scene.validate().unwrap();
+        let slope = |deg: f64, z: f64| {
+            let t = deg.to_radians();
+            (Vec3::new(-60.0, 0.0, z), Vec3::new(t.cos(), t.sin(), 0.0), 0.55)
+        };
+        let rays = [
+            (Vec3::new(-60.0, 0.0, 0.0), Vec3::X, 0.55),
+            slope(15.0, 0.0),
+            slope(15.0, 3.0),
+            slope(22.0, -2.0),
+            (Vec3::new(-60.0, 5.5, 0.0), Vec3::X, 0.55),
+        ];
+        assert_gpu_matches_cpu_at(&tracer, &scene, &rays, opts());
+    }
+}

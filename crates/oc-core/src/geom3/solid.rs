@@ -9,7 +9,7 @@
 
 use super::primitives::{
     box_contains, box_intersect, cylinder_contains, cylinder_intersect, sphere_contains,
-    sphere_intersect, RawHit3,
+    sphere_intersect, tube_contains, tube_intersect, RawHit3,
 };
 use super::profile::{
     extrude_aabb, extrude_contains, extrude_intersect, revolve_aabb, revolve_contains,
@@ -79,6 +79,14 @@ fn local_aabb(geom: &SolidGeometry3) -> Aabb3 {
                 max: ext,
             }
         }
+        SolidGeometry3::Tube {
+            outer_radius_mm,
+            half_length_mm,
+            ..
+        } => Aabb3 {
+            min: Vec3::new(-half_length_mm, -outer_radius_mm, -outer_radius_mm),
+            max: Vec3::new(*half_length_mm, *outer_radius_mm, *outer_radius_mm),
+        },
         SolidGeometry3::Profile(p) => profile_aabb(p),
     }
 }
@@ -99,9 +107,10 @@ fn profile_aabb(p: &ProfileSolid3) -> Aabb3 {
 }
 
 /// Wrap an analytic primitive's [`RawHit3`] as a [`LocalHit3`], turning the face
-/// index into a stable synthetic patch: an analytic solid carries no authored
-/// patches, and validation refuses a per-patch override on one, so the face index
-/// is only ever resolved against the body's default response.
+/// index into a stable synthetic patch. An analytic solid carries no authored
+/// patches, and validation refuses a per-patch override on every one but the
+/// tube, whose faces are fixed by construction and so are stable ids already
+/// ([`tube_face`](super::primitives::tube_face)).
 fn raw_to_local(raw: RawHit3) -> LocalHit3 {
     LocalHit3 {
         t_mm: raw.t_mm,
@@ -196,6 +205,19 @@ impl Intersect3 for SolidGeometry3 {
                 t_max_mm,
                 &mut |h| out(raw_to_local(h)),
             ),
+            SolidGeometry3::Tube {
+                inner_radius_mm,
+                outer_radius_mm,
+                half_length_mm,
+            } => tube_intersect(
+                *inner_radius_mm,
+                *outer_radius_mm,
+                *half_length_mm,
+                &ray,
+                t_min_mm,
+                t_max_mm,
+                &mut |h| out(raw_to_local(h)),
+            ),
             SolidGeometry3::Profile(p) => match p.construction {
                 ProfileConstruction3::RevolveLocalX => {
                     revolve_intersect(&p.profile, &ray, t_min_mm, t_max_mm, out)
@@ -230,6 +252,11 @@ impl Intersect3 for SolidGeometry3 {
                 p,
                 tol,
             ),
+            SolidGeometry3::Tube {
+                inner_radius_mm,
+                outer_radius_mm,
+                half_length_mm,
+            } => tube_contains(*inner_radius_mm, *outer_radius_mm, *half_length_mm, p, tol),
             SolidGeometry3::Profile(prof) => match prof.construction {
                 ProfileConstruction3::RevolveLocalX => revolve_contains(&prof.profile, p, tol),
                 ProfileConstruction3::ExtrudeLocalZ { z_min_mm, z_max_mm } => {

@@ -74,6 +74,17 @@ fn body(b: &Body3, plane: &Plane3, out: &mut Vec<String>) {
             half_length_mm,
             axis_local,
         } => cylinder(iso, plane, *radius_mm, *half_length_mm, *axis_local, out),
+        SolidGeometry3::Tube {
+            inner_radius_mm,
+            outer_radius_mm,
+            half_length_mm,
+        } => tube(
+            iso,
+            plane,
+            [*inner_radius_mm, *outer_radius_mm, *half_length_mm],
+            &b.surface,
+            out,
+        ),
     }
 }
 
@@ -273,6 +284,52 @@ fn cylinder(
             plane.to_local(c + axis * hl - rad * r),
         ];
         out.push(poly("body", true, &rect));
+    }
+}
+
+/// A tube's section: its two walls when the plane holds the axis, two rings
+/// when the plane is square to it. A bore that reflects draws as a mirror, so
+/// a light pipe reads as one on the canvas.
+fn tube(
+    iso: &Isometry3,
+    plane: &Plane3,
+    [ri, ro, hl]: [f64; 3],
+    props: &oc_core::scene3::SurfaceProps3,
+    out: &mut Vec<String>,
+) {
+    let axis = iso.rotate(Vec3::X).normalize();
+    let dot = axis.dot(plane.normal).abs();
+    let c = iso.pos;
+    if dot > 0.98 {
+        if plane.signed_distance(c).abs() < hl {
+            let centre = plane.to_local(c);
+            out.push(poly("body", true, &circle(centre, ro)));
+            out.push(poly("body", true, &circle(centre, ri)));
+        }
+    } else if dot < 0.02 {
+        let rad = plane.normal.cross(axis).normalize();
+        for side in [1.0, -1.0] {
+            let at = |x: f64, r: f64| plane.to_local(c + axis * x + rad * (side * r));
+            out.push(poly(
+                "body",
+                true,
+                &[at(hl, ri), at(hl, ro), at(-hl, ro), at(-hl, ri)],
+            ));
+        }
+        let bore = &props
+            .for_patch(oc_core::id::PatchId(u64::from(
+                oc_core::geom3::primitives::tube_face::INNER,
+            )))
+            .from_outside;
+        if matches!(
+            bore,
+            SurfaceResponse::Mirror { .. } | SurfaceResponse::Coating { .. }
+        ) {
+            for side in [1.0, -1.0] {
+                let at = |x: f64| plane.to_local(c + axis * x + rad * (side * ri));
+                out.push(poly("mirror", false, &[at(hl), at(-hl)]));
+            }
+        }
     }
 }
 

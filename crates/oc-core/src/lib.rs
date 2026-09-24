@@ -56,6 +56,8 @@ pub mod seq_import;
 pub mod source3;
 #[cfg(feature = "scene3")]
 pub mod thinfilm;
+#[cfg(feature = "scene3")]
+pub mod tube;
 pub mod vec;
 pub mod vec3;
 

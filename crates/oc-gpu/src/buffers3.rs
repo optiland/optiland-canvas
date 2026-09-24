@@ -439,6 +439,20 @@ fn pack_body(b: &GpuBody3, verts: &mut Vec<Vert3Buf>, faces: &mut Vec<Face3Buf>)
         contour_start = verts.len() as u32;
         verts.extend(rev.contour.iter().map(|p| [p.x, p.y]));
         contour_count = rev.contour.len() as u32;
+    } else if !b.face_resp.is_empty() {
+        // An analytic body with per-face responses (a tube): its faces need no
+        // geometry here, only a slot for the response, indexed by the face
+        // number its own hit routine reports.
+        face_start = faces.len() as u32;
+        for resp in &b.face_resp {
+            let mut packed = Face3Buf::zeroed();
+            if let Some(resp) = resp {
+                packed.has_resp = 1;
+                packed.resp = encode_response(resp, verts);
+            }
+            faces.push(packed);
+        }
+        face_count = b.face_resp.len() as u32;
     }
     Body3Buf {
         rot0,

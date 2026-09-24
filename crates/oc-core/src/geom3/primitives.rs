@@ -414,6 +414,133 @@ pub fn cylinder_contains(
 }
 
 // ---------------------------------------------------------------------------
+// Hollow tube about local +X, centred at the local origin
+// ---------------------------------------------------------------------------
+
+/// Face indices of a tube, which are also its patch ids: a tube is the one
+/// analytic solid whose faces can carry their own responses, because the
+/// inside of a light pipe and the outside of it are different parts.
+pub mod tube_face {
+    /// The outer wall, `ρ = outer_radius`.
+    pub const OUTER: u32 = 0;
+    /// The end ring at `x = +half_length`.
+    pub const END_PLUS: u32 = 1;
+    /// The end ring at `x = −half_length`.
+    pub const END_MINUS: u32 = 2;
+    /// The bore, `ρ = inner_radius`.
+    pub const INNER: u32 = 3;
+}
+
+/// Where a ray crosses the infinite cylinder `y² + z² = r²` about `+X`, both
+/// roots, stable against cancellation. `None` for a ray parallel to the axis
+/// or one that misses.
+fn x_cylinder_roots(r: f64, ray: &Ray3) -> Option<[f64; 2]> {
+    let (oy, oz, dy, dz) = (ray.origin.y, ray.origin.z, ray.dir.y, ray.dir.z);
+    let aa = dy * dy + dz * dz;
+    if aa <= PARALLEL_EPS * PARALLEL_EPS {
+        return None;
+    }
+    let bb = 2.0 * (oy * dy + oz * dz);
+    let cc = oy * oy + oz * oz - r * r;
+    let disc = bb * bb - 4.0 * aa * cc;
+    if disc < 0.0 {
+        return None;
+    }
+    let q = -0.5 * (bb + bb.signum() * disc.sqrt());
+    Some([q / aa, cc / q])
+}
+
+/// A hollow circular tube: the region `inner ≤ ρ ≤ outer`, `|x| ≤ half_length`,
+/// with `ρ = √(y² + z²)`. Faces as [`tube_face`].
+///
+/// The bore's outward normal points **toward the axis**: outward from the
+/// material, which is what makes a ray travelling down the bore "outside" the
+/// solid and its reflection off the wall a reflection from outside.
+pub fn tube_intersect(
+    inner_radius_mm: f64,
+    outer_radius_mm: f64,
+    half_length_mm: f64,
+    ray: &Ray3,
+    tmin: f64,
+    tmax: f64,
+    out: &mut dyn FnMut(RawHit3),
+) {
+    let l = half_length_mm;
+    for (r, face, sign) in [
+        (outer_radius_mm, tube_face::OUTER, 1.0),
+        (inner_radius_mm, tube_face::INNER, -1.0),
+    ] {
+        let Some(roots) = x_cylinder_roots(r, ray) else {
+            continue;
+        };
+        for t in roots {
+            if t.is_finite() && in_range(t, tmin, tmax) {
+                let p = ray.at(t);
+                if p.x.abs() <= l {
+                    out(RawHit3 {
+                        t_mm: t,
+                        point: p,
+                        normal: Vec3::new(0.0, p.y, p.z) * (sign / r),
+                        uv: None,
+                        face,
+                    });
+                }
+            }
+        }
+    }
+
+    // End rings at x = ±l.
+    if ray.dir.x.abs() >= PARALLEL_EPS {
+        let (ri2, ro2) = (
+            inner_radius_mm * inner_radius_mm,
+            outer_radius_mm * outer_radius_mm,
+        );
+        for (s, face) in [(l, tube_face::END_PLUS), (-l, tube_face::END_MINUS)] {
+            let t = (s - ray.origin.x) / ray.dir.x;
+            if in_range(t, tmin, tmax) {
+                let p = ray.at(t);
+                let rho2 = p.y * p.y + p.z * p.z;
+                if rho2 >= ri2 && rho2 <= ro2 {
+                    out(RawHit3 {
+                        t_mm: t,
+                        point: p,
+                        normal: Vec3::new(s.signum(), 0.0, 0.0),
+                        uv: None,
+                        face,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Containment for [`tube_intersect`]'s solid, by the exact signed distance.
+///
+/// In the meridian half-plane `(|x|, ρ)` the tube's section is the rectangle
+/// `[0, l] × [inner, outer]`, and the distance from a point to a solid of
+/// revolution is the distance from its meridian point to the section. So this
+/// is the ordinary box distance, centred on the wall.
+pub fn tube_contains(
+    inner_radius_mm: f64,
+    outer_radius_mm: f64,
+    half_length_mm: f64,
+    p: Vec3,
+    tol: &ToleranceContext,
+) -> super::Containment {
+    let rho = (p.y * p.y + p.z * p.z).sqrt();
+    let mid = 0.5 * (inner_radius_mm + outer_radius_mm);
+    let half_wall = 0.5 * (outer_radius_mm - inner_radius_mm);
+    let qa = p.x.abs() - half_length_mm;
+    let qr = (rho - mid).abs() - half_wall;
+    let d = if qa <= 0.0 && qr <= 0.0 {
+        qa.max(qr)
+    } else {
+        qa.max(0.0).hypot(qr.max(0.0))
+    };
+    classify(d, tol)
+}
+
+// ---------------------------------------------------------------------------
 // Conic and even-asphere of revolution about an arbitrary local axis
 // ---------------------------------------------------------------------------
 

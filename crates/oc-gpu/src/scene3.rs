@@ -49,6 +49,11 @@ pub const OBJ_EXTRUDE: u32 = 3;
 /// A profile revolved about local `+X`. Its surfaces and containment contour are
 /// in [`GpuBody3::revolve`].
 pub const OBJ_REVOLVE: u32 = 4;
+/// A hollow tube about local `+X`. `params = (inner_radius, outer_radius,
+/// half_length)`, and its four faces carry their own responses through
+/// [`GpuBody3::face_resp`] in the kernel's
+/// [`tube_face`](oc_core::geom3::primitives::tube_face) order.
+pub const OBJ_TUBE: u32 = 5;
 
 /// Surface behaviour kinds.
 pub const SURF_DIELECTRIC: u32 = 0;
@@ -336,6 +341,11 @@ fn body_world_bound(b: &Body3) -> Option<(DVec3, f64)> {
             half_length_mm,
             ..
         } => Some((t.pos, radius_mm.hypot(*half_length_mm))),
+        SolidGeometry3::Tube {
+            outer_radius_mm,
+            half_length_mm,
+            ..
+        } => Some((t.pos, outer_radius_mm.hypot(*half_length_mm))),
         SolidGeometry3::Profile(p) => {
             // The profile's XY reach plus its Z span, roughly.
             let r = p
@@ -429,6 +439,15 @@ fn compile_body(
                 body_rot * align,
             )
         }
+        SolidGeometry3::Tube {
+            inner_radius_mm,
+            outer_radius_mm,
+            half_length_mm,
+        } => (
+            OBJ_TUBE,
+            Vec3::new(s(*inner_radius_mm), s(*outer_radius_mm), s(*half_length_mm)),
+            body_rot,
+        ),
         SolidGeometry3::Profile(p) => match p.construction {
             ProfileConstruction3::ExtrudeLocalZ { z_min_mm, z_max_mm } => {
                 extrude = Some(GpuExtrude {
@@ -461,53 +480,77 @@ fn compile_body(
             .map(|&l| body_index_at(&b.material, catalog, l as f64).unwrap_or(1.0))
             .collect()
     };
-    if let SolidGeometry3::Profile(prof) = &b.geometry {
-        for edge in &prof.profile.edges {
-            let two = b.surface.for_patch(edge.patch);
-            if std::ptr::eq(two, &b.surface.default) {
-                face_resp.push(None);
-                continue;
+    // The patches a per-face response can name, in the face order the preview
+    // reports hits in: a revolved profile's edges, or a tube's four faces.
+    let patches: Vec<oc_core::id::PatchId> = match &b.geometry {
+        SolidGeometry3::Profile(prof) => prof.profile.edges.iter().map(|e| e.patch).collect(),
+        SolidGeometry3::Tube { .. } if !b.surface.overrides.is_empty() => (0
+            ..=oc_core::geom3::primitives::tube_face::INNER)
+            .map(|f| oc_core::id::PatchId(f as u64))
+            .collect(),
+        _ => Vec::new(),
+    };
+    for &patch in &patches {
+        let two = b.surface.for_patch(patch);
+        if std::ptr::eq(two, &b.surface.default) {
+            face_resp.push(None);
+            continue;
+        }
+        // A coated face's inside copy is the same stack met from behind.
+        // The grid is baked from outside and serves a ray from inside as
+        // well, because a lossless stack reflects and transmits the same
+        // from either side at conjugate angles; the inside copy exists to
+        // tell the reference which way round to walk the layers.
+        let mirrored = match (&two.from_outside, &two.from_inside) {
+            (SurfaceResponse::Coating { coating: a }, SurfaceResponse::Coating { coating: b }) => {
+                a.seen_from_behind() == *b
             }
-            // A coated face's inside copy is the same stack met from behind.
-            // The grid is baked from outside and serves a ray from inside as
-            // well, because a lossless stack reflects and transmits the same
-            // from either side at conjugate angles; the inside copy exists to
-            // tell the reference which way round to walk the layers.
-            let mirrored = match (&two.from_outside, &two.from_inside) {
-                (SurfaceResponse::Coating { coating: a }, SurfaceResponse::Coating { coating: b }) => {
-                    a.seen_from_behind() == *b
-                }
-                _ => false,
-            };
-            if two.from_outside != two.from_inside && !mirrored {
-                return Err("asymmetric per-face response (not yet in the f32 preview)".into());
+            _ => false,
+        };
+        if two.from_outside != two.from_inside && !mirrored {
+            return Err("asymmetric per-face response (not yet in the f32 preview)".into());
+        }
+        match &two.from_outside {
+            SurfaceResponse::Coating { coating } => {
+                face_resp.push(Some(bake_coating(
+                    coating,
+                    ambient,
+                    coat_lambdas,
+                    &body_indices,
+                )?));
             }
-            match &two.from_outside {
-                SurfaceResponse::Coating { coating } => {
-                    face_resp.push(Some(bake_coating(
-                        coating,
-                        ambient,
-                        coat_lambdas,
-                        &body_indices,
-                    )?));
-                }
-                SurfaceResponse::DielectricFresnel { .. } => face_resp.push(None),
-                other => {
-                    return Err(format!(
-                        "per-face {} response (not yet in the f32 preview)",
-                        oc_core::build3::response_kind(other)
-                    ));
-                }
+            SurfaceResponse::DielectricFresnel { .. } => face_resp.push(None),
+            // A mirror face on a solid: the bore of a light pipe.
+            SurfaceResponse::Mirror { .. } => face_resp.push(Some(compile_response(
+                &two.from_outside,
+                norm.scale,
+                ambient,
+                coat_lambdas,
+            )?)),
+            other => {
+                return Err(format!(
+                    "per-face {} response (not yet in the f32 preview)",
+                    oc_core::build3::response_kind(other)
+                ));
             }
         }
     }
-    // Per-face responses are honoured below for revolved bodies, which is what
-    // a coated plate and a coated lens are. Anything else carrying an override
+    // Per-face responses are honoured for revolved bodies, which is what a
+    // coated plate and a coated lens are, and for a tube, whose bore is the
+    // reason it exists. Anything else carrying an override
     // is rejected by name rather than traced as if the override were not there:
     // a dichroic silently reduced to plain glass is worse than a dichroic that
     // says it cannot be previewed.
-    if !b.surface.overrides.is_empty() && !matches!(b.geometry, SolidGeometry3::Profile(_)) {
-        return Err("per-face response on a non-profile body (not yet in the f32 preview)".into());
+    if !b.surface.overrides.is_empty()
+        && !matches!(
+            b.geometry,
+            SolidGeometry3::Profile(_) | SolidGeometry3::Tube { .. }
+        )
+    {
+        return Err(
+            "per-face response on a body other than a profile or tube (not yet in the f32 preview)"
+                .into(),
+        );
     }
     let alpha_per_mm = match &b.absorption {
         AbsorptionModel::None => 0.0,

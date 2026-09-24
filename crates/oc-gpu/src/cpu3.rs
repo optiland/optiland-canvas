@@ -22,7 +22,7 @@ use glam::{DVec3, Vec2, Vec3};
 use crate::scene3::{
     even_asphere_dsag, even_asphere_sag, GpuAperture3, GpuBody3, GpuDetector3, GpuExtrude,
     GpuResponse, GpuRevolve, GpuScene3, GpuSurface3, RevFace, Spectral32, OBJ_BOX, OBJ_CYLINDER,
-    OBJ_EXTRUDE, OBJ_REVOLVE, OBJ_SPHERE, SURF_ABSORBER,
+    OBJ_EXTRUDE, OBJ_REVOLVE, OBJ_SPHERE, OBJ_TUBE, SURF_ABSORBER,
 };
 
 /// Segment flag bits (shared meaning with the 2D path).
@@ -272,14 +272,42 @@ fn interact_body(
     max_depth: u32,
     min_flux: f32,
 ) {
-    if scene.bodies[body].surface == SURF_ABSORBER {
-        return; // swallowed at the surface
+    // An absorbing body swallows the ray at its surface, unless the face it hit
+    // carries a response of its own: the silvered bore of a black tube.
+    let own_face = matches!(scene.bodies[body].face_resp.get(face), Some(Some(_)));
+    if scene.bodies[body].surface == SURF_ABSORBER && !own_face {
+        return;
     }
     let n = if hit_normal.dot(w.d) > 0.0 {
         -hit_normal
     } else {
         hit_normal
     };
+    // A mirror face reflects what its reflectivity says and absorbs the rest.
+    // A table with no value at this wavelength ends the branch, as it does on a
+    // standalone mirror.
+    if let Some(Some(GpuResponse::Mirror { r })) = scene.bodies[body].face_resp.get(face) {
+        let Some(r) = r.sample(lambda) else {
+            return;
+        };
+        let dir = reflect(w.d, n);
+        push(
+            stack,
+            Work {
+                o: point + dir * EPS,
+                d: dir,
+                flux: flux_end * r.clamp(0.0, 1.0),
+                depth: w.depth + 1,
+                gdepth: w.gdepth,
+                medium_n: w.medium_n,
+                medium_alpha: w.medium_alpha,
+                flags: w.flags & !SEG_TIR,
+            },
+            max_depth,
+            min_flux,
+        );
+        return;
+    }
     let (n1, _a1) = region_optics(scene, point + n * EPS, lambda);
     let (n2, a2) = region_optics(scene, point - n * EPS, lambda);
 
@@ -288,9 +316,8 @@ fn interact_body(
     // and T come from the baked grid at this ray's own angle, and the
     // transmitted branch still refracts, because unlike a zero-thickness plate
     // this interface really does change the medium.
-    if let Some(Some(GpuResponse::CoatingGrid { lambdas, rt, stray })) = scene.bodies[body]
-        .face_resp
-        .get(face)
+    if let Some(Some(GpuResponse::CoatingGrid { lambdas, rt, stray })) =
+        scene.bodies[body].face_resp.get(face)
     {
         let cos_i = (-n.dot(w.d)).clamp(0.0, 1.0);
         let (r, t) = crate::scene3::sample_coating_grid(
@@ -370,6 +397,9 @@ fn interact_body(
                 min_flux,
             );
         }
+        return;
+    }
+    if scene.bodies[body].surface == SURF_ABSORBER {
         return;
     }
 
@@ -754,6 +784,7 @@ fn body_hit(b: &GpuBody3, o: Vec3, d: Vec3) -> Option<(f32, Vec3, usize)> {
         OBJ_CYLINDER => plain(cylinder_hit(ol, dl, b.params.x, b.params.y, EPS)),
         OBJ_EXTRUDE => plain(extrude_hit(b.extrude.as_ref()?, ol, dl, EPS)),
         OBJ_REVOLVE => revolve_hit(b.revolve.as_ref()?, ol, dl, EPS),
+        OBJ_TUBE => tube_hit(ol, dl, b.params, EPS),
         _ => None,
     }
 }
@@ -920,6 +951,12 @@ fn contains(b: &GpuBody3, p: Vec3) -> bool {
             .as_ref()
             .map(|r| revolve_contains(r, pl))
             .unwrap_or(false),
+        OBJ_TUBE => {
+            let rho2 = pl.y * pl.y + pl.z * pl.z;
+            pl.x.abs() <= b.params.z
+                && rho2 >= b.params.x * b.params.x
+                && rho2 <= b.params.y * b.params.y
+        }
         _ => false,
     }
 }
@@ -1321,6 +1358,47 @@ fn cylinder_hit(o: Vec3, d: Vec3, r: f32, hl: f32, tmin: f32) -> Option<(f32, Ve
             let p = o + d * t;
             if p.x * p.x + p.y * p.y <= r * r {
                 keep(&mut best, t, Vec3::new(0.0, 0.0, nz));
+            }
+        }
+    }
+    best
+}
+
+/// Nearest tube intersection at `t > tmin`: `(t, outward local normal, face)`,
+/// faces in the kernel's `tube_face` order. `p = (inner, outer, half_length)`,
+/// axis local `+X`; the bore's outward normal faces the axis.
+fn tube_hit(o: Vec3, d: Vec3, p: Vec3, tmin: f32) -> Option<(f32, Vec3, usize)> {
+    let (ri, ro, hl) = (p.x, p.y, p.z);
+    let mut best: Option<(f32, Vec3, usize)> = None;
+    let mut keep = |t: f32, n: Vec3, face: usize| {
+        if t > tmin && best.map(|(bt, _, _)| t < bt).unwrap_or(true) {
+            best = Some((t, n, face));
+        }
+    };
+    let a = d.y * d.y + d.z * d.z;
+    if a > 1e-20 {
+        for (r, face, sign) in [(ro, 0usize, 1.0f32), (ri, 3usize, -1.0f32)] {
+            let b = 2.0 * (o.y * d.y + o.z * d.z);
+            let c = o.y * o.y + o.z * o.z - r * r;
+            let disc = b * b - 4.0 * a * c;
+            if disc >= 0.0 {
+                let sq = disc.sqrt();
+                for t in [(-b - sq) / (2.0 * a), (-b + sq) / (2.0 * a)] {
+                    let q = o + d * t;
+                    if q.x.abs() <= hl {
+                        keep(t, Vec3::new(0.0, q.y, q.z) * (sign / r), face);
+                    }
+                }
+            }
+        }
+    }
+    if d.x.abs() > 1e-20 {
+        for (xc, nx, face) in [(hl, 1.0f32, 1usize), (-hl, -1.0f32, 2usize)] {
+            let t = (xc - o.x) / d.x;
+            let q = o + d * t;
+            let rho2 = q.y * q.y + q.z * q.z;
+            if rho2 >= ri * ri && rho2 <= ro * ro {
+                keep(t, Vec3::new(nx, 0.0, 0.0), face);
             }
         }
     }

@@ -247,9 +247,11 @@ fn conic2_to_1(c: &ConicParams2) -> ConicParams {
 
 /// A profile curve as a v1 edge. The inverse of
 /// [`crate::migrate_v1`]'s `edge_to_curve`. `Polyline` becomes the degree-1
-/// `Spline` it always was (§6.3); no ray changes.
-fn curve2_to_edge(c: &Curve2) -> Edge {
-    match c {
+/// `Spline` it always was (§6.3); no ray changes. A [`Curve2::SagSegment`] (a
+/// Fresnel facet) has no v1 form, since a v1 conic always spans its axis, and
+/// comes back `None`.
+fn curve2_to_edge(c: &Curve2) -> Option<Edge> {
+    Some(match c {
         Curve2::Line { a, b } => Edge::Line { a: *a, b: *b },
         Curve2::Arc {
             center,
@@ -271,7 +273,8 @@ fn curve2_to_edge(c: &Curve2) -> Edge {
             ctrl: points.clone(),
             degree: 1,
         },
-    }
+        Curve2::SagSegment { .. } => return None,
+    })
 }
 
 /// A constant spectral scalar's value, or `None` if it is tabulated (which v1
@@ -403,7 +406,11 @@ fn body_boundary(body: &Body3) -> Result<(Vec<Edge>, &'static str), ReductionIss
                 .edges
                 .iter()
                 .map(|e| curve2_to_edge(&e.curve))
-                .collect();
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| ReductionIssue::UnsupportedGeometry {
+                    object,
+                    kind: "a Fresnel facet (an annular piece of a sag curve)".to_string(),
+                })?;
             Ok((boundary, kind))
         }
         SolidGeometry3::Sphere { radius_mm } => {
@@ -752,7 +759,8 @@ mod tests {
     fn a_polyline_reduces_to_a_degree_one_spline() {
         let e = curve2_to_edge(&Curve2::Polyline {
             points: vec![Vec2::ZERO, Vec2::X, Vec2::Y],
-        });
+        })
+        .expect("a polyline has a v1 form");
         match e {
             Edge::Spline { ctrl, degree } => {
                 assert_eq!(degree, 1);

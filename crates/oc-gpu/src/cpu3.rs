@@ -928,7 +928,73 @@ fn contains(b: &GpuBody3, p: Vec3) -> bool {
 /// sampled meridian contour.
 fn revolve_contains(rev: &GpuRevolve, p: Vec3) -> bool {
     let r = (p.y * p.y + p.z * p.z).sqrt();
-    point_in_polygon(&rev.contour, Vec2::new(p.x, r))
+    let q = Vec2::new(p.x, r);
+    match &rev.index {
+        Some(ix) => indexed_point_in_polygon(&rev.contour, ix, q),
+        None => point_in_polygon(&rev.contour, q),
+    }
+}
+
+/// [`point_in_polygon`] over the one bucket holding `p.y`: the segments a
+/// horizontal probe at that height can cross, which are all that change the
+/// parity. The same test on each, so the same answer.
+fn indexed_point_in_polygon(verts: &[Vec2], ix: &crate::scene3::ContourIndex, p: Vec2) -> bool {
+    let n = verts.len();
+    let (start, count) = ix.buckets[ix.bucket(p.y)];
+    let mut inside = false;
+    for &i in &ix.items[start as usize..(start + count) as usize] {
+        let i = i as usize;
+        let (a, b) = (verts[i], verts[if i == 0 { n - 1 } else { i - 1 }]);
+        if (a.y > p.y) != (b.y > p.y) {
+            let t = (p.y - a.y) / (b.y - a.y);
+            if p.x < a.x + t * (b.x - a.x) {
+                inside = !inside;
+            }
+        }
+    }
+    inside
+}
+
+/// The radii a ray passes through inside an indexed body's `x` slab at
+/// `t > tmin`, or `None` if it never enters the slab. Mirrors `ray_radii` in
+/// the shader.
+fn ray_radii(ix: &crate::scene3::ContourIndex, o: Vec3, d: Vec3, tmin: f32) -> Option<(f32, f32)> {
+    const PAD: f32 = 1e-3;
+    let (mut ta, mut tb) = (tmin, 1e30_f32);
+    if d.x.abs() > 1e-12 {
+        let u = (ix.x_lo - PAD - o.x) / d.x;
+        let v = (ix.x_hi + PAD - o.x) / d.x;
+        ta = ta.max(u.min(v));
+        tb = tb.min(u.max(v));
+    } else if o.x < ix.x_lo - PAD || o.x > ix.x_hi + PAD {
+        return None;
+    }
+    if ta > tb {
+        return None;
+    }
+    let oo = o.y * o.y + o.z * o.z;
+    let od = o.y * d.y + o.z * d.z;
+    let dd = d.y * d.y + d.z * d.z;
+    let r2 = |t: f32| (oo + t * (2.0 * od + t * dd)).max(0.0);
+    let ts = if dd > 0.0 {
+        (-od / dd).clamp(ta, tb)
+    } else {
+        ta
+    };
+    let lo = r2(ts).min(r2(ta)).min(r2(tb)).sqrt();
+    let hi = r2(ta).max(r2(tb)).sqrt();
+    Some((lo, hi))
+}
+
+/// The radii a revolved face spans, where that is read straight off it.
+fn face_radii(face: &RevFace) -> Option<(f32, f32)> {
+    match face {
+        RevFace::Sag {
+            inner_r, outer_r, ..
+        } => Some((*inner_r, *outer_r)),
+        RevFace::Frustum { y0, y1, .. } => Some((y0.min(*y1), y0.max(*y1))),
+        RevFace::Arc { .. } => None,
+    }
 }
 
 /// Nearest revolved-profile intersection at `t > tmin`, with the outward local
@@ -941,7 +1007,22 @@ fn revolve_hit(rev: &GpuRevolve, o: Vec3, d: Vec3, tmin: f32) -> Option<(f32, Ve
             *best = Some((t, orient_rev(rev, n, o + d * t), i));
         }
     };
+    // An indexed (many-faced) body passes over the faces whose radii the ray
+    // never reaches inside its slab.
+    let reach = match &rev.index {
+        Some(ix) => match ray_radii(ix, o, d, tmin) {
+            Some(r) => Some(r),
+            None => return None,
+        },
+        None => None,
+    };
     for (fi, face) in rev.faces.iter().enumerate() {
+        if let (Some((lo, hi)), Some((f_lo, f_hi))) = (reach, face_radii(face)) {
+            let pad = 1e-3 * (1.0 + hi.min(1e3));
+            if f_hi < lo - pad || f_lo > hi + pad {
+                continue;
+            }
+        }
         match face {
             RevFace::Sag {
                 vertex_x,
@@ -949,6 +1030,7 @@ fn revolve_hit(rev: &GpuRevolve, o: Vec3, d: Vec3, tmin: f32) -> Option<(f32, Ve
                 c,
                 k,
                 coeffs,
+                inner_r,
                 outer_r,
                 is_conic,
             } => sag_hit(
@@ -957,7 +1039,7 @@ fn revolve_hit(rev: &GpuRevolve, o: Vec3, d: Vec3, tmin: f32) -> Option<(f32, Ve
                 *c,
                 *k,
                 coeffs,
-                *outer_r,
+                (*inner_r, *outer_r),
                 *is_conic,
                 o,
                 d,
@@ -1014,7 +1096,7 @@ fn sag_hit(
     c: f32,
     k: f32,
     coeffs: &[f32; 8],
-    outer_r: f32,
+    (inner_r, outer_r): (f32, f32),
     is_conic: bool,
     o: Vec3,
     d: Vec3,
@@ -1042,7 +1124,7 @@ fn sag_hit(
         let p = o + d * t;
         let r = (p.y * p.y + p.z * p.z).sqrt();
         let z = (p - Vec3::new(vertex_x, 0.0, 0.0)).x * axis_sign;
-        if r <= outer_r + r_tol && z >= z_lo - z_tol && z <= z_hi + z_tol {
+        if r >= inner_r - r_tol && r <= outer_r + r_tol && z >= z_lo - z_tol && z <= z_hi + z_tol {
             out(t, sag_normal(vertex_x, axis_sign, c, k, coeffs, p));
         }
     };

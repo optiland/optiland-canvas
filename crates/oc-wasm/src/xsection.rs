@@ -138,6 +138,20 @@ fn sample_curve(c: &Curve2, out: &mut Vec<Vec2>) {
         }
         Curve2::Conic(cp) => sample_sag(cp, &[0.0; 8], out),
         Curve2::EvenAsphere { base, coeffs } => sample_sag(base, coeffs, out),
+        Curve2::SagSegment {
+            base,
+            coeffs,
+            y0,
+            y1,
+        } => {
+            // One facet: a short piece of a face, so a fraction of a face's
+            // samples draws it as smoothly.
+            const N_SEG: usize = 8;
+            for i in 0..=N_SEG {
+                let t = y0 + (y1 - y0) * i as f64 / N_SEG as f64;
+                out.push(oc_core::geom3::profile::sag_segment_point(base, coeffs, t));
+            }
+        }
     }
 }
 

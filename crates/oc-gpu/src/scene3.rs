@@ -369,6 +369,15 @@ fn profile_edge_points(e: &oc_core::profile2::ProfileEdge2) -> Vec<oc_core::vec:
         } => {
             vec![*center + oc_core::vec::Vec2::splat(*radius_mm)]
         }
+        Curve2::SagSegment {
+            base,
+            coeffs,
+            y0,
+            y1,
+        } => vec![
+            oc_core::geom3::profile::sag_segment_point(base, coeffs, *y0),
+            oc_core::geom3::profile::sag_segment_point(base, coeffs, *y1),
+        ],
     }
 }
 
@@ -567,7 +576,10 @@ fn line_polygon(
                     verts.push(Vec2::new((p.x / scale) as f32, (p.y / scale) as f32));
                 }
             }
-            Curve2::Conic(_) | Curve2::EvenAsphere { .. } | Curve2::Arc { .. } => {
+            Curve2::Conic(_)
+            | Curve2::EvenAsphere { .. }
+            | Curve2::Arc { .. }
+            | Curve2::SagSegment { .. } => {
                 return Err(
                     "extruded profile has a curved edge (not yet in the f32 preview)".into(),
                 )
@@ -590,13 +602,16 @@ fn line_polygon(
 pub enum RevFace {
     /// A conic or even-asphere surface of revolution. `axis_sign` is the sign of
     /// the profile conic's axis (`±X`). `is_conic` selects the exact quadratic
-    /// over the safeguarded Newton solver.
+    /// over the safeguarded Newton solver. `inner_r` is `0` for a face that
+    /// spans the axis and the facet's inner radius for an annular one (a
+    /// Fresnel facet, [`Curve2::SagSegment`](oc_core::profile2::Curve2)).
     Sag {
         vertex_x: f32,
         axis_sign: f32,
         c: f32,
         k: f32,
         coeffs: [f32; 8],
+        inner_r: f32,
         outer_r: f32,
         is_conic: bool,
     },
@@ -620,6 +635,84 @@ pub struct GpuRevolve {
     /// The meridian, sampled and closed, in `(x, r)` normalized coordinates. Used
     /// by point-in-polygon to classify a point's medium.
     pub contour: Vec<Vec2>,
+    /// A many-edged profile's contour bucketed by height, with its local `x`
+    /// range; `None` for an ordinary lens, which is scanned whole.
+    pub index: Option<ContourIndex>,
+}
+
+/// The contour's segments bucketed by the heights they span, for a profile with
+/// hundreds of edges (a Fresnel lens), plus the body's local `x` range.
+///
+/// Point-in-polygon counts the segments a horizontal probe at the point's
+/// height crosses, and only a segment whose `y` range holds that height can be
+/// crossed, so the one bucket holding it has every segment that counts: the
+/// same parity as the whole scan, from a handful of segments. The `x` range
+/// lets the face loop pass over a face whose radii the ray never reaches
+/// inside the body's slab. The shader reads the same tables from the `verts`
+/// arena (`buffers3`), so the two stay in lockstep.
+#[derive(Debug, Clone, Default)]
+pub struct ContourIndex {
+    pub y0: f32,
+    pub inv_h: f32,
+    /// `(start, count)` into `items`, one per bucket.
+    pub buckets: Vec<(u32, u32)>,
+    /// Segment `i` joins contour points `i - 1` (wrapping) and `i`, the pair
+    /// point-in-polygon visits at `i`.
+    pub items: Vec<u32>,
+    pub x_lo: f32,
+    pub x_hi: f32,
+}
+
+/// Contours at least this long are indexed; a lens's hundred points are
+/// scanned, exactly as before.
+pub const CONTOUR_INDEX_MIN: usize = 256;
+
+impl ContourIndex {
+    /// Index a closed contour, or `None` for one short enough to scan.
+    pub fn build(contour: &[Vec2]) -> Option<Self> {
+        let n = contour.len();
+        if n < CONTOUR_INDEX_MIN {
+            return None;
+        }
+        let (mut y_lo, mut y_hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        let (mut x_lo, mut x_hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        for p in contour {
+            y_lo = y_lo.min(p.y);
+            y_hi = y_hi.max(p.y);
+            x_lo = x_lo.min(p.x);
+            x_hi = x_hi.max(p.x);
+        }
+        let nb = (n / 4).clamp(1, 1024);
+        let span = if y_hi > y_lo { y_hi - y_lo } else { 1.0 };
+        let mut ix = Self {
+            y0: y_lo,
+            inv_h: nb as f32 / span,
+            buckets: vec![(0, 0); nb],
+            items: Vec::new(),
+            x_lo,
+            x_hi,
+        };
+        let mut lists: Vec<Vec<u32>> = vec![Vec::new(); nb];
+        for i in 0..n {
+            let (a, b) = (contour[i], contour[if i == 0 { n - 1 } else { i - 1 }]);
+            let (k0, k1) = (ix.bucket(a.y.min(b.y)), ix.bucket(a.y.max(b.y)));
+            for list in &mut lists[k0..=k1] {
+                list.push(i as u32);
+            }
+        }
+        for (k, list) in lists.into_iter().enumerate() {
+            ix.buckets[k] = (ix.items.len() as u32, list.len() as u32);
+            ix.items.extend(list);
+        }
+        Some(ix)
+    }
+
+    /// The bucket holding height `y`. Monotone in `y`, which is what makes a
+    /// segment's bucket range hold every height it spans.
+    pub fn bucket(&self, y: f32) -> usize {
+        let last = (self.buckets.len() - 1) as f32;
+        ((y - self.y0) * self.inv_h).floor().clamp(0.0, last) as usize
+    }
 }
 
 /// Even-asphere sag at radial coordinate `r`, in f32 (§7.4). Shared by the
@@ -670,6 +763,28 @@ fn compile_revolve(profile: &ClosedProfile2, scale: f64) -> Result<GpuRevolve, S
             Curve2::EvenAsphere { base, coeffs } => {
                 faces.push(sag_face(base, coeffs, scale, false)?)
             }
+            Curve2::SagSegment {
+                base,
+                coeffs,
+                y0,
+                y1,
+            } => {
+                // Only the part at r >= 0 is a surface; one entirely below the
+                // axis is its mirror edge's surface already.
+                let (lo, hi) = (y0.min(*y1), y0.max(*y1));
+                if !(hi <= 0.0 && lo < 0.0) {
+                    let is_conic = coeffs.iter().all(|a| *a == 0.0);
+                    let mut face = sag_face(base, coeffs, scale, is_conic)?;
+                    if let RevFace::Sag {
+                        inner_r, outer_r, ..
+                    } = &mut face
+                    {
+                        *inner_r = (lo.max(0.0) / scale) as f32;
+                        *outer_r = (hi / scale) as f32;
+                    }
+                    faces.push(face);
+                }
+            }
             Curve2::Arc {
                 center,
                 radius_mm,
@@ -688,9 +803,11 @@ fn compile_revolve(profile: &ClosedProfile2, scale: f64) -> Result<GpuRevolve, S
             }
         }
     }
+    let contour = revolve_contour(profile, scale);
     Ok(GpuRevolve {
         faces,
-        contour: revolve_contour(profile, scale),
+        index: ContourIndex::build(&contour),
+        contour,
     })
 }
 
@@ -716,6 +833,7 @@ fn sag_face(
         c: (cp.c * scale) as f32,
         k: cp.k as f32,
         coeffs: cn,
+        inner_r: 0.0,
         outer_r: (cp.half_ap / scale) as f32,
         is_conic,
     })
@@ -769,6 +887,21 @@ fn revolve_contour(profile: &ClosedProfile2, scale: f64) -> Vec<Vec2> {
             }
             Curve2::Conic(cp) => sample_sag(cp, &[0.0; 8], scale, N, &mut pts),
             Curve2::EvenAsphere { base, coeffs } => sample_sag(base, coeffs, scale, N, &mut pts),
+            Curve2::SagSegment {
+                base,
+                coeffs,
+                y0,
+                y1,
+            } => {
+                // A facet is one annular piece, so fewer samples hold the same
+                // chord error a whole face gets from `N`.
+                const N_SEG: usize = 12;
+                for i in 0..=N_SEG {
+                    let t = y0 + (y1 - y0) * i as f64 / N_SEG as f64;
+                    let q = oc_core::geom3::profile::sag_segment_point(base, coeffs, t);
+                    pts.push(Vec2::new(s(q.x), s(q.y)));
+                }
+            }
             Curve2::Arc {
                 center,
                 radius_mm,

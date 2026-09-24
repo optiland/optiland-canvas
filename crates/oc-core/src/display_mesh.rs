@@ -707,7 +707,41 @@ fn sample_curve(curve: &Curve2, tess: &Tessellation) -> Vec<Vec<Sample>> {
         }
         Curve2::Conic(cp) => vec![sag_curve(cp, &[0.0; 8], tess)],
         Curve2::EvenAsphere { base, coeffs } => vec![sag_curve(base, coeffs, tess)],
+        Curve2::SagSegment {
+            base,
+            coeffs,
+            y0,
+            y1,
+        } => vec![sag_segment_curve(base, coeffs, *y0, *y1, tess)],
     }
+}
+
+/// One annular piece of a sag curve, `t` from `t0` to `t1` along `perp(axis)`,
+/// sampled the way [`sag_curve`] samples a whole face (a Fresnel facet).
+fn sag_segment_curve(
+    cp: &ConicParams2,
+    coeffs: &[f64; 8],
+    t0: f64,
+    t1: f64,
+    tess: &Tessellation,
+) -> Vec<Sample> {
+    let axis = cp.axis.normalize();
+    let p = perp(axis);
+    let (c, k) = (cp.c, cp.k);
+    let coeffs = *coeffs;
+    let vertex = cp.vertex;
+    let f = move |t: f64| {
+        let z = even_asphere_sag(c, k, &coeffs, t);
+        let n = (-even_asphere_dsag(c, k, &coeffs, t)) * p + axis;
+        Sample {
+            p: vertex + axis * z + p * t,
+            n: n.normalize_or_zero(),
+        }
+    };
+    if t0 == t1 {
+        return vec![f(t0)];
+    }
+    adaptive(&f, t0, t1, 2, tess)
 }
 
 fn line_piece(a: Vec2, b: Vec2) -> Option<Vec<Sample>> {

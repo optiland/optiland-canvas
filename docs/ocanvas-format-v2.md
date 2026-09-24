@@ -132,6 +132,14 @@ default is the old behaviour, never a new one:
 |---|---|---|---|
 | `measure` | detector | `Power`, flux per cell, which is what a detector read before there was a choice | [what a detector measures](detectors.md) |
 
+A new variant is the other way the schema grows, and an old document never
+contains one. `Curve2::SagSegment { base, coeffs, y0, y1 }` is an annular piece of
+an on-axis conic or even asphere, between signed profile heights `y0` and `y1`;
+`base.half_ap` is not read. It is what a Fresnel lens's facets are
+(`oc_core::fresnel_lens`), and a Fresnel lens stores no recipe beside its
+profile: the recipe is read back out of the edges. A reader that predates the
+variant refuses such a document rather than dropping the facets.
+
 ## What a document may not contain
 
 Validation runs on load and refuses, rather than repairs:

@@ -157,7 +157,7 @@ pub struct Face3Buf {
     /// Sag: `(vertex_x, axis_sign, c, k)`; frustum: `(x0,y0,x1,y1)`; arc:
     /// `(center_x, r, a0, a1)`.
     pub a: [f32; 4],
-    /// Sag: `(outer_r, 0, 0, 0)`.
+    /// Sag: `(outer_r, inner_r, 0, 0)`.
     pub b: [f32; 4],
     /// Sag aspheric coefficients A4.. (unused by frustum/arc).
     pub coeffs: [f32; 8],
@@ -439,6 +439,19 @@ fn pack_body(b: &GpuBody3, verts: &mut Vec<Vert3Buf>, faces: &mut Vec<Face3Buf>)
         contour_start = verts.len() as u32;
         verts.extend(rev.contour.iter().map(|p| [p.x, p.y]));
         contour_count = rev.contour.len() as u32;
+        // A many-edged body's contour index rides in the fields a revolved body
+        // does not otherwise use: its tables at `verts[poly_start..]`, bucket
+        // count in `poly_count`, and its `x` slab in `z_min`/`z_max`. Integers
+        // go in as exact f32 values. See `indexed_poly_contains` in the shader.
+        if let Some(ix) = &rev.index {
+            poly_start = verts.len() as u32;
+            poly_count = ix.buckets.len() as u32;
+            verts.push([ix.y0, ix.inv_h]);
+            verts.extend(ix.buckets.iter().map(|&(s, c)| [s as f32, c as f32]));
+            verts.extend(ix.items.iter().map(|&i| [i as f32, 0.0]));
+            z_min = ix.x_lo;
+            z_max = ix.x_hi;
+        }
     }
     Body3Buf {
         rot0,
@@ -487,6 +500,7 @@ fn pack_face(f: &RevFace) -> Face3Buf {
             c,
             k,
             coeffs,
+            inner_r,
             outer_r,
             is_conic,
         } => Face3Buf {
@@ -496,7 +510,7 @@ fn pack_face(f: &RevFace) -> Face3Buf {
             resp: zero_response(),
             _p1: 0,
             a: [*vertex_x, *axis_sign, *c, *k],
-            b: [*outer_r, 0.0, 0.0, 0.0],
+            b: [*outer_r, *inner_r, 0.0, 0.0],
             coeffs: *coeffs,
         },
         RevFace::Frustum { x0, y0, x1, y1 } => Face3Buf {

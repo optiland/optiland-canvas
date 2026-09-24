@@ -86,6 +86,12 @@ fn curve2_intersect_unit(
                 line2(w[0], w[1], o, dir, smin, push);
             }
         }
+        Curve2::SagSegment {
+            base,
+            coeffs,
+            y0,
+            y1,
+        } => conic2_range(base, coeffs, y0.min(*y1), y0.max(*y1), o, dir, smin, push),
     }
 }
 
@@ -158,6 +164,23 @@ fn conic2(
     smin: f64,
     push: &mut dyn FnMut(Hit2),
 ) {
+    conic2_range(cp, coeffs, -cp.half_ap, cp.half_ap, o, dir, smin, push)
+}
+
+/// [`conic2`] restricted to the transverse range `t_lo..=t_hi` along
+/// `perp(axis)`: the whole aperture for a face, one annular piece for a
+/// [`Curve2::SagSegment`].
+#[allow(clippy::too_many_arguments)] // curve, range, ray, and sink
+fn conic2_range(
+    cp: &ConicParams2,
+    coeffs: &[f64; 8],
+    t_lo: f64,
+    t_hi: f64,
+    o: Vec2,
+    dir: Vec2,
+    smin: f64,
+    push: &mut dyn FnMut(Hit2),
+) {
     let pure_conic = coeffs.iter().all(|a| *a == 0.0);
     let axis = cp.axis.normalize();
     let p = perp(axis);
@@ -166,7 +189,8 @@ fn conic2(
     let z0 = rel.dot(axis);
     let dy = dir.dot(p);
     let dz = dir.dot(axis);
-    let ha = cp.half_ap;
+    let ha = t_lo.abs().max(t_hi.abs());
+    let in_range = |y: f64| y >= t_lo - 1e-12 && y <= t_hi + 1e-12;
 
     // The physical cap's axial span out to the aperture, so the far nappe of a
     // sphere or hyperboloid is never accepted (as in `crate::geom`).
@@ -191,7 +215,7 @@ fn conic2(
         }
         let y = y0 + s * dy;
         let z = z0 + s * dz;
-        if y.abs() <= ha + 1e-12 && z >= z_lo - z_tol && z <= z_hi + z_tol {
+        if in_range(y) && z >= z_lo - z_tol && z <= z_hi + z_tol {
             push(Hit2 {
                 s,
                 normal: normal_at(y, z),
@@ -230,9 +254,16 @@ fn conic2(
 
     let mut seeds = Vec::new();
     let base = ConicParams2 { half_ap: ha, ..*cp };
-    conic2(&base, &[0.0; 8], o, dir, smin - ha.max(1.0), &mut |h| {
-        seeds.push(h.s)
-    });
+    conic2_range(
+        &base,
+        &[0.0; 8],
+        -ha,
+        ha,
+        o,
+        dir,
+        smin - ha.max(1.0),
+        &mut |h| seeds.push(h.s),
+    );
     if seeds.is_empty() {
         let step = ha.max(1.0) * 0.1;
         let start = smin.max(0.0);
@@ -263,7 +294,7 @@ fn conic2(
         }
         if s > smin && residual(s).abs() < 1e-9 {
             let y = y0 + s * dy;
-            if y.abs() <= ha + 1e-12 {
+            if in_range(y) {
                 push(Hit2 {
                     s,
                     normal: normal_at(y, 0.0),
@@ -296,32 +327,206 @@ fn asphere2(
 /// Parity is direction-independent for a point that is not on the boundary, which
 /// is the only case a containment test must get right.
 pub fn profile_contains_2d(profile: &ClosedProfile2, p: Vec2) -> bool {
+    profile_contains_2d_until(profile, None, p, f64::INFINITY)
+}
+
+/// [`profile_contains_2d`] for a profile known to lie at `x <= x_max`: the probe
+/// can only cross an edge before it leaves that range, so an edge above the
+/// height it has climbed to by then is passed over too. The same answer.
+fn profile_contains_2d_until(
+    profile: &ClosedProfile2,
+    index: Option<&EdgeYIndex>,
+    p: Vec2,
+    x_max: f64,
+) -> bool {
     let dir = Vec2::new(0.998_654_2, 0.051_857_3).normalize();
     let mut crossings = 0usize;
-    for edge in &profile.edges {
+    // The probe climbs in y, so an edge wholly below `p` cannot be crossed, nor
+    // one wholly above where it leaves the profile. Skipping them changes no
+    // count; it is what keeps a many-edged profile (a Fresnel lens) from paying
+    // for every groove on every query.
+    let pad = Y_CULL_PAD * (1.0 + p.y.abs());
+    let floor = p.y - pad;
+    let ceiling = p.y + (x_max - p.x).max(0.0) * (dir.y / dir.x) + pad;
+    for_edges_in(profile, index, floor, ceiling, &mut |edge| {
         curve2_intersect_unit(&edge.curve, p, dir, 0.0, &mut |_| crossings += 1);
-    }
+    });
     crossings % 2 == 1
+}
+
+/// Call `f` on every edge whose y-range meets `[lo, hi]`, in profile order.
+/// With an index this touches only the edges near that band; without one it
+/// scans them all. The same edges either way.
+fn for_edges_in(
+    profile: &ClosedProfile2,
+    index: Option<&EdgeYIndex>,
+    lo: f64,
+    hi: f64,
+    f: &mut dyn FnMut(&crate::profile2::ProfileEdge2),
+) {
+    let meets = |c: &Curve2| {
+        let (a, b) = curve_y_range(c);
+        b >= lo && a <= hi
+    };
+    match index {
+        Some(ix) if ix.ranges.len() == profile.edges.len() => {
+            for i in ix.candidates(lo, hi) {
+                let (a, b) = ix.ranges[i as usize];
+                if b >= lo && a <= hi {
+                    f(&profile.edges[i as usize]);
+                }
+            }
+        }
+        _ => {
+            for edge in &profile.edges {
+                if meets(&edge.curve) {
+                    f(edge);
+                }
+            }
+        }
+    }
+}
+
+/// Edges bucketed by the y-range they span, so a query about one band of
+/// heights does not walk a many-edged profile end to end. Built once per body
+/// ([`RevolvePrep`]); it only narrows which edges are asked, never what they
+/// answer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EdgeYIndex {
+    ranges: Vec<(f64, f64)>,
+    y0: f64,
+    inv_h: f64,
+    buckets: Vec<Vec<u32>>,
+    /// Edges with no finite range: asked on every query.
+    always: Vec<u32>,
+}
+
+impl EdgeYIndex {
+    fn new(profile: &ClosedProfile2) -> Self {
+        let ranges: Vec<(f64, f64)> = profile
+            .edges
+            .iter()
+            .map(|e| curve_y_range(&e.curve))
+            .collect();
+        let finite = |r: &(f64, f64)| r.0.is_finite() && r.1.is_finite();
+        let (y0, y1) = ranges
+            .iter()
+            .filter(|r| finite(r))
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), r| {
+                (a.min(r.0), b.max(r.1))
+            });
+        let n = ranges.len().clamp(1, 4096);
+        let span = if y1 > y0 { y1 - y0 } else { 1.0 };
+        let inv_h = n as f64 / span;
+        let mut ix = Self {
+            y0: if y0.is_finite() { y0 } else { 0.0 },
+            inv_h,
+            buckets: vec![Vec::new(); n],
+            always: Vec::new(),
+            ranges: Vec::new(),
+        };
+        for (i, r) in ranges.iter().enumerate() {
+            if !finite(r) {
+                ix.always.push(i as u32);
+                continue;
+            }
+            let (a, b) = (ix.bucket(r.0), ix.bucket(r.1));
+            for k in a..=b {
+                ix.buckets[k].push(i as u32);
+            }
+        }
+        ix.ranges = ranges;
+        ix
+    }
+
+    fn bucket(&self, y: f64) -> usize {
+        let k = ((y - self.y0) * self.inv_h).floor();
+        if k.is_nan() || k < 0.0 {
+            0
+        } else {
+            (k as usize).min(self.buckets.len() - 1)
+        }
+    }
+
+    /// Every edge that may meet `[lo, hi]`, each once, in profile order.
+    fn candidates(&self, lo: f64, hi: f64) -> Vec<u32> {
+        let mut out = self.always.clone();
+        let (a, b) = (self.bucket(lo), self.bucket(hi));
+        for k in a..=b {
+            out.extend_from_slice(&self.buckets[k]);
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+}
+
+/// Slack on the y-range culls: far above the rounding in a curve's own
+/// aperture test, far below any authored feature.
+const Y_CULL_PAD: f64 = 1e-9;
+
+/// Every `y` a curve reaches, read off its parameters without sampling, or the
+/// whole line where that is not free (a conic whose axis is not `±X`, as an
+/// extruded profile may have).
+fn curve_y_range(curve: &Curve2) -> (f64, f64) {
+    const ALL: (f64, f64) = (f64::NEG_INFINITY, f64::INFINITY);
+    // For an axis along ±X the transverse coordinate is ±y; any other axis mixes
+    // the sag into y.
+    let along_x = |cp: &ConicParams2| {
+        // perp(±X) = (0, ±1): no normalizing needed to read it.
+        let a = cp.axis;
+        (a.y == 0.0 && a.x != 0.0).then(|| a.x.signum())
+    };
+    let span = |cp: &ConicParams2, t0: f64, t1: f64| match along_x(cp) {
+        Some(py) => {
+            let (u, v) = (cp.vertex.y + py * t0, cp.vertex.y + py * t1);
+            (u.min(v), u.max(v))
+        }
+        None => ALL,
+    };
+    match curve {
+        Curve2::Line { a, b } => (a.y.min(b.y), a.y.max(b.y)),
+        Curve2::Arc {
+            center, radius_mm, ..
+        } => (center.y - radius_mm.abs(), center.y + radius_mm.abs()),
+        Curve2::Conic(cp) | Curve2::EvenAsphere { base: cp, .. } => {
+            span(cp, -cp.half_ap.abs(), cp.half_ap.abs())
+        }
+        Curve2::SagSegment { base, y0, y1, .. } => span(base, *y0, *y1),
+        Curve2::Polyline { points } => points
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), q| {
+                (lo.min(q.y), hi.max(q.y))
+            }),
+    }
 }
 
 /// Signed-distance-free boundary test: how close is `p` to the nearest edge,
 /// along the probe direction, relative to the tolerance band?
-fn near_profile_boundary(profile: &ClosedProfile2, p: Vec2, tol: &ToleranceContext) -> bool {
+fn near_profile_boundary(
+    profile: &ClosedProfile2,
+    index: Option<&EdgeYIndex>,
+    p: Vec2,
+    tol: &ToleranceContext,
+) -> bool {
     // A cheap boundary check that does not need per-curve distance: fire a short
     // probe both ways and see whether an edge sits within the band. Good enough to
     // report `Boundary` for the medium sampler, which never queries exactly on a
     // surface in practice.
     let band = tol.medium_abs_mm;
     let mut near = false;
-    for dir in [Vec2::X, Vec2::Y, perp(Vec2::X)] {
-        for edge in &profile.edges {
+    // A hit within `band` of `p` is within `band` of it in y too, so only the
+    // edges whose y-range comes that close can answer.
+    let reach = band + Y_CULL_PAD * (1.0 + p.y.abs());
+    for_edges_in(profile, index, p.y - reach, p.y + reach, &mut |edge| {
+        for dir in [Vec2::X, Vec2::Y, perp(Vec2::X)] {
             curve2_intersect_unit(&edge.curve, p, dir, -band, &mut |h| {
                 if h.s.abs() <= band {
                     near = true;
                 }
             });
         }
-    }
+    });
     near
 }
 
@@ -355,7 +560,7 @@ pub fn extrude_contains(
     if !within_z {
         return Containment::Outside;
     }
-    if (on_cap && inside_xy) || (within_z && near_profile_boundary(profile, xy, tol)) {
+    if (on_cap && inside_xy) || (within_z && near_profile_boundary(profile, None, xy, tol)) {
         return Containment::Boundary;
     }
     if inside_xy && p.z > z_min + band && p.z < z_max - band {
@@ -459,10 +664,32 @@ pub fn revolve_aabb(profile: &ClosedProfile2) -> Aabb3 {
 pub fn revolve_contains(profile: &ClosedProfile2, p: Vec3, tol: &ToleranceContext) -> Containment {
     let r = (p.y * p.y + p.z * p.z).sqrt();
     let xr = Vec2::new(p.x, r);
-    if near_profile_boundary(profile, xr, tol) {
+    if near_profile_boundary(profile, None, xr, tol) {
         return Containment::Boundary;
     }
     if profile_contains_2d(profile, xr) {
+        Containment::Inside
+    } else {
+        Containment::Outside
+    }
+}
+
+/// [`revolve_contains`] with the body's [`RevolvePrep`]: its axial extent bounds
+/// how far the parity probe has to look. The same answer.
+pub fn revolve_contains_prepared(
+    profile: &ClosedProfile2,
+    prep: &RevolvePrep,
+    p: Vec3,
+    tol: &ToleranceContext,
+) -> Containment {
+    let r = (p.y * p.y + p.z * p.z).sqrt();
+    let xr = Vec2::new(p.x, r);
+    let index = prep.index.as_ref();
+    if near_profile_boundary(profile, index, xr, tol) {
+        return Containment::Boundary;
+    }
+    let x_max = prep.x_hi + 1e-9 * (1.0 + prep.x_hi.abs());
+    if profile_contains_2d_until(profile, index, xr, x_max) {
         Containment::Inside
     } else {
         Containment::Outside
@@ -477,7 +704,7 @@ pub fn revolve_intersect(
     tmax: f64,
     out: &mut dyn FnMut(LocalHit3),
 ) {
-    revolve_intersect_with(profile, &revolve_tolerance(profile), ray, tmin, tmax, out)
+    revolve_intersect_prepared(profile, &revolve_prepare(profile), ray, tmin, tmax, out)
 }
 
 /// The tolerances a revolved body's hits are oriented with: its own size's.
@@ -497,8 +724,127 @@ pub fn revolve_intersect_with(
     tmax: f64,
     out: &mut dyn FnMut(LocalHit3),
 ) {
+    let span = (f64::NEG_INFINITY, f64::INFINITY);
+    revolve_intersect_in(profile, tol, None, span, ray, tmin, tmax, out)
+}
+
+/// What intersecting a revolved body reuses from one step to the next: its
+/// tolerances and its axial extent. Depends on the profile alone.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RevolvePrep {
+    pub tol: ToleranceContext,
+    /// The body's local `x` range: no hit lies outside it.
+    x_lo: f64,
+    x_hi: f64,
+    index: Option<EdgeYIndex>,
+}
+
+/// Work out a revolved body's [`RevolvePrep`] once, for a trace that meets it
+/// at every step.
+pub fn revolve_prepare(profile: &ClosedProfile2) -> RevolvePrep {
+    let bb = revolve_aabb(profile);
+    RevolvePrep {
+        tol: ToleranceContext::from_aabb(&bb),
+        x_lo: bb.min.x,
+        x_hi: bb.max.x,
+        // A lens has a handful of edges, and scanning them is cheaper than any
+        // index; a Fresnel lens has hundreds.
+        index: (profile.edges.len() > INDEX_MIN_EDGES).then(|| EdgeYIndex::new(profile)),
+    }
+}
+
+/// Below this many edges a profile is scanned rather than indexed.
+const INDEX_MIN_EDGES: usize = 32;
+
+/// [`revolve_intersect`] with the body's [`RevolvePrep`] already found. The
+/// same hits, to the bit: the axial extent only lets it pass over faces the ray
+/// cannot reach.
+pub fn revolve_intersect_prepared(
+    profile: &ClosedProfile2,
+    prep: &RevolvePrep,
+    ray: &Ray3,
+    tmin: f64,
+    tmax: f64,
+    out: &mut dyn FnMut(LocalHit3),
+) {
+    let span = (prep.x_lo, prep.x_hi);
+    revolve_intersect_in(
+        profile,
+        &prep.tol,
+        prep.index.as_ref(),
+        span,
+        ray,
+        tmin,
+        tmax,
+        out,
+    )
+}
+
+/// The radii a ray passes through while `t` is in `(tmin, tmax]` and its `x` in
+/// `span`, or `None` if it never is. A face whose radii miss this range cannot
+/// be hit, which is what lets a many-faced profile (a Fresnel lens, hundreds of
+/// grooves) skip nearly all of them for a ray that crosses it near the axis.
+fn ray_radius_range(ray: &Ray3, span: (f64, f64), tmin: f64, tmax: f64) -> Option<(f64, f64)> {
+    let (o, d) = (ray.origin, ray.dir);
+    let pad = 1e-9 * (1.0 + span.0.abs().max(span.1.abs()).min(1e12));
+    let (mut ta, mut tb) = (tmin, tmax);
+    if d.x.abs() >= PARALLEL_EPS {
+        let u = (span.0 - pad - o.x) / d.x;
+        let v = (span.1 + pad - o.x) / d.x;
+        ta = ta.max(u.min(v));
+        tb = tb.min(u.max(v));
+    } else if o.x < span.0 - pad || o.x > span.1 + pad {
+        return None;
+    }
+    if ta.is_nan() || tb.is_nan() || ta > tb {
+        return None;
+    }
+    // r(t)² = |o_r + t d_r|²: convex in t, so its least value is at the
+    // clamped vertex and its greatest at an end.
+    let (oo, od, dd) = (
+        o.y * o.y + o.z * o.z,
+        o.y * d.y + o.z * d.z,
+        d.y * d.y + d.z * d.z,
+    );
+    let r2 = |t: f64| {
+        if t.is_infinite() {
+            if dd == 0.0 {
+                oo
+            } else {
+                f64::INFINITY
+            }
+        } else {
+            (oo + t * (2.0 * od + t * dd)).max(0.0)
+        }
+    };
+    let t_star = if dd > 0.0 {
+        (-od / dd).clamp(ta, tb)
+    } else {
+        ta
+    };
+    let lo = r2(t_star).min(r2(ta)).min(r2(tb)).sqrt();
+    let hi = r2(ta).max(r2(tb)).sqrt();
+    Some((lo, hi))
+}
+
+#[allow(clippy::too_many_arguments)] // body, its prep, ray interval, and sink
+fn revolve_intersect_in(
+    profile: &ClosedProfile2,
+    tol: &ToleranceContext,
+    index: Option<&EdgeYIndex>,
+    span: (f64, f64),
+    ray: &Ray3,
+    tmin: f64,
+    tmax: f64,
+    out: &mut dyn FnMut(LocalHit3),
+) {
+    let Some((r_lo, r_hi)) = ray_radius_range(ray, span, tmin, tmax) else {
+        return;
+    };
+    let r_pad = Y_CULL_PAD * (1.0 + r_hi.min(1e12));
     let tol = *tol;
     let probe = 8.0 * tol.medium_abs_mm;
+    let x_max = span.1 + 1e-9 * (1.0 + span.1.abs().min(1e12));
     // Outward when a point just off the hit along `n` is outside the body:
     // what `revolve_contains` calls `Outside`, neither inside nor on the
     // boundary band. Asked inside-first, since a point inside needs no
@@ -506,8 +852,8 @@ pub fn revolve_intersect_with(
     let orient = |n: Vec3, p: Vec3| -> Vec3 {
         let q = p + n * probe;
         let xr = Vec2::new(q.x, (q.y * q.y + q.z * q.z).sqrt());
-        let outside =
-            !profile_contains_2d(profile, xr) && !near_profile_boundary(profile, xr, &tol);
+        let outside = !profile_contains_2d_until(profile, index, xr, x_max)
+            && !near_profile_boundary(profile, index, xr, &tol);
         if outside {
             n
         } else {
@@ -515,7 +861,9 @@ pub fn revolve_intersect_with(
         }
     };
 
-    for edge in &profile.edges {
+    // A face spans the radii of its `y` range clipped at the axis, and one whose
+    // range misses the ray's cannot be hit.
+    for_edges_in(profile, index, r_lo - r_pad, r_hi + r_pad, &mut |edge| {
         let patch = edge.patch;
         let mut emit = |raw: RawHit3| {
             out(LocalHit3 {
@@ -527,7 +875,7 @@ pub fn revolve_intersect_with(
             });
         };
         revolve_edge(&edge.curve, ray, tmin, tmax, &mut emit);
-    }
+    });
 }
 
 /// Revolve one profile edge's `y >= 0` portion about `+X`, reporting geometric
@@ -563,6 +911,29 @@ fn revolve_edge(curve: &Curve2, ray: &Ray3, tmin: f64, tmax: f64, out: &mut dyn 
                 coeffs: *coeffs,
                 inner_r: 0.0,
                 outer_r: base.half_ap,
+            };
+            revolution_intersect(&surf, ray, tmin, tmax, out);
+        }
+        Curve2::SagSegment {
+            base,
+            coeffs,
+            y0,
+            y1,
+        } => {
+            // Only the part at r >= 0 is a surface; a segment entirely below the
+            // axis is its mirror edge's surface already.
+            let (lo, hi) = (y0.min(*y1), y0.max(*y1));
+            if hi <= 0.0 && lo < 0.0 {
+                return;
+            }
+            let surf = Revolution {
+                vertex: Vec3::new(base.vertex.x, 0.0, 0.0),
+                axis: conic_axis3(base),
+                c: base.c,
+                k: base.k,
+                coeffs: *coeffs,
+                inner_r: lo.max(0.0),
+                outer_r: hi,
             };
             revolution_intersect(&surf, ray, tmin, tmax, out);
         }
@@ -678,6 +1049,12 @@ pub fn validate_revolvable(profile: &ClosedProfile2) -> Result<(), String> {
         match &edge.curve {
             Curve2::Conic(cp) => on_axis_conic(cp)?,
             Curve2::EvenAsphere { base, .. } => on_axis_conic(base)?,
+            Curve2::SagSegment { base, .. } => {
+                on_axis_conic(base)?;
+                if base.vertex.y.abs() > 1e-9 * scale {
+                    return Err("a sag segment's vertex is off the optical axis (+X)".to_string());
+                }
+            }
             Curve2::Arc { center, .. } => {
                 if center.y.abs() > 1e-6 * scale {
                     return Err(
@@ -751,7 +1128,24 @@ fn curve_endpoints(curve: &Curve2) -> (Vec2, Vec2) {
             *points.first().unwrap_or(&Vec2::ZERO),
             *points.last().unwrap_or(&Vec2::ZERO),
         ),
+        Curve2::SagSegment {
+            base,
+            coeffs,
+            y0,
+            y1,
+        } => (
+            sag_segment_point(base, coeffs, *y0),
+            sag_segment_point(base, coeffs, *y1),
+        ),
     }
+}
+
+/// The point of an on-axis sag curve at transverse coordinate `t` along
+/// `perp(axis)`: `vertex + sag(t)·axis + t·perp(axis)`. For the `+X` axis `t` is
+/// the profile's `y`.
+pub fn sag_segment_point(cp: &ConicParams2, coeffs: &[f64; 8], t: f64) -> Vec2 {
+    let axis = cp.axis.normalize();
+    cp.vertex + even_asphere_sag(cp.c, cp.k, coeffs, t) * axis + t * perp(axis)
 }
 
 fn conic_rim(cp: &ConicParams2, coeffs: &[f64; 8]) -> (Vec2, Vec2) {
@@ -808,6 +1202,17 @@ fn sample_curve(curve: &Curve2, n: usize) -> Vec<Vec2> {
         Curve2::Conic(cp) => sample_conic(cp, &[0.0; 8], n, &mut pts),
         Curve2::EvenAsphere { base, coeffs } => sample_conic(base, coeffs, n, &mut pts),
         Curve2::Polyline { points } => pts.extend_from_slice(points),
+        Curve2::SagSegment {
+            base,
+            coeffs,
+            y0,
+            y1,
+        } => {
+            for i in 0..=n {
+                let t = y0 + (y1 - y0) * (i as f64 / n as f64);
+                pts.push(sag_segment_point(base, coeffs, t));
+            }
+        }
     }
     pts
 }
@@ -832,9 +1237,17 @@ fn is_mirror_symmetric_y(profile: &ClosedProfile2, scale: f64) -> bool {
         .iter()
         .flat_map(|e| sample_curve(&e.curve, 16))
         .collect();
-    cloud.iter().all(|p| {
+    // Sorted by x, a mirror sample can only sit in the `x ± tol` window, so a
+    // profile of hundreds of edges (a Fresnel lens) is not a quadratic scan.
+    let mut by_x = cloud;
+    by_x.sort_by(|a, b| a.x.total_cmp(&b.x));
+    by_x.iter().all(|p| {
         let mirror = Vec2::new(p.x, -p.y);
-        cloud.iter().any(|q| (*q - mirror).length() <= tol)
+        let start = by_x.partition_point(|q| q.x < p.x - tol);
+        by_x[start..]
+            .iter()
+            .take_while(|q| q.x <= p.x + tol)
+            .any(|q| (*q - mirror).length() <= tol)
     })
 }
 
@@ -891,17 +1304,28 @@ fn profile_self_intersects(profile: &ClosedProfile2) -> bool {
     if n < 4 {
         return false;
     }
-    for i in 0..n {
-        let a0 = poly[i];
-        let a1 = poly[(i + 1) % n];
-        for j in (i + 2)..n {
-            // Skip the pair that wraps back to segment i.
-            if i == 0 && j == n - 1 {
+    // Sweep in y: two segments can only cross where their y ranges overlap. The
+    // pairs tested are the same non-adjacent pairs as a full scan, just fewer of
+    // them, which a many-edged profile (a Fresnel lens) needs.
+    let y_range = |i: usize| {
+        let (a, b) = (poly[i].y, poly[(i + 1) % n].y);
+        (a.min(b), a.max(b))
+    };
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| y_range(a).0.total_cmp(&y_range(b).0));
+    for (k, &i) in order.iter().enumerate() {
+        let (_, i_hi) = y_range(i);
+        for &j in &order[k + 1..] {
+            if y_range(j).0 > i_hi {
+                break;
+            }
+            let (lo, hi) = (i.min(j), i.max(j));
+            // Adjacent segments share a vertex, and the pair that wraps back
+            // to segment 0 is adjacent too.
+            if hi - lo < 2 || (lo == 0 && hi == n - 1) {
                 continue;
             }
-            let b0 = poly[j];
-            let b1 = poly[(j + 1) % n];
-            if segments_cross(a0, a1, b0, b1) {
+            if segments_cross(poly[lo], poly[(lo + 1) % n], poly[hi], poly[(hi + 1) % n]) {
                 return true;
             }
         }
@@ -955,6 +1379,17 @@ fn profile_xy_bounds(profile: &ClosedProfile2) -> (Vec2, Vec2) {
             Curve2::Polyline { points } => {
                 for p in points {
                     grow(*p);
+                }
+            }
+            Curve2::SagSegment {
+                base,
+                coeffs,
+                y0,
+                y1,
+            } => {
+                for i in 0..=24 {
+                    let t = y0 + (y1 - y0) * (i as f64 / 24.0);
+                    grow(sag_segment_point(base, coeffs, t));
                 }
             }
         }

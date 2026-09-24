@@ -4682,6 +4682,17 @@ fn body_radius(b: &oc_core::scene3::Body3) -> f64 {
                     Curve2::Arc {
                         center, radius_mm, ..
                     } => vec![center.length() + radius_mm],
+                    Curve2::SagSegment {
+                        base,
+                        coeffs,
+                        y0,
+                        y1,
+                    } => [*y0, *y1]
+                        .iter()
+                        .map(|t| {
+                            oc_core::geom3::profile::sag_segment_point(base, coeffs, *t).length()
+                        })
+                        .collect(),
                 })
                 .fold(0.0_f64, f64::max);
             r.max(1.0)

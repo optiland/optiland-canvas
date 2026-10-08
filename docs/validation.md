@@ -235,6 +235,19 @@ wrong pair of interfaces" (C31).
 | The plate Mueller matrix against its series summed to 200 passes; S0 against the incoherent powers; DOP of +45 degree light at most 1 + 1e-12 (C18) | 1e-12 | passes |
 | `PhaseFree` plates against the pre-profile kernel (C33) | bit-identical | passes |
 
+### The preview's coatings (CF-07)
+
+| Check | Tolerance | Result |
+|---|---|---|
+| A silvered glass tube's bore, from the bore and from the glass, against the f64 kernel (C22) | 2e-3 | passes; the outside grid reused inside errs above 1e-2, as the mutation must |
+| A Fresnel lens with an AR as its default response, 10 000 random wavelength, angle and side samples (C23) | 2e-3 | passes |
+| An edge filter from 85 to 88.2 degrees (C24) | 5e-3 | passes; flat beyond 88.2 |
+| `coating_model: Nominal` | the design point in every row | passes |
+
+The grid used to be 64 rows uniform in `sin²θ`, and near grazing it was out by
+up to 8e-2 on bare glass and a three-layer AR; the earlier figure of 7.6e-4
+(C10) was measured on scenes that did not reach those angles.
+
 ## Worth adding
 
 - An uncoated N-BK7 and fused-silica window against published internal

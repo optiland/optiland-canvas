@@ -246,6 +246,27 @@ pub fn preview_fidelity(asked: &oc_core::fidelity::FidelityProfile) -> PreviewFi
     PreviewFidelity { runs, refused, message }
 }
 
+/// What a coating is baked under: the wavelengths in flight, and the parts of
+/// the profile the preview runs ([`preview_fidelity`]).
+pub struct Bake<'a> {
+    pub lambdas: &'a [f32],
+    pub ctx: oc_core::thinfilm::FilmContext,
+    /// `coating_model: Nominal`: every coating is its design point.
+    pub nominal: bool,
+}
+
+impl<'a> Bake<'a> {
+    /// The bake for `scene`'s profile at `lambdas`.
+    pub fn for_scene(scene: &Scene3, lambdas: &'a [f32]) -> Self {
+        let runs = preview_fidelity(&scene.fidelity).runs;
+        Self {
+            lambdas,
+            ctx: oc_core::thinfilm::FilmContext::from_profile(&runs),
+            nominal: runs.coating_model == oc_core::fidelity::CoatingModel::Nominal,
+        }
+    }
+}
+
 /// The compiled, uploadable 3D scene.
 pub struct GpuScene3 {
     pub bodies: Vec<GpuBody3>,
@@ -278,6 +299,7 @@ impl GpuScene3 {
         let norm = scene_norm(scene);
         // Coatings bake at the wavelengths this launch set actually carries.
         let coat_lambdas = launch_lambdas(launch);
+        let bake = Bake::for_scene(scene, &coat_lambdas);
         let mut bodies = Vec::new();
         let mut surfaces = Vec::new();
         let mut apertures = Vec::new();
@@ -294,14 +316,14 @@ impl GpuScene3 {
                 &norm,
                 &scene.catalog,
                 scene.env.ambient_index,
-                &coat_lambdas,
+                &bake,
             ) {
                 Ok(gb) => bodies.push(gb),
                 Err(kind) => reject(b.common.id.0, kind),
             }
         }
         for s in &scene.surfaces {
-            match compile_surface(s, &norm, scene.env.ambient_index, &coat_lambdas) {
+            match compile_surface(s, &norm, scene.env.ambient_index, &bake) {
                 Ok(gs) => surfaces.push(gs),
                 Err(kind) => reject(s.common.id.0, kind),
             }
@@ -466,8 +488,9 @@ fn compile_body(
     norm: &Norm,
     catalog: &oc_core::material::GlassCatalog,
     ambient: f64,
-    coat_lambdas: &[f32],
+    bake: &Bake,
 ) -> Result<GpuBody3, String> {
+    let coat_lambdas = bake.lambdas;
     let s = |v: f64| (v / norm.scale) as f32;
     // Body rotation from the transform. A cylinder composes an axis alignment on
     // top so the primitive is always along canonical +Z.
@@ -530,12 +553,19 @@ fn compile_body(
         },
     };
 
-    let surface = classify_surface(&b.surface.default)?;
+    // A coating as the body's default response: every face carries it as its
+    // own response, baked against the body's glass, and the body itself is
+    // plain dielectric for the media it separates. The Fresnel lens's AR is
+    // the case: a coat on every groove.
+    let default_coating = matches!(b.surface.default.from_outside, SurfaceResponse::Coating { .. })
+        && matches!(b.surface.default.from_inside, SurfaceResponse::Coating { .. });
+    let per_face = !b.surface.overrides.is_empty() || default_coating;
+    let surface = if default_coating { SURF_DIELECTRIC } else { classify_surface(&b.surface.default)? };
     // Per-face responses, in the same order the revolved faces were built. A
     // film on a face of a solid is backed by that solid's own glass, so it is
     // baked against the body's index at each wavelength, not against air.
     let mut face_resp: Vec<Option<GpuResponse>> = Vec::new();
-    let body_indices: Vec<f64> = if b.surface.overrides.is_empty() {
+    let body_indices: Vec<f64> = if !per_face {
         Vec::new()
     } else {
         coat_lambdas
@@ -546,7 +576,7 @@ fn compile_body(
     // The patches a per-face response can name, in the face order the preview
     // reports hits in: a revolved profile's edges, or a tube's four faces.
     let patches: Vec<oc_core::id::PatchId> = match &b.geometry {
-        SolidGeometry3::Profile(_) if !b.surface.overrides.is_empty() => match &revolve {
+        SolidGeometry3::Profile(_) if per_face => match &revolve {
             Some(rev) => rev.face_patch.clone(),
             // An extruded body reports every hit as face 0, so no response
             // could reach the face it was authored on.
@@ -556,48 +586,44 @@ fn compile_body(
                 )
             }
         },
-        SolidGeometry3::Tube { .. } if !b.surface.overrides.is_empty() => (0
+        SolidGeometry3::Tube { .. } if per_face => (0
             ..=oc_core::geom3::primitives::tube_face::INNER)
             .map(|f| oc_core::id::PatchId(f as u64))
             .collect(),
         _ => Vec::new(),
     };
+    // Faces that share one response share one bake: a Fresnel lens has
+    // thousands of grooves and one coating.
+    let mut baked: Vec<(*const TwoSidedSurfaceResponse, GpuResponse)> = Vec::new();
     for &patch in &patches {
         let two = b.surface.for_patch(patch);
-        if std::ptr::eq(two, &b.surface.default) {
+        if std::ptr::eq(two, &b.surface.default) && !default_coating {
             face_resp.push(None);
             continue;
         }
-        // A coated face's inside copy is the same stack met from behind.
-        // The grid is baked from outside and serves a ray from inside as
-        // well, because a lossless stack reflects and transmits the same
-        // from either side at conjugate angles; the inside copy exists to
-        // tell the reference which way round to walk the layers.
-        let mirrored = match (&two.from_outside, &two.from_inside) {
-            (SurfaceResponse::Coating { coating: a }, SurfaceResponse::Coating { coating: b }) => {
-                a.seen_from_behind() == *b
-            }
-            _ => false,
-        };
-        if two.from_outside != two.from_inside && !mirrored {
+        if let Some((_, r)) = baked.iter().find(|(p, _)| std::ptr::eq(*p, two)) {
+            face_resp.push(Some(r.clone()));
+            continue;
+        }
+        if let (SurfaceResponse::Coating { coating: outside }, SurfaceResponse::Coating { coating: inside }) =
+            (&two.from_outside, &two.from_inside)
+        {
+            let r = bake_two_sided(outside, inside, ambient, bake, &body_indices)?;
+            baked.push((two as *const _, r.clone()));
+            face_resp.push(Some(r));
+            continue;
+        }
+        if two.from_outside != two.from_inside {
             return Err("asymmetric per-face response (not yet in the f32 preview)".into());
         }
         match &two.from_outside {
-            SurfaceResponse::Coating { coating } => {
-                face_resp.push(Some(bake_coating(
-                    coating,
-                    ambient,
-                    coat_lambdas,
-                    &body_indices,
-                )?));
-            }
             SurfaceResponse::DielectricFresnel { .. } => face_resp.push(None),
             // A mirror face on a solid: the bore of a light pipe.
             SurfaceResponse::Mirror { .. } => face_resp.push(Some(compile_response(
                 &two.from_outside,
                 norm.scale,
                 ambient,
-                coat_lambdas,
+                bake,
             )?)),
             other => {
                 return Err(format!(
@@ -1316,7 +1342,14 @@ pub enum GpuResponse {
     /// `sin2 theta`, of one `(R, T)` pair per entry in `lambdas`.
     CoatingGrid {
         lambdas: Vec<f32>,
-        rt: Vec<[f32; 2]>,
+        rt: std::sync::Arc<Vec<[f32; 2]>>,
+        /// The grid for a ray arriving from inside the body, baked with the
+        /// body's glass as the incident medium; `None` when the outside grid
+        /// serves both sides (a lossless stack met from behind is the same
+        /// stack walked the other way, and reflects and transmits the same at
+        /// conjugate angles). An absorbing stack does not: silver behind glass
+        /// reflects less than silver in air.
+        rt_inside: Option<std::sync::Arc<Vec<[f32; 2]>>>,
         /// The reflection is stray light (an AR coat's residual) and so a
         /// ghost, rather than a designed path. See
         /// `oc_core::thinfilm::Coating::reflection_is_stray`.
@@ -1365,7 +1398,7 @@ pub fn sample_coating_grid(
     } else {
         sin_local
     };
-    let fa = ((sin_amb * sin_amb) / 0.999).clamp(0.0, 1.0) * (COAT_ANGLES as f32 - 1.0);
+    let fa = (sin_amb.asin() / COAT_THETA_MAX).clamp(0.0, 1.0) * (COAT_ANGLES as f32 - 1.0);
     let a0 = fa.floor() as usize;
     let a1 = (a0 + 1).min(COAT_ANGLES - 1);
     let ta = fa - a0 as f32;
@@ -1422,8 +1455,9 @@ fn compile_response(
     r: &SurfaceResponse,
     scale: f64,
     ambient: f64,
-    coat_lambdas: &[f32],
+    bake: &Bake,
 ) -> Result<GpuResponse, String> {
+    let coat_lambdas = bake.lambdas;
     Ok(match r {
         SurfaceResponse::Absorber => GpuResponse::Absorber,
         SurfaceResponse::ThinLens { focal_length_mm } => GpuResponse::ThinLens {
@@ -1467,7 +1501,7 @@ fn compile_response(
         },
         SurfaceResponse::Coating { coating } => {
             let far: Vec<f64> = coat_lambdas.iter().map(|_| ambient).collect();
-            bake_coating(coating, ambient, coat_lambdas, &far)?
+            bake_coating(coating, ambient, bake, &far)?
         }
         // The preview carries no polarization state, so all these elements can
         // be there is what they do to unpolarized light: a polarizer passes half
@@ -1515,9 +1549,21 @@ fn two_faces(n: f64) -> f64 {
     (1.0 - face_reflectance(n)).powi(2)
 }
 
-/// Angle samples in a baked coating grid, uniform in `sin2 theta` from 0 (on
-/// axis) to 1 (grazing).
-pub const COAT_ANGLES: usize = 64;
+/// Angle samples in a baked coating grid, uniform in the angle in the ambient
+/// medium from 0 to [`COAT_THETA_MAX`], and held flat beyond it.
+///
+/// Uniform in angle and not in `sin²θ`, and 128 rows, because that is what
+/// keeps a grid within 2e-3 of the transfer matrix up to 88.2 degrees
+/// (measured at CF-07 on bare glass, a three-layer AR and an eight-period
+/// edge filter: worst 5.4e-4, 5.8e-4 and 1.6e-3). Sixty-four rows uniform in
+/// `sin²θ` put one row across 82.8 to 88.2 degrees, where a coating's
+/// reflectance climbs towards 1, and were out by up to 8e-2 there. At 64
+/// wavelengths a grid is 64 kB.
+pub const COAT_ANGLES: usize = 128;
+
+/// The last baked angle in the ambient medium, radians: `sin²θ = 0.999`,
+/// 88.19 degrees. A ray beyond it reads the last row.
+pub const COAT_THETA_MAX: f32 = 1.539_168_3;
 /// The most wavelengths a coating grid is baked at. Scenes carry a handful of
 /// spectral lines; this only bounds a pathological one.
 pub const COAT_MAX_LAMBDAS: usize = 64;
@@ -1552,31 +1598,98 @@ pub const COAT_MAX_LAMBDAS: usize = 64;
 fn bake_coating(
     c: &oc_core::thinfilm::Coating,
     ambient: f64,
-    lambdas: &[f32],
+    bake: &Bake,
     n_far: &[f64],
 ) -> Result<GpuResponse, String> {
+    Ok(GpuResponse::CoatingGrid {
+        lambdas: bake.lambdas.to_vec(),
+        rt: std::sync::Arc::new(bake_grid(c, ambient, bake, n_far, None)?),
+        rt_inside: None,
+        stray: c.reflection_is_stray(),
+    })
+}
+
+/// A coated face of a body, baked for the side each ray arrives from. The
+/// inside grid is baked only when it differs: when the stack absorbs, or the
+/// inside response is not the outside stack met from behind.
+fn bake_two_sided(
+    outside: &oc_core::thinfilm::Coating,
+    inside: &oc_core::thinfilm::Coating,
+    ambient: f64,
+    bake: &Bake,
+    n_body: &[f64],
+) -> Result<GpuResponse, String> {
+    let rt = bake_grid(outside, ambient, bake, n_body, None)?;
+    let rt_inside = if absorbs(outside) || outside.seen_from_behind() != *inside {
+        Some(std::sync::Arc::new(bake_grid(inside, ambient, bake, n_body, Some(n_body))?))
+    } else {
+        None
+    };
+    Ok(GpuResponse::CoatingGrid {
+        lambdas: bake.lambdas.to_vec(),
+        rt: std::sync::Arc::new(rt),
+        rt_inside,
+        stray: outside.reflection_is_stray(),
+    })
+}
+
+/// Does any part of the stack absorb?
+fn absorbs(c: &oc_core::thinfilm::Coating) -> bool {
+    use oc_core::thinfilm::CoatingBacking;
+    let k = |m: &oc_core::thinfilm::FilmMaterial| m.k.values_max() > 0.0;
+    c.layers.iter().any(|l| k(&l.material))
+        || match &c.backing {
+            CoatingBacking::Medium => false,
+            CoatingBacking::Plate { substrate, .. } | CoatingBacking::Opaque { substrate } => k(substrate),
+        }
+}
+
+/// One grid: `COAT_ANGLES` rows of `(R, T)` per wavelength, indexed on
+/// `sin²θ` in the ambient medium. `from_inside` names the medium a ray from
+/// inside the body arrives through (the body's glass, per wavelength): the
+/// coating is then evaluated with that as the incident medium and ambient as
+/// the far one, at the angle in the glass that carries the same `n sin θ`.
+///
+/// The last row is `sin²θ = 0.999`, 88.2 degrees in the ambient medium; the
+/// grid holds that row flat beyond it. Under `coating_model: Nominal` every
+/// row is the design point, as the reference tracer then answers.
+fn bake_grid(
+    c: &oc_core::thinfilm::Coating,
+    ambient: f64,
+    bake: &Bake,
+    n_far: &[f64],
+    from_inside: Option<&[f64]>,
+) -> Result<Vec<[f32; 2]>, String> {
+    let lambdas = bake.lambdas;
     if lambdas.is_empty() {
         return Err("a coating in a scene that emits no light".to_string());
     }
+    let (lam_design, cos_design, _) = c.nominal_point();
     let mut rt = Vec::with_capacity(lambdas.len() * COAT_ANGLES);
     for a in 0..COAT_ANGLES {
-        let sin2 = a as f64 / (COAT_ANGLES - 1) as f64;
         // Stop just short of grazing: at exactly 90 degrees the admittances
         // degenerate and every coating reflects everything, which is true but
         // useless to interpolate toward.
-        let cos_i = (1.0 - sin2 * 0.999).max(0.0).sqrt();
+        let theta = f64::from(COAT_THETA_MAX) * a as f64 / (COAT_ANGLES - 1) as f64;
+        let sin2_amb = theta.sin().powi(2);
         for (i, &lam) in lambdas.iter().enumerate() {
             let far = n_far.get(i).copied().unwrap_or(ambient);
-            let v = oc_core::thinfilm::coating_rt_at(c, ambient, far, lam as f64, cos_i)
+            let (n_in, n_out, cos_i) = match from_inside {
+                // From the glass: the same `n sin θ` at the glass's index.
+                Some(glass) => {
+                    let n_g = glass.get(i).copied().unwrap_or(ambient).max(1e-9);
+                    let sin2_g = (sin2_amb * ambient * ambient / (n_g * n_g)).min(1.0);
+                    (n_g, ambient, (1.0 - sin2_g).max(0.0).sqrt())
+                }
+                None => (ambient, far, (1.0 - sin2_amb).max(0.0).sqrt()),
+            };
+            let (lam_eval, cos_eval) = if bake.nominal { (lam_design, cos_design) } else { (lam as f64, cos_i) };
+            let (v, _) = oc_core::thinfilm::coating_eval(c, n_in, n_out, lam_eval, cos_eval, &bake.ctx)
                 .map_err(|e| format!("coating: {e}"))?;
             rt.push([v.r() as f32, v.t() as f32]);
         }
     }
-    Ok(GpuResponse::CoatingGrid {
-        lambdas: lambdas.to_vec(),
-        rt,
-        stray: c.reflection_is_stray(),
-    })
+    Ok(rt)
 }
 
 /// The distinct wavelengths a launch set carries, sorted, for baking coatings.
@@ -1613,7 +1726,7 @@ fn compile_surface(
     s: &SurfaceObject3,
     norm: &Norm,
     ambient: f64,
-    coat_lambdas: &[f32],
+    bake: &Bake,
 ) -> Result<GpuSurface3, String> {
     let shape = match &s.geometry {
         SurfaceGeometry3::Plane { shape } => GpuShape2::from_planar(shape, norm.scale),
@@ -1626,8 +1739,8 @@ fn compile_surface(
         rot,
         pos,
         shape,
-        front: compile_response(&s.response_front, norm.scale, ambient, coat_lambdas)?,
-        back: compile_response(&s.response_back, norm.scale, ambient, coat_lambdas)?,
+        front: compile_response(&s.response_front, norm.scale, ambient, bake)?,
+        back: compile_response(&s.response_back, norm.scale, ambient, bake)?,
         object: s.common.id.0,
     })
 }

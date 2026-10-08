@@ -195,7 +195,7 @@ substrate.
 | Coating | the transfer matrix, per hit | a baked grid, read bilinearly |
 | Angle | the ray's own `cos_i` | interpolated in the ambient-medium `sin²θ` |
 | Wavelength | exact | exact at the baked columns |
-| Per-face | yes, always | revolved bodies only |
+| Per-face | yes, always | revolved bodies and tubes, with a grid per side when the stack absorbs |
 
 Running a multilayer matrix per ray in a shader is not on, so the stack is baked
 onto a grid when the scene compiles. Two things keep that honest.
@@ -212,12 +212,35 @@ because the preview recompiles the scene on every frame of a drag. Moving to the
 scene's own wavelengths dropped the worst drift from 1.0e-2 to 7.6e-4 of a ray's
 flux, and made the bake 40 times cheaper.
 
-The angle axis is uniform in `sin²θ` rather than in θ, because that is very
-nearly what the band shift is linear in. It is measured **in the ambient
-medium**, not in whatever medium the ray is in: a coated face of a plate is
-crossed from both sides, and what both crossings share is `n sin θ`, which Snell
-conserves. Indexing on it lets one grid serve a ray arriving through air and the
-same ray coming back out through the glass.
+The angle axis has 128 rows uniform in the angle, from 0 to 88.2 degrees
+(`sin²θ = 0.999`), and holds the last row flat beyond it. It used to be 64
+rows uniform in `sin²θ`, which put one row across 82.8 to 88.2 degrees, where a
+coating's reflectance climbs towards 1: bare glass and a three-layer AR were
+out by up to 8e-2 there, which nothing measured until CF-07 sampled the whole
+range. Uniform in angle with 128 rows the worst drift is 5.4e-4 on bare glass,
+5.8e-4 on the AR and 1.6e-3 on an eight-period edge filter, and a grid at 64
+wavelengths is 64 kB. The angle is measured **in the ambient medium**, not in
+whatever medium the ray is in: a coated face of a plate is crossed from both
+sides, and what both crossings share is `n sin θ`, which Snell conserves.
+Indexing on it lets one grid serve a ray arriving through air and the same ray
+coming back out through the glass, **for a lossless stack**: a lossless stack
+reflects and transmits the same from either side at conjugate angles.
+
+An absorbing stack does not. Silver behind glass reflects less than silver in
+air, so a coated face whose stack absorbs (or whose inside response is not the
+outside stack met from behind) is baked twice: from outside, and from inside
+with the body's glass as the incident medium. The shader and the CPU mirror
+read the inside grid for a ray arriving from inside the body. Reusing the
+outside grid there is wrong by more than 1e-2 on a silvered glass tube (C22).
+
+A coating can also be a body's **default** response, which is what the
+Fresnel lens's AR is: every face then carries the coating as its own response,
+and faces that share one response share one bake (a lens with thousands of
+grooves has one grid). Under `coating_model: Nominal` every row of a grid is
+the coating's design point, which is what the reference answers then.
+
+Baking a protected-silver face from both sides at 64 wavelengths takes 5 ms in
+release (`bake_cost` in `coating_preview3.rs`); the budget is 20 ms.
 
 Two things about that grid were wrong before plates had thickness, in ways only
 a body exposes. It was baked with air behind the coating, which is right for a

@@ -16,6 +16,11 @@
 //
 // Kind buttons and the fields apply to both faces. Everything but `film` is
 // scalar: no angle of incidence and no polarization anywhere.
+//
+// For a film, the angles the scene's rays actually meet the face at are
+// histogrammed (`faceIncidenceJSON`, one f64 trace with the event log on) and
+// drawn top right, and the R and T those rays see on average, the curves
+// weighted by that histogram, are drawn dotted beside the single-angle ones.
 
 import {
   fmt,
@@ -50,6 +55,9 @@ const T_COLOR = "#ffd678";
 
 type Kind = "mirror" | "split" | "dichroic" | "film" | "clear" | "absorb";
 
+type IncidenceSide = { weights: number[]; flux: number; hits: number; meanDeg: number | null; r: number[] | null; t: number[] | null };
+type Incidence = { binDeg: number; front: IncidenceSide; back: IncidenceSide };
+
 export function createCoatingEditor(ctx: EditorContext): Editor {
   const { scene, id } = ctx;
   const grid = new Float64Array(Math.round((NM1 - NM0) / STEP) + 1).map((_, i) => NM0 + i * STEP);
@@ -58,6 +66,8 @@ export function createCoatingEditor(ctx: EditorContext): Editor {
   // The same stack on axis, drawn behind the working curve: the gap between the
   // two is the whole reason this editor exists.
   let curveOnAxis: Float64Array<ArrayBufferLike> | null = null;
+  // The angles the scene's rays meet this face at, and the curves they see.
+  let incidence: Incidence | null = null;
   let film: Film | null = null;
   let lines: { nm: number; color: string }[] = [];
   let atLines: Float64Array<ArrayBufferLike> = new Float64Array(0);
@@ -190,6 +200,14 @@ export function createCoatingEditor(ctx: EditorContext): Editor {
     const aoi = film?.aoiDeg ?? 0;
     curve = scene.surfaceRtF64(id, false, grid, aoi);
     curveOnAxis = film && aoi > 0.5 ? scene.surfaceRtF64(id, false, grid, 0) : null;
+    incidence = null;
+    if (film) {
+      try {
+        incidence = JSON.parse(scene.faceIncidenceJSON(id, grid)) as Incidence | null;
+      } catch {
+        incidence = null;
+      }
+    }
     const src = JSON.parse(scene.firstSourceWavelengthsJSON()) as { nm: number }[] | null;
     lines = (src ?? []).map((l) => ({ nm: l.nm, color: scene.wavelengthCssColor(l.nm) }));
     atLines = scene.surfaceRtF64(id, false, new Float64Array(lines.map((l) => l.nm)), film?.aoiDeg ?? 0);
@@ -230,9 +248,13 @@ export function createCoatingEditor(ctx: EditorContext): Editor {
       const miss = asked != null && got != null && Math.abs(got - asked) > 2;
       const edge = got == null ? "no edge in band" : `cuts at <b>${fmt(got, 0)} nm</b>`;
       const off = miss ? ` <span style="color:#ffb454">(asked ${fmt(asked!, 0)})</span>` : "";
+      const hit = incidence && incidence.front.hits > 0 ? incidence.front : null;
+      const seen = hit
+        ? `<br>the rays meet it at <b>${fmt(hit.meanDeg ?? NaN, 1)}°</b> on average (${hit.hits} hits; histogram top right, their R and T dotted)`
+        : "";
       ctx.read.innerHTML =
         `${film.layers.length} layers · used at <b>${fmt(film.aoiDeg, 1)}°</b> · ${edge}${off} · peak R <b>${pct(film.peakR)}</b>` +
-        `<br>${parts.length ? parts.join(" · ") : "no source wavelengths"}`;
+        `<br>${parts.length ? parts.join(" · ") : "no source wavelengths"}${seen}`;
       return;
     }
     ctx.read.innerHTML =
@@ -316,6 +338,40 @@ export function createCoatingEditor(ctx: EditorContext): Editor {
       });
       c.stroke();
       c.setLineDash([]);
+    }
+    // The curves the rays actually see: R and T averaged over the angles
+    // they meet the face at, dotted.
+    const seen = incidence && incidence.front.hits > 0 ? incidence.front : null;
+    if (seen && seen.r && seen.t) {
+      for (const [vals, color] of [[seen.r, R_COLOR], [seen.t, T_COLOR]] as const) {
+        c.strokeStyle = color;
+        c.lineWidth = 1.5;
+        c.setLineDash([2, 3]);
+        c.beginPath();
+        let pen = false;
+        grid.forEach((nm, i) => {
+          const v = vals[i];
+          if (v == null || Number.isNaN(v)) { pen = false; return; }
+          if (pen) c.lineTo(X(nm), Y(v)); else c.moveTo(X(nm), Y(v));
+          pen = true;
+        });
+        c.stroke();
+        c.setLineDash([]);
+      }
+      // The histogram of those angles, 0 to 90 degrees, top right.
+      const hw = 90, hh = 24, hx = w - box.r - hw - 4, hy = box.t + 18;
+      const peak = Math.max(...seen.weights, 1e-300);
+      c.fillStyle = "rgba(10,14,22,0.6)";
+      c.fillRect(hx - 2, hy - 2, hw + 4, hh + 14);
+      c.fillStyle = "rgba(205,214,228,0.75)";
+      const bw = hw / seen.weights.length;
+      seen.weights.forEach((v, i) => {
+        const bh = (v / peak) * hh;
+        if (bh > 0) c.fillRect(hx + i * bw, hy + hh - bh, Math.max(1, bw - 0.5), bh);
+      });
+      c.fillStyle = "rgba(205,214,228,0.55)";
+      c.fillText("0°", hx - 1, hy + hh + 10);
+      c.fillText("90°", hx + hw - 16, hy + hh + 10);
     }
     // Where each line meets the curves.
     lines.forEach((l, i) => {

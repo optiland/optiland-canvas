@@ -862,3 +862,30 @@ test.describe("component view — a detector's face", () => {
     expect(q.inset).toBe(q.dock);
   });
 });
+
+test.describe("component view — the angles a coating is used at", () => {
+  test("a film shows the angles its rays arrive at, and the curve they see", async ({ page }) => {
+    await freshApp(page);
+    await openInset(page);
+    await page.locator("#addDichroic").click();
+    await expect(page.locator("#componentInset .inset-sub")).toContainText("dichroic");
+    const id = (await insetView(page)).id;
+    // A collimated beam meets the 135 degree plate at 45 degrees, all of it.
+    await expect(page.locator("#componentInset .cv-read")).toContainText("the rays meet it at");
+    const seen = await page.evaluate((id) => {
+      const s = (window as unknown as { __ocDebug: any }).__ocDebug.scene;
+      const nm = new Float64Array([450, 550, 650]);
+      return {
+        hit: JSON.parse(s.faceIncidenceJSON(id, nm)),
+        one: Array.from(s.surfaceRtF64(id, false, nm, 45) as Float64Array),
+      };
+    }, id);
+    expect(seen.hit.front.hits).toBeGreaterThan(0);
+    expect(Math.abs(seen.hit.front.meanDeg - 45)).toBeLessThan(1.5);
+    // Every hit at one angle: the weighted curve is the single-angle curve at
+    // that bin's centre, to the grid's width.
+    for (let i = 0; i < 3; i++) {
+      expect(Math.abs(seen.hit.front.r[i] - seen.one[2 * i])).toBeLessThan(0.05);
+    }
+  });
+});

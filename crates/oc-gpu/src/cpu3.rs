@@ -316,13 +316,20 @@ fn interact_body(
     // and T come from the baked grid at this ray's own angle, and the
     // transmitted branch still refracts, because unlike a zero-thickness plate
     // this interface really does change the medium.
-    if let Some(Some(GpuResponse::CoatingGrid { lambdas, rt, stray })) =
+    if let Some(Some(GpuResponse::CoatingGrid { lambdas, rt, rt_inside, stray })) =
         scene.bodies[body].face_resp.get(face)
     {
         let cos_i = (-n.dot(w.d)).clamp(0.0, 1.0);
+        // A ray from inside the body reads the grid baked from inside, when
+        // the face has one (an absorbing stack does).
+        let from_inside = hit_normal.dot(w.d) > 0.0;
+        let grid = match rt_inside {
+            Some(g) if from_inside => g,
+            _ => rt,
+        };
         let (r, t) = crate::scene3::sample_coating_grid(
             lambdas,
-            rt,
+            grid,
             lambda,
             cos_i,
             w.medium_n,
@@ -563,7 +570,7 @@ fn interact_surface(
                 transmit(stack, flux_end * t);
             }
         }
-        GpuResponse::CoatingGrid { lambdas, rt, stray } => {
+        GpuResponse::CoatingGrid { lambdas, rt, stray, .. } => {
             // A real thin-film stack, read off the grid that was baked from the
             // transfer matrix when the scene compiled. Both branches are primary
             // paths, exactly as for `ExplicitRt`, unless the stack is an AR coat,

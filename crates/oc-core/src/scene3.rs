@@ -273,6 +273,12 @@ impl SpectralScalar {
     pub(crate) fn min(&self) -> f64 {
         self.values().iter().copied().fold(f64::INFINITY, f64::min)
     }
+
+    /// The largest sample, for a caller outside this crate: whether a film's
+    /// extinction coefficient is ever non-zero, say.
+    pub fn values_max(&self) -> f64 {
+        self.max()
+    }
 }
 
 /// A wavelength table is a function: strictly increasing, at least two samples,

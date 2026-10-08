@@ -195,7 +195,9 @@ const RESP_FLAG_TRANSMIT: u32 = 2u;
 // A baked thin-film coating grid: `COAT_ANGLES` rows of `COAT_LAMBDAS` (R, T)
 // pairs, uniform in wavelength and in sin²θ. Must match scene3::COAT_* exactly;
 // `the_coating_grid_constants_agree` pins that.
-const COAT_ANGLES: u32 = 64u;
+const COAT_ANGLES: u32 = 128u;
+// The last baked angle in the ambient medium, radians; scene3::COAT_THETA_MAX.
+const COAT_THETA_MAX: f32 = 1.5391683;
 
 // Out-of-range policies of a tabulated response scalar.
 const POLICY_ERROR: u32 = 0u;
@@ -1046,7 +1048,7 @@ fn sample_spectral(s: Spectral, lambda: f32) -> vec2<f32> {
 // face of a plate is crossed from both sides, and the quantity both crossings
 // share is n*sin(theta), which Snell conserves, so that is what the grid is
 // indexed on. Mirrors scene3::sample_coating_grid exactly.
-fn sample_coating(resp: Response, lambda: f32, cos_i: f32, n_medium: f32) -> vec2<f32> {
+fn sample_coating(resp: Response, lambda: f32, cos_i: f32, n_medium: f32, inside: bool) -> vec2<f32> {
     let n_l = resp.t.tab_count;
     if (n_l == 0u) { return vec2<f32>(0.0, 0.0); }
     var l0 = 0u;
@@ -1066,12 +1068,15 @@ fn sample_coating(resp: Response, lambda: f32, cos_i: f32, n_medium: f32) -> vec
     if (params.ambient > 0.0) {
         sin_amb = clamp(n_medium * sin_local / params.ambient, 0.0, 1.0);
     }
-    let fa = clamp((sin_amb * sin_amb) / 0.999, 0.0, 1.0) * f32(COAT_ANGLES - 1u);
+    let fa = clamp(asin(sin_amb) / COAT_THETA_MAX, 0.0, 1.0) * f32(COAT_ANGLES - 1u);
     let a0 = u32(floor(fa));
     let a1 = min(a0 + 1u, COAT_ANGLES - 1u);
     let ta = fa - floor(fa);
 
-    let base = resp.r.tab_start;
+    // A ray from inside a body reads the grid baked from inside, when the face
+    // has one (in the `ar` slot; an absorbing stack does).
+    var base = resp.r.tab_start;
+    if (inside && resp.ar.tab_count > 0u) { base = resp.ar.tab_start; }
     let lo = mix(verts[base + a0 * n_l + l0], verts[base + a0 * n_l + l1], tl);
     let hi = mix(verts[base + a1 * n_l + l0], verts[base + a1 * n_l + l1], tl);
     return mix(lo, hi, ta);
@@ -1286,7 +1291,7 @@ fn interact_body(w: Work, ev: Event, point: vec3<f32>, flux_end: f32, lambda: f3
                 return;
             }
             let cos_ic = clamp(-dot(n, w.d), 0.0, 1.0);
-            let rt = sample_coating(f.resp, lambda, cos_ic, w.medium_n);
+            let rt = sample_coating(f.resp, lambda, cos_ic, w.medium_n, dot(ev.n, w.d) > 0.0);
             let rc = clamp(rt.x, 0.0, 1.0);
             let tc = clamp(rt.y, 0.0, 1.0);
             // An AR coat's reflection is a ghost, like bare glass's below; any
@@ -1399,7 +1404,7 @@ fn interact_surface(w: Work, ev: Event, point: vec3<f32>, flux_end: f32, lambda:
         // explicit R/T below, unless the stack is an AR coat, whose reflection
         // is a ghost.
         let cos_i = clamp(-dot(n_oppose, w.d), 0.0, 1.0);
-        let rt = sample_coating(resp, lambda, cos_i, w.medium_n);
+        let rt = sample_coating(resp, lambda, cos_i, w.medium_n, false);
         let r = clamp(rt.x, 0.0, 1.0);
         let t = clamp(rt.y, 0.0, 1.0);
         let stray = (resp.flags & RESP_FLAG_STRAY) != 0u;

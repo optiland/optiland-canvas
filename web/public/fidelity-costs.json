@@ -1,4 +1,21 @@
 {
- "comment": "Relative throughput of each fidelity switch value against Fast, written by bench_throughput3 --fidelity-table. A value with no row has not been measured.",
- "rows": []
+ "comment": "Relative trace time of each fidelity switch value against the value named, the worst over the bench scenes. Written by bench_throughput3 --fidelity-table --write-costs; a value with no row has not been measured.",
+ "rays": 200000,
+ "scenes": ["heliostat-light-pipe", "two-dichroics", "singlet"],
+ "rows": [
+  {"switch": "coating_model", "value": "Nominal", "against": "Fast", "relative": 1.000},
+  {"switch": "coating_model", "value": "Unpolarized", "against": "Nominal", "relative": 1.047},
+  {"switch": "coating_model", "value": "Polarized", "against": "Unpolarized", "relative": 1.026},
+  {"switch": "film_materials", "value": "Nominal", "against": "Fast", "relative": 1.000},
+  {"switch": "film_materials", "value": "Dispersive", "against": "Nominal", "relative": 1.010},
+  {"switch": "layer_absorption", "value": "Off", "against": "Fast", "relative": 1.000},
+  {"switch": "layer_absorption", "value": "PerFace", "against": "Off", "relative": 1.095},
+  {"switch": "layer_absorption", "value": "PerLayer", "against": "PerFace", "relative": 1.275},
+  {"switch": "plate_model", "value": "PhaseFree", "against": "Fast", "relative": 1.000},
+  {"switch": "plate_model", "value": "Incoherent", "against": "PhaseFree", "relative": 1.027},
+  {"switch": "temperature", "value": "Off", "against": "Fast", "relative": 1.000},
+  {"switch": "temperature", "value": "Declared", "against": "Off", "relative": 0.991},
+  {"switch": "numerics", "value": "Permissive", "against": "Fast", "relative": 1.000},
+  {"switch": "numerics", "value": "Strict", "against": "Permissive", "relative": 1.012}
+ ]
 }

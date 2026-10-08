@@ -198,6 +198,29 @@ The preview recompiles on every frame of a drag, so this is a per-frame cost
 for a coated face that is being moved; a scene's coatings that are not edited
 cost it once per compile.
 
+## What each fidelity switch costs
+
+Relative trace time of each switch value against the value named, about 200000 launch rays per scene, best of 3, ghosts off, deposits recorded on every body. Measured on one Windows desktop (release build, all cores), regenerated with
+`cargo run --release -p oc-trace --features trace3 --example bench_throughput3 -- --fidelity-table --write-costs`,
+which also writes `web/public/fidelity-costs.json`, the numbers the fidelity panel shows. The ceiling is the coating-fidelity spec's §11 budget; every value is inside it. Values below 1 are timing noise of a switch that costs nothing on that scene: the singlet has no coating for `PerLayer` to split, and no scene declares a temperature.
+
+| Switch value | against | heliostat-light-pipe | two-dichroics | singlet | worst | ceiling |
+|---|---|---|---|---|---|---|
+| `coating_model: Nominal` | Fast | 1.000 | 1.000 | 1.000 | 1.000 |  |
+| `coating_model: Unpolarized` | Nominal | 1.047 | 1.027 | 1.002 | 1.047 |  |
+| `coating_model: Polarized` | Unpolarized | 1.000 | 1.004 | 1.026 | 1.026 | 1.5x |
+| `film_materials: Nominal` | Fast | 1.000 | 1.000 | 1.000 | 1.000 |  |
+| `film_materials: Dispersive` | Nominal | 1.010 | 0.989 | 1.006 | 1.010 | 1.15x |
+| `layer_absorption: Off` | Fast | 1.000 | 1.000 | 1.000 | 1.000 |  |
+| `layer_absorption: PerFace` | Off | 1.021 | 1.067 | 1.095 | 1.095 |  |
+| `layer_absorption: PerLayer` | PerFace | 1.053 | 1.275 | 0.950 | 1.275 | 1.3x |
+| `plate_model: PhaseFree` | Fast | 1.000 | 1.000 | 1.000 | 1.000 |  |
+| `plate_model: Incoherent` | PhaseFree | 1.027 | 0.998 | 0.994 | 1.027 | 1.05x |
+| `temperature: Off` | Fast | 1.000 | 1.000 | 1.000 | 1.000 |  |
+| `temperature: Declared` | Off | 0.991 | 0.986 | 0.986 | 0.991 | 1.05x |
+| `numerics: Permissive` | Fast | 1.000 | 1.000 | 1.000 | 1.000 |  |
+| `numerics: Strict` | Permissive | 1.012 | 0.989 | 0.972 | 1.012 | 1.02x |
+
 ## Still open
 
 - Software-rasterized WebGL (no GPU acceleration) cannot draw a ghost-lit

@@ -101,6 +101,20 @@ jobs:
       - name: pytest (.ocanvas ⇄ Optiland Optic round-trip)
         working-directory: crates/oc-py
         run: pytest tests -q
+      # The coating validation report (coating-fidelity spec CF-12, C32): the
+      # oracle matrix as one table, checked against the committed copy and
+      # kept as an artifact stamped with the commit it was made at.
+      - name: coating validation report
+        working-directory: crates/oc-py
+        run: |
+          python tests/report_coatings.py --check
+          python tests/report_coatings.py --out validation-coatings.md
+      - name: upload the coating validation report
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-coatings
+          path: crates/oc-py/validation-coatings.md
+          retention-days: 90
 
   # The coating oracle fixtures, regenerated with the pinned oracle versions.
   # Fails if two runs differ or if the result moved from the committed files;

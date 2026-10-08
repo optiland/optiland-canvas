@@ -202,6 +202,55 @@ documentation PR would bury the diff, and the reformat is worthless without the
 CI step that keeps it from drifting back. Both want their own commit.
 
 
+## Coating cases C01 to C34
+
+The thin-film acceptance cases: C01 to C10 from the next-steps spec (M4b),
+C11 to C34 from the coating-fidelity spec. Each row names the test that holds
+the case; `docs/validation-coatings.md` is the generated table of the oracle
+matrix (C32), and `docs/validation.md` records the numbers. The oracle cases
+run in `crates/oc-py/tests/test_coating_fixtures.py` (frozen) and
+`test_thinfilm_tmm.py` (live), from `coating_cases.py`.
+
+| Case | What | Held by |
+|---|---|---|
+| C01 | zero layers is the bare interface | `oc-core/src/thinfilm.rs` tests; fixture `bare` against `tmm` and Optiland |
+| C02 | a zero-thickness layer is its removal | `thinfilm.rs` `c02_*` |
+| C03 | a layer split in two is the same layer | `thinfilm.rs` `c03_*` |
+| C04 | the quarter-wave AR null | `thinfilm.rs` `c04_*` |
+| C05 | one lossless layer, swept | fixture `single_quarter_wave` |
+| C06 | lossless multilayers | fixtures `quarter_wave_mirror`, `edge_filter` |
+| C07 | absorbing films | fixtures `aluminium_film`, `aluminium_under_dielectric` |
+| C08 | the reversed asymmetric stack | `thinfilm.rs` `c08_*`; fixtures `asymmetric_absorbing_*` |
+| C09 | grazing and TIR-adjacent stress | `thinfilm.rs` `c09_*` |
+| C10 | preview grid against f64 | `oc-gpu/tests/cpu3_vs_f64.rs`, `coating_preview3.rs` |
+| C11 | a dispersive catalogue stack | fixture `dispersive_catalogue_stack`; `oc-py/tests/test_film_catalog.py` |
+| C12 | 5 um aluminium and 64-layer absorbing stacks | `thinfilm.rs` `c12_*`; fixture `thick_aluminium`; `test_thinfilm_stress.py` (mpmath) |
+| C13 | silica on an opaque aluminium substrate | `thinfilm.rs` `c13_*`; fixture `silica_on_opaque_aluminium` |
+| C14 | the TIR phase pin, and Optiland's divergence | `oc-py/tests/test_polarization_outputs.py` `test_c14_*` |
+| C15 | per-layer absorption | `thinfilm.rs` `c15_*`; `test_thinfilm_tmm.py` `test_c15_*` |
+| C16 | deposits against the object ledger | `oc-trace/tests/deposits_by_layer3.rs` `c16_*` |
+| C17 | a coated absorbing slab against `inc_tmm` | `oc-py/tests/test_thinfilm_incoherent.py` `test_c17_*` |
+| C18 | the plate Mueller matrix | `thinfilm.rs` `c18_*` |
+| C19 | ψ and Δ against `tmm.ellips` | `test_polarization_outputs.py` `test_c19_*` |
+| C20 | transmission retardance | `test_polarization_outputs.py` `test_c20_*` |
+| C21 | reciprocal T, distinct R, reversed | `thinfilm.rs` `c08_*`; fixture `asymmetric_absorbing_reversed` |
+| C22 | the two-sided preview bake | `oc-gpu/tests/coating_preview3.rs` `c22_*` |
+| C23 | a body-default AR in the preview | `coating_preview3.rs` `c23_*` |
+| C24 | angle edges to grazing | `thinfilm.rs` `c24_*`; `coating_preview3.rs` `c24_*` |
+| C25 | the matched AR against the single layer and bare glass | `oc-core/src/synthesis.rs` `c25_*` |
+| C26 | the V-coat null and its refusal | `synthesis.rs` `c26_*` |
+| C27 | the solar band AR | `synthesis.rs` `c27_*` |
+| C28 | measured tables | `oc-core/src/response_table.rs` `c28_*`; `oc-trace/tests/measured_tables3.rs` `c28_*` |
+| C29 | the thermo-optic shift, and `Off` bit-identical | `oc-trace/tests/thermo3.rs` `c29_*` |
+| C30 | v2 to v3 migration changes no number | `oc-core/tests/film_catalog3.rs` `c30_*` |
+| C31 | mutations caught | `thinfilm.rs` `mutation` module and its tests |
+| C32 | the validation report | `oc-py/tests/test_report_coatings.py` `test_c32_*`; CI step "coating validation report" |
+| C33 | `Standard` is the pre-spec kernel bit for bit | `oc-trace/tests/fidelity3.rs` against `tests/data/pre_profile_corpus3.json` |
+| C34 | the stamp, the preview's refusals, the round trip, no mixed tables | `fidelity3.rs`; `web/tests/fidelity.spec.ts`; `test_report_coatings.py` `test_c34_*` |
+
+Every MUST in the coating-fidelity spec maps to one of these cases; the spec's
+work packages name theirs in their exit criteria.
+
 ## Per-PR checklist
 
 Before opening any PR in this epic:

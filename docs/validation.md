@@ -248,6 +248,16 @@ The grid used to be 64 rows uniform in `sin²θ`, and near grazing it was out by
 up to 8e-2 on bare glass and a three-layer AR; the earlier figure of 7.6e-4
 (C10) was measured on scenes that did not reach those angles.
 
+### Substrate-adapted designs (CF-08)
+
+| Check | Tolerance | Result |
+|---|---|---|
+| `Bbar` against the fitted single layer and bare glass, n_s 1.46 to 2.00, 400 to 700 nm, 0 to 30 degrees (C25) | Bbar ≤ single + 1e-3 ≤ bare | passes; Bbar 0.0056 / 0.0059 / 0.0090 / 0.0076 / 0.0073 / 0.0056 band R; on 1.72 it falls back to one layer, on 1.92 and 2.00 to two |
+| The old three-layer preset on N-SF66 at its 650 nm design wavelength (C25) | ≥ 8% band R | 8.08% |
+| A V-coat of SiO₂ over TiO₂ on N-BK7 (C26) | R(550 nm) ≤ 1e-10 | passes; two low-index films are refused by name |
+| A solar `BandAr` on low-iron glass, 0.4 to 2.5 µm, 0 to 40 degrees, weighted by the G173 direct sun (C27) | ≤ single + 1e-3; ≤ 0.5 × bare | 0.0211 against 0.0213 single and 0.0445 bare: 0.475 of bare |
+| Seven synthesized layer lists pinned to the bit | identical on Windows and Linux | thicknesses quantized to 1e-6 nm, so an ulp of a platform's `powf` cannot show |
+
 ## Worth adding
 
 - An uncoated N-BK7 and fused-silica window against published internal

@@ -114,7 +114,7 @@ fn c16_a_plate_puts_its_slab_in_the_volume() {
 #[test]
 fn c16_a_dielectric_ar_deposits_nothing() {
     let ar = film_coating(
-        CoatingDesign { kind: DesignKind::BroadbandAr, lambda_nm: 550.0, aoi_deg: 0.0, periods: 1, n_high: 2.35, n_low: 1.38 },
+        CoatingDesign { kind: DesignKind::BroadbandArLegacy, lambda_nm: 550.0, aoi_deg: 0.0, periods: 1, n_high: 2.35, n_low: 1.38, adapt: None },
         1.0,
         1.0,
     );

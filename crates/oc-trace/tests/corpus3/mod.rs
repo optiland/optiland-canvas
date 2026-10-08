@@ -57,7 +57,7 @@ fn lines() -> Spectrum {
 
 fn ar(kind: DesignKind) -> oc_core::thinfilm::Coating {
     film_coating(
-        CoatingDesign { kind, lambda_nm: 550.0, aoi_deg: 0.0, periods: 1, n_high: 2.35, n_low: 1.38 },
+        CoatingDesign { kind, lambda_nm: 550.0, aoi_deg: 0.0, periods: 1, n_high: 2.35, n_low: 1.38, adapt: None },
         1.0,
         1.5168,
     )
@@ -90,7 +90,7 @@ pub fn cases() -> Vec<Case> {
     s.sources[0].spectrum = lines();
     let mirror = metal_mirror(materials::silver(), Some((materials::silica(), 90.0)));
     s.add_coated_plate(Vec3::new(-45.0, 0.0, 0.0), 15.0, 3.0, 120.0, mirror);
-    s.add_coated_plate(Vec3::new(-25.0, 0.0, 0.0), 15.0, 3.0, 160.0, ar(DesignKind::BroadbandAr));
+    s.add_coated_plate(Vec3::new(-25.0, 0.0, 0.0), 15.0, 3.0, 160.0, ar(DesignKind::BroadbandArLegacy));
     add_rect_detector(&mut s, Vec3::new(-45.0, 60.0, 0.0), -Vec3::Y, 60.0, 60.0, [4, 4]);
     out.push(Case { name: "mirror_and_window", scene: s, rays: None });
 

@@ -41,7 +41,7 @@ def _rows(block: dict) -> list[list[float]]:
 
 def test_the_catalogue_has_what_the_spec_lists():
     want = {
-        "magnesium_fluoride", "silica", "alumina", "titania", "tantala", "hafnia", "zirconia", "niobia",
+        "magnesium_fluoride", "magnesium_fluoride_bulk", "silica", "alumina", "titania", "tantala", "hafnia", "zirconia", "niobia",
         "zinc_sulfide", "silicon", "silver", "silver_johnson", "aluminium", "gold", "chromium", "nickel",
     }
     assert set(CATALOG) == want

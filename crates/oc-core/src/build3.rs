@@ -676,6 +676,7 @@ impl Scene3 {
             periods,
             n_high,
             n_low,
+            adapt: None,
         }
         .sanitized()?;
         let coating = film_coating(design, n0, n0);
@@ -1289,7 +1290,15 @@ impl Scene3 {
             Some(d) => match d.sanitized() {
                 None => return false,
                 Some(d) => Some(SurfaceResponse::Coating {
-                    coating: film_coating(d, ambient, glass),
+                    coating: match d.adapt {
+                        // An adapted design is solved against the glass at its
+                        // own wavelength, not at the d line.
+                        Some(_) => {
+                            let (_, n_s) = self.coated_face_media(id, d.lambda_nm / 1000.0);
+                            film_coating(d, ambient, n_s)
+                        }
+                        None => film_coating(d, ambient, glass),
+                    },
                 }),
             },
         };
@@ -1391,10 +1400,16 @@ impl Scene3 {
             return self.set_surface_coating_design(id, design);
         }
         let ambient = self.env.ambient_index;
+        // An adapted design is solved against the body's own glass at the
+        // design wavelength; a fixed recipe keeps the plate glass it always had.
+        let n_s = match design.adapt {
+            Some(_) => self.coated_face_media(id, design.lambda_nm / 1000.0).1,
+            None => PLATE_ND,
+        };
         let Some(b) = self.bodies.iter_mut().find(|b| b.common.id.0 == id) else {
             return false;
         };
-        let coating = film_coating(design, ambient, PLATE_ND);
+        let coating = film_coating(design, ambient, n_s);
         let mut touched = false;
         for o in &mut b.surface.overrides {
             if matches!(o.response.from_outside, SurfaceResponse::Coating { .. }) {
@@ -2246,14 +2261,22 @@ impl Scene3 {
 
     /// Set a body's bulk glass to an Abbe point `(nd, vd)`. Returns false if `id`
     /// is not a body.
+    ///
+    /// A face coated with a substrate-adapted design is re-synthesized for the
+    /// new glass: the design is what was asked for, the layers follow from it.
+    /// A face with a fixed recipe keeps its layers.
     pub fn set_body_glass_abbe(&mut self, id: u64, nd: f64, vd: f64) -> bool {
         match self.bodies.iter_mut().find(|b| b.common.id.0 == id) {
-            Some(b) => {
-                b.material = Material::AbbePoint { nd, vd };
-                true
-            }
-            None => false,
+            Some(b) => b.material = Material::AbbePoint { nd, vd },
+            None => return false,
         }
+        for face in [BodyFace::Front, BodyFace::Back] {
+            let adapted = self.body_face_coating(id, face).and_then(|c| c.design).filter(|d| d.adapt.is_some());
+            if let Some(d) = adapted {
+                self.set_body_face_coating(id, face, Some(d));
+            }
+        }
+        true
     }
 
     /// Delete any object or source by id. Returns false if nothing matched.

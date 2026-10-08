@@ -216,6 +216,7 @@ fn one_effective_index_fits_the_edge_at_every_angle() {
         periods: 8,
         n_high,
         n_low,
+        adapt: None,
     };
     let c = film_coating(design, 1.0, 1.5168);
     let edge = |aoi: f64| {

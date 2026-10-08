@@ -609,19 +609,6 @@ impl Coating {
         c
     }
 
-    /// Is what this stack reflects stray light, rather than a path?
-    ///
-    /// An AR coat exists to transmit. The little it still reflects is the
-    /// residual it failed to suppress, which is a ghost for exactly the reason
-    /// bare glass's reflection is one, so it is traced when ghosts are and
-    /// named in the ledger when they are not. Every other design exists to
-    /// reflect something (a band, a mirror's whole spectrum, a splitter's s),
-    /// so its reflection is the part doing its job and is always followed.
-    ///
-    /// Read off the design because that is where the intent is written down.
-    /// A layer edit keeps the design, so a hand-thinned AR coat is still an AR
-    /// coat. A stack with no design at all reads as a path, which is what a
-    /// hand-written dichroic or mirror wants.
     /// Where `coating_model: Nominal` evaluates this coating: `(lambda_um,
     /// cos_i, designed)`. The design's own wavelength and angle when it has a
     /// design record; 0.55 µm at normal incidence when it has none, which
@@ -635,10 +622,29 @@ impl Coating {
         }
     }
 
+    /// Is what this stack reflects stray light, rather than a path?
+    ///
+    /// An AR coat exists to transmit. The little it still reflects is the
+    /// residual it failed to suppress, which is a ghost for exactly the reason
+    /// bare glass's reflection is one, so it is traced when ghosts are and
+    /// named in the ledger when they are not. Every other design exists to
+    /// reflect something (a band, a mirror's whole spectrum, a splitter's s),
+    /// so its reflection is the part doing its job and is always followed.
+    ///
+    /// Read off the design because that is where the intent is written down.
+    /// A layer edit keeps the design, so a hand-thinned AR coat is still an AR
+    /// coat. A stack with no design at all reads as a path, which is what a
+    /// hand-written dichroic or mirror wants.
     pub fn reflection_is_stray(&self) -> bool {
         matches!(
             self.design.map(|d| d.kind),
-            Some(DesignKind::SingleLayerAr | DesignKind::BroadbandAr)
+            Some(
+                DesignKind::SingleLayerAr
+                    | DesignKind::BroadbandArLegacy
+                    | DesignKind::VCoat
+                    | DesignKind::Bbar
+                    | DesignKind::BandAr
+            )
         )
     }
 }
@@ -660,6 +666,11 @@ pub struct CoatingDesign {
     pub periods: u32,
     pub n_high: f64,
     pub n_low: f64,
+    /// What a substrate-adapted design is adapted to (CF-08): the substrate,
+    /// the band and angles it is judged over, its materials, and its design
+    /// point. Absent from every older design, which builds as it always did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapt: Option<crate::synthesis::DesignAdapt>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -681,9 +692,23 @@ pub enum DesignKind {
     /// [`macneille_glass`].
     Polarizing,
     /// A single quarter wave of a low index: the classic single-layer AR.
+    /// Without an `adapt` record it is constant MgF₂, as it always was; with
+    /// one, the catalogue film nearest `√(n₀ n_s)` ([`crate::synthesis`]).
     SingleLayerAr,
-    /// Quarter-half-quarter, the broadband three-layer AR.
-    BroadbandAr,
+    /// Quarter-half-quarter of constant MgF₂, TiO₂ and Al₂O₃ at one
+    /// wavelength: the broadband preset before the catalogue existed.
+    /// Nominal, not adapted: it ignores the substrate, and on N-SF66 it
+    /// reflects about 10% of the visible. Written `BroadbandAr` in documents.
+    #[serde(rename = "BroadbandAr")]
+    BroadbandArLegacy,
+    /// Two layers with an exact null at the design wavelength (a V-coat).
+    VCoat,
+    /// Quarter-half-quarter with the inner quarter matched to the substrate.
+    Bbar,
+    /// Up to 8 layers refined over a band and an angle range.
+    BandAr,
+    /// A metal under quarter-wave high/low pairs.
+    EnhancedMetal { metal: crate::synthesis::MetalKind, pairs: u32 },
 }
 
 /// Reflectance and transmittance, resolved by polarization.
@@ -2279,6 +2304,11 @@ pub mod materials {
         pub fn magnesium_fluoride() -> FilmMaterial {
             entry("magnesium_fluoride")
         }
+        /// The bulk crystal's ordinary index: what a hot-deposited AR layer
+        /// of MgF2 sits near, and the AR designs' default low-index film.
+        pub fn magnesium_fluoride_bulk() -> FilmMaterial {
+            entry("magnesium_fluoride_bulk")
+        }
         pub fn silica() -> FilmMaterial {
             entry("silica")
         }
@@ -2467,6 +2497,7 @@ impl CoatingDesign {
             periods: 8,
             n_high: 2.35,
             n_low: 1.46,
+            adapt: None,
         }
     }
 
@@ -2669,13 +2700,29 @@ pub fn design_layers_for(
             }
             symmetric_period(&d, lambda0, n_incident, d.periods)
         }
-        DesignKind::SingleLayerAr => vec![FilmLayer::quarter_wave(
+        DesignKind::SingleLayerAr if d.adapt.is_none() => vec![FilmLayer::quarter_wave(
             materials::magnesium_fluoride(),
             d.lambda_nm,
             n_incident,
             d.aoi_deg,
         )],
-        DesignKind::BroadbandAr => {
+        // Substrate-adapted designs: the substrate is the far medium, or a
+        // plate's own glass. A refused design builds no layers; the editor
+        // reports why through `crate::synthesis::synthesize`.
+        DesignKind::SingleLayerAr
+        | DesignKind::VCoat
+        | DesignKind::Bbar
+        | DesignKind::BandAr
+        | DesignKind::EnhancedMetal { .. } => {
+            let n_s = match backing {
+                CoatingBacking::Plate { substrate, .. } | CoatingBacking::Opaque { substrate } => {
+                    substrate.index_at(d.lambda_nm / 1000.0).map_or(n_far, |c| c.re)
+                }
+                CoatingBacking::Medium => d.adapt.map(|a| a.substrate_n).filter(|n| n.is_finite() && *n > 0.0).unwrap_or(n_far),
+            };
+            crate::synthesis::synthesize(&d, n_incident, n_s).unwrap_or_default()
+        }
+        DesignKind::BroadbandArLegacy => {
             // Quarter-half-quarter, the classic three-layer broadband AR: a
             // half wave of a high index widens the band a single layer cannot,
             // and the middle index does the impedance match the substrate needs.
@@ -2694,18 +2741,22 @@ pub fn design_layers_for(
 
 /// A complete coating from a design, on a plate of `substrate`.
 pub fn plate_coating(
-    design: CoatingDesign,
+    mut design: CoatingDesign,
     substrate: FilmMaterial,
     exit: ExitFace,
     n_incident: f64,
 ) -> Coating {
+    if let Some(a) = design.adapt.as_mut() {
+        a.substrate_n = substrate.index_at(design.lambda_nm / 1000.0).map_or(n_incident, |c| c.re);
+    }
     let backing = CoatingBacking::Plate { substrate, exit, thickness_mm: 0.0 };
-    Coating {
+    let c = Coating {
         layers: design_layers_for(&design, n_incident, &backing, n_incident),
         backing,
         incidence: Incidence::Film,
         design: Some(design),
-    }
+    };
+    crate::synthesis::record_design_point(c, n_incident, n_incident)
 }
 
 /// Which side of the reflectance band an edge is measured on.
@@ -2743,13 +2794,20 @@ impl BandSide {
 /// plane has no room for glass. Here the glass is a body the tracer crosses on
 /// its own: it refracts at this face, travels, and meets the far face as a
 /// second interface. Folding anything in would count it twice.
-pub fn film_coating(design: CoatingDesign, n_incident: f64, n_substrate: f64) -> Coating {
-    Coating {
+///
+/// A substrate-adapted design (`design.adapt`) is solved for `n_substrate`,
+/// which it records along with its R and T at the design point.
+pub fn film_coating(mut design: CoatingDesign, n_incident: f64, n_substrate: f64) -> Coating {
+    if let Some(a) = design.adapt.as_mut() {
+        a.substrate_n = n_substrate;
+    }
+    let c = Coating {
         layers: design_layers(&design, n_incident, n_substrate),
         backing: CoatingBacking::Medium,
         incidence: Incidence::Film,
         design: Some(design),
-    }
+    };
+    crate::synthesis::record_design_point(c, n_incident, n_substrate)
 }
 
 /// The sideways shift a plane-parallel plate gives a beam crossing it:
@@ -2858,6 +2916,7 @@ mod tests {
                 periods: 12,
                 n_high: nh,
                 n_low: nl,
+                adapt: None,
             };
             let c = film_coating(d, n0, n0);
             coating_rt_at(&c, n0, n0, 0.55, 45f64.to_radians().cos()).unwrap()
@@ -2978,6 +3037,7 @@ mod tests {
                 periods: 4,
                 n_high: 2.35,
                 n_low: 1.46,
+                adapt: None,
             },
             1.0,
             1.5168,
@@ -3013,6 +3073,7 @@ mod tests {
                 periods: 1,
                 n_high: 2.35,
                 n_low: 1.38,
+                adapt: None,
             },
             n1,
             n2,
@@ -3042,6 +3103,7 @@ mod tests {
                     periods: 8,
                     n_high: 2.35,
                     n_low: 1.46,
+                    adapt: None,
                 },
                 1.0,
                 1.5168,
@@ -3502,6 +3564,7 @@ mod tests {
                 periods: 1,
                 n_high: 2.35,
                 n_low: 1.46,
+                adapt: None,
             };
             let c = Coating {
                 layers: design_layers(&d, 1.0, 1.5168),
@@ -3521,7 +3584,7 @@ mod tests {
             sum / n as f64
         };
         let single = mean_r(DesignKind::SingleLayerAr);
-        let broad = mean_r(DesignKind::BroadbandAr);
+        let broad = mean_r(DesignKind::BroadbandArLegacy);
         assert!(
             single < bare * 0.4,
             "single-layer AR: {single} vs bare {bare}"
@@ -3575,12 +3638,13 @@ mod tests {
     fn check_reverse_walk() -> Result<(), String> {
         let n_glass = 1.5168;
         let design = CoatingDesign {
-            kind: DesignKind::BroadbandAr,
+            kind: DesignKind::BroadbandArLegacy,
             lambda_nm: 550.0,
             aoi_deg: 0.0,
             periods: 1,
             n_high: 2.35,
             n_low: 1.38,
+            adapt: None,
         };
         let front = film_coating(design, 1.0, n_glass);
         let back = front.seen_from_behind();
@@ -3799,7 +3863,7 @@ mod tests {
     fn c09_a_grazing_sweep_stays_finite() {
         let ar = |kind| {
             film_coating(
-                CoatingDesign { kind, lambda_nm: 550.0, aoi_deg: 0.0, periods: 1, n_high: 2.35, n_low: 1.38 },
+                CoatingDesign { kind, lambda_nm: 550.0, aoi_deg: 0.0, periods: 1, n_high: 2.35, n_low: 1.38, adapt: None },
                 1.0,
                 1.5168,
             )
@@ -3807,7 +3871,7 @@ mod tests {
         let stacks = [
             bare(),
             ar(DesignKind::SingleLayerAr),
-            ar(DesignKind::BroadbandAr),
+            ar(DesignKind::BroadbandArLegacy),
             quarter_wave_mirror(550.0, 45.0, 10),
             on_medium(&ASYMMETRIC),
             on_medium(&[(0.958, 6.69, 150.0)]),
@@ -4134,7 +4198,7 @@ mod tests {
     #[test]
     fn a_lossless_coating_absorbs_exactly_nothing() {
         let ar = film_coating(
-            CoatingDesign { kind: DesignKind::BroadbandAr, lambda_nm: 550.0, aoi_deg: 0.0, periods: 1, n_high: 2.35, n_low: 1.38 },
+            CoatingDesign { kind: DesignKind::BroadbandArLegacy, lambda_nm: 550.0, aoi_deg: 0.0, periods: 1, n_high: 2.35, n_low: 1.38, adapt: None },
             1.0,
             1.5168,
         );

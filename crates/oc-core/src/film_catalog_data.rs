@@ -497,6 +497,21 @@ pub(crate) const ENTRIES: &[Entry] = &[
     ]),
     },
     Entry {
+        key: "magnesium_fluoride_bulk",
+        name: "MgF2 (crystal, o)",
+        form: FilmForm::Crystal,
+        reference: "M. J. Dodge. Refractive properties of magnesium fluoride, Appl. Opt. 23, 1980-1985 (1984)",
+        url: "https://refractiveindex.info/?shelf=main&book=MgF2&page=Dodge-o",
+        note: "19 °C. Ordinary ray (o).; ordinary ray of the bulk crystal, k zero: a hot-deposited AR film sits within about 0.01 of it, where the 44 nm film above sits 0.04 higher",
+        range_um: [0.2, 7.0],
+        nominal: [1.3785057149207824, 0.0],
+        data: Data::Formula {
+        formula: 1,
+        coefficients: &[0.0, 0.48755108, 0.04338408, 0.39875031, 0.09461442, 2.3120353, 23.793604],
+        k: None,
+    },
+    },
+    Entry {
         key: "silica",
         name: "SiO2 (film)",
         form: FilmForm::Film,

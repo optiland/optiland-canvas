@@ -143,6 +143,38 @@ fn v2_material(m: &FilmMaterial, what: &str, losses: &mut Vec<String>) -> FilmMa
 ///
 /// Empty losses means the v2 document holds everything the scene does, which
 /// is the case for any scene read from v2 and not edited with a v3 feature.
+/// A v2 reader knows the six original design kinds and no `adapt` record.
+/// The layers are written as they are either way, since they are what the
+/// transfer matrix reads; only the recipe goes. A substrate-adapted AR is
+/// written as `SingleLayerAr`, which keeps its residual reflection a ghost in
+/// v2; an enhanced metal loses its record and reads as a path, which a mirror
+/// is.
+fn design_to_v2(c: &mut Coating, losses: &mut Vec<String>) {
+    use crate::thinfilm::DesignKind as K;
+    let Some(d) = c.design.as_mut() else {
+        return;
+    };
+    match d.kind {
+        K::VCoat | K::Bbar | K::BandAr => {
+            losses.push(format!(
+                "a {:?} design is written as SingleLayerAr: v2 has no such kind; the layers are kept, the recipe is not",
+                d.kind
+            ));
+            d.kind = K::SingleLayerAr;
+            d.adapt = None;
+        }
+        K::EnhancedMetal { .. } => {
+            losses.push("an enhanced-metal design record is dropped: v2 has no such kind; the layers are kept".into());
+            c.design = None;
+        }
+        _ if d.adapt.is_some() => {
+            losses.push(format!("the substrate adaptation of a {:?} design is dropped; the layers are kept", d.kind));
+            d.adapt = None;
+        }
+        _ => {}
+    }
+}
+
 pub fn to_v2(scene: &Scene3) -> (Scene3, Vec<String>) {
     let mut s = scene.clone();
     let mut losses = Vec::new();
@@ -150,6 +182,7 @@ pub fn to_v2(scene: &Scene3) -> (Scene3, Vec<String>) {
         m.provenance.as_ref().is_some_and(|p| p.note != V2_NOTE) || m.nominal.is_some() || m.form != crate::thinfilm::FilmForm::Bulk
     };
     for_each_coating_mut(&mut s, |c| {
+        design_to_v2(c, &mut losses);
         for (i, layer) in c.layers.iter_mut().enumerate() {
             if sourced(&layer.material) {
                 losses.push(format!("layer {} ({}): provenance, form and nominal value dropped", i + 1, layer.material.name));

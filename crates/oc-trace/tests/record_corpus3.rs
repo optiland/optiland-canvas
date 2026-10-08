@@ -11,7 +11,9 @@
 //!   cargo test -p oc-trace --features trace3 --test record_corpus3 -- --ignored
 //! ```
 //!
-//! and copy the result to `tests/data/pre_profile_corpus3.json`. Running it on
+//! and copy the result to `tests/data/pre_profile_corpus3.json`. Since CF-08
+//! the corpus names the legacy broadband AR `DesignKind::BroadbandArLegacy`;
+//! at 212c747 it is `DesignKind::BroadbandAr`, so rename it in the copy. Running it on
 //! a later commit records that commit's numbers, which is not what C33 holds
 //! the kernel to.
 #![cfg(feature = "trace3")]

@@ -113,7 +113,7 @@ fn c23_a_coating_as_a_body_default_previews() {
     let pmma = 1.4917;
     let id = s.add_fresnel_lens(Vec3::ZERO, 0.0, &FresnelLens1::default(), Material::AbbePoint { nd: pmma, vd: 1e9 }).unwrap();
     let ar = film_coating(
-        CoatingDesign { kind: DesignKind::BroadbandAr, lambda_nm: 550.0, aoi_deg: 0.0, periods: 1, n_high: 2.35, n_low: 1.38 },
+        CoatingDesign { kind: DesignKind::BroadbandArLegacy, lambda_nm: 550.0, aoi_deg: 0.0, periods: 1, n_high: 2.35, n_low: 1.38, adapt: None },
         1.0,
         pmma,
     );
@@ -169,7 +169,7 @@ fn c24_the_preview_holds_to_88_degrees_and_is_flat_beyond() {
     let mut s = Scene3::new();
     let id = s.add_planar_mirror(Vec3::new(0.0, -10.0, 0.0), Vec3::new(0.0, 10.0, 0.0), 0.5).unwrap();
     let dichroic = film_coating(
-        CoatingDesign { kind: DesignKind::LongPass, lambda_nm: 600.0, aoi_deg: 45.0, periods: 8, n_high: 2.35, n_low: 1.46 },
+        CoatingDesign { kind: DesignKind::LongPass, lambda_nm: 600.0, aoi_deg: 45.0, periods: 8, n_high: 2.35, n_low: 1.46, adapt: None },
         1.0,
         1.0,
     );
@@ -207,7 +207,7 @@ fn a_nominal_coating_bakes_a_flat_grid() {
     let mut s = Scene3::new();
     let id = s.add_planar_mirror(Vec3::new(0.0, -10.0, 0.0), Vec3::new(0.0, 10.0, 0.0), 0.5).unwrap();
     let dichroic = film_coating(
-        CoatingDesign { kind: DesignKind::LongPass, lambda_nm: 600.0, aoi_deg: 45.0, periods: 8, n_high: 2.35, n_low: 1.46 },
+        CoatingDesign { kind: DesignKind::LongPass, lambda_nm: 600.0, aoi_deg: 45.0, periods: 8, n_high: 2.35, n_low: 1.46, adapt: None },
         1.0,
         1.0,
     );

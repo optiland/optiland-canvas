@@ -22,7 +22,7 @@ fn coated_v2_scene() -> Scene3 {
     let mirror = metal_mirror(materials::silver(), Some((materials::silica(), 90.0)));
     s.add_coated_plate(Vec3::new(-45.0, 0.0, 0.0), 15.0, 3.0, 120.0, mirror);
     let ar = film_coating(
-        CoatingDesign { kind: DesignKind::BroadbandAr, lambda_nm: 550.0, aoi_deg: 0.0, periods: 1, n_high: 2.35, n_low: 1.38 },
+        CoatingDesign { kind: DesignKind::BroadbandArLegacy, lambda_nm: 550.0, aoi_deg: 0.0, periods: 1, n_high: 2.35, n_low: 1.38, adapt: None },
         1.0,
         1.5168,
     );
@@ -211,4 +211,31 @@ fn nominal_materials_are_the_nominal_constants() {
     // At 0.55 um, where the nominal is taken, the two agree; elsewhere they do not.
     assert!((at(0.55, &ctx) - at(0.55, &dispersive)).abs() < 1e-12);
     assert!((at(0.4, &ctx) - at(0.4, &dispersive)).abs() > 1e-4);
+}
+
+/// A v2 reader knows six design kinds: the v2 export writes an adapted AR as
+/// `SingleLayerAr` and drops an enhanced metal's record, keeping the layers
+/// (CF-08), and says so.
+#[test]
+fn the_v2_export_writes_new_design_kinds_as_old_ones() {
+    use oc_core::synthesis::{DesignAdapt, MetalKind};
+    let mut s = Scene3::default_scene();
+    let base = CoatingDesign { kind: DesignKind::VCoat, lambda_nm: 550.0, aoi_deg: 0.0, periods: 1, n_high: 2.35, n_low: 1.38, adapt: Some(DesignAdapt::visible(1.5168, 0.0)) };
+    let vcoat = film_coating(base, 1.0, 1.5168);
+    let metal = film_coating(CoatingDesign { kind: DesignKind::EnhancedMetal { metal: MetalKind::Silver, pairs: 1 }, ..base }, 1.0, 1.5168);
+    s.add_coated_plate(Vec3::new(-25.0, 0.0, 0.0), 15.0, 3.0, 160.0, vcoat.clone());
+    s.add_coated_plate(Vec3::new(-45.0, 0.0, 0.0), 15.0, 3.0, 120.0, metal.clone());
+    let (v2, losses) = s.to_json_v2();
+    let all = losses.join(" | ");
+    assert!(all.contains("VCoat design is written as SingleLayerAr"), "{all}");
+    assert!(all.contains("enhanced-metal design record is dropped"), "{all}");
+    assert!(!v2.contains("\"adapt\""), "no adapt record in v2");
+    assert!(!v2.contains("VCoat") && !v2.contains("EnhancedMetal"));
+    let old: Scene3 = serde_json::from_str(&v2).unwrap();
+    // The materials lose their provenance on the way, so compare the stack
+    // by its thicknesses.
+    let cs = coatings(&old);
+    let thick = |c: &Coating| c.layers.iter().map(|l| l.thickness_nm).collect::<Vec<_>>();
+    assert!(cs.iter().any(|c| thick(c) == thick(&vcoat) && c.design.map(|d| d.kind) == Some(DesignKind::SingleLayerAr)));
+    assert!(cs.iter().any(|c| thick(c) == thick(&metal) && c.design.is_none()));
 }

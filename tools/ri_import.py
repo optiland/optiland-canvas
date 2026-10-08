@@ -36,6 +36,14 @@ NOMINAL_UM = 0.55
 # key, display name, database path (shelf/book/page), form, note
 ENTRIES = [
     ("magnesium_fluoride", "MgF2 (film)", "main/MgF2/Rodriguez-de Marcos", "Film", ""),
+    (
+        "magnesium_fluoride_bulk",
+        "MgF2 (crystal, o)",
+        "main/MgF2/Dodge-o",
+        "Crystal",
+        "ordinary ray of the bulk crystal, k zero: a hot-deposited AR film sits within about 0.01 of it,"
+        " where the 44 nm film above sits 0.04 higher",
+    ),
     ("silica", "SiO2 (film)", "main/SiO2/Lemarchand", "Film", ""),
     ("alumina", "Al2O3 (film)", "main/Al2O3/Boidin", "Film", "k not measured; zero"),
     ("titania", "TiO2 (film)", "main/TiO2/Siefke", "Film", ""),

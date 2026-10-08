@@ -285,6 +285,7 @@ fn an_ar_coating_on_a_lens_face_passes_more_light() {
         periods: 1,
         n_high: 2.35,
         n_low: n_film,
+        adapt: None,
     };
 
     let measure = |coat: bool| -> f64 {
@@ -337,6 +338,7 @@ fn a_lens_face_can_be_coated_and_stripped_one_side_at_a_time() {
         periods: 1,
         n_high: 2.35,
         n_low: 1.38,
+        adapt: None,
     };
     let mut s = Scene3::default_scene();
     let lens = s.bodies.first().map(|b| b.common.id.0).expect("a singlet");
@@ -391,6 +393,7 @@ fn an_ar_coats_reflection_is_a_ghost_like_bare_glass() {
                 periods: 1,
                 n_high: 2.35,
                 n_low: 1.38,
+                adapt: None,
             };
             for face in [BodyFace::Front, BodyFace::Back] {
                 assert!(s.set_body_face_coating(lens, face, Some(d)), "{face:?} coats");
@@ -405,7 +408,7 @@ fn an_ar_coats_reflection_is_a_ghost_like_bare_glass() {
     };
 
     let bare = trace_scene3(&scene(None), &ghosts(false));
-    for kind in [DesignKind::SingleLayerAr, DesignKind::BroadbandAr] {
+    for kind in [DesignKind::SingleLayerAr, DesignKind::BroadbandArLegacy] {
         let s = scene(Some(kind));
 
         // Ghosts off: the coated lens draws exactly the rays the bare one does,
@@ -485,6 +488,7 @@ fn a_broadband_ar_beats_a_single_layer_on_the_way_out_too() {
                 periods: 1,
                 n_high: 2.35,
                 n_low: 1.38,
+                adapt: None,
             };
             for face in [BodyFace::Front, BodyFace::Back] {
                 assert!(s.set_body_face_coating(lens, face, Some(d)));
@@ -496,7 +500,7 @@ fn a_broadband_ar_beats_a_single_layer_on_the_way_out_too() {
     };
     let bare = through(None);
     let one = through(Some(DesignKind::SingleLayerAr));
-    let three = through(Some(DesignKind::BroadbandAr));
+    let three = through(Some(DesignKind::BroadbandArLegacy));
     assert!(one > bare, "a single layer helps: {one} vs {bare}");
     assert!(three > one, "and three help more: {three} vs {one}");
     // A broadband AR on both faces leaves about a percent of the light, where
@@ -533,6 +537,7 @@ fn total_internal_reflection_at_a_coated_face_is_still_the_ray() {
                 periods: 1,
                 n_high: 2.35,
                 n_low: 1.38,
+                adapt: None,
             };
             for face in [BodyFace::Front, BodyFace::Back] {
                 assert!(s.set_body_face_coating(id.0, face, Some(d)));
@@ -553,7 +558,7 @@ fn total_internal_reflection_at_a_coated_face_is_still_the_ray() {
     let bare = trace3(&lens(None), &ray, &no_ghosts());
     assert!(bare.segments[1].flags.tir, "the bare lens reflects it totally");
 
-    for kind in [DesignKind::SingleLayerAr, DesignKind::BroadbandAr] {
+    for kind in [DesignKind::SingleLayerAr, DesignKind::BroadbandArLegacy] {
         let coated = trace3(&lens(Some(kind)), &ray, &no_ghosts());
         assert_eq!(
             coated.segments.len(),
@@ -586,4 +591,39 @@ fn total_internal_reflection_at_a_coated_face_is_still_the_ray() {
         );
         assert!(coated.ledger.residual() < 1e-12);
     }
+}
+
+/// A face coated with a substrate-adapted design follows the glass: change the
+/// lens to a dense flint and the matched layer, the recorded substrate and the
+/// design point all move. A fixed recipe on the other face keeps its layers
+/// (coating-fidelity spec CF-08).
+#[test]
+fn an_adapted_face_is_resynthesized_when_the_glass_changes() {
+    use oc_core::build3::BodyFace;
+    use oc_core::synthesis::DesignAdapt;
+    use oc_core::thinfilm::DesignKind;
+
+    let fixed = CoatingDesign { kind: DesignKind::SingleLayerAr, lambda_nm: 550.0, aoi_deg: 0.0, periods: 1, n_high: 2.35, n_low: 1.38, adapt: None };
+    let adapted = CoatingDesign { kind: DesignKind::Bbar, adapt: Some(DesignAdapt::visible(f64::NAN, 0.0)), ..fixed };
+    let mut s = Scene3::default_scene();
+    let lens = s.bodies.first().map(|b| b.common.id.0).expect("a singlet");
+    assert!(s.set_body_face_coating(lens, BodyFace::Front, Some(adapted)));
+    assert!(s.set_body_face_coating(lens, BodyFace::Back, Some(fixed)));
+
+    let front = |s: &Scene3| s.body_face_coating(lens, BodyFace::Front).cloned().expect("front coated");
+    let back = |s: &Scene3| s.body_face_coating(lens, BodyFace::Back).cloned().expect("back coated");
+    let (crown_front, crown_back) = (front(&s), back(&s));
+    let a = crown_front.design.and_then(|d| d.adapt).expect("adapt kept");
+    assert!((a.substrate_n - 1.5).abs() < 0.05, "solved on the crown: {}", a.substrate_n);
+    let [r, _] = a.design_point.expect("design point recorded");
+    assert!(r < 0.01, "R at the design point on crown: {r}");
+
+    assert!(s.set_body_glass_abbe(lens, 1.9229, 20.88));
+    let (flint_front, flint_back) = (front(&s), back(&s));
+    let b = flint_front.design.and_then(|d| d.adapt).expect("adapt kept");
+    assert!((b.substrate_n - 1.92).abs() < 0.03, "solved on the flint: {}", b.substrate_n);
+    assert_ne!(crown_front.layers, flint_front.layers, "the matched layer moves with the glass");
+    let [r, _] = b.design_point.expect("design point recorded");
+    assert!(r < 0.01, "R at the design point on flint: {r}");
+    assert_eq!(crown_back.layers, flint_back.layers, "a fixed recipe keeps its layers");
 }

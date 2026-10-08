@@ -1462,12 +1462,13 @@ fn an_ar_coated_lens_reflects_ghosts_like_f64() {
     let mut scene = Scene3::new();
     let lens = scene.add_singlet(Vec3::ZERO, SingletGeom::biconvex(), 1.5168, 64.17);
     let ar = CoatingDesign {
-        kind: DesignKind::BroadbandAr,
+        kind: DesignKind::BroadbandArLegacy,
         lambda_nm: 550.0,
         aoi_deg: 0.0,
         periods: 1,
         n_high: 2.35,
         n_low: 1.38,
+        adapt: None,
     };
     for face in [BodyFace::Front, BodyFace::Back] {
         assert!(scene.set_body_face_coating(lens.0, face, Some(ar)));

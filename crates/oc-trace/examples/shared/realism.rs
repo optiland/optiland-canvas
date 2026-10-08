@@ -22,7 +22,8 @@ use oc_core::material::{Glass, Sellmeier};
 use oc_core::scene3::{
     AbsorptionModel, FigureError, Interpolation, OutOfRangePolicy, Scene3, SurfaceResponse,
 };
-use oc_core::thinfilm::{materials, metal_mirror, Coating, CoatingBacking, FilmLayer, Incidence};
+use oc_core::synthesis::MetalKind;
+use oc_core::thinfilm::{materials, metal_mirror, Coating, CoatingBacking, CoatingDesign, DesignKind, FilmLayer, Incidence};
 
 const MATERIALS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/heliostat-lightpipe/materials/");
 
@@ -97,6 +98,11 @@ pub fn low_iron_glass() -> Glass {
 /// "enhanced silver": 99.1% of the light by the eye's weighting at normal
 /// incidence, 98.7% at 45 degrees, 97.6% at 380 nm, and silver's own 99% in
 /// the infrared. Ta2O5 rather than TiO2 because TiO2 absorbs below 400 nm.
+///
+/// The layers are the studies' fixed recipe (constant indices, so every number
+/// they quote still holds); the design record names what it is, an enhanced
+/// metal with one pair at 520 nm, which the editor shows and
+/// `oc_core::synthesis` can rebuild from the catalogue.
 pub fn enhanced_silver() -> Coating {
     Coating {
         layers: vec![
@@ -106,7 +112,15 @@ pub fn enhanced_silver() -> Coating {
         ],
         backing: CoatingBacking::Medium,
         incidence: Incidence::Film,
-        design: None,
+        design: Some(CoatingDesign {
+            kind: DesignKind::EnhancedMetal { metal: MetalKind::Silver, pairs: 1 },
+            lambda_nm: 520.0,
+            aoi_deg: 0.0,
+            periods: 1,
+            n_high: 2.10,
+            n_low: 1.46,
+            adapt: None,
+        }),
     }
 }
 

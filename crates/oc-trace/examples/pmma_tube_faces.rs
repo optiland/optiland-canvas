@@ -81,6 +81,7 @@ fn main() {
                 periods: 1,
                 n_high: 2.35,
                 n_low: 1.38,
+                adapt: None,
             },
             1.0,
             pmma.index(0.55),

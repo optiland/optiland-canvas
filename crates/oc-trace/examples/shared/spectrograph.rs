@@ -2650,12 +2650,13 @@ fn field_lens(s: &mut Scene3, centre: Vec3, axis: Vec3, d: &Design, radius: f64)
         super::realism::absorb(s, id, "pmma");
         // Both faces carry the lens's broadband AR coat.
         let ar = oc_core::thinfilm::CoatingDesign {
-            kind: oc_core::thinfilm::DesignKind::BroadbandAr,
+            kind: oc_core::thinfilm::DesignKind::BroadbandArLegacy,
             lambda_nm: 550.0,
             aoi_deg: 0.0,
             periods: 1,
             n_high: 2.35,
             n_low: 1.38,
+            adapt: None,
         };
         let film = oc_core::thinfilm::film_coating(ar, 1.0, n);
         if let Some(body) = s.bodies.iter_mut().find(|q| q.common.id.0 == id) {
@@ -2734,12 +2735,13 @@ fn projection_lens(s: &mut Scene3, first_vertex: Vec3, axis: Vec3, up: Vec3, pro
         before_air = after_air;
     }
     let ar = oc_core::thinfilm::CoatingDesign {
-        kind: oc_core::thinfilm::DesignKind::BroadbandAr,
+        kind: oc_core::thinfilm::DesignKind::BroadbandArLegacy,
         lambda_nm: 550.0,
         aoi_deg: 0.0,
         periods: 1,
         n_high: 2.35,
         n_low: 1.38,
+        adapt: None,
     };
     let catalog = &built.scene.catalog;
     for (k, mut b) in built.scene.bodies.clone().into_iter().enumerate() {
@@ -3056,12 +3058,13 @@ fn lamp_arm(s: &mut Scene3, lamp: &Lamp, ls: &LampSlit, glass: oc_core::material
     // (bare, 4% lost at each). `LAMP_AR=0` leaves them bare.
     if knob("LAMP_AR", 1.0) > 0.5 {
         let ar = oc_core::thinfilm::CoatingDesign {
-            kind: oc_core::thinfilm::DesignKind::BroadbandAr,
+            kind: oc_core::thinfilm::DesignKind::BroadbandArLegacy,
             lambda_nm: 550.0,
             aoi_deg: 0.0,
             periods: 1,
             n_high: 2.35,
             n_low: 1.38,
+            adapt: None,
         };
         for face in [oc_core::build3::BodyFace::Front, oc_core::build3::BodyFace::Back] {
             assert!(s.set_body_face_coating(lens.0, face, Some(ar)), "the lamp lens's AR coat");

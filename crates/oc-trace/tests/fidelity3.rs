@@ -46,6 +46,7 @@ fn ar_window() -> (Scene3, oc_core::id::ObjectId, oc_core::id::ObjectId, oc_core
             periods: 3,
             n_high: 2.35,
             n_low: 1.46,
+            adapt: None,
         },
         1.0,
         1.0,

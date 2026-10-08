@@ -2907,20 +2907,16 @@ impl Canvas {
 
         let design = match &coating.design {
             Some(d) => format!(
-                "{{\"kind\":\"{}\",\"lambdaNm\":{},\"aoiDeg\":{},\"periods\":{},\"nHigh\":{},\"nLow\":{}}}",
-                match d.kind {
-                    DesignKind::QuarterWaveStack => "mirror",
-                    DesignKind::Polarizing => "polarizing",
-                    DesignKind::LongPass => "long-pass",
-                    DesignKind::ShortPass => "short-pass",
-                    DesignKind::SingleLayerAr => "ar-1",
-                    DesignKind::BroadbandAr => "ar-3",
-                },
+                "{{\"kind\":\"{}\",\"lambdaNm\":{},\"aoiDeg\":{},\"periods\":{},\"nHigh\":{},\"nLow\":{},\"adapt\":{}}}",
+                design_kind_name(d),
                 json_num(d.lambda_nm),
                 json_num(d.aoi_deg),
                 d.periods,
                 json_num(d.n_high),
-                json_num(d.n_low)
+                json_num(d.n_low),
+                // What an adapted design was adapted to and its R and T at the
+                // design point; null for a fixed recipe.
+                serde_json::to_string(&d.adapt).unwrap_or_else(|_| "null".into())
             ),
             None => "null".into(),
         };
@@ -2992,14 +2988,9 @@ impl Canvas {
         n_high: f64,
         n_low: f64,
     ) -> bool {
-        use oc_core::thinfilm::{CoatingDesign, DesignKind};
-        let kind = match kind {
-            "long-pass" => DesignKind::LongPass,
-            "short-pass" => DesignKind::ShortPass,
-            "mirror" => DesignKind::QuarterWaveStack,
-            "ar-1" => DesignKind::SingleLayerAr,
-            "ar-3" => DesignKind::BroadbandAr,
-            _ => return false,
+        use oc_core::thinfilm::CoatingDesign;
+        let Some((kind, adapt)) = design_kind_named(kind, periods, aoi_deg) else {
+            return false;
         };
         let design = CoatingDesign {
             kind,
@@ -3008,6 +2999,7 @@ impl Canvas {
             periods,
             n_high,
             n_low,
+            adapt,
         };
         let Some(scene) = self.scene3.as_mut() else {
             return false;
@@ -3040,7 +3032,7 @@ impl Canvas {
         lambda_nm: f64,
     ) -> bool {
         use oc_core::build3::BodyFace;
-        use oc_core::thinfilm::{CoatingDesign, DesignKind};
+        use oc_core::thinfilm::CoatingDesign;
         let face = match face {
             "front" => BodyFace::Front,
             "back" => BodyFace::Back,
@@ -3049,13 +3041,8 @@ impl Canvas {
         let design = match kind {
             "none" => None,
             _ => {
-                let kind = match kind {
-                    "ar-1" => DesignKind::SingleLayerAr,
-                    "ar-3" => DesignKind::BroadbandAr,
-                    "mirror" => DesignKind::QuarterWaveStack,
-                    "long-pass" => DesignKind::LongPass,
-                    "short-pass" => DesignKind::ShortPass,
-                    _ => return false,
+                let Some((kind, adapt)) = design_kind_named(kind, 2, 0.0) else {
+                    return false;
                 };
                 Some(CoatingDesign {
                     kind,
@@ -3067,6 +3054,7 @@ impl Canvas {
                     periods: 4,
                     n_high: 2.35,
                     n_low: 1.38,
+                    adapt,
                 })
             }
         };
@@ -3087,7 +3075,6 @@ impl Canvas {
     #[wasm_bindgen(js_name = lensFaceCoatingsJSON)]
     pub fn lens_face_coatings_json(&self, id: f64) -> String {
         use oc_core::build3::BodyFace;
-        use oc_core::thinfilm::DesignKind;
         let Some(scene) = self.scene3.as_ref() else {
             return "null".into();
         };
@@ -3096,15 +3083,7 @@ impl Canvas {
                 None => "null".into(),
                 Some(c) => format!(
                     "\"{}\"",
-                    match c.design.map(|d| d.kind) {
-                        Some(DesignKind::SingleLayerAr) => "ar-1",
-                        Some(DesignKind::BroadbandAr) => "ar-3",
-                        Some(DesignKind::QuarterWaveStack) => "mirror",
-                        Some(DesignKind::Polarizing) => "polarizing",
-                        Some(DesignKind::LongPass) => "long-pass",
-                        Some(DesignKind::ShortPass) => "short-pass",
-                        None => "film",
-                    }
+                    c.design.as_ref().map_or("film", design_kind_name)
                 ),
             }
         };
@@ -4410,6 +4389,57 @@ pub(crate) fn pack_world_iter(segs: &mut dyn Iterator<Item = oc_gpu::cpu3::SegOu
 
 /// A finite number for JSON, or `null`. `serde_json` refuses NaN and infinity,
 /// and a silent `0` there would be a lie about a measurement that failed.
+/// The editor's name for a coating design.
+fn design_kind_name(d: &oc_core::thinfilm::CoatingDesign) -> &'static str {
+    use oc_core::synthesis::MetalKind;
+    use oc_core::thinfilm::DesignKind;
+    match d.kind {
+        DesignKind::QuarterWaveStack => "mirror",
+        DesignKind::Polarizing => "polarizing",
+        DesignKind::LongPass => "long-pass",
+        DesignKind::ShortPass => "short-pass",
+        DesignKind::SingleLayerAr if d.adapt.is_some() => "ar-matched",
+        DesignKind::SingleLayerAr => "ar-1",
+        DesignKind::BroadbandArLegacy => "ar-3",
+        DesignKind::VCoat => "ar-v",
+        DesignKind::Bbar => "ar-bbar",
+        DesignKind::BandAr => "ar-band",
+        DesignKind::EnhancedMetal { metal: MetalKind::Silver, .. } => "enhanced-silver",
+        DesignKind::EnhancedMetal { metal: MetalKind::Aluminium, .. } => "enhanced-aluminium",
+        DesignKind::EnhancedMetal { metal: MetalKind::Gold, .. } => "enhanced-gold",
+    }
+}
+
+/// The design an editor name asks for, and for a substrate-adapted kind what
+/// it is adapted to: the visible at the design angle, the substrate filled in
+/// when the coating is built. `periods` is the number of high/low pairs over
+/// an enhanced metal. None for a name the editor does not offer.
+fn design_kind_named(
+    name: &str,
+    periods: u32,
+    aoi_deg: f64,
+) -> Option<(oc_core::thinfilm::DesignKind, Option<oc_core::synthesis::DesignAdapt>)> {
+    use oc_core::synthesis::{DesignAdapt, MetalKind};
+    use oc_core::thinfilm::DesignKind;
+    let adapted = Some(DesignAdapt::visible(f64::NAN, aoi_deg));
+    let metal = |metal| (DesignKind::EnhancedMetal { metal, pairs: periods.clamp(1, 20) }, adapted);
+    Some(match name {
+        "long-pass" => (DesignKind::LongPass, None),
+        "short-pass" => (DesignKind::ShortPass, None),
+        "mirror" => (DesignKind::QuarterWaveStack, None),
+        "ar-1" => (DesignKind::SingleLayerAr, None),
+        "ar-3" => (DesignKind::BroadbandArLegacy, None),
+        "ar-matched" => (DesignKind::SingleLayerAr, adapted),
+        "ar-v" => (DesignKind::VCoat, adapted),
+        "ar-bbar" => (DesignKind::Bbar, adapted),
+        "ar-band" => (DesignKind::BandAr, adapted),
+        "enhanced-silver" => metal(MetalKind::Silver),
+        "enhanced-aluminium" => metal(MetalKind::Aluminium),
+        "enhanced-gold" => metal(MetalKind::Gold),
+        _ => return None,
+    })
+}
+
 fn json_num(v: f64) -> String {
     if v.is_finite() {
         format!("{v}")

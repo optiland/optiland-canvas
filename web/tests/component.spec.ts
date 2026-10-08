@@ -352,13 +352,40 @@ test.describe("component view — coating a lens", () => {
 
     // The control follows whichever face is selected, so coating twice needs
     // the face buttons in between, the same way R and k do.
-    await page.locator('#componentInset button[data-value="ar-3"]').click();
-    expect((await faces()).front).toBe("ar-3");
+    await page.locator('#componentInset button[data-value="ar-bbar"]').click();
+    expect((await faces()).front).toBe("ar-bbar");
     expect((await faces()).back).toBeNull();
-    await expect(page.locator("#componentInset .cv-read")).toContainText("AR ×3 / bare");
+    await expect(page.locator("#componentInset .cv-read")).toContainText("AR ×3 fit / bare");
 
     const oneFace = await flux();
     expect(oneFace).toBeGreaterThan(bare);
+
+    // The fitted AR is solved for this lens's glass, and solved again when the
+    // glass changes (coating-fidelity spec CF-08).
+    const adapt = () =>
+      page.evaluate(
+        (i) => JSON.parse((window as unknown as { __ocDebug: any }).__ocDebug.scene.surfaceFilmJSON(i)).design.adapt,
+        id,
+      );
+    const setGlass = (nd: number, vd: number) =>
+      page.evaluate(
+        ([i, n, v]) => (window as unknown as { __ocDebug: any }).__ocDebug.scene.setBodyGlassAbbe(i, n, v),
+        [id, nd, vd],
+      );
+    const glass = await page.evaluate(
+      (i) => JSON.parse((window as unknown as { __ocDebug: any }).__ocDebug.scene.bodyGlassJSON(i)),
+      id,
+    );
+    const crown = await adapt();
+    expect(crown.substrate_n).toBeLessThan(1.6);
+    expect(crown.design_point[0]).toBeLessThan(0.01);
+    await setGlass(1.9229, 20.88);
+    const flint = await adapt();
+    expect(flint.substrate_n).toBeGreaterThan(1.9);
+    expect(flint.design_point[0]).toBeLessThan(0.01);
+    expect((await faces()).front).toBe("ar-bbar");
+    await setGlass(glass.nd, glass.vd);
+    expect((await adapt()).substrate_n).toBeCloseTo(crown.substrate_n, 12);
 
     // And the lens keeps its own editor once it is coated, rather than being
     // taken for a coated plate.
@@ -388,7 +415,7 @@ test.describe("component view — coating a lens", () => {
       });
     const bare = await drawn();
 
-    for (const kind of ["ar-1", "ar-3"]) {
+    for (const kind of ["ar-1", "ar-bbar", "ar-3"]) {
       await page.locator(`#componentInset button[data-value="${kind}"]`).click();
       await expect(page.locator("#stat")).toContainText("segs");
       // The preview draws the picture and the exact trace the numbers; both

@@ -141,7 +141,7 @@ mod tests {
     #[test]
     fn every_entry_builds_and_says_where_it_came_from() {
         let all = builtin();
-        assert_eq!(all.len(), 16);
+        assert_eq!(all.len(), 17);
         for (key, m) in &all {
             let p = m.provenance.as_ref().expect("provenance");
             assert_eq!(p.source_kind, SourceKind::Database, "{key}");

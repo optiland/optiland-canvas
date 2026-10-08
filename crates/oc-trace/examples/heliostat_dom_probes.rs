@@ -332,11 +332,11 @@ fn face_probe(s: &mut Scene3, parent: u64, side: f64, name: &'static str) -> Pro
 /// `EYE_AR_NM` (650).
 fn eye_ar() -> CoatingDesign {
     let kind = match std::env::var("EYE_AR").as_deref() {
-        Ok("bbar") => DesignKind::BroadbandAr,
+        Ok("bbar") => DesignKind::BroadbandArLegacy,
         Ok(other) if other != "single" => panic!("EYE_AR: single or bbar, not {other}"),
         _ => DesignKind::SingleLayerAr,
     };
-    CoatingDesign { kind, lambda_nm: env_f64("EYE_AR_NM", 650.0), aoi_deg: 0.0, periods: 1, n_high: 2.1, n_low: 1.38 }
+    CoatingDesign { kind, lambda_nm: env_f64("EYE_AR_NM", 650.0), aoi_deg: 0.0, periods: 1, n_high: 2.1, n_low: 1.38, adapt: None }
 }
 
 /// An air-spaced doublet eyepiece (`EYE_DESIGN`): two glasses (Sellmeier),
@@ -531,7 +531,7 @@ fn build(kind: TubeKind) -> (Scene3, Vec<Probe>) {
     // `FRESNEL_SLOPE` (0 mrad): a figure error on the Fresnel lens's faces, for the tolerance study.
     realism::slope(&mut s, f, env_f64("FRESNEL_SLOPE", 0.0));
     let film = oc_core::thinfilm::film_coating(
-        CoatingDesign { kind: DesignKind::SingleLayerAr, lambda_nm: 550.0, aoi_deg: 0.0, periods: 1, n_high: 2.35, n_low: 1.38 },
+        CoatingDesign { kind: DesignKind::SingleLayerAr, lambda_nm: 550.0, aoi_deg: 0.0, periods: 1, n_high: 2.35, n_low: 1.38, adapt: None },
         1.0,
         pmma.index(0.55),
     );
@@ -716,7 +716,7 @@ fn build(kind: TubeKind) -> (Scene3, Vec<Probe>) {
                     assert!(!(ar_faces.contains(&OUTER) && outer_set), "TUBE_AR outer and TUBE_OUTER both coat the outer face");
                     for &face in ar_faces {
                         let mut c = oc_core::thinfilm::film_coating(
-                            CoatingDesign { kind: DesignKind::SingleLayerAr, lambda_nm: 550.0, aoi_deg: 0.0, periods: 1, n_high: 2.35, n_low: 1.38 },
+                            CoatingDesign { kind: DesignKind::SingleLayerAr, lambda_nm: 550.0, aoi_deg: 0.0, periods: 1, n_high: 2.35, n_low: 1.38, adapt: None },
                             1.0,
                             pmma.index(0.55),
                         );

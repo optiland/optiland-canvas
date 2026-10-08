@@ -275,35 +275,56 @@ drags, changing the thickness of the layer to its left.
 
 ## Coating a lens
 
-Select a lens in the component view and each face takes one of two
-antireflection coatings, following whichever face is selected the same way `R`
-and `k` do. A real lens is coated a face at a time and the two are often
-different.
+Select a lens in the component view and each face takes an antireflection
+coating, following whichever face is selected the same way `R` and `k` do. A
+real lens is coated a face at a time and the two are often different.
 
-Both are solved against **that lens's own glass**: the same three layers on
+Every one is solved against **that lens's own glass**: the same three layers on
 crown and on flint are not the same coating, because what a stack reflects
 depends on what it is sitting on. They are designed at 550 nm on axis, which is
 where a general-purpose AR is centred and how a lens face is used. A face meant
 for 45 degrees is a different part.
 
-What it is worth, for the default singlet:
+| button | design | what it is |
+|---|---|---|
+| AR ×1 | `SingleLayerAr` | a quarter wave of MgF₂ at the constant 1.38 |
+| ×1 fit | `SingleLayerAr` + `adapt` | the catalogue film nearest √(n₀ n_s), a quarter wave |
+| V | `VCoat` | SiO₂ over TiO₂ with an exact null at 550 nm, narrow |
+| ×3 fit | `Bbar` + `adapt` | MgF₂, a half wave of Ta₂O₅, and a quarter matched to the glass |
+| band | `BandAr` + `adapt` | the same three refined over 400 to 700 nm |
+| ×3 nominal | `BroadbandArLegacy` | nominal, not adapted: the old preset, kept so old documents read the same |
 
-| face | reflects at 550 nm |
-|---|---|
-| bare crown | 4.2% |
-| single quarter wave of MgF₂ | 1.3% |
-| quarter-half-quarter | lower again, and flatter across the visible |
+The fitted designs (`crates/oc-core/src/synthesis.rs`) take their films from
+the catalogue at their index at the design wavelength, and **are solved again
+when the lens's glass changes**; a fixed recipe keeps its layers. A fitted AR
+is never worse over its band than the fitted single layer: when the three
+layers would be, it falls back to two, then one. On N-SF66 the matched
+quarter wants an index near 1.8 that no catalogue film has, so `×3 fit` there
+is MgF₂ over HfO₂.
 
-Through the default scene, to the detector:
+Through the default scene, both faces coated, to the detector:
 
-| both faces | passes |
-|---|---|
-| bare | 0.917 |
-| AR ×1 | 0.971 |
-| AR ×3 | 0.987 |
+| both faces | crown (default singlet) | N-SF66 (n_d 1.923) |
+|---|---|---|
+| bare | 0.917 | 0.807 |
+| AR ×1 | 0.971 | 0.987 |
+| ×1 fit | 0.972 | 0.987 |
+| V | 0.950 | 0.973 |
+| ×3 fit | 0.991 | 0.990 |
+| band | 0.996 | 0.991 |
+| ×3 nominal | 0.987 | **0.936** |
 
-The five percent that stops bouncing around inside the instrument is the
-reason coatings exist.
+The last row is the reason this table exists. The old three-layer preset is a
+quarter-half-quarter of constant indices that ignores the glass: on N-SF66 it
+passes less than one MgF₂ layer. At its 650 nm design wavelength it reflects
+8.1% of 400 to 700 nm per face (the 8 October eyepiece study, held as a
+regression in C25). The V-coat is a laser-line part: an exact null at one
+wavelength, and more than a single layer over the visible.
+
+MgF₂ is taken at the bulk crystal's ordinary index (1.378 at 550 nm), which a
+hot-deposited AR layer sits near. The catalogue's MgF₂ film is a 44 nm sample
+that reads 1.423; designed with that number, the fitted single layer passes
+0.954 on crown, worse than the constant it replaces.
 
 **What an AR coat still reflects is a ghost.** It is the residual the coating
 failed to suppress, stray light for exactly the reason bare glass's reflection
@@ -448,18 +469,19 @@ to 1e-9 (C15) and the deposits sum to the ledger to 1e-10 (C16).
   A **polarizing beam splitter** as a part is still missing, and so is any
   source that emits polarized light without a polarizer in front of it.
 - **Anything but an AR on a lens, from the app.** The core will put any design
-  on either face of any revolved body, and the lens editor offers the two ARs,
-  which is what a lens is coated with. A mirror or an edge filter on a lens
-  face needs `setLensFaceCoating` from script.
+  on either face of any revolved body, and the lens editor offers the ARs,
+  which is what a lens is coated with. A mirror, an enhanced metal or an edge
+  filter on a lens face needs `setLensFaceCoating` from script.
 - **Wedged plates.** Both faces are parallel. A wedge, which is how real
   beamsplitters push their ghost out of the way, is not authorable.
 - **Scatter at the rim.** A ray that leaves through the edge of the glass is
   traced as glass, not as the ground edge it would really meet.
-- **Dispersive films.** Layer indices are `SpectralScalar`, so a measured `n(λ)`
-  serializes and traces, but the presets are constants. Real films disperse by a
-  percent or two.
-- **Optimized designs.** No needle optimization, no matching sections. The
-  synthesized stacks are textbook quarter-wave designs and behave like them.
+- **Optimized designs beyond the band AR.** `BandAr` is a bounded,
+  deterministic Nelder-Mead over thicknesses only: no needle optimization, no
+  matching sections, no material changes. A solar AR on low-iron glass reaches
+  0.475 of bare glass over 0.4 to 2.5 µm and 0 to 40 degrees (C27); a lower
+  floor needs a film below MgF₂, such as porous silica, which the catalogue
+  does not have.
 - **Optiland export.** A film has no place in a v1 `SurfaceSpec`, and
   `planar_reduce` refuses to reduce one rather than picking an angle and baking
   it in.

@@ -785,12 +785,13 @@ fn an_ar_coat_reflects_ghosts_like_cpu() {
         return;
     };
     let ar = CoatingDesign {
-        kind: DesignKind::BroadbandAr,
+        kind: DesignKind::BroadbandArLegacy,
         lambda_nm: 550.0,
         aoi_deg: 0.0,
         periods: 1,
         n_high: 2.35,
         n_low: 1.38,
+        adapt: None,
     };
 
     // A coated lens: the body-face path.

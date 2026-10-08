@@ -388,6 +388,7 @@ fn build_prescription(
                     ChildRole::Reflect => SeqAction::Reflect,
                     ChildRole::Tir => SeqAction::Tir,
                     ChildRole::ThinLens => SeqAction::ThinLens,
+                    ChildRole::Diffract => SeqAction::Diffract,
                 };
                 let split = children.len() > 1;
                 let arc = (e.point - prev_point).length();

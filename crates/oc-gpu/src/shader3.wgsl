@@ -177,10 +177,15 @@ const RESP_MIRROR: u32 = 1u;
 const RESP_DIELECTRIC: u32 = 2u;
 const RESP_EXPLICIT_RT: u32 = 3u;
 const RESP_THIN_LENS: u32 = 4u;
+// A diffraction grating: `r` the working order's efficiency, `t` the zero
+// order's, `ar.value` the order times the groove density per um.
+const RESP_GRATING: u32 = 6u;
 const RESP_COATING: u32 = 5u;
 // Response.flags: the reflection is stray light (an AR coat's residual), so a
 // ghost like bare glass's. Must match buffers3::RESP_FLAG_STRAY.
 const RESP_FLAG_STRAY: u32 = 1u;
+// A transmission grating. Must match buffers3::RESP_FLAG_TRANSMIT.
+const RESP_FLAG_TRANSMIT: u32 = 2u;
 
 // A baked thin-film coating. `resp.t` holds the wavelength axis (tab_count
 // entries at tab_start, x = lambda) and `resp.r` the grid itself: COAT_ANGLES
@@ -1344,6 +1349,32 @@ fn interact_surface(w: Work, ev: Event, point: vec3<f32>, flux_end: f32, lambda:
             dir = srot * normalize(vec3<f32>(dl.x - abs(dl.z) * pl.x / fl, dl.y - abs(dl.z) * pl.y / fl, dl.z));
         }
         push(Work(point + dir * EPS, dir, flux_end, w.depth + 1u, w.gdepth, w.medium_n, w.medium_alpha, w.flags & ~SEG_TIR), min_flux);
+    } else if (kind == RESP_GRATING) {
+        // The grating equation in the surface's frame (mirrors tracer3): the
+        // working order shifts the direction cosine across the grooves by
+        // k * lambda; the zero order is the mirror or the straight beam.
+        let es = sample_spectral(resp.r, lambda);
+        let zs = sample_spectral(resp.t, lambda);
+        let em = select(0.0, clamp(es.x, 0.0, 1.0), es.y > 0.5);
+        let e0 = select(0.0, clamp(zs.x, 0.0, 1.0), zs.y > 0.5);
+        let over = max(em + e0, 1.0);
+        let transmit = (resp.flags & RESP_FLAG_TRANSMIT) != 0u;
+        let srot = surface_rot(s);
+        let dl = transpose(srot) * w.d;
+        let tx = dl.x + resp.ar.value * lambda;
+        let t2 = tx * tx + dl.y * dl.y;
+        if (em > 0.0 && t2 < 1.0) {
+            let ahead = select(-1.0, 1.0, dl.z >= 0.0);
+            let nz = sqrt(1.0 - t2);
+            let z = select(-ahead * nz, ahead * nz, transmit);
+            let dir = normalize(srot * vec3<f32>(tx, dl.y, z));
+            push(Work(point + dir * EPS, dir, flux_end * em / over, w.depth + 1u, w.gdepth, w.medium_n, w.medium_alpha, w.flags & ~SEG_TIR), min_flux);
+        }
+        if (e0 > 0.0) {
+            var dir = w.d;
+            if (!transmit) { dir = reflect3(w.d, n_oppose); }
+            push(Work(point + dir * EPS, dir, flux_end * e0 / over, w.depth + 1u, w.gdepth, w.medium_n, w.medium_alpha, w.flags & ~SEG_TIR), min_flux);
+        }
     } else if (kind == RESP_MIRROR) {
         // A table with no value at `lambda` ends the branch.
         let rs = sample_spectral(resp.r, lambda);

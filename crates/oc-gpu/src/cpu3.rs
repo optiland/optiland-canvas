@@ -586,6 +586,52 @@ fn interact_surface(
                 transmit(stack, flux_end * t);
             }
         }
+        GpuResponse::Grating {
+            k,
+            eta,
+            zero,
+            transmit,
+        } => {
+            // The grating equation in the surface's frame (mirrors tracer3):
+            // the working order shifts the direction cosine across the
+            // grooves by k·λ; the zero order is the mirror or the straight
+            // beam; the rest is absorbed.
+            let em = eta.sample(lambda).unwrap_or(0.0).clamp(0.0, 1.0);
+            let e0 = zero.sample(lambda).unwrap_or(0.0).clamp(0.0, 1.0);
+            let over = (em + e0).max(1.0);
+            let rt = s.rot.transpose();
+            let dl = rt * w.d;
+            let tx = dl.x + k * lambda;
+            let t2 = tx * tx + dl.y * dl.y;
+            let go = |stack: &mut Vec<Work>, dir: Vec3, flux: f32| {
+                push(
+                    stack,
+                    Work {
+                        o: point + dir * EPS,
+                        d: dir,
+                        flux,
+                        depth: w.depth + 1,
+                        gdepth: w.gdepth,
+                        medium_n: w.medium_n,
+                        medium_alpha: w.medium_alpha,
+                        flags: w.flags & !SEG_TIR,
+                    },
+                    max_depth,
+                    min_flux,
+                );
+            };
+            if em > 0.0 && t2 < 1.0 {
+                let ahead = if dl.z >= 0.0 { 1.0 } else { -1.0 };
+                let nz = (1.0 - t2).sqrt();
+                let z = if *transmit { ahead * nz } else { -ahead * nz };
+                let dir = (s.rot * Vec3::new(tx, dl.y, z)).normalize();
+                go(stack, dir, flux_end * em / over);
+            }
+            if e0 > 0.0 {
+                let dir = if *transmit { w.d } else { reflect(w.d, n_oppose) };
+                go(stack, dir, flux_end * e0 / over);
+            }
+        }
         GpuResponse::ThinLens { f } => {
             // Ideal-lens slope law u' = u − h/f in the surface's local frame
             // (direction-aware; mirrors tracer3's f64 branch). Full
@@ -654,6 +700,16 @@ fn record_detector(out: &mut DetReadout3, d: &GpuDetector3, uv: Vec2, dir: Vec3,
 fn direction_cell(d: &GpuDetector3, dir_local: Vec3) -> Option<usize> {
     let (cone, rings, sectors) = d.measure.direction_grid()?;
     let cone = cone as f32;
+    if d.measure.direction_layout() == Some(oc_core::scene3::DirectionLayout::Grid) {
+        let (nu, nv) = (rings, sectors);
+        let z = dir_local.z.abs();
+        let (au, av) = (dir_local.x.atan2(z), dir_local.y.atan2(z));
+        if au.abs() > cone || av.abs() > cone {
+            return None;
+        }
+        let cell = |a: f32, n: usize| (((a + cone) / (2.0 * cone) * n as f32) as usize).min(n - 1);
+        return Some(cell(av, nv) * nu + cell(au, nu));
+    }
     let theta = dir_local.z.abs().clamp(0.0, 1.0).acos();
     if theta > cone {
         return None;

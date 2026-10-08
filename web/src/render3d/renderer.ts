@@ -75,6 +75,7 @@ export class OpticalRenderer3D {
   private gridSpacing = 5;
   private gridOn = true;
   private groundOn = true;
+  private upSign: 1 | -1 = 1;
   private bounds: Bounds3 | null = null;
   private theme: ScaffoldTheme;
 
@@ -285,8 +286,16 @@ export class OpticalRenderer3D {
     return this.scaffold.axisEnds();
   }
 
+  /** Put the ground on the side that is down: below the model, or above it
+   *  in world terms for a model drawn upside down. */
+  setUpSign(s: 1 | -1) {
+    if (s === this.upSign) return;
+    this.upSign = s;
+    this.relayout();
+  }
+
   private relayout() {
-    this.scaffold.layout(this.bounds, this.gridSpacing, this.gridOn, this.groundOn, this.theme);
+    this.scaffold.layout(this.bounds, this.gridSpacing, this.gridOn, this.groundOn, this.theme, this.upSign);
   }
 
   /** Copy the rig into the active three.js camera. */
@@ -296,7 +305,7 @@ export class OpticalRenderer3D {
     const { near, far } = rig.clipRange();
     const cam = rig.perspective ? this.persp : this.ortho;
     cam.position.set(eye.x, eye.y, eye.z);
-    cam.up.set(0, 1, 0);
+    cam.up.set(0, rig.upSign, 0);
     cam.lookAt(rig.target.x, rig.target.y, rig.target.z);
     if (rig.perspective) {
       this.persp.fov = THREE.MathUtils.radToDeg(rig.fovY());
@@ -320,6 +329,7 @@ export class OpticalRenderer3D {
 
   render(rig: CameraRig) {
     const t0 = performance.now();
+    this.setUpSign(rig.upSign);
     const cam = this.applyCamera(rig);
     // The bookkeeping three.js's own loop would have done this frame.
     const internals = this.renderer as unknown as Internals;

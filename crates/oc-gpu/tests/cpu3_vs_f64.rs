@@ -818,6 +818,7 @@ fn the_preview_bins_arrival_directions_like_the_reference() {
             d.measure = oc_core::scene3::DetectorMeasure::Intensity {
                 half_angle_deg: 30.0,
                 bins: [6, 4],
+                layout: Default::default(),
             }
         });
     scene.validate().unwrap();
@@ -1900,4 +1901,38 @@ fn a_face_response_follows_its_patch_past_a_polyline() {
         (out.b - out.a).x < 0.0,
         "the silvered back face returns the ray: {segs:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Diffraction gratings
+// ---------------------------------------------------------------------------
+
+/// Both engines send each order where the grating equation says and split
+/// the flux the same way: reflection and transmission, both orders' signs,
+/// skew rays, and a wavelength whose working order is evanescent (only the
+/// zero order leaves).
+#[test]
+fn a_grating_matches_f64_order_for_order() {
+    for transmissive in [false, true] {
+        for order in [1, -1] {
+            let mut scene = Scene3::new();
+            let id = scene.add_grating(Vec3::ZERO, 50.0, 40.0, 160.0, 1200.0, transmissive);
+            if let Some(s) = scene.surfaces.iter_mut().find(|s| s.common.id.0 == id) {
+                for r in [&mut s.response_front, &mut s.response_back] {
+                    if let SurfaceResponse::Grating { order: o, .. } = r {
+                        *o = order;
+                    }
+                }
+            }
+            scene.validate().unwrap();
+            let toward = Vec3::new(-0.94, -0.34, 0.0).normalize();
+            for ray in [
+                (Vec3::new(30.0, 11.0, 0.0), toward, 0.45),
+                (Vec3::new(30.0, 11.0, 3.0), (toward + Vec3::new(0.0, 0.0, -0.1)).normalize(), 0.6),
+                (Vec3::new(30.0, 11.0, -2.0), toward, 1.6),
+            ] {
+                assert_tree_matches(&scene, ray, false);
+            }
+        }
+    }
 }

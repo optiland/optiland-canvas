@@ -19,6 +19,7 @@
 
 import type { Canvas } from "../pkg/oc_wasm.js";
 import { createCardManager, type CardSource } from "./cards";
+import { panKeyHeld } from "./pan-key";
 
 type V2 = { x: number; y: number };
 type Tool = "select" | "draw" | "pin";
@@ -362,7 +363,8 @@ export function initM3(app: AppCtx): {
 
   view.addEventListener("pointerdown", (e) => {
     if (!viewOn()) return; // the 3D model view owns the canvas
-    if (e.button === 1) { startPan(e); e.preventDefault(); return; } // middle-drag pans anywhere
+    // Middle-drag, or any drag with Space held, pans anywhere, over parts too.
+    if (e.button === 1 || panKeyHeld()) { startPan(e); e.preventDefault(); return; }
     if (tool === "draw") return startDraw(e);
     const p = app.toWorld(e.clientX, e.clientY);
     if (tool === "pin") {

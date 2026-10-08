@@ -150,6 +150,14 @@ coherence length here, so intensities add and the bounces between the faces sum
 as a geometric series). Documents written before plates had thickness carry that
 shape, and it is what `coating_rt` returns.
 
+`thickness_mm` gives the plate its glass: each pass through it is attenuated by
+the substrate's own `k` along the slant path, `τ = exp(−4πk·d / (λ cos θ))`,
+and the series becomes `R = r₁ + t₁t₁′ r₂τ² / (1 − r₁′ r₂τ²)`. Nothing else
+reads it: the plate stays zero thickness, so the beam is not displaced. With
+the layers on the far face and `Incidence::Substrate`, this is a second-surface
+mirror; `a_thick_plate_absorbs_on_every_pass` checks both against the closed
+form.
+
 ## The two tracers
 
 | | Exact (`oc-trace`) | Preview (`oc-gpu`) |

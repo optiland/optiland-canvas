@@ -575,6 +575,36 @@ pub enum SurfaceResponse {
     ThinLens {
         focal_length_mm: f64,
     },
+    /// A plane diffraction grating: the grooves run along the surface's local
+    /// `Y`. Every ray leaves in `order` by the grating equation, exactly, and
+    /// in the zero order; the fractions going into each are declared, not
+    /// computed, and the rest is absorbed (it would go into other orders).
+    /// See [`crate::grating`]. Only meaningful on a standalone planar surface,
+    /// whose frame sets the grooves; a body patch authoring it is rejected.
+    Grating {
+        lines_per_mm: f64,
+        /// The diffraction order traced besides the zero order, never 0. Its
+        /// sign says which way across the grooves light is sent: `+1` turns a
+        /// ray toward local `+X`.
+        order: i32,
+        /// The power fraction sent into `order`.
+        efficiency: SpectralScalar,
+        /// The power fraction left in the zero order: the specular
+        /// reflection off a reflection grating, the straight-through beam of
+        /// a transmission one.
+        zero_order: SpectralScalar,
+        /// A transmission grating: light carries on through the surface.
+        /// False for a reflection grating.
+        #[serde(default)]
+        transmissive: bool,
+        /// The two fractions for light polarized across the grooves (TM, the
+        /// electric field perpendicular to them), when the grating treats the
+        /// polarizations differently, as a ruled metal grating does by tens of
+        /// percent. `efficiency` and `zero_order` are then the fractions for
+        /// light polarized along the grooves (TE). `None` treats both alike.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tm: Option<GratingTm>,
+    },
     /// A real thin-film coating: a stack of layers, evaluated by the transfer
     /// matrix at the wavelength **and the angle of incidence** of each ray.
     ///
@@ -738,6 +768,42 @@ impl SurfaceResponse {
                 }
                 Ok(())
             }
+            Self::Grating {
+                lines_per_mm,
+                order,
+                efficiency,
+                zero_order,
+                tm,
+                ..
+            } => {
+                if let Some(tm) = tm {
+                    tm.efficiency.validate(&format!("{field}.tm.efficiency"))?;
+                    tm.zero_order.validate(&format!("{field}.tm.zero_order"))?;
+                    if !tm.efficiency.is_unit_fraction() || !tm.zero_order.is_unit_fraction() {
+                        return Err(range("tm", "has an efficiency outside [0, 1]"));
+                    }
+                }
+                if !(lines_per_mm.is_finite() && *lines_per_mm > 0.0 && *lines_per_mm <= 20_000.0) {
+                    return Err(range("lines_per_mm", "must be in (0, 20000]"));
+                }
+                if *order == 0 || order.abs() > 50 {
+                    return Err(range("order", "must be nonzero and at most 50 either way"));
+                }
+                efficiency.validate(&format!("{field}.efficiency"))?;
+                zero_order.validate(&format!("{field}.zero_order"))?;
+                if !efficiency.is_unit_fraction() {
+                    return Err(range("efficiency", "is outside [0, 1]"));
+                }
+                if !zero_order.is_unit_fraction() {
+                    return Err(range("zero_order", "is outside [0, 1]"));
+                }
+                if let (SpectralScalar::Constant(a), SpectralScalar::Constant(b)) = (efficiency, zero_order) {
+                    if a + b > 1.0 + 1e-12 {
+                        return Err(range("efficiency", "and zero_order add up to more than 1"));
+                    }
+                }
+                Ok(())
+            }
             Self::Coating { coating } => {
                 // A layer is a thickness and an index; both have to be real
                 // numbers or the transfer matrix has nothing to multiply. There
@@ -768,7 +834,7 @@ impl SurfaceResponse {
                         ));
                     }
                 }
-                if let crate::thinfilm::CoatingBacking::Plate { substrate, exit } = &coating.backing
+                if let crate::thinfilm::CoatingBacking::Plate { substrate, exit, thickness_mm } = &coating.backing
                 {
                     substrate
                         .n
@@ -778,6 +844,9 @@ impl SurfaceResponse {
                         .validate(&format!("{field}.coating.substrate.k"))?;
                     if substrate.n.min() <= 0.0 {
                         return Err(range("coating.substrate.n", "must be positive"));
+                    }
+                    if !thickness_mm.is_finite() || !(0.0..=1_000.0).contains(thickness_mm) {
+                        return Err(range("coating.thickness_mm", "is outside [0, 1000]"));
                     }
                     if let crate::thinfilm::ExitFace::AntiReflective { residual } = exit {
                         if !residual.is_finite() || !(0.0..=1.0).contains(residual) {
@@ -1170,6 +1239,11 @@ pub enum SurfaceGeometry3 {
     SurfaceOfRevolution {
         sag: SagModel,
         radial_aperture: RadialAperture,
+        /// The piece of the revolution that exists, in the local `XY` plane
+        /// (seen down the axis): a strip cut from a large mirror, or an
+        /// off-axis segment as a polygon. `None` is the whole annulus.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outline: Option<PlanarShape2>,
     },
 }
 
@@ -1318,15 +1392,30 @@ impl Detector3 {
         self.geometry.covered_cell_areas_mm2(self.bins)
     }
 
-    /// The direction cell an arriving ray falls in, row-major over the
-    /// measure's own `[rings, sectors]` as `sector * rings + ring`, or `None`
-    /// when the measure bins no directions or the ray came in past the cone.
+    /// The direction cell an arriving ray falls in, or `None` when the
+    /// measure bins no directions or the ray came in past the cone.
+    ///
+    /// Polar cells are row-major over the measure's own `[rings, sectors]` as
+    /// `sector * rings + ring`. Grid cells are row-major over `[across, down]`
+    /// with `across` fastest, laid out like the face's pixels, so a picture
+    /// of either is drawn the same way.
     ///
     /// `dir_local` is the ray's direction in the detector's own frame. The
     /// polar angle is taken to the normal **line**, not the normal vector, so
     /// a detector reads the same whichever side light reaches it from, which
-    /// is the convention `max_tilt_rad` already uses.
+    /// is the convention `max_tilt_rad` already uses. The grid's two angles
+    /// are taken the same way: `atan(x / |z|)` and `atan(y / |z|)`.
     pub fn direction_cell(&self, dir_local: Vec3) -> Option<usize> {
+        if self.measure.direction_layout() == Some(DirectionLayout::Grid) {
+            let (cone, nu, nv) = self.measure.direction_grid()?;
+            let z = dir_local.z.abs();
+            let (au, av) = (dir_local.x.atan2(z), dir_local.y.atan2(z));
+            if au.abs() > cone || av.abs() > cone {
+                return None;
+            }
+            let cell = |a: f64, n: usize| (((a + cone) / (2.0 * cone) * n as f64) as usize).min(n - 1);
+            return Some(cell(av, nv) * nu + cell(au, nu));
+        }
         let (cone, rings, sectors) = self.measure.direction_grid()?;
         let theta = dir_local.z.abs().clamp(0.0, 1.0).acos();
         if theta > cone {
@@ -1350,6 +1439,12 @@ impl Detector3 {
     /// assumes a small cell, so a two-ring histogram is as exact as a
     /// hundred-ring one.
     pub fn direction_cell_solid_angles(&self) -> Option<Vec<f64>> {
+        if self.measure.direction_layout() == Some(DirectionLayout::Grid) {
+            return self
+                .measure
+                .direction_grid()
+                .map(|(cone, nu, nv)| grid_solid_angles(cone, nu, nv));
+        }
         let (cone, rings, sectors) = self.measure.direction_grid()?;
         let dphi = std::f64::consts::TAU / sectors as f64;
         let ring_cos: Vec<f64> = (0..=rings)
@@ -1363,6 +1458,36 @@ impl Detector3 {
         }
         Some(out)
     }
+}
+
+/// Each cell's solid angle, steradians, for a grid `nu` by `nv` cells over
+/// `±cone` in both angles, row-major with `u` fastest.
+///
+/// Closed form and exact. A direction `(p, q, 1)` in slope space covers
+/// `dp dq / (1 + p² + q²)^{3/2}` of the sphere, and over the rectangle from
+/// the origin to `(p, q)` that integrates to `F(p, q) = atan(pq / √(1 + p² +
+/// q²))`, the solid angle a rectangle subtends from above its corner. A cell
+/// between slopes `p₀..p₁` and `q₀..q₁` is then four values of `F`. At a
+/// 90° cone the edge slope is `tan(π/2)`, which in f64 is a large finite
+/// number, and the whole grid sums to `2π` as it should.
+pub fn grid_solid_angles(cone: f64, nu: usize, nv: usize) -> Vec<f64> {
+    let f = |p: f64, q: f64| (p * q / (1.0 + p * p + q * q).sqrt()).atan();
+    let edges = |n: usize| -> Vec<f64> {
+        (0..=n)
+            .map(|i| (-cone + 2.0 * cone * i as f64 / n as f64).tan())
+            .collect()
+    };
+    let (pu, pv) = (edges(nu), edges(nv));
+    let mut out = Vec::with_capacity(nu * nv);
+    for j in 0..nv {
+        for i in 0..nu {
+            out.push(
+                f(pu[i + 1], pv[j + 1]) - f(pu[i], pv[j + 1]) - f(pu[i + 1], pv[j])
+                    + f(pu[i], pv[j]),
+            );
+        }
+    }
+    out
 }
 
 impl DetectorGeometry3 {
@@ -1495,8 +1620,9 @@ pub enum DetectorMeasure {
         /// `(0, 90]`. Flux arriving outside it still counts in the totals and
         /// is binned nowhere, which the result reports rather than hides.
         half_angle_deg: f64,
-        /// Polar rings out to that cone, and azimuth sectors around the
-        /// normal. `[24, 1]` is the `I(θ)` curve an LED datasheet plots.
+        /// Polar rings out to that cone and azimuth sectors around the normal,
+        /// or, on a [`DirectionLayout::Grid`], cells across and down.
+        /// `[24, 1]` polar is the `I(θ)` curve an LED datasheet plots.
         ///
         /// Its own resolution rather than the face's, because the two have
         /// nothing to say to each other: a detector can want a fine spot on
@@ -1504,10 +1630,60 @@ pub enum DetectorMeasure {
         /// sharing one number would make every mode switch a resolution
         /// change as well.
         bins: [usize; 2],
+        /// How the directions are cut up. Polar when a file says nothing,
+        /// which is what every file written before there was a choice meant.
+        #[serde(default, skip_serializing_if = "DirectionLayout::is_polar")]
+        layout: DirectionLayout,
     },
+
+    /// What the eye makes of the light in each cell: illuminance, the
+    /// `683 lm/W · Σ Φ ȳ(λ)` a light meter reads, per `m²` of the cell on the
+    /// face, with the cell's colour `(X, Y, Z)` under the CIE 1931 observer
+    /// kept beside it so the face can be drawn as a person would see it
+    /// ([`crate::colorimetry`]). Lux when the flux is watts; relative
+    /// otherwise, like every other reading.
+    ///
+    /// A line probe has no area and cannot ask for this, as for irradiance.
+    Illuminance,
+}
+
+/// How an intensity histogram cuts up the directions around the normal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum DirectionLayout {
+    /// Rings of polar angle and sectors of azimuth: the goniometer's picture,
+    /// and the `I(θ)` curve with one sector.
+    #[default]
+    Polar,
+    /// A square grid in the two angles `atan(x/|z|)` and `atan(y/|z|)`, each
+    /// over `±cone`: a far-field picture with straight axes, the one a camera
+    /// in a lens's focal plane records, and one a cross-section can be cut
+    /// through along either axis.
+    Grid,
+}
+
+impl DirectionLayout {
+    pub fn is_polar(&self) -> bool {
+        *self == Self::Polar
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Polar => "polar",
+            Self::Grid => "grid",
+        }
+    }
 }
 
 impl DetectorMeasure {
+    /// How the intensity histogram is laid out, or `None` if this measure
+    /// bins no directions.
+    pub fn direction_layout(&self) -> Option<DirectionLayout> {
+        match *self {
+            Self::Intensity { layout, .. } => Some(layout),
+            Self::Power | Self::Irradiance | Self::Illuminance => None,
+        }
+    }
+
     /// A cone in radians and the `[rings, sectors]` across it, or `None` if
     /// this measure bins no directions at all.
     pub fn direction_grid(&self) -> Option<(f64, usize, usize)> {
@@ -1515,8 +1691,9 @@ impl DetectorMeasure {
             Self::Intensity {
                 half_angle_deg,
                 bins,
+                ..
             } => Some((half_angle_deg.to_radians(), bins[0].max(1), bins[1].max(1))),
-            Self::Power | Self::Irradiance => None,
+            Self::Power | Self::Irradiance | Self::Illuminance => None,
         }
     }
 
@@ -1532,6 +1709,7 @@ impl DetectorMeasure {
             Self::Power => "flux",
             Self::Irradiance => "flux/mm²",
             Self::Intensity { .. } => "flux/sr",
+            Self::Illuminance => "lx",
         }
     }
 }
@@ -1582,13 +1760,37 @@ pub enum AngularDistribution3 {
     },
     LambertianHemisphere,
 
+    /// The sun as it looks: a disc of angular radius `half_angle_rad`,
+    /// brighter at the centre than the limb as `disc` says, and a share `csr`
+    /// of the light in the aureole around it out to 43.6 mrad
+    /// ([`crate::solar::sunshape`]). A limb-darkened disc depends on the
+    /// wavelength, so each ray's direction is drawn for its own.
+    Sun {
+        half_angle_rad: f64,
+        disc: crate::solar::sunshape::SunDisc,
+        csr: f64,
+    },
+
     /// **v1 compatibility.** An equal-angle fan in one plane: a degenerate 3D
     /// distribution whose measure exists only in that plane. It is not a cone,
     /// and it is not uniform in solid angle.
     PlanarFanLegacy {
         half_angle_rad: f64,
     },
+
+    /// A measured beam, the same all round its axis: radiance (per steradian,
+    /// any scale) at [`RADIAL_NODES`] polar angles evenly spaced from 0 to
+    /// `half_angle_rad`, linear between them and nothing beyond. What a long
+    /// light pipe hands on: the sun's disc widened by every slope error and
+    /// wall bounce on the way, which no analytic shape describes.
+    RadialProfile {
+        half_angle_rad: f64,
+        radiance: [f64; RADIAL_NODES],
+    },
 }
+
+/// The node count of [`AngularDistribution3::RadialProfile`].
+pub const RADIAL_NODES: usize = 24;
 
 impl SpatialDistribution3 {
     pub fn is_legacy(&self) -> bool {
@@ -1754,6 +1956,41 @@ pub struct Scene3 {
     /// reads unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub solar: Option<Box<crate::heliostat::SolarRig>>,
+    /// Elements locked to other elements: rigidly attached, or turned to
+    /// face them. Authored intent like [`Scene3::solar`], resolved into the
+    /// transforms by [`resolve_links`](Scene3::resolve_links). Absent from a
+    /// document that has none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<crate::link::Link3>,
+    /// Faces that are not quite the shape they are drawn as: a heliostat's
+    /// waviness, a rolled sheet's ripple. See [`FigureError`]. Absent from a
+    /// document that has none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub figure_errors: Vec<FigureError>,
+}
+
+/// A grating's efficiencies for light polarized across its grooves (TM).
+/// See [`SurfaceResponse::Grating`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GratingTm {
+    pub efficiency: SpectralScalar,
+    pub zero_order: SpectralScalar,
+}
+
+/// The figure error of one body's or surface's faces, as the slope error a
+/// concentrator datasheet quotes: at every hit the local normal leans away
+/// from the drawn one by a Gaussian angle, `slope_rms_mrad` RMS in each of
+/// the two directions across it, drawn afresh for each hit. A reflected ray
+/// turns by twice the lean, a refracted one by `(n1 - n2) / n2` of it.
+///
+/// This is the statistical model solar-concentrator tracers use. It does not
+/// know where on the face the error sits, so it cannot stand for a
+/// systematic figure (a mirror bent to the wrong curve), and the f32 preview
+/// leaves it out.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FigureError {
+    pub object: ObjectId,
+    pub slope_rms_mrad: f64,
 }
 
 impl Default for Scene3 {
@@ -1780,6 +2017,8 @@ impl Scene3 {
             intent: SceneIntent::default(),
             next_id: 0,
             solar: None,
+            links: Vec::new(),
+            figure_errors: Vec::new(),
         }
     }
 
@@ -2001,7 +2240,50 @@ impl Scene3 {
         if let Some(rig) = &self.solar {
             rig.validate(self)?;
         }
+        self.validate_links()?;
+        self.validate_figure_errors()?;
         Ok(())
+    }
+
+    fn validate_figure_errors(&self) -> Result<(), SceneError> {
+        let mut seen = HashSet::new();
+        for f in &self.figure_errors {
+            let id = f.object.0;
+            let optical = self.bodies.iter().any(|b| b.common.id.0 == id)
+                || self.surfaces.iter().any(|x| x.common.id.0 == id);
+            if !optical {
+                return Err(SceneError::DanglingRef { what: "figure error", id });
+            }
+            if !f.slope_rms_mrad.is_finite() {
+                return Err(SceneError::NonFinite {
+                    object: Some(id),
+                    field: "figure_errors.slope_rms_mrad".into(),
+                });
+            }
+            let bad = |reason: &str| SceneError::OutOfRange {
+                object: Some(id),
+                field: "figure_errors".into(),
+                reason: reason.into(),
+            };
+            // Past 100 mrad a face is no longer a wavy version of its drawn
+            // shape, and the small-lean model below stops meaning anything.
+            if !(0.0..=100.0).contains(&f.slope_rms_mrad) {
+                return Err(bad("slope_rms_mrad must be in [0, 100]"));
+            }
+            if !seen.insert(id) {
+                return Err(bad("an object has one figure error"));
+            }
+        }
+        Ok(())
+    }
+
+    /// The RMS slope error of object `id`'s faces, in radians per axis; 0 for
+    /// one drawn true.
+    pub fn slope_error_rad(&self, id: ObjectId) -> f64 {
+        self.figure_errors
+            .iter()
+            .find(|f| f.object == id)
+            .map_or(0.0, |f| f.slope_rms_mrad * 1e-3)
     }
 
     fn validate_ids(&self) -> Result<(), SceneError> {
@@ -2272,9 +2554,13 @@ impl Scene3 {
                 SurfaceGeometry3::SurfaceOfRevolution {
                     sag,
                     radial_aperture,
+                    outline,
                 } => {
                     sag.validate(oid, "geometry.sag")?;
                     radial_aperture.validate(oid, "geometry.radial_aperture")?;
+                    if let Some(o) = outline {
+                        o.validate(oid, "geometry.outline")?;
+                    }
                 }
             }
             s.response_front.validate("response_front")?;
@@ -2385,9 +2671,18 @@ impl Scene3 {
                         ));
                     }
                 }
+                DetectorMeasure::Illuminance => {
+                    if !d.geometry.has_area() {
+                        return Err(range(
+                            "measure",
+                            "asks a line probe for illuminance, and a line has no area",
+                        ));
+                    }
+                }
                 DetectorMeasure::Intensity {
                     half_angle_deg,
                     bins,
+                    ..
                 } => {
                     if !half_angle_deg.is_finite() {
                         return Err(SceneError::NonFinite {
@@ -2518,6 +2813,38 @@ impl Scene3 {
                     }
                 }
                 AngularDistribution3::LambertianHemisphere => {}
+                AngularDistribution3::RadialProfile { half_angle_rad, radiance } => {
+                    if !half_angle_rad.is_finite() || radiance.iter().any(|v| !v.is_finite()) {
+                        return Err(SceneError::NonFinite {
+                            object: oid,
+                            field: "angular.radial_profile".to_string(),
+                        });
+                    }
+                    if !(half_angle_rad > 0.0 && half_angle_rad <= std::f64::consts::FRAC_PI_2) {
+                        return Err(range("angular.half_angle_rad", "is outside (0, pi/2]"));
+                    }
+                    if radiance.iter().any(|v| *v < 0.0) || radiance.iter().all(|v| *v == 0.0) {
+                        return Err(range("angular.radiance", "must be non-negative and not all zero"));
+                    }
+                }
+                AngularDistribution3::Sun {
+                    half_angle_rad,
+                    csr,
+                    ..
+                } => {
+                    if !half_angle_rad.is_finite() || !csr.is_finite() {
+                        return Err(SceneError::NonFinite {
+                            object: oid,
+                            field: "angular.sun".to_string(),
+                        });
+                    }
+                    if !(0.0..=0.1).contains(&half_angle_rad) {
+                        return Err(range("angular.half_angle_rad", "is not a sun's disc"));
+                    }
+                    if !(0.0..=crate::solar::sunshape::MAX_CSR).contains(&csr) {
+                        return Err(range("angular.csr", "is outside [0, 0.849]"));
+                    }
+                }
             }
             for (l, w) in s.spectrum.samples() {
                 if !l.is_finite() || !w.is_finite() || l <= 0.0 {

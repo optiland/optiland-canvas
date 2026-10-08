@@ -16,6 +16,7 @@
 //!   convention across hemispheres, seasons, centuries and a sun below the
 //!   horizon.
 
+use oc_core::solar;
 use oc_core::solar::{
     am15_direct_lines, am15_direct_lines_equal_energy, am15_fraction, solar_position,
     sun_direction_enu, sun_half_angle_rad, SolarPosition, SolarSite, UtcInstant,
@@ -369,4 +370,52 @@ fn am15_centroids_sit_inside_their_bands() {
     }
     assert!(am15_direct_lines(0, 0.3, 2.5).is_empty());
     assert!(am15_direct_lines(3, 2.5, 0.3).is_empty());
+}
+
+/// The continuum is the table at its own resolution: its power adds up to
+/// the band's, every line sits inside its interval, and the lines equal-width
+/// sampling gives are the ones the G173 functions always gave.
+#[test]
+fn the_g173_continuum_is_the_table_itself() {
+    let t = solar::g173_direct();
+    let lines = solar::table_continuum(t, 0.3, 2.5);
+    // 0.5 nm steps to 400 nm, 1 nm to 1700 nm, then 5 nm: 1661 intervals.
+    assert_eq!(lines.len(), 1661);
+    let sum: f64 = lines.iter().map(|(_, p)| p).sum();
+    assert!((sum - solar::table_power(t, 0.3, 2.5)).abs() < 1e-9 * sum);
+    assert!(lines.windows(2).all(|w| w[0].0 < w[1].0));
+    assert!(lines.iter().all(|(l, _)| (0.3..=2.5).contains(l)));
+    assert_eq!(solar::table_lines(t, 6, 0.3, 2.5), solar::am15_direct_lines(6, 0.3, 2.5));
+    assert!((solar::table_fraction(t, 0.3, 2.5) - solar::am15_fraction(0.3, 2.5)).abs() < 1e-12);
+}
+
+/// A SMARTS-style file: a header naming its columns, several irradiance
+/// columns, and the direct one with the circumsolar part picked.
+#[test]
+fn a_smarts_file_reads_its_direct_column() {
+    let text = "Wvlgth Extraterrestrial_spectrm Global_tilted_irradiance Beam_normal_+circumsolar\n\
+                300 0.45 0.01 0.002\n400 1.60 1.10 0.80\n500 1.95 1.50 1.30\n";
+    let p = solar::parse_spectrum_table(text).unwrap();
+    assert_eq!(p.rows, vec![[300.0, 0.002], [400.0, 0.80], [500.0, 1.30]]);
+    assert!(p.summary.contains("beam_normal_+circumsolar"), "{}", p.summary);
+    // The trapezoids between the rows.
+    assert!(p.summary.contains("W/m²"));
+    assert!((solar::table_power(&p.rows, 0.3, 0.5) - (0.5 * 100.0 * 0.802 + 0.5 * 100.0 * 2.1)).abs() < 1e-9);
+}
+
+/// Two bare columns in micrometres and W/m²/µm, commas, a comment.
+#[test]
+fn micrometres_per_micrometre_read_as_nanometres() {
+    let text = "# a spectroradiometer\nwavelength_um, irradiance_W/m2/um\n0.4, 800\n0.5, 1300\n";
+    let p = solar::parse_spectrum_table(text).unwrap();
+    assert_eq!(p.rows, vec![[400.0, 0.8], [500.0, 1.3]]);
+}
+
+#[test]
+fn a_table_that_is_not_one_is_refused() {
+    assert!(solar::parse_spectrum_table("just words\n").is_err());
+    assert!(solar::parse_spectrum_table("400 1\n").is_err());
+    assert!(solar::parse_spectrum_table("400 1\n400 2\n").is_err());
+    assert!(solar::parse_spectrum_table("400 1\n500 -2\n").is_err());
+    assert!(solar::parse_spectrum_table("400 0\n500 0\n").is_err());
 }

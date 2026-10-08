@@ -33,8 +33,11 @@ export type DetectorReadout = {
   hits: number;
   /** The flux on the whole face: the one number every view quotes. */
   totalIncident: number;
-  measure: "power" | "irradiance" | "intensity";
+  measure: "power" | "irradiance" | "intensity" | "illuminance";
   unit: string;
+  /** Under illuminance, each pixel's CIE 1931 `(X, Y, Z)` scaled like the
+   *  lux in `cells`, flattened; null under any other measure. */
+  colour: number[] | null;
   bins: [number, number];
   /** Flux per pixel, whatever the measure. */
   incident: number[];
@@ -55,7 +58,86 @@ export type DetectorReadout = {
   dolp: number | null;
   azimuthDeg: number | null;
   maxTiltDeg: number | null;
+  /** How an intensity histogram is laid out: `grid` (two angles, `cells`
+   *  row-major like the face's pixels over `coneBins` = [across, down]) or
+   *  `polar` (rings and sectors); null for any other measure. */
+  directionLayout: "grid" | "polar" | null;
+  /** The hits by wavelength, in order of wavelength. */
+  spectral: SpectralLine[];
+  /** Flux on lines past the ones broken out (only a source with more lines
+   *  than the tracer keeps has any). */
+  spectralUntracked: number;
 };
+
+/** One wavelength's hits on a detector. Lengths are mm and angles radians:
+ *  `angle` is the mean arrival direction's angle to the normal in the `u` and
+ *  `v` planes, `spread` the RMS angular spread about it, and `focus` how far
+ *  along the normal, the way light travels, this line's spot is smallest
+ *  (null when its rays are all parallel). */
+export type SpectralLine = {
+  nm: number;
+  hits: number;
+  flux: number;
+  centroid: [number, number];
+  rms: number | null;
+  angle: [number, number];
+  spread: number | null;
+  focus: number | null;
+  /** The raw sums behind the numbers: hits, Σw, Σwu, Σwv, Σwu², Σwv², Σwa,
+   *  Σwb, Σwa², Σwb², Σwua, Σwvb, with `a, b` the slopes. Bins merge
+   *  exactly by adding these. */
+  sums?: number[];
+};
+
+/** Bins merged into one: their sums added, and the numbers taken again from
+ *  the total, exactly as the tracer takes them from one bin's. */
+export function mergeLines(bins: SpectralLine[]): SpectralLine {
+  const s = new Array(12).fill(0);
+  let nmFlux = 0;
+  for (const b of bins) {
+    b.sums?.forEach((v, i) => (s[i] += v));
+    nmFlux += b.nm * b.flux;
+  }
+  const [hits, w, u, v, uu, vv, a, b_, aa, bb, ua, vb] = s;
+  const m = (x: number) => x / w;
+  const [mu, mv, ma, mb] = [m(u), m(v), m(a), m(b_)];
+  const varU = Math.max(0, m(uu) - mu * mu), varV = Math.max(0, m(vv) - mv * mv);
+  const varA = Math.max(0, m(aa) - ma * ma), varB = Math.max(0, m(bb) - mb * mb);
+  const cov = m(ua) - mu * ma + (m(vb) - mv * mb);
+  const spread = varA + varB;
+  return {
+    nm: w > 0 ? nmFlux / w : bins[0]?.nm ?? 0,
+    hits,
+    flux: w,
+    centroid: [mu, mv],
+    rms: Math.sqrt(varU + varV),
+    angle: [Math.atan(ma), Math.atan(mb)],
+    spread: Math.sqrt(spread),
+    focus: spread > 1e-18 ? -cov / spread : null,
+    sums: s,
+  };
+}
+
+/** At most `most` groups of neighbouring bins carrying about equal flux, for
+ *  a continuum whose hundreds of 5 nm bins hold a handful of rays each. A
+ *  spectrum of fewer bins than that, or bins without sums, is left as it is. */
+export function groupLines(lines: SpectralLine[], most = 24): SpectralLine[] {
+  if (lines.length <= most || lines.some((l) => !l.sums)) return lines;
+  const total = lines.reduce((t, l) => t + l.flux, 0);
+  const out: SpectralLine[] = [];
+  let group: SpectralLine[] = [];
+  let acc = 0;
+  for (const l of lines) {
+    group.push(l);
+    acc += l.flux;
+    if (acc >= ((out.length + 1) * total) / most) {
+      out.push(mergeLines(group));
+      group = [];
+    }
+  }
+  if (group.length) out.push(mergeLines(group));
+  return out;
+}
 
 /** A flux, or any reading, for display: four significant figures, and an
  *  exponent outside the range where that reads well. One formatter, so the
@@ -120,7 +202,9 @@ let scratch: HTMLCanvasElement | null = null;
  *  face in `area`, scaled so `scaleTo` is the top of the ramp; a value above
  *  it saturates. Unlit pixels and everything off the face stay dark. The
  *  pixel grid is drawn when a pixel is big enough on screen to see. Returns
- *  where the face landed; `fixedScale` is passed to [`faceBox`]. */
+ *  where the face landed; `fixedScale` is passed to [`faceBox`]. `colours`,
+ *  three bytes a pixel, paints the pixels in those colours instead of the
+ *  ramp (a true-colour picture). */
 export function drawFacePixels(
   c: CanvasRenderingContext2D,
   face: DetectorFace,
@@ -128,6 +212,7 @@ export function drawFacePixels(
   area: Box,
   scaleTo?: number | null,
   fixedScale?: number,
+  colours?: ArrayLike<number>,
 ): FaceBox {
   const b = faceBox(face, area, 8, fixedScale);
   const [nu, nv] = face.pixels;
@@ -151,7 +236,8 @@ export function drawFacePixels(
       for (let u = 0; u < nu; u++) {
         const val = values[v * nu + u];
         if (!(val > 0)) continue;
-        const [r, g, bl] = heatRgb(val / top);
+        const i = v * nu + u;
+        const [r, g, bl] = colours ? [colours[3 * i], colours[3 * i + 1], colours[3 * i + 2]] : heatRgb(val / top);
         const k = (row * nu + u) * 4;
         img.data[k] = r;
         img.data[k + 1] = g;

@@ -238,3 +238,146 @@ fn every_heliostat_in_a_field_is_lit() {
     assert!(rel < 0.02, "{got:.1} W from two mirrors vs {want:.1} W, {rel:.4}");
     let _ = (first, second);
 }
+
+/// The sun's distance is the user's to choose, over a field too: a disc far
+/// up-sun stands above a tall target, as the real sun does, and the mirror
+/// gets the same watts. Asked for less than a beam radius, the disc stays a
+/// radius out so it clears the mirrors.
+#[test]
+fn the_sun_stands_as_far_up_sun_as_asked() {
+    let (mut s, _, det, target) = field(at(13, 0));
+    s.solar.as_mut().unwrap().bands = 1;
+    s.sources[0].samples.spatial_samples = 65_536;
+    s.sources[0].samples.angular_samples = 1;
+    s.resolve_solar().unwrap();
+    let near_w = detector_named(&trace_scene3(&s, &cfg_for(&s)), det).total_incident;
+    let r = s.solar.as_ref().unwrap().beam_radius_mm;
+
+    s.solar.as_mut().unwrap().standoff_mm = 30_000.0;
+    let state = s.resolve_solar().unwrap();
+    let at_ = s.sources[0].transform.pos;
+    assert!((at_.length() - 30_000.0).abs() < 1.0, "disc {:.0} mm out", at_.length());
+    assert!(at_.dot(state.sun_dir) > 29_999.0, "the disc sits up-sun");
+    assert!(at_.y > target.y, "the disc stands above the target, y {:.0}", at_.y);
+    let far_w = detector_named(&trace_scene3(&s, &cfg_for(&s)), det).total_incident;
+    assert!((far_w - near_w).abs() / near_w < 0.01, "{far_w:.1} W far vs {near_w:.1} W near");
+
+    s.solar.as_mut().unwrap().standoff_mm = 0.0;
+    s.resolve_solar().unwrap();
+    let back = s.solar.as_ref().unwrap().standoff_mm;
+    assert!((back - r.max(200.0)).abs() < 1e-9, "floor {back:.1} mm, radius {r:.1} mm");
+}
+
+/// A model drawn upside down (the room turned over about +X, a roof
+/// heliostat below the target in world coordinates) says so, and the sun
+/// comes from world -Y: the same sun turned with the room, the same
+/// incidence, the same watts on the target.
+#[test]
+fn an_upside_down_model_has_its_sun_below() {
+    let turn = |v: Vec3| Vec3::new(v.x, -v.y, -v.z);
+    let watts = |upside_down: bool| {
+        let mut s = Scene3::new();
+        s.add_sun(almeria(), at(13, 0), 180.0);
+        let target = Vec3::new(-20_000.0, 8_000.0, 3_000.0);
+        let (target, n) = if upside_down { (turn(target), turn(-target.normalize())) } else { (target, -target.normalize()) };
+        let det = add_rect_detector(&mut s, target, n, 1500.0, 1500.0, [16, 16]);
+        s.add_heliostat(Vec3::ZERO, 1000.0, 1000.0, 0.95, HelioTarget::Object(det)).expect("a heliostat");
+        let rig = s.solar.as_mut().unwrap();
+        rig.upside_down = upside_down;
+        rig.bands = 1;
+        s.sources[0].samples.spatial_samples = 65_536;
+        s.sources[0].samples.angular_samples = 1;
+        let state = s.resolve_solar().unwrap();
+        let back: Scene3 = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.solar.as_ref().unwrap().upside_down, upside_down, "the flag round-trips");
+        let w = detector_named(&trace_scene3(&s, &cfg_for(&s)), det).total_incident;
+        (state.sun_dir, state.heliostats[0].incidence_deg, w)
+    };
+    let (sun, inc, w) = watts(false);
+    let (sun_down, inc_down, w_down) = watts(true);
+    assert!(sun.y > 0.0 && sun_down.y < 0.0, "sun {sun:?}, upside down {sun_down:?}");
+    assert!((turn(sun) - sun_down).length() < 1e-12, "the sun turns with the room");
+    assert!((inc - inc_down).abs() < 1e-9, "incidence {inc} vs {inc_down}");
+    assert!((w - w_down).abs() / w < 0.01, "{w:.1} W upright vs {w_down:.1} W upside down");
+}
+
+/// A new sun is the measured one: every wavelength of G173, a limb-darkened
+/// disc with a clear day's aureole. A file written before those choices reads
+/// as the flat disc and six lines it was written with.
+#[test]
+fn a_new_sun_is_measured_and_an_old_file_keeps_its_sun() {
+    use oc_core::scene::Spectrum;
+    use oc_core::scene3::AngularDistribution3;
+    let (s, _, _, _) = field(at(12, 0));
+    let src = &s.sources[0];
+    assert!(matches!(src.spectrum, Spectrum::Continuum(ref v) if v.len() == 1661));
+    match src.angular {
+        AngularDistribution3::Sun { disc, csr, .. } => {
+            assert_eq!(disc, oc_core::solar::sunshape::SunDisc::LimbDarkened);
+            assert_eq!(csr, oc_core::heliostat::DEFAULT_CSR);
+        }
+        other => panic!("{other:?}"),
+    }
+    // The same rig as a file from before: the new keys taken out.
+    let mut json: serde_json::Value = serde_json::to_value(&s).unwrap();
+    let rig = json["solar"].as_object_mut().unwrap();
+    for k in ["continuous", "disc", "csr"] {
+        rig.remove(k);
+    }
+    let mut old: Scene3 = serde_json::from_value(json).unwrap();
+    old.resolve_solar().unwrap();
+    assert!(matches!(old.sources[0].spectrum, Spectrum::Lines(ref v) if v.len() == 6));
+    assert!(matches!(old.sources[0].angular, AngularDistribution3::UniformConeSolidAngle { .. }));
+}
+
+/// Whatever the sun's shape and spectrum, it carries the DNI times its beam's
+/// area times the band's share: the aureole and the limb move light around,
+/// and the continuum shares it out, but none of them makes or loses any.
+#[test]
+fn the_shape_and_the_spectrum_keep_the_watts() {
+    let (mut s, _, _, _) = field(at(12, 0));
+    let watts = |s: &mut Scene3| s.resolve_solar().unwrap().source_flux_w;
+    let measured = watts(&mut s);
+    let rig = s.solar.as_mut().unwrap();
+    rig.continuous = false;
+    rig.disc = oc_core::solar::sunshape::SunDisc::Uniform;
+    rig.csr = 0.0;
+    let flat = watts(&mut s);
+    assert!((measured - flat).abs() < 1e-9 * flat, "{measured} vs {flat}");
+    let emitted: f64 = oc_trace::launch_from_scene(&s).iter().map(|l| l.flux).sum();
+    assert!((emitted - flat).abs() < 1e-9 * flat);
+}
+
+/// The object ledger books every removal once: summed over objects and bands
+/// it is the energy ledger, it moves no other number, and what it books on
+/// the mirror is the mirror's absorption.
+#[test]
+fn the_object_ledger_is_the_ledger_object_by_object() {
+    let (mut s, mirror, det, _) = field(at(12, 0));
+    s.sources[0].samples.spatial_samples = 2048;
+    s.sources[0].samples.angular_samples = 4;
+    s.resolve_solar().expect("resolves");
+    let plain = trace_scene3(&s, &cfg_for(&s));
+    let cfg = TraceConfig3 { object_ledger: true, ..cfg_for(&s) };
+    let booked = trace_scene3(&s, &cfg);
+    assert_eq!(plain.ledger, booked.ledger, "the ledger is the same with or without the books");
+    let d = |r: &oc_trace::TraceResult3| r.detectors.iter().find(|x| x.detector.0 == det.0).unwrap().total_incident;
+    assert_eq!(d(&plain), d(&booked));
+    assert!(plain.objects.is_empty());
+    let removed: f64 = booked.objects.iter().map(|e| e.ledger.removed()).sum();
+    let l = booked.ledger;
+    assert!((removed - l.accounted()).abs() < 1e-9 * l.launched, "{removed} vs {}", l.accounted());
+    // The mirror's row holds the mirror's absorption, and it saw light.
+    let mi = s.surfaces.iter().position(|x| x.common.id == mirror).expect("the mirror is a surface");
+    let m: f64 = booked
+        .objects
+        .iter()
+        .filter(|e| e.object == oc_trace::ObjectRef3::Surface(mi))
+        .map(|e| e.ledger.absorbed_surface)
+        .sum();
+    assert!(m > 0.0 && (m - l.absorbed_surface).abs() < 1e-9 * l.launched, "mirror {m} of {}", l.absorbed_surface);
+    // Nothing named, nothing counted.
+    for r in &booked.detectors.iter().find(|x| x.detector.0 == det.0).unwrap().records {
+        assert_eq!(r.counted, 0);
+    }
+}

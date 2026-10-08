@@ -1126,3 +1126,26 @@ fn a_filled_beam_through_a_fresnel_lens_matches_cpu() {
     eprintln!("GPU vs CPU mirror, filled beam through a Fresnel lens: {agree:.4} agree");
     assert!(agree >= 0.99, "only {agree} of the beam agrees");
 }
+
+#[test]
+fn a_grating_matches_cpu() {
+    let Some(tracer) = tracer_or_skip() else {
+        return;
+    };
+    for transmissive in [false, true] {
+        let mut scene = Scene3::new();
+        scene.add_grating(Vec3::ZERO, 50.0, 40.0, 160.0, 1200.0, transmissive);
+        scene.validate().unwrap();
+        let toward = Vec3::new(-0.94, -0.34, 0.0).normalize();
+        assert_gpu_matches_cpu_at(
+            &tracer,
+            &scene,
+            &[
+                (Vec3::new(30.0, 11.0, 0.0), toward, 0.45),
+                (Vec3::new(30.0, 11.0, 3.0), (toward + Vec3::new(0.0, 0.0, -0.1)).normalize(), 0.6),
+                (Vec3::new(30.0, 11.0, -2.0), toward, 1.6),
+            ],
+            opts(),
+        );
+    }
+}

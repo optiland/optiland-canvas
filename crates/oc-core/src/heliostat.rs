@@ -22,6 +22,13 @@
 //! the north-south plane seen from the west, south to the right: the plane the
 //! noon sun stands in, north of the tropics.
 //!
+//! A model built the other way up, the room turned over about world `+X`
+//! (a heliostat on the roof drawn below the tube it feeds), sets
+//! [`SolarRig::upside_down`]: room up is then world `-Y`, world `+Z` is 90
+//! degrees anticlockwise of `+X`, and the sun comes from the `-Y` side. The
+//! turn is a rotation, not a mirror image, so the sun's east-west sense is
+//! kept.
+//!
 //! # Units
 //!
 //! The sun is the one calibrated source. Its flux is the direct normal
@@ -131,12 +138,43 @@ pub struct SolarRig {
     pub time: LocalTime,
     /// Compass bearing of world `+X`, degrees clockwise from north.
     pub x_bearing_deg: f64,
+    /// The scene is the room turned over about world `+X`: up is world
+    /// `-Y`. See the module's frames.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub upside_down: bool,
     /// Direct normal irradiance, W/m². The ASTM G173 direct spectrum carries
     /// 900.1, a clear-sky noon at mid latitudes 800 to 1000.
     pub dni_w_m2: f64,
-    /// The band the sun source emits, µm, and how many lines stand for it.
+    /// The band the sun source emits, µm, and how many lines stand for it
+    /// when the spectrum is sampled as lines.
     pub band_um: [f64; 2],
     pub bands: u32,
+    /// Sample the spectrum continuously: every ray draws its own wavelength
+    /// from the table at the table's resolution (a [`Spectrum::Continuum`]),
+    /// instead of every ray going out once per line. False in a file written
+    /// before the choice, which meant lines.
+    #[serde(default)]
+    pub continuous: bool,
+    /// How bright the disc is across its face. Uniform in a file written
+    /// before the choice.
+    #[serde(default)]
+    pub disc: solar::sunshape::SunDisc,
+    /// Circumsolar ratio: the share of the direct light, within 43.6 mrad of
+    /// the sun's centre, that comes from the aureole around the disc. 0 in a
+    /// file written before the choice.
+    #[serde(default)]
+    pub csr: f64,
+    /// [`Self::dni_w_m2`] is the disc alone, as a radiative-transfer model
+    /// gives it (CAMS McClear, libRadtran: no circumsolar light), and the
+    /// aureole comes on top: the source carries `DNI / (1 − csr)`. False, the
+    /// default, reads the DNI as a pyrheliometer's, aureole included, which
+    /// the disc and the aureole then share.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dni_disc_only: bool,
+    /// A measured or modelled spectrum in place of ASTM G173, for a site and
+    /// a day (SMARTS output, a spectroradiometer): rows `[nm, W/m²/nm]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spectrum: Option<SunSpectrum>,
     /// The source this rig drives. Its placement, spread, spectrum and flux
     /// are overwritten by every resolve; its sampling is left alone.
     pub source: SourceId,
@@ -149,12 +187,31 @@ pub struct SolarRig {
     /// Radius of the sun beam's disc, mm: big enough to fill what it lights,
     /// and no bigger, or rays are spent on the ground.
     pub beam_radius_mm: f64,
-    /// How far up-sun of what it lights the beam starts, mm.
+    /// How far up-sun of what it lights the beam starts, mm. Over a field
+    /// ([`Self::aim_at`] `None`) this is a floor: the beam starts at least
+    /// one beam radius out.
     pub standoff_mm: f64,
     pub heliostats: Vec<Heliostat>,
 }
 
+/// A spectrum imported for the sun, and where it came from.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SunSpectrum {
+    /// What the user called it: the file's name.
+    pub name: String,
+    /// `[nm, W/m²/nm]`, wavelength increasing.
+    pub rows: Vec<[f64; 2]>,
+}
+
 impl SolarRig {
+    /// The spectral table the sun emits: the imported one, else ASTM G173-03
+    /// direct + circumsolar.
+    pub fn table(&self) -> &[[f64; 2]] {
+        self.spectrum
+            .as_ref()
+            .map_or(solar::g173_direct(), |t| t.rows.as_slice())
+    }
+
     pub(crate) fn validate(&self, scene: &Scene3) -> Result<(), SceneError> {
         let range = |field: &str, reason: &str| SceneError::OutOfRange {
             object: None,
@@ -194,6 +251,17 @@ impl SolarRig {
         }
         if self.band_um[0] >= self.band_um[1] || self.bands == 0 {
             return Err(range("band_um", "is empty"));
+        }
+        if !self.csr.is_finite() || !(0.0..=solar::sunshape::MAX_CSR).contains(&self.csr) {
+            return Err(range("csr", "is outside [0, 0.849]"));
+        }
+        if let Some(t) = &self.spectrum {
+            let ok = t.rows.len() >= 2
+                && t.rows.iter().all(|r| r[0].is_finite() && r[1].is_finite() && r[0] > 0.0 && r[1] >= 0.0)
+                && t.rows.windows(2).all(|w| w[1][0] > w[0][0]);
+            if !ok {
+                return Err(range("spectrum", "is not a table of increasing wavelengths"));
+            }
         }
         if self.beam_radius_mm <= 0.0 || self.standoff_mm < 0.0 {
             return Err(range("beam", "has no size or a negative standoff"));
@@ -239,8 +307,22 @@ impl SolarRig {
     fn world_axes_enu(&self) -> [Vec3; 3] {
         let b = self.x_bearing_deg.to_radians();
         let x = Vec3::new(b.sin(), b.cos(), 0.0);
-        let y = Vec3::new(0.0, 0.0, 1.0);
+        let y = Vec3::new(0.0, 0.0, self.up_sign());
         [x, y, x.cross(y)]
+    }
+
+    /// `+1` when world `+Y` is up, `-1` when the scene is upside down.
+    pub fn up_sign(&self) -> f64 {
+        if self.upside_down {
+            -1.0
+        } else {
+            1.0
+        }
+    }
+
+    /// Up in the room, in world coordinates.
+    pub fn up(&self) -> Vec3 {
+        Vec3::Y * self.up_sign()
     }
 
     /// An East-North-Up vector in world coordinates.
@@ -310,14 +392,21 @@ fn frame(x: Vec3, y: Vec3, z: Vec3) -> [f64; 4] {
 /// The azimuth-elevation mount's frame for a mirror normal: `+Z` the normal,
 /// `+X` horizontal. `None` for a normal straight up or down, where
 /// horizontal is every direction and the previous orientation is kept.
-fn az_el_frame(normal: Vec3) -> Option<(Vec3, Vec3, Vec3)> {
-    let x = Vec3::Y.cross(normal);
+fn az_el_frame(normal: Vec3, up: Vec3) -> Option<(Vec3, Vec3, Vec3)> {
+    let x = up.cross(normal);
     if x.length() < 1e-9 {
         return None;
     }
     let x = x.normalize();
     Some((x, normal.cross(x), normal))
 }
+
+/// The circumsolar ratio a new sun starts with. Buie et al. (2003) found
+/// clear-sky CSRs mostly between 0.01 and 0.1 in the measurements behind their
+/// model; 0.05 is the middle of that, a clear day with some haze, and the
+/// value concentrator studies commonly assume. Measure or look up the site's
+/// for anything that depends on it.
+pub const DEFAULT_CSR: f64 = 0.05;
 
 impl Scene3 {
     /// Recompute everything a [`SolarRig`] decides: the sun source's
@@ -353,7 +442,7 @@ impl Scene3 {
             let bisector = sun + to_target;
             let axes = (to_target != Vec3::ZERO && bisector.length() > 1e-9)
                 .then(|| bisector.normalize())
-                .and_then(az_el_frame);
+                .and_then(|n| az_el_frame(n, rig.up()));
             if let Some((x, y, z)) = axes {
                 if let Ok(t) = Isometry3::new(pivot, frame(x, y, z)) {
                     m.common.transform = t;
@@ -369,9 +458,12 @@ impl Scene3 {
         }
 
         // The beam: a disc square to the sun, up-sun of what it lights,
-        // emitting down-sun into the sun's own cone.
+        // emitting down-sun into the sun's own cone. Over a field the disc
+        // starts at least one radius out, so it clears every mirror, and
+        // farther when the rig asks: a sun drawn above a 5 m tower reads
+        // right to someone looking at the layout.
         let (radius, standoff, centre) = match (rig.aim_at, self.field_cover(&rig)) {
-            (None, Some((c, r))) => (r, r.max(200.0), Some(c)),
+            (None, Some((c, r))) => (r, rig.standoff_mm.max(r).max(200.0), Some(c)),
             (aim, _) => (
                 rig.beam_radius_mm,
                 rig.standoff_mm,
@@ -383,13 +475,22 @@ impl Scene3 {
             r.beam_radius_mm = radius;
             r.standoff_mm = standoff;
         }
-        let lines = solar::am15_direct_lines(rig.bands as usize, rig.band_um[0], rig.band_um[1]);
-        let fraction = solar::am15_fraction(rig.band_um[0], rig.band_um[1]);
+        let table = rig.table();
+        let [lo, hi] = rig.band_um;
+        let spectrum = if rig.continuous {
+            Spectrum::Continuum(solar::table_continuum(table, lo, hi))
+        } else {
+            Spectrum::Lines(solar::table_lines(table, rig.bands as usize, lo, hi))
+        };
+        // The DNI is the whole table's; the beam carries the band's share.
+        let fraction = solar::table_fraction(table, lo, hi);
         let area_m2 = std::f64::consts::PI * radius * radius * 1e-6;
         // No light from a sun below the horizon, whatever the clock says.
         let up = pos.elevation_deg > 0.0;
+        // A disc-only DNI leaves the aureole's share to be added.
+        let aureole = if rig.dni_disc_only { 1.0 / (1.0 - rig.csr) } else { 1.0 };
         let flux = if up {
-            rig.dni_w_m2 * fraction * area_m2
+            rig.dni_w_m2 * aureole * fraction * area_m2
         } else {
             0.0
         };
@@ -400,10 +501,19 @@ impl Scene3 {
             src.transform = t;
         }
         src.spatial = SpatialDistribution3::Disc { radius_mm: radius };
-        src.angular = AngularDistribution3::UniformConeSolidAngle {
-            half_angle_rad: half_angle,
+        // A uniform disc with no aureole is the cone it always was.
+        src.angular = if rig.disc == solar::sunshape::SunDisc::Uniform && rig.csr == 0.0 {
+            AngularDistribution3::UniformConeSolidAngle {
+                half_angle_rad: half_angle,
+            }
+        } else {
+            AngularDistribution3::Sun {
+                half_angle_rad: half_angle,
+                disc: rig.disc,
+                csr: rig.csr,
+            }
         };
-        src.spectrum = Spectrum::Lines(lines);
+        src.spectrum = spectrum;
         src.flux = flux;
 
         Some(SolarState {
@@ -514,9 +624,17 @@ impl Scene3 {
             site,
             time,
             x_bearing_deg,
+            upside_down: false,
             dni_w_m2: 900.0,
             band_um: [0.3, 2.5],
             bands: 6,
+            // A new sun is the measured one: every wavelength of the table,
+            // a limb-darkened disc, and a clear day's aureole.
+            continuous: true,
+            disc: solar::sunshape::SunDisc::LimbDarkened,
+            csr: DEFAULT_CSR,
+            dni_disc_only: false,
+            spectrum: None,
             source: id,
             aim_at: None,
             beam_radius_mm: 100.0,

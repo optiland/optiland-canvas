@@ -102,6 +102,7 @@ fn response_role(r: &SurfaceResponse) -> &'static str {
         // read as a window, which is what it is to the preview and is not what
         // it is.
         "polarizer" | "retarder" => "polarizing",
+        "grating" => "grating",
         _ => "generic_dielectric",
     }
 }

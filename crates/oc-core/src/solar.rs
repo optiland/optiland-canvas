@@ -60,6 +60,7 @@
 
 mod astm_g173;
 mod spa_tables;
+pub mod sunshape;
 
 use astm_g173::G173_DIRECT;
 use spa_tables::*;
@@ -516,12 +517,22 @@ pub const AM15_LAMBDA_MAX_UM: f64 = 4.0;
 /// the embedded table.
 pub const AM15_DIRECT_TOTAL_W_M2: f64 = 900.139_329_284_214_9;
 
-/// Integrals of the piecewise-linear G173 direct spectrum from 280 nm to
-/// `lambda_nm`: `(∫E dλ, ∫λ E dλ)` in W/m² and W/m²·nm. Zero below the table;
-/// the spectrum is zero outside it.
+/// The ASTM G173-03 direct + circumsolar table, rows `[nm, W/m²/nm]`.
+pub fn g173_direct() -> &'static [[f64; 2]] {
+    &G173_DIRECT
+}
+
 fn g173_cumulative(lambda_nm: f64) -> (f64, f64) {
+    table_cumulative(&G173_DIRECT, lambda_nm)
+}
+
+/// Integrals of a piecewise-linear spectrum `table` (rows `[nm, W/m²/nm]`,
+/// wavelength increasing) from its first row to `lambda_nm`: `(∫E dλ,
+/// ∫λ E dλ)` in W/m² and W/m²·nm. Zero below the table; the spectrum is zero
+/// outside it.
+pub fn table_cumulative(table: &[[f64; 2]], lambda_nm: f64) -> (f64, f64) {
     let (mut e, mut le) = (0.0, 0.0);
-    for w in G173_DIRECT.windows(2) {
+    for w in table.windows(2) {
         let ([x0, y0], [x1, y1]) = (w[0], w[1]);
         if lambda_nm <= x0 {
             break;
@@ -554,6 +565,192 @@ pub fn am15_fraction(lo_um: f64, hi_um: f64) -> f64 {
     let (hi, _) = g173_cumulative(hi_um * 1000.0);
     let (tot, _) = g173_cumulative(AM15_LAMBDA_MAX_UM * 1000.0);
     (hi - lo) / tot
+}
+
+/// Power of `table` between `lo_um` and `hi_um`, W/m².
+pub fn table_power(table: &[[f64; 2]], lo_um: f64, hi_um: f64) -> f64 {
+    if hi_um <= lo_um {
+        return 0.0;
+    }
+    table_cumulative(table, hi_um * 1000.0).0 - table_cumulative(table, lo_um * 1000.0).0
+}
+
+/// Share of all of `table`'s power that lies between `lo_um` and `hi_um`.
+pub fn table_fraction(table: &[[f64; 2]], lo_um: f64, hi_um: f64) -> f64 {
+    let (Some(first), Some(last)) = (table.first(), table.last()) else {
+        return 0.0;
+    };
+    let all = table_power(table, first[0] / 1000.0, last[0] / 1000.0);
+    if all > 0.0 {
+        table_power(table, lo_um, hi_um) / all
+    } else {
+        0.0
+    }
+}
+
+/// `table` between `lo_um` and `hi_um` at its own resolution: one line per
+/// tabulated interval (clipped to the band), at the interval's power-weighted
+/// wavelength and carrying its power, W/m². What a continuous source draws a
+/// wavelength per ray from; ASTM G173 gives 1661 of them over 0.3–2.5 µm,
+/// half a nanometre apart in the ultraviolet and a nanometre in the visible.
+pub fn table_continuum(table: &[[f64; 2]], lo_um: f64, hi_um: f64) -> Vec<(f64, f64)> {
+    let (lo, hi) = (lo_um * 1000.0, hi_um * 1000.0);
+    // Each interval integrated on its own segment: the same numbers as
+    // differences of `table_cumulative`, in one pass rather than one pass per
+    // interval, which a solar atlas of 70 000 rows cannot afford.
+    table
+        .windows(2)
+        .filter_map(|w| {
+            let ([x0, y0], [x1, y1]) = (w[0], w[1]);
+            let (a, b) = (x0.max(lo), x1.min(hi));
+            if b <= a {
+                return None;
+            }
+            let at = |x: f64| y0 + (y1 - y0) * (x - x0) / (x1 - x0);
+            let (ya, yb) = (at(a), at(b));
+            let p = 0.5 * (b - a) * (ya + yb);
+            let le = (b - a) / 6.0 * (a * (2.0 * ya + yb) + b * (ya + 2.0 * yb));
+            let c = if p > 0.0 { (le / p).clamp(a, b) } else { 0.5 * (a + b) };
+            Some((c / 1000.0, p))
+        })
+        .filter(|(_, p)| *p > 0.0)
+        .collect()
+}
+
+/// [`am15_direct_lines`] for any table.
+pub fn table_lines(table: &[[f64; 2]], n_bands: usize, lo_um: f64, hi_um: f64) -> Vec<(f64, f64)> {
+    if n_bands == 0 || hi_um <= lo_um {
+        return Vec::new();
+    }
+    let (lo, hi) = (lo_um * 1000.0, hi_um * 1000.0);
+    let w = (hi - lo) / n_bands as f64;
+    (0..n_bands)
+        .map(|i| {
+            let a = lo + w * i as f64;
+            let b = if i + 1 == n_bands { hi } else { a + w };
+            table_band_line(table, a, b)
+        })
+        .collect()
+}
+
+fn table_band_line(table: &[[f64; 2]], a_nm: f64, b_nm: f64) -> (f64, f64) {
+    let (e0, l0) = table_cumulative(table, a_nm);
+    let (e1, l1) = table_cumulative(table, b_nm);
+    let p = e1 - e0;
+    let c = if p > 0.0 {
+        ((l1 - l0) / p).clamp(a_nm, b_nm)
+    } else {
+        0.5 * (a_nm + b_nm)
+    };
+    (c / 1000.0, p)
+}
+
+/// A spectrum read from text: its rows `[nm, W/m²/nm]` and a line saying what
+/// was read.
+pub struct ParsedSpectrum {
+    pub rows: Vec<[f64; 2]>,
+    pub summary: String,
+}
+
+/// Read a spectral irradiance table from delimited text: a SMARTS output file,
+/// a spectroradiometer export, or two columns typed by hand.
+///
+/// Commas, semicolons, tabs and spaces all separate fields, and lines starting
+/// with `#`, `;` or `//` are comments. A header row, if any, picks the columns:
+/// the wavelength is the first column whose name mentions a wavelength
+/// (`wvl`, `wave`, `lambda`, `nm`, `µm`), else the first; the irradiance is
+/// the column naming direct light with the circumsolar part (`circumsolar`),
+/// else any direct or beam column (`direct`, `beam`, `dni`), else the second.
+/// Wavelengths all below 30 are taken as micrometres; an irradiance column
+/// whose name says per micrometre is divided by 1000 into per nanometre.
+pub fn parse_spectrum_table(text: &str) -> Result<ParsedSpectrum, String> {
+    let split = |line: &str| -> Vec<String> {
+        line.split(|c: char| c == ',' || c == ';' || c == '\t' || c.is_whitespace())
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    let mut header: Option<Vec<String>> = None;
+    let mut rows: Vec<Vec<f64>> = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') || t.starts_with(';') || t.starts_with("//") {
+            continue;
+        }
+        let fields = split(t);
+        let nums: Vec<Option<f64>> = fields.iter().map(|f| f.parse::<f64>().ok()).collect();
+        if nums.len() >= 2 && nums.iter().all(Option::is_some) {
+            rows.push(nums.into_iter().flatten().collect());
+        } else if rows.is_empty() {
+            header = Some(fields.iter().map(|f| f.to_lowercase()).collect());
+        }
+    }
+    if rows.len() < 2 {
+        return Err("fewer than two rows of numbers".into());
+    }
+    let width = rows.iter().map(Vec::len).min().unwrap_or(0);
+    let find = |keys: &[&str]| -> Option<usize> {
+        header
+            .as_ref()?
+            .iter()
+            .position(|h| keys.iter().any(|k| h.contains(k)))
+            .filter(|i| *i < width)
+    };
+    let wl = find(&["wvl", "wave", "lambda", "nm", "µm", "um"]).unwrap_or(0);
+    let ir = find(&["circumsolar"])
+        .or_else(|| find(&["direct", "beam", "dni"]))
+        .filter(|i| *i != wl)
+        .unwrap_or(if wl == 0 { 1 } else { 0 });
+    let name = |i: usize| {
+        header
+            .as_ref()
+            .and_then(|h| h.get(i).cloned())
+            .unwrap_or_else(|| format!("column {}", i + 1))
+    };
+    let micrometres = rows.iter().all(|r| r[wl] < 30.0);
+    let per_um = header
+        .as_ref()
+        .and_then(|h| h.get(ir))
+        // Per micrometre, said as a unit: "/um", "um-1", "per um". A bare "um"
+        // would match "circumsolar".
+        .is_some_and(|h| {
+            ["/um", "/µm", "um-1", "µm-1", "um^-1", "per_um", "per um", "per µm"]
+                .iter()
+                .any(|k| h.contains(k))
+        });
+    let mut out: Vec<[f64; 2]> = rows
+        .iter()
+        .map(|r| {
+            let nm = if micrometres { r[wl] * 1000.0 } else { r[wl] };
+            let e = if per_um { r[ir] / 1000.0 } else { r[ir] };
+            [nm, e]
+        })
+        .collect();
+    out.sort_by(|a, b| a[0].total_cmp(&b[0]));
+    if out.iter().any(|r| !r[0].is_finite() || !r[1].is_finite() || r[0] <= 0.0) {
+        return Err("a wavelength or an irradiance is not a finite number".into());
+    }
+    if out.iter().any(|r| r[1] < 0.0) {
+        return Err("an irradiance is negative".into());
+    }
+    if out.windows(2).any(|w| w[1][0] <= w[0][0]) {
+        return Err("two rows share a wavelength".into());
+    }
+    let total = table_cumulative(&out, out[out.len() - 1][0]).0;
+    if total <= 0.0 {
+        return Err("the table carries no power".into());
+    }
+    let summary = format!(
+        "{} rows, {:.0}–{:.0} nm{}, irradiance from '{}'{}: {:.1} W/m²",
+        out.len(),
+        out[0][0],
+        out[out.len() - 1][0],
+        if micrometres { " (read as µm)" } else { "" },
+        name(ir),
+        if per_um { " per µm" } else { "" },
+        total
+    );
+    Ok(ParsedSpectrum { rows: out, summary })
 }
 
 /// One band `[a, b]` (nm) as a line: power-weighted centroid in µm, and power.

@@ -35,6 +35,12 @@ test.describe("light source picker", () => {
     await expect(page.locator("#wlPreset")).toHaveValue("white");
     await expect(swatches).toHaveCount(9);
     await expect(page.locator("#wlList")).toBeDisabled();
+    // The swatches start folded away, behind a count and a range.
+    await expect(page.locator("#wlFold")).not.toHaveAttribute("open", "");
+    await expect(page.locator("#wlSummary")).toHaveText("9 wavelengths, 420–660 nm");
+    await expect(swatches.first()).toBeHidden();
+    await page.locator("#wlSummary").click();
+    await expect(swatches.first()).toBeVisible();
 
     // The F, d, C preset: three lines, still forming an image.
     await page.locator("#wlPreset").selectOption("fdc");

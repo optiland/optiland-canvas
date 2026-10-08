@@ -234,12 +234,19 @@ fn every_number(r: &TraceResult3) -> Vec<u64> {
             d.stokes_local.s3,
             d.max_tilt_rad,
             d.outside_cone_flux,
+            d.spectral_untracked_flux,
         ];
         v.extend(sums.map(f64::to_bits));
+        v.push(d.spectral.len() as u64);
+        for line in &d.spectral {
+            v.extend(line.to_array().map(f64::to_bits));
+        }
         for cells in [&d.incident_flux, &d.detected_signal, &d.direction_flux] {
             v.push(cells.len() as u64);
             v.extend(cells.iter().map(|x| x.to_bits()));
         }
+        v.push(d.colour_xyz.len() as u64);
+        v.extend(d.colour_xyz.iter().flatten().map(|x| x.to_bits()));
         v.push(d.records.len() as u64);
         for h in &d.records {
             let fields = [
@@ -372,4 +379,138 @@ fn a_pool_sharing_the_blocks_out_gives_the_jobs_trace_to_the_bit() {
         assert!(pooled.segments.is_empty());
         assert_eq!(in_order(&picture), in_order(&job.segments), "{id}: picture");
     }
+}
+
+/// `scene` with every source emitting `k` times the rays: what the page's
+/// analysis ray count traces its numbers with.
+fn with_more_rays(scene: &Scene3, k: u32) -> Scene3 {
+    let mut more = scene.clone();
+    for src in &mut more.sources {
+        src.samples.spatial_samples *= k;
+    }
+    more
+}
+
+/// Numbers traced with more rays than the picture shows: the numbers are the
+/// denser scene's, to the bit, and the picture is the scene's own, segment
+/// for segment and in order, whether one job traces it or a pool of workers
+/// shares the blocks out.
+#[test]
+fn more_rays_for_the_numbers_leave_the_picture_as_it_was() {
+    for (id, ghosts) in [("cooke-triplet", true), ("double-gauss", false)] {
+        let scene = design(id);
+        let more = with_more_rays(&scene, 4);
+        let cfg = TraceConfig3 {
+            segment_floor: 1e-5,
+            ..cfg(&scene, ghosts)
+        };
+        let plain = run(&scene, cfg, usize::MAX);
+        let dense = run(&more, cfg, usize::MAX);
+
+        for batch in [usize::MAX, 7] {
+            let mut job = TraceJob3::with_picture(more.clone(), Some(&scene), cfg);
+            // Progress counts the numbers' rays, the ones the status line quotes.
+            assert_eq!(
+                job.progress().1,
+                TraceBlocks3::new(more.clone(), cfg).rays()
+            );
+            while !job.step(batch) {}
+            let split = job.finish();
+            let mut numbers_only = every_number(&split);
+            let mut dense_numbers = every_number(&dense);
+            // The count of segments left out below the floor is the
+            // picture's, like the segments themselves.
+            numbers_only.pop();
+            dense_numbers.pop();
+            assert_eq!(numbers_only, dense_numbers, "{id}, batch {batch}: numbers");
+            assert_eq!(split.terminations, dense.terminations, "{id}: terminations");
+            assert_eq!(
+                split.segments_omitted, plain.segments_omitted,
+                "{id}: omitted"
+            );
+            assert_eq!(
+                in_order(&split.segments),
+                in_order(&plain.segments),
+                "{id}: picture"
+            );
+        }
+
+        // The same through a pool: each block traces its share of both.
+        let workers: Vec<TraceBlocks3> = (0..2)
+            .map(|_| TraceBlocks3::with_picture(more.clone(), Some(&scene), cfg))
+            .collect();
+        let mut merge = TraceMerge3::new(&workers[0]);
+        let mut picture = Vec::new();
+        for b in 0..workers[0].blocks() {
+            let w = &workers[b % 2];
+            let mut part = w.part(b, true);
+            while !w.step(&mut part, 5) {}
+            picture.extend_from_slice(part.segments());
+            merge.add_encoded(&part.encode()).unwrap();
+        }
+        let pooled = merge.finish();
+        let mut a = every_number(&pooled);
+        let mut b = every_number(&dense);
+        a.pop();
+        b.pop();
+        assert_eq!(a, b, "{id}: pooled numbers");
+        assert_eq!(
+            in_order(&picture),
+            in_order(&plain.segments),
+            "{id}: pooled picture"
+        );
+    }
+}
+
+/// Rays past one pass come as more passes, each the scene's point sets
+/// shifted afresh: the totals stay one pass's, the hits grow with the
+/// passes, and a pool whose workers hop between passes gives what one job
+/// gives, to the bit.
+#[test]
+fn passes_add_rays_and_a_pool_agrees_with_a_job() {
+    // Its detectors asked for illuminance, so the colour sums travel through
+    // the pool with the rest.
+    let mut scene = design("cooke-triplet");
+    for d in &mut scene.detectors {
+        if d.geometry.has_area() {
+            d.measure = oc_core::scene3::DetectorMeasure::Illuminance;
+        }
+    }
+    assert!(scene.detectors.iter().any(|d| d.measure == oc_core::scene3::DetectorMeasure::Illuminance));
+    let cfg = cfg(&scene, false);
+    let one = run(&scene, cfg, usize::MAX);
+
+    let mut job = TraceJob3::with_passes(scene.clone(), 3, None, cfg);
+    assert_eq!(job.progress().1, 3 * TraceBlocks3::new(scene.clone(), cfg).rays());
+    while !job.step(7) {}
+    let passes = job.finish();
+    assert!((passes.ledger.launched - one.ledger.launched).abs() <= 1e-12 * one.ledger.launched);
+    for (a, b) in passes.detectors.iter().zip(&one.detectors) {
+        assert!(a.hits >= 2 * b.hits, "{} hits against {}", a.hits, b.hits);
+        assert!(
+            (a.total_incident - b.total_incident).abs() <= 0.02 * b.total_incident.max(1e-12),
+            "{} against {}",
+            a.total_incident,
+            b.total_incident
+        );
+    }
+
+    // Three workers, handed blocks round the table: each makes the passes it
+    // reaches, in whatever order they come.
+    let workers: Vec<TraceBlocks3> = (0..3)
+        .map(|_| TraceBlocks3::with_passes(scene.clone(), 3, None, cfg))
+        .collect();
+    let mut merge = TraceMerge3::new(&workers[0]);
+    for b in 0..workers[0].blocks() {
+        let w = &workers[(b * 7) % 3];
+        let mut part = w.part(b, true);
+        while !w.step(&mut part, 11) {}
+        merge.add_encoded(&part.encode()).unwrap();
+    }
+    let pooled = merge.finish();
+    let mut a = every_number(&pooled);
+    let mut b = every_number(&passes);
+    a.pop();
+    b.pop();
+    assert_eq!(a, b, "pooled numbers");
 }

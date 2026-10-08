@@ -1067,6 +1067,9 @@ fn classify_surface(r: &TwoSidedSurfaceResponse) -> Result<u32, String> {
         SurfaceResponse::ThinLens { .. } => {
             Err("thin lens on a body patch (only standalone surfaces carry it)".into())
         }
+        SurfaceResponse::Grating { .. } => {
+            Err("grating on a body patch (only standalone surfaces carry one)".into())
+        }
         SurfaceResponse::Polarizer { .. } | SurfaceResponse::Retarder { .. } => {
             Err("polarizing element on a body patch (only standalone surfaces carry one)".into())
         }
@@ -1246,6 +1249,15 @@ pub enum GpuResponse {
     ThinLens {
         f: f32,
     },
+    /// A diffraction grating, grooves along the surface's local Y: `k` is
+    /// the order times the groove density per micrometre, `eta` and `zero`
+    /// the fractions sent into that order and the zero order.
+    Grating {
+        k: f32,
+        eta: Spectral32,
+        zero: Spectral32,
+        transmit: bool,
+    },
     /// A thin-film stack evaluated onto a grid: `COAT_ANGLES` rows, uniform in
     /// `sin2 theta`, of one `(R, T)` pair per entry in `lambdas`.
     CoatingGrid {
@@ -1362,6 +1374,29 @@ fn compile_response(
         SurfaceResponse::Absorber => GpuResponse::Absorber,
         SurfaceResponse::ThinLens { focal_length_mm } => GpuResponse::ThinLens {
             f: (focal_length_mm / scale) as f32,
+        },
+        // Directions do not depend on the scene's scale: the shift in a ray's
+        // direction cosine is per micrometre of wavelength.
+        // The preview traces no polarization, so a grating that splits it
+        // gives each ray the mean of its two curves.
+        SurfaceResponse::Grating {
+            lines_per_mm,
+            order,
+            efficiency,
+            zero_order,
+            transmissive,
+            tm,
+        } => GpuResponse::Grating {
+            k: oc_core::grating::k_per_um(*lines_per_mm, *order) as f32,
+            eta: match tm {
+                Some(t) => spectral(&oc_core::grating::unpolarized(efficiency, &t.efficiency))?,
+                None => spectral(efficiency)?,
+            },
+            zero: match tm {
+                Some(t) => spectral(&oc_core::grating::unpolarized(zero_order, &t.zero_order))?,
+                None => spectral(zero_order)?,
+            },
+            transmit: *transmissive,
         },
         SurfaceResponse::Mirror { reflectivity } => GpuResponse::Mirror {
             r: spectral(reflectivity)?,

@@ -19,6 +19,13 @@ export default defineConfig({
   use: {
     baseURL: `http://localhost:${PORT}`,
     trace: "retain-on-failure",
+    // The scene tools card starts folded for a new viewer; the specs drive
+    // the controls in it, so they start with it open (tools.spec.ts checks
+    // the fold itself).
+    storageState: {
+      cookies: [],
+      origins: [{ origin: `http://localhost:${PORT}`, localStorage: [{ name: "optiland-canvas:tools", value: "open" }] }],
+    },
   },
   projects: [
     {

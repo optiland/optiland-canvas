@@ -25,6 +25,7 @@
 
 #[cfg(feature = "scene3")]
 pub mod build3;
+pub mod colorimetry;
 pub mod coordinates;
 #[cfg(feature = "scene3")]
 pub mod display_mesh;
@@ -37,7 +38,11 @@ pub mod geom;
 #[cfg(feature = "scene3")]
 pub mod geom3;
 #[cfg(feature = "scene3")]
+pub mod grating;
+#[cfg(feature = "scene3")]
 pub mod heliostat;
+#[cfg(feature = "scene3")]
+pub mod link;
 pub mod id;
 pub mod material;
 #[cfg(feature = "scene3")]

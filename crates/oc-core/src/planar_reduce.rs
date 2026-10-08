@@ -332,6 +332,8 @@ fn response_to_spec(object: u64, r: &SurfaceResponse) -> Result<SurfaceSpec, Red
         // v1 has no ideal-lens surface either; a thin lens reduced to a plain
         // plane would silently stop focusing. Refuse.
         SurfaceResponse::ThinLens { .. } => Err(unsupported("thin lens")),
+        // v1 has no diffraction at all.
+        SurfaceResponse::Grating { .. } => Err(unsupported("grating")),
     }
 }
 
@@ -624,6 +626,13 @@ pub fn reduce_to_planar(
     if !matches!(scene.env.ambient_absorption, AbsorptionModel::None) {
         return Err(ReductionIssue::UnsupportedEnvironment {
             reason: "ambient absorption has no v1 form".to_string(),
+        });
+    }
+
+    // Nor any slope error: the fast path would draw the faces true.
+    if !scene.figure_errors.is_empty() {
+        return Err(ReductionIssue::UnsupportedEnvironment {
+            reason: "slope error has no v1 form".to_string(),
         });
     }
 

@@ -71,4 +71,61 @@ test.describe("solar — tubes, the sun, heliostats", () => {
     expect(after.solar.azimuth).not.toBeCloseTo(before.solar.azimuth, 1);
     expect(rot(after)).not.toEqual(rot(before));
   });
+
+  test("a new sun is the measured one, and its shape and spectrum are the panel's", async ({ page }) => {
+    await page.goto("/?debug");
+    await expect(page.locator("#stat")).toContainText("segs");
+    await page.locator("#addHeliostat").click();
+    await expect(page.locator("#sunSec")).toBeVisible();
+    // Jena, the Deutsches Optisches Museum, until someone says otherwise.
+    let s = (await debug(page)).solar;
+    expect(s.site.lat).toBeCloseTo(50.92781, 5);
+    expect(s.site.lon).toBeCloseTo(11.57928, 5);
+    // Every wavelength of G173, a limb-darkened disc, a 5% aureole.
+    expect(s.continuous).toBe(true);
+    expect(s.wavelengths).toBe(1661);
+    expect(s.disc).toBe("limb");
+    expect(s.csr).toBeCloseTo(0.05, 12);
+    await expect(page.locator("#sunReadout")).toContainText("continuous, 1661 wavelengths");
+    await expect(page.locator("#sunReadout")).toContainText("limb-darkened disc, 5% aureole");
+    const watts = s.fluxW as number;
+
+    // The shape moves light around and makes none.
+    await page.locator("#sunDisc").selectOption("buie");
+    await page.locator("#sunCsr").fill("20");
+    await page.locator("#sunCsr").press("Enter");
+    await page.locator("#sunCsr").blur();
+    await expect.poll(async () => (await debug(page)).solar.csr).toBeCloseTo(0.2, 12);
+    s = (await debug(page)).solar;
+    expect(s.disc).toBe("buie");
+    expect(s.fluxW).toBeCloseTo(watts, 6);
+
+    // Lines instead of the continuum.
+    await page.locator("#sunSpectral").selectOption("lines");
+    await expect.poll(async () => (await debug(page)).solar.continuous).toBe(false);
+    await expect(page.locator("#sunBands")).toBeVisible();
+    await expect(page.locator("#sunReadout")).toContainText("6 lines");
+
+    // A table for the site: a flat 1 W/m²/nm from 300 to 2500 nm carries
+    // 2200 W/m², all of it in the band, so the DNI becomes 2200.
+    await page.locator("#sunFile").setInputFiles({
+      name: "flat.csv",
+      mimeType: "text/csv",
+      buffer: Buffer.from(["wavelength_nm,direct_W/m2/nm", "300,1", "2500,1"].join("\n")),
+    });
+    await expect(page.locator("#sunTable")).toHaveText("flat.csv");
+    await expect(page.locator("#sunReadout")).toContainText("imported 2 rows, 300–2500 nm");
+    s = (await debug(page)).solar;
+    expect(s.dni).toBeCloseTo(2200, 9);
+    expect(s.spectrum.name).toBe("flat.csv");
+    // Back to the standard.
+    await page.locator("#sunG173").click();
+    await expect(page.locator("#sunTable")).toHaveText("ASTM G173-03");
+    expect((await debug(page)).solar.dni).toBe(900);
+
+    // Nonsense is refused and says why, and nothing changes.
+    await page.locator("#sunFile").setInputFiles({ name: "junk.txt", mimeType: "text/plain", buffer: Buffer.from("no numbers here") });
+    await expect(page.locator("#sunReadout")).toContainText("junk.txt refused");
+    await expect(page.locator("#sunTable")).toHaveText("ASTM G173-03");
+  });
 });

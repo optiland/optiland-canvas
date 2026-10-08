@@ -501,6 +501,59 @@ fn ref_dsag(c: f64, k: f64, coeffs: &[f64; 8], r: f64) -> f64 {
     d
 }
 
+#[test]
+fn an_asphere_zone_is_hit_whatever_range_is_asked() {
+    // One groove of a 1.65 m PMMA Fresnel lens: a zone 0.5 mm wide at 825 mm
+    // of a strongly aspheric hyperboloid. A ray that meets it far from where it
+    // crosses the base conic was found or missed depending on `tmax`, which in
+    // a scene hung on the order a BVH walk met the objects. The hits must be
+    // the same over any range that holds them.
+    let coeffs = [-1.130_789_121_707_859_1e-11, 7.610_977_872_741_671e-18, 6.204_182_179_959_649e-24, 0.0, 0.0, 0.0, 0.0, 0.0];
+    let (c, k) = (-5.167_617_542_177_864e-4, -9.415_963_503_551_353);
+    let surf = Revolution {
+        vertex: Vec3::new(138.28, 0.0, 0.0),
+        axis: Vec3::X,
+        c,
+        k,
+        coeffs,
+        inner_r: 824.5,
+        outer_r: 825.0,
+    };
+    let sag = |r: f64| {
+        let mut z = c * r * r / (1.0 + (1.0 - (1.0 + k) * c * c * r * r).sqrt());
+        for (i, a) in coeffs.iter().enumerate() {
+            z += a * r.powi(2 * i as i32 + 4);
+        }
+        z
+    };
+    let mut met = 0;
+    for dx in [-2.0, -0.3, 0.05, 0.3, 2.0] {
+        for theta_deg in [0.5f64, 10.0, 45.0, 80.0, 88.0, 89.5, 90.5, 92.0, 100.0, 135.0, 170.0] {
+            for psi_deg in [0.0f64, 30.0, 85.0] {
+                let (t, p) = (theta_deg.to_radians(), psi_deg.to_radians());
+                let o = Vec3::new(138.28 + sag(824.75) + dx, 824.75, 0.0);
+                let r = ray(o, Vec3::new(t.cos(), t.sin() * p.cos(), t.sin() * p.sin()));
+                let all = prim(|out| revolution_intersect(&surf, &r, TMIN, TMAX, out));
+                met += all.len();
+                for h in &all {
+                    let near = prim(|out| revolution_intersect(&surf, &r, TMIN, h.t_mm + 1e-6, out));
+                    assert!(
+                        near.iter().any(|q| (q.t_mm - h.t_mm).abs() < 1e-9),
+                        "dx {dx} theta {theta_deg} psi {psi_deg}: hit at {} found only over a longer range",
+                        h.t_mm
+                    );
+                }
+                for tmax in [0.3, 5.0, 50.0] {
+                    let short: Vec<f64> = prim(|out| revolution_intersect(&surf, &r, TMIN, tmax, out)).iter().map(|q| q.t_mm).collect();
+                    let expect: Vec<f64> = all.iter().map(|q| q.t_mm).filter(|t| *t <= tmax).collect();
+                    assert_eq!(short.len(), expect.len(), "dx {dx} theta {theta_deg} psi {psi_deg} tmax {tmax}: {short:?} vs {expect:?}");
+                }
+            }
+        }
+    }
+    assert!(met > 20, "the rays should meet the zone: {met} hits");
+}
+
 // ---------------------------------------------------------------------------
 // Frustum (revolved line segment)
 // ---------------------------------------------------------------------------
@@ -852,6 +905,7 @@ fn a_zero_thickness_surface_contains_nothing() {
             inner_radius_mm: 0.0,
             outer_radius_mm: 5.0,
         },
+        outline: None,
     };
     let tol = ToleranceContext::default();
     assert_eq!(
@@ -873,6 +927,7 @@ fn a_surface_of_revolution_is_hit_with_a_front_facing_normal() {
             inner_radius_mm: 0.0,
             outer_radius_mm: 6.0,
         },
+        outline: None,
     };
     let hs = hits(
         &geom,
@@ -895,6 +950,43 @@ fn a_surface_of_revolution_is_hit_with_a_front_facing_normal() {
         (vertex.normal_local - Vec3::Z).length() < 1e-9,
         "vertex normal is +Z"
     );
+}
+
+#[test]
+fn an_outline_keeps_only_its_piece_of_the_revolution() {
+    // A strip 20 x 4 mm cut from a 25 mm sphere of radius 12: a ray at y = 1
+    // hits it, one at y = 3 lies inside the disc but off the strip, and the
+    // bounds shrink to the strip.
+    let geom = SurfaceGeometry3::SurfaceOfRevolution {
+        sag: SagModel::Conic {
+            curvature_per_mm: 1.0 / 25.0,
+            conic: 0.0,
+        },
+        radial_aperture: RadialAperture {
+            inner_radius_mm: 0.0,
+            outer_radius_mm: 12.0,
+        },
+        outline: Some(PlanarShape2::Rectangle {
+            half_width_mm: 10.0,
+            half_height_mm: 2.0,
+        }),
+    };
+    let down = |x: f64, y: f64| {
+        hits(
+            &geom,
+            &ray(Vec3::new(x, y, 10.0), Vec3::NEG_Z),
+            &Isometry3::IDENTITY,
+        )
+    };
+    let on = down(8.0, 1.0);
+    assert_eq!(on.len(), 1);
+    let r2: f64 = 64.0 + 1.0;
+    let sag = 25.0 - (625.0 - r2).sqrt();
+    assert!((on[0].point_local.z - sag).abs() < 1e-9);
+    assert!(down(0.0, 3.0).is_empty(), "inside the disc, off the strip");
+    assert!(down(11.0, 0.0).is_empty(), "past the strip's end");
+    let bb = geom.aabb_world(&Isometry3::IDENTITY);
+    assert_eq!((bb.min.x, bb.max.y), (-10.0, 2.0));
 }
 
 // ---------------------------------------------------------------------------

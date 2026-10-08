@@ -8,7 +8,8 @@
 //! which is the stable "front" side that two-sided response selection reads.
 
 use super::primitives::{
-    even_asphere_sag, planar_shape_intersect, revolution_intersect, Revolution,
+    even_asphere_sag, planar_shape_contains, planar_shape_intersect, revolution_intersect,
+    Revolution,
 };
 use super::{ray_to_local, Containment, Intersect3, LocalHit3, ToleranceContext};
 use crate::id::PatchId;
@@ -48,7 +49,7 @@ fn revolution_of(sag: &SagModel, aperture: &RadialAperture) -> Revolution {
 }
 
 /// Conservative `XY` bounds of a planar shape, at `z = 0`.
-fn planar_shape_bounds(shape: &PlanarShape2) -> (Vec2, Vec2) {
+pub(crate) fn planar_shape_bounds(shape: &PlanarShape2) -> (Vec2, Vec2) {
     match shape {
         PlanarShape2::Rectangle {
             half_width_mm,
@@ -87,13 +88,23 @@ fn local_aabb(geom: &SurfaceGeometry3) -> Aabb3 {
         SurfaceGeometry3::SurfaceOfRevolution {
             sag,
             radial_aperture,
+            outline,
         } => {
             let (c, k, coeffs) = sag_params(sag);
             let outer = radial_aperture.outer_radius_mm;
             let sag_edge = even_asphere_sag(c, k, &coeffs, outer);
+            // The sag is monotone only for the usual caps, so the axial span
+            // stays the full aperture's; the outline narrows X and Y.
+            let (lo, hi) = match outline {
+                Some(o) => {
+                    let (lo, hi) = planar_shape_bounds(o);
+                    (lo.max(Vec2::splat(-outer)), hi.min(Vec2::splat(outer)))
+                }
+                None => (Vec2::splat(-outer), Vec2::splat(outer)),
+            };
             Aabb3 {
-                min: Vec3::new(-outer, -outer, sag_edge.min(0.0)),
-                max: Vec3::new(outer, outer, sag_edge.max(0.0)),
+                min: Vec3::new(lo.x, lo.y, sag_edge.min(0.0)),
+                max: Vec3::new(hi.x, hi.y, sag_edge.max(0.0)),
             }
         }
     }
@@ -142,9 +153,17 @@ impl Intersect3 for SurfaceGeometry3 {
             SurfaceGeometry3::SurfaceOfRevolution {
                 sag,
                 radial_aperture,
+                outline,
             } => {
                 let surf = revolution_of(sag, radial_aperture);
-                revolution_intersect(&surf, &ray, t_min_mm, t_max_mm, &mut emit)
+                match outline {
+                    None => revolution_intersect(&surf, &ray, t_min_mm, t_max_mm, &mut emit),
+                    Some(o) => revolution_intersect(&surf, &ray, t_min_mm, t_max_mm, &mut |raw| {
+                        if planar_shape_contains(o, Vec2::new(raw.point.x, raw.point.y)) {
+                            emit(raw)
+                        }
+                    }),
+                }
             }
         }
     }

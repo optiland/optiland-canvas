@@ -143,6 +143,7 @@ pub fn export_seq(
     let tol = ToleranceContext::for_scene_scale(axial(chain.terminal.point).abs());
     let step = 8.0 * tol.medium_abs_mm;
     let mut noted_absorption: Vec<ObjectId> = Vec::new();
+    let mut noted_figure: Vec<ObjectId> = Vec::new();
     let ambient = ambient_material(scene);
 
     for hit in &chain.hits {
@@ -166,6 +167,12 @@ pub fn export_seq(
             SeqAction::ThinLens => {
                 reasons.push(format!(
                     "{who} is an ideal thin lens, which has no surfaces to export"
+                ));
+                continue;
+            }
+            SeqAction::Diffract => {
+                reasons.push(format!(
+                    "the path diffracts at {who}; this export writes no gratings"
                 ));
                 continue;
             }
@@ -229,6 +236,13 @@ pub fn export_seq(
         let entering =
             body.geometry.contains(past, &body.common.transform, &tol) == Containment::Inside;
         let behind = medium_body(scene, past, &tol);
+        if scene.slope_error_rad(body.common.id) > 0.0 && !noted_figure.contains(&body.common.id) {
+            noted_figure.push(body.common.id);
+            notes.push(format!(
+                "{}: its slope error is not carried; the sequential surface is drawn true",
+                describe(scene, body.common.id)
+            ));
+        }
         if let Some(b) = behind {
             if !matches!(b.absorption, AbsorptionModel::None)
                 && !noted_absorption.contains(&b.common.id)
@@ -671,6 +685,15 @@ fn illumination(
         AngularDistribution3::PlanarFanLegacy { .. } => {
             Err("the source is a v1 fan, which has no aperture in 3D".into())
         }
+        AngularDistribution3::RadialProfile { .. } => Err(
+            "the source is a measured beam, a spread of directions from an area; a sequential              system needs a point or a beam"
+                .into(),
+        ),
+        AngularDistribution3::Sun { .. } => Err(
+            "the source is the sun, a disc of directions from a disc of origins; a sequential \
+             system needs a point or a beam"
+                .into(),
+        ),
     }
 }
 
@@ -723,6 +746,7 @@ fn surface_kind(scene: &Scene3, id: ObjectId) -> &'static str {
         SurfaceResponse::Retarder { .. } => "a waveplate",
         SurfaceResponse::Absorber => "an absorber",
         SurfaceResponse::ThinLens { .. } => "an ideal thin lens",
+        SurfaceResponse::Grating { .. } => "a diffraction grating",
         SurfaceResponse::DielectricFresnel { .. } => "a bare zero-thickness interface",
     }
 }

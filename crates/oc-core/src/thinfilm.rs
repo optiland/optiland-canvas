@@ -294,7 +294,18 @@ pub enum CoatingBacking {
     Plate {
         substrate: FilmMaterial,
         exit: ExitFace,
+        /// The plate's thickness, mm, which only its absorption reads: each
+        /// pass through the glass is attenuated by the substrate's own `k`
+        /// along the slant path, `exp(-4π k d / (λ cos θ))`. A silvered sheet
+        /// of float glass loses a few percent this way, most of it near 1 µm
+        /// where the iron absorbs. `0`, the default, is a lossless plate.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        thickness_mm: f64,
     },
+}
+
+fn is_zero(v: &f64) -> bool {
+    *v == 0.0
 }
 
 /// The second face of a plate.
@@ -637,7 +648,7 @@ pub fn coating_rt_at(
         // The stack sits straight on whatever the scene has on the far side: an
         // AR coating on a lens face is backed by that lens's own glass.
         CoatingBacking::Medium => Some(rt_both(&layers, n0, n_far, lambda_um, q)),
-        CoatingBacking::Plate { substrate, exit } => {
+        CoatingBacking::Plate { substrate, exit, thickness_mm } => {
             let n_sub = substrate.index_at(lambda_um)?;
             if !n_sub.is_finite() || n_sub.re <= 0.0 {
                 return None;
@@ -655,6 +666,7 @@ pub fn coating_rt_at(
                 q,
                 residual,
                 c.incidence,
+                thickness_mm.max(0.0) * 1e3,
             ))
         }
     }
@@ -852,8 +864,16 @@ fn plate_rt(
     q: Cx,
     exit_residual: f64,
     incidence: Incidence,
+    thickness_um: f64,
 ) -> FilmRt {
     let reversed: Vec<(Cx, f64)> = layers.iter().rev().copied().collect();
+    // One pass through the glass, by its extinction along the slant path.
+    let tau = if thickness_um > 0.0 && n_sub.im > 0.0 {
+        let cos_t = snell_cos(q, Cx::real(n_sub.re)).re.max(1e-6);
+        (-4.0 * std::f64::consts::PI * n_sub.im * thickness_um / (lambda_um * cos_t)).exp()
+    } else {
+        1.0
+    };
     let mut out = [(0.0, 0.0); 2];
     for (idx, p_pol) in [false, true].into_iter().enumerate() {
         // The coated face, lit from the air side and from inside the glass.
@@ -873,10 +893,11 @@ fn plate_rt(
             Incidence::Substrate => (r1p, t1p),
         };
 
-        let den = 1.0 - back_r * second_r;
+        let tau2 = tau * tau;
+        let den = 1.0 - back_r * second_r * tau2;
         let den = if den.abs() < 1e-12 { 1e-12 } else { den };
-        let r = (front_r + front_t * back_t * second_r / den).clamp(0.0, 1.0);
-        let t = (front_t * second_t / den).clamp(0.0, 1.0);
+        let r = (front_r + front_t * back_t * second_r * tau2 / den).clamp(0.0, 1.0);
+        let t = (front_t * second_t * tau / den).clamp(0.0, 1.0);
         // Absorption in the stack can only take energy away, never add it.
         let scale = if r + t > 1.0 { 1.0 / (r + t) } else { 1.0 };
         out[idx] = (r * scale, t * scale);
@@ -1281,7 +1302,7 @@ pub fn plate_coating(
     exit: ExitFace,
     n_incident: f64,
 ) -> Coating {
-    let backing = CoatingBacking::Plate { substrate, exit };
+    let backing = CoatingBacking::Plate { substrate, exit, thickness_mm: 0.0 };
     Coating {
         layers: design_layers_for(&design, n_incident, &backing, n_incident),
         backing,
@@ -1897,6 +1918,47 @@ mod tests {
         );
     }
 
+    /// A thick plate absorbs by its own `k` on every pass: an uncoated one at
+    /// normal incidence is the textbook incoherent slab, and a silvered one
+    /// lit through its glass returns its front face's 4% plus the silver's
+    /// share of what survives two passes.
+    #[test]
+    fn a_thick_plate_absorbs_on_every_pass() {
+        let (n, k, d_mm, lam) = (1.52, 2e-6, 4.0, 1.0);
+        let glass = FilmMaterial::absorbing("glass", n, k);
+        let tau = (-4.0 * std::f64::consts::PI * k * d_mm * 1e3 / lam).exp();
+        let r = ((n - 1.0) / (n + 1.0)).powi(2);
+        let bare = Coating {
+            layers: Vec::new(),
+            backing: CoatingBacking::Plate { substrate: glass.clone(), exit: ExitFace::Bare, thickness_mm: d_mm },
+            incidence: Incidence::Film,
+            design: None,
+        };
+        let got = coating_rt(&bare, 1.0, lam, 1.0).unwrap();
+        let t_slab = (1.0 - r) * (1.0 - r) * tau / (1.0 - r * r * tau * tau);
+        assert!((got.t() - t_slab).abs() < 1e-5, "{} vs {t_slab}", got.t());
+        assert!(tau < 0.92 && tau > 0.9);
+
+        let silvered = Coating {
+            layers: vec![FilmLayer::new(materials::silver(), 150.0)],
+            backing: CoatingBacking::Plate { substrate: glass, exit: ExitFace::Bare, thickness_mm: d_mm },
+            incidence: Incidence::Substrate,
+            design: None,
+        };
+        let r_ag = coating_rt_at(
+            &Coating { layers: vec![FilmLayer::new(materials::silver(), 150.0)], backing: CoatingBacking::Medium, incidence: Incidence::Film, design: None },
+            n,
+            1.0,
+            lam,
+            1.0,
+        )
+        .unwrap()
+        .r();
+        let want = r + (1.0 - r) * (1.0 - r) * r_ag * tau * tau / (1.0 - r * r_ag * tau * tau);
+        let got = coating_rt(&silvered, 1.0, lam, 1.0).unwrap().r();
+        assert!((got - want).abs() < 2e-4, "{got} vs {want}");
+    }
+
     /// A plate transmits less than its coating alone, because the light still
     /// has to leave the glass, and an AR on the back face recovers most of it.
     #[test]
@@ -1908,6 +1970,7 @@ mod tests {
             backing: CoatingBacking::Plate {
                 substrate: bk7.clone(),
                 exit: ExitFace::Bare,
+                thickness_mm: 0.0,
             },
             incidence: Incidence::Film,
             design: None,
@@ -1916,6 +1979,7 @@ mod tests {
             backing: CoatingBacking::Plate {
                 substrate: bk7,
                 exit: ExitFace::AntiReflective { residual: 0.05 },
+                thickness_mm: 0.0,
             },
             ..bare.clone()
         };

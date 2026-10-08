@@ -249,9 +249,13 @@ pub fn surface_mesh(s: &SurfaceObject3, tess: &Tessellation) -> DisplayMesh {
         SurfaceGeometry3::SurfaceOfRevolution {
             sag,
             radial_aperture,
+            outline,
         } => {
             let half = slab_half_thickness(radial_aperture.outer_radius_mm);
-            revolved_sheet(&mut m, sag, radial_aperture, half, tess);
+            match outline {
+                None => revolved_sheet(&mut m, sag, radial_aperture, half, tess),
+                Some(o) => outlined_sheet(&mut m, sag, radial_aperture, o, half),
+            }
         }
     }
     m.finish(None)
@@ -1747,6 +1751,71 @@ fn revolved_sheet(
     }
 }
 
+/// A piece cut from a surface of revolution by an outline in local `XY`, as
+/// two sheets `half` apart on a square grid. Cells whose centre falls outside
+/// the outline or the radial aperture are left out, so a curved outline edge
+/// is drawn to the grid's step.
+fn outlined_sheet(m: &mut Builder, sag: &SagModel, ap: &RadialAperture, outline: &PlanarShape2, half: f64) {
+    let (c, k, coeffs) = match sag {
+        SagModel::Plane => (0.0, 0.0, [0.0; 8]),
+        SagModel::Conic {
+            curvature_per_mm,
+            conic,
+        } => (*curvature_per_mm, *conic, [0.0; 8]),
+        SagModel::EvenAsphere {
+            curvature_per_mm,
+            conic,
+            coeffs,
+        } => (*curvature_per_mm, *conic, *coeffs),
+    };
+    let (r0, r1) = (ap.inner_radius_mm.max(0.0), ap.outer_radius_mm);
+    let (lo, hi) = crate::geom3::surface::planar_shape_bounds(outline);
+    let (lo, hi) = (lo.max(Vec2::splat(-r1)), hi.min(Vec2::splat(r1)));
+    if lo.x >= hi.x || lo.y >= hi.y {
+        return;
+    }
+    let step = (hi - lo).max_element() / 64.0;
+    let nx = (((hi.x - lo.x) / step).ceil() as usize).max(1);
+    let ny = (((hi.y - lo.y) / step).ceil() as usize).max(1);
+    let at = |i: usize, j: usize| Vec2::new(lo.x + (hi.x - lo.x) * i as f64 / nx as f64, lo.y + (hi.y - lo.y) * j as f64 / ny as f64);
+    let keep = |p: Vec2| {
+        let r = p.length();
+        r >= r0 && r <= r1 && crate::geom3::primitives::planar_shape_contains(outline, p)
+    };
+    for (off, g, flip) in [
+        (half, FaceGroup::Front, 1.0),
+        (-half, FaceGroup::Back, -1.0),
+    ] {
+        m.group(g);
+        let mut ids = vec![0u32; (nx + 1) * (ny + 1)];
+        for j in 0..=ny {
+            for i in 0..=nx {
+                let p = at(i, j);
+                // Corner points past the rim belong to no kept cell; clamping
+                // keeps them off the sag's domain edge.
+                let r = p.length().min(r1);
+                let dz = even_asphere_dsag(c, k, &coeffs, r);
+                let radial = if r > 0.0 { p / r } else { Vec2::ZERO };
+                let n = Vec3::new(-dz * radial.x, -dz * radial.y, 1.0).normalize() * flip;
+                ids[j * (nx + 1) + i] = m.vertex(Vec3::new(p.x, p.y, even_asphere_sag(c, k, &coeffs, r) + off), n);
+            }
+        }
+        for j in 0..ny {
+            for i in 0..nx {
+                if !keep((at(i, j) + at(i + 1, j + 1)) * 0.5) {
+                    continue;
+                }
+                let id = |i: usize, j: usize| ids[j * (nx + 1) + i];
+                if flip > 0.0 {
+                    m.quad(id(i, j), id(i + 1, j), id(i + 1, j + 1), id(i, j + 1));
+                } else {
+                    m.quad(id(i, j), id(i, j + 1), id(i + 1, j + 1), id(i + 1, j));
+                }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -2255,6 +2324,7 @@ mod tests {
                 inner_radius_mm: 2.0,
                 outer_radius_mm: 10.0,
             },
+            outline: None,
         };
         let mut s = Scene3::new();
         let id = s
@@ -2265,6 +2335,35 @@ mod tests {
         assert_watertight(&m);
         assert_faces_outward(&m);
         assert!(signed_volume(&m) > 0.0);
+    }
+
+    #[test]
+    fn an_outlined_surface_is_drawn_inside_its_outline() {
+        let mut s = Scene3::new();
+        let id = s
+            .add_planar_mirror(Vec3::ZERO, Vec3::Y * 10.0, 0.9)
+            .unwrap();
+        s.surfaces[0].geometry = SurfaceGeometry3::SurfaceOfRevolution {
+            sag: SagModel::Conic {
+                curvature_per_mm: 1.0 / 100.0,
+                conic: 0.0,
+            },
+            radial_aperture: RadialAperture {
+                inner_radius_mm: 0.0,
+                outer_radius_mm: 40.0,
+            },
+            outline: Some(PlanarShape2::Rectangle {
+                half_width_mm: 30.0,
+                half_height_mm: 5.0,
+            }),
+        };
+        let m = object_mesh(&s, id, &tess()).unwrap();
+        assert!(m.triangle_count() > 100);
+        assert!(m.bounds_max[0] <= 30.0 + 1e-9 && m.bounds_min[1] >= -5.0 - 1e-9);
+        // The sheet follows the sphere: the strip's corner, r^2 = 925, sits a
+        // sag of 100 - sqrt(100^2 - 925) up, plus the 1 mm display slab.
+        let corner = 100.0 - (1e4f64 - 925.0).sqrt() + 1.0;
+        assert!((m.bounds_max[2] - corner).abs() < 1e-6);
     }
 
     /// The crease lines, as welded position pairs.

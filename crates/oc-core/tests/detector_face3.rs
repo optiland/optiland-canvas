@@ -237,6 +237,7 @@ fn a_file_cannot_ask_for_a_grid_that_overflows() {
     s.detectors[0].measure = DetectorMeasure::Intensity {
         half_angle_deg: 30.0,
         bins: [usize::MAX, 3],
+        layout: Default::default(),
     };
     assert!(s.validate().is_err(), "the angular grid is capped too");
 }
@@ -328,6 +329,7 @@ fn only_an_intensity_detector_has_angular_bins_to_set() {
     s.detectors[0].measure = DetectorMeasure::Intensity {
         half_angle_deg: 40.0,
         bins: [24, 1],
+        layout: Default::default(),
     };
     assert!(s.set_detector_direction_bins(id, 12, 4));
     assert_eq!(
@@ -335,6 +337,7 @@ fn only_an_intensity_detector_has_angular_bins_to_set() {
         DetectorMeasure::Intensity {
             half_angle_deg: 40.0,
             bins: [12, 4],
+            layout: Default::default(),
         },
         "the cone stays"
     );

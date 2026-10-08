@@ -12,7 +12,10 @@ type Debug = { scene: any; inset: { view: () => { id: number; kind: string } } }
 async function freshApp(page: Page) {
   await page.goto("/?debug");
   await expect(page.locator("#stat")).toContainText("segs");
-  await page.evaluate(() => localStorage.clear());
+  await page.evaluate(() => {
+    localStorage.clear();
+    localStorage.setItem("optiland-canvas:tools", "open");
+  });
   await page.reload();
   await expect(page.locator("#stat")).toContainText("segs");
 }

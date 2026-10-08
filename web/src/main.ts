@@ -5,6 +5,7 @@
 // (spectral colour, ghost layer, TIR glow); the f64 reference feeds the
 // detector dock's *numbers*, on idle.
 
+import { exposureWhite, trueColourPixels } from "./true-colour";
 import init, { Canvas } from "../pkg/oc_wasm.js";
 import { initM3 } from "./m3";
 import { PLAIN_RAYS, RayLayer, type RayDrawOpts, type RayLayout } from "./rays";
@@ -16,11 +17,15 @@ import { createComponentView, type ComponentView } from "./inset/component-view"
 import { initOpenUc2 } from "./features/openuc2/OpenUc2Page";
 import { drawFacePixels, faceBox, facePath, formatFlux, type DetectorFace, type DetectorReadout } from "./detector-face";
 import { drawPolarMap } from "./polarmap";
+import { cellGrid, drawCellGrid } from "./detector-plots";
 import { initGallery } from "./gallery";
 import { createReference, type ReferenceBundle } from "./reference";
 import { initSunPanel } from "./sun-panel";
 
 const SCALE = 6.5; // px per mm
+// Zoom-out floor, px per mm: 0.01 shows 100 m across a 1000 px view, enough
+// for a heliostat field and a long light pipe.
+const MIN_SCALE = 0.01;
 type V2 = { x: number; y: number };
 type Glass = { name: string; nd: number; vd: number };
 
@@ -74,7 +79,12 @@ async function main() {
   // while one runs, the status line says how far it has got.
   const reference = createReference(
     scene,
-    () => ({ revision: scene.sceneRevision(), ghosts: scene.ghostsEnabled(), maxGhost: scene.maxGhostBounces() }),
+    () => ({
+      revision: scene.sceneRevision(),
+      ghosts: scene.ghostsEnabled(),
+      maxGhost: scene.maxGhostBounces(),
+      rays: scene.analysisRays(),
+    }),
     (why) => {
       if (why === "result" && slice3d?.active()) {
         refreshActive3d();
@@ -144,22 +154,25 @@ async function main() {
   const h = () => window.innerHeight;
   let scale = SCALE;        // px per mm (zoom)
   let panX = 0, panY = 0;   // screen-px offset of the world origin from centre
-  const toScreen = (p: V2): V2 => ({ x: w() / 2 + panX + p.x * scale, y: h() / 2 + panY - p.y * scale });
-  const toWorld = (px: number, py: number): V2 => ({ x: (px - w() / 2 - panX) / scale, y: (h() / 2 + panY - py) / scale });
+  // +1 draws world +Y up; -1 draws a model built upside down (the sun says
+  // so) the room's way up, world -Y at the top, turned about the axis.
+  let ySign: 1 | -1 = 1;
+  const toScreen = (p: V2): V2 => ({ x: w() / 2 + panX + p.x * scale, y: h() / 2 + panY - ySign * p.y * scale });
+  const toWorld = (px: number, py: number): V2 => ({ x: (px - w() / 2 - panX) / scale, y: (ySign * (h() / 2 + panY - py)) / scale });
   // `toScreen` for the view as it is now, for rasterizing millions of points:
   // the same arithmetic in the same order, without reading the window's size
   // twice per point.
   const screenMap = (): ((p: V2) => V2) => {
-    const cx = w() / 2 + panX, cy = h() / 2 + panY, k = scale;
-    return (p) => ({ x: cx + p.x * k, y: cy - p.y * k });
+    const cx = w() / 2 + panX, cy = h() / 2 + panY, k = scale, ky = ySign * scale;
+    return (p) => ({ x: cx + p.x * k, y: cy - p.y * ky });
   };
 
   // Zoom about a screen point, keeping the world point under it fixed.
   function zoomAt(clientX: number, clientY: number, factor: number) {
     const before = toWorld(clientX, clientY);
-    scale = Math.min(400, Math.max(0.4, scale * factor));
+    scale = Math.min(400, Math.max(MIN_SCALE, scale * factor));
     panX = clientX - w() / 2 - before.x * scale;
-    panY = clientY - h() / 2 + before.y * scale;
+    panY = clientY - h() / 2 + ySign * before.y * scale;
   }
   const panBy = (dxScreen: number, dyScreen: number) => { panX += dxScreen; panY += dyScreen; };
   const resetView = () => { scale = SCALE; panX = 0; panY = 0; };
@@ -174,9 +187,21 @@ async function main() {
     const aw = Math.max(160, w() - left - right);
     const ah = Math.max(120, h() - top - bottom);
     const dx = Math.max(x1 - x0, 1e-6), dy = Math.max(y1 - y0, 1e-6);
-    scale = Math.min(400, Math.max(0.4, 0.9 * Math.min(aw / dx, ah / dy)));
+    scale = Math.min(400, Math.max(MIN_SCALE, 0.9 * Math.min(aw / dx, ah / dy)));
     panX = left + aw / 2 - w() / 2 - ((x0 + x1) / 2) * scale;
-    panY = top + ah / 2 - h() / 2 + ((y0 + y1) / 2) * scale;
+    panY = top + ah / 2 - h() / 2 + ySign * ((y0 + y1) / 2) * scale;
+  }
+
+  // A design just opened (a file or the gallery): frame it and let the
+  // panels follow it.
+  function framed() {
+    if (in3dModel()) viewport3d!.resetView();
+    else fitView();
+    refreshActive3d();
+    syncSourcePicker();
+    drawAbbe();
+    renderView();
+    refreshReference();
   }
 
   function resize() {
@@ -233,7 +258,7 @@ async function main() {
     ctx.fillStyle = "rgba(150,175,210,0.55)";
     ctx.font = "11px ui-monospace, monospace";
     ctx.fillText("Z", W - 16, axisY - 6);
-    ctx.fillText("Y", axisX + 6, 14);
+    ctx.fillText(ySign > 0 ? "Y" : "−Y", axisX + 6, 14);
   }
 
   // --- interactive view -------------------------------------------------
@@ -248,7 +273,7 @@ async function main() {
   // once the view has been still for RASTER_SETTLE_MS. The rays are the same
   // either way; this only decides when they are drawn.
   type RasterKey = {
-    version: number; scale: number; panX: number; panY: number;
+    version: number; scale: number; panX: number; panY: number; ySign: number;
     W: number; H: number; dpr: number; gOpacity: number;
   };
   type Shown = RasterKey & { count: number; ms: number };
@@ -281,9 +306,9 @@ async function main() {
 
   const samePicture = (a: RasterKey, b: RasterKey) =>
     a.version === b.version && a.W === b.W && a.H === b.H && a.dpr === b.dpr && a.gOpacity === b.gOpacity;
-  const sameView = (a: RasterKey, b: RasterKey) => a.scale === b.scale && a.panX === b.panX && a.panY === b.panY;
+  const sameView = (a: RasterKey, b: RasterKey) => a.scale === b.scale && a.panX === b.panX && a.panY === b.panY && a.ySign === b.ySign;
   const keyOf = (k: RasterKey): RasterKey => ({
-    version: k.version, scale: k.scale, panX: k.panX, panY: k.panY,
+    version: k.version, scale: k.scale, panX: k.panX, panY: k.panY, ySign: k.ySign,
     W: k.W, H: k.H, dpr: k.dpr, gOpacity: k.gOpacity,
   });
 
@@ -340,7 +365,7 @@ async function main() {
     // Ray segments (9 floats: ax ay bx by r g b flux flags) in meridional-plane
     // coordinates, mapped world→screen by `toScreen`.
     const version = slice3d?.active() ? slice3d.picture() : -1;
-    const want: RasterKey = { version, scale, panX, panY, W, H, dpr, gOpacity };
+    const want: RasterKey = { version, scale, panX, panY, ySign, W, H, dpr, gOpacity };
     let traceMs = 0;
     if (version < 0) {
       // A v1 scene: light, and drawn at once.
@@ -391,7 +416,7 @@ async function main() {
     ctx.fillStyle = "#06080d";
     ctx.fillRect(0, 0, W, H);
     draw2dGrid(W, H);
-    if (shown && shown.dpr === dpr) {
+    if (shown && shown.dpr === dpr && shown.ySign === ySign) {
       const k = scale / shown.scale;
       const ox = W / 2 + panX - k * (shown.W / 2 + shown.panX);
       const oy = H / 2 + panY - k * (shown.H / 2 + shown.panY);
@@ -629,13 +654,20 @@ async function main() {
   // which skips rim slivers, so one sliver cannot darken the rest.
   function drawHeatmap(info: DetectorReadout) {
     if (!info.face) return;
-    const irradiance = info.measure === "irradiance";
+    // Under illuminance the face is drawn in true colour, exposed for its
+    // brightest part.
+    const perArea = info.measure === "irradiance" || info.measure === "illuminance";
+    const rgb = info.measure === "illuminance" && info.colour
+      ? trueColourPixels(info.colour, exposureWhite(info.colour))
+      : undefined;
     drawFacePixels(
       hctx,
       info.face,
-      irradiance ? info.cells : info.incident,
+      perArea ? info.cells : info.incident,
       { x: 0, y: 0, w: hist.width, h: hist.height },
-      irradiance ? info.peak : null,
+      perArea ? info.peak : null,
+      undefined,
+      rgb,
     );
   }
 
@@ -721,10 +753,18 @@ async function main() {
       if (info.face) drawSpot(b.hits.get(detId) ?? new Float32Array(0), info.face);
     } else if (info.measure === "intensity") {
       // Not a heatmap of anything on the face, so the label stops saying so.
-      detHead.textContent = "detector — intensity, polar (f64)";
-      drawPolar({ cells: info.cells, coneBins: info.coneBins, coneDeg: info.coneDeg ?? 0 });
+      const far = cellGrid(info, info.face);
+      if (far) {
+        detHead.textContent = "detector — intensity, far field (f64)";
+        drawCellGrid(hctx, far, { x: 0, y: 0, w: hist.width, h: hist.height });
+      } else {
+        detHead.textContent = "detector — intensity, polar (f64)";
+        drawPolar({ cells: info.cells, coneBins: info.coneBins, coneDeg: info.coneDeg ?? 0 });
+      }
     } else {
-      detHead.textContent = info.measure === "irradiance" ? "detector — irradiance heatmap (f64)" : "detector — heatmap (f64)";
+      detHead.textContent = info.measure === "irradiance" ? "detector — irradiance heatmap (f64)"
+        : info.measure === "illuminance" ? "detector — illuminance, true colour (f64)"
+        : "detector — heatmap (f64)";
       drawHeatmap(info);
     }
     const c = info.centroid ? `(${info.centroid[0].toFixed(2)}, ${info.centroid[1].toFixed(2)})` : "—";
@@ -749,7 +789,7 @@ async function main() {
     // nothing extra, because the peak of a flux histogram in flux is the
     // number already there under another name.
     let reads = "";
-    if (info.measure === "irradiance") {
+    if (info.measure === "irradiance" || info.measure === "illuminance") {
       reads = ` · peak ${formatFlux(info.peak)} ${info.unit}`;
     } else if (info.measure === "intensity") {
       const share = Number(info.totalIncident) > 0 ? Number(info.outsideCone) / Number(info.totalIncident) : 0;
@@ -853,6 +893,7 @@ async function main() {
   const wlPreset = document.getElementById("wlPreset") as HTMLSelectElement;
   const wlList = document.getElementById("wlList") as HTMLInputElement;
   const wlSwatches = document.getElementById("wlSwatches")!;
+  const wlSummary = document.getElementById("wlSummary")!;
   const WL_PRESETS: Record<string, number[]> = {
     // White: nine equal lines across the visible band (the default beam).
     white: [420, 450, 480, 510, 540, 570, 600, 630, 660],
@@ -861,11 +902,69 @@ async function main() {
     gfedc: [435.83, 486.13, 546.07, 587.56, 656.27],
   };
 
+  // The scene tools card folds to its wrench and starts folded; a viewer who
+  // opens it finds it open on the next visit.
+  {
+    const card = document.getElementById("m4dock")!;
+    const toggle = document.getElementById("toolsToggle")!;
+    const KEY = "optiland-canvas:tools";
+    const show = (open: boolean) => {
+      card.classList.toggle("collapsed", !open);
+      toggle.setAttribute("aria-expanded", String(open));
+    };
+    let open = false;
+    try { open = localStorage.getItem(KEY) === "open"; } catch { /* storage blocked: stay folded */ }
+    show(open);
+    toggle.addEventListener("click", () => {
+      open = !open;
+      show(open);
+      try { localStorage.setItem(KEY, open ? "open" : "closed"); } catch { /* not remembered */ }
+    });
+  }
+
+  // The controls panel ends above the detector dock under it and scrolls
+  // there, so nothing it holds sits behind the dock.
+  {
+    const controls = document.getElementById("controls")!;
+    const dock = document.getElementById("dock")!;
+    const fit = () => {
+      const top = controls.getBoundingClientRect().top;
+      const r = dock.getBoundingClientRect();
+      const bottom = r.height > 0 ? r.top - 8 : window.innerHeight - 12;
+      controls.style.maxHeight = `${Math.max(120, bottom - top)}px`;
+    };
+    new ResizeObserver(fit).observe(dock);
+    window.addEventListener("resize", fit);
+    fit();
+  }
+
   const parseWlList = () =>
     wlList.value.split(/[\s,]+/).map(Number).filter((x) => Number.isFinite(x) && x > 0);
 
   function renderSwatches(nm: number[]) {
     wlSwatches.replaceChildren();
+    // The fold stays shut by default: a sun's continuum is tens of thousands
+    // of wavelengths. (A reduce, not Math.min(...nm): that many arguments
+    // overflow the stack.)
+    const lo = nm.reduce((a, b) => Math.min(a, b), Infinity);
+    const hi = nm.reduce((a, b) => Math.max(a, b), -Infinity);
+    wlSummary.textContent =
+      nm.length === 0 ? "no wavelengths"
+      : nm.length === 1 ? `1 wavelength, ${lo} nm`
+      : `${nm.length} wavelengths, ${Math.round(lo)}–${Math.round(hi)} nm`;
+    if (nm.length > 200) {
+      // One bar across the band instead of a swatch each.
+      const stops = Array.from({ length: 48 }, (_, i) => {
+        const w = lo + ((hi - lo) * i) / 47;
+        return `${scene.wavelengthCssColor(w)} ${((100 * i) / 47).toFixed(1)}%`;
+      });
+      const bar = document.createElement("div");
+      bar.className = "wl-bar";
+      bar.title = `${Math.round(lo)}–${Math.round(hi)} nm, continuous`;
+      bar.style.cssText = `height:12px; width:100%; border-radius:3px; background:linear-gradient(90deg, ${stops.join(", ")})`;
+      wlSwatches.appendChild(bar);
+      return;
+    }
     for (const w of nm) {
       const dot = document.createElement("span");
       dot.title = `${w} nm`;
@@ -911,7 +1010,11 @@ async function main() {
     );
     wlPreset.value = preset ?? "custom";
     wlList.disabled = wlPreset.value !== "custom";
-    wlList.value = preset === "white" ? "" : nm.join(", ");
+    // A continuous spectrum has tens of thousands: the fold's summary says
+    // how many, and the box stays empty rather than hold them all.
+    const continuum = nm.length > 64;
+    wlList.value = preset === "white" || continuum ? "" : nm.join(", ");
+    wlList.placeholder = continuum ? `continuous: ${nm.length} wavelengths` : "e.g. 486, 588, 656";
     renderSwatches(nm);
   }
   updateSrcLabels();
@@ -977,6 +1080,7 @@ async function main() {
     // When a 3D body is selected, aim the Abbe picker at its glass; the readout
     // dock follows the selected detector when a scene has more than one.
     onSelect: (id) => { committed3d = readGlass3d(id); drawAbbe(); refresh3dDetector(); },
+    onFileOpened: () => framed(),
   });
   const onSelect3d = (id: number) => { committed3d = readGlass3d(id); drawAbbe(); refresh3dDetector(); };
   viewport3d = initView3dThree({
@@ -1015,6 +1119,13 @@ async function main() {
     scene,
     // The readout the dock shows: this scene's reference, else the newest.
     readout: (id) => shownReference()?.readouts.get(id) ?? null,
+    frame: inset,
+    // The analysis ray count moves no revision, like the ghost layer.
+    retrace: () => {
+      refreshActive3d();
+      renderView();
+      refreshReference();
+    },
     body: inset.body,
     setSubtitle: inset.setSubtitle,
     selected: () => selectedBody3d(),
@@ -1183,6 +1294,8 @@ async function main() {
   // preview has no polarization state to act on, so it draws a polarizer as a
   // 50% attenuator and a waveplate as a window. The f64 readout is the one that
   // knows what they do.
+  document.getElementById("addGrating")!.onclick = () =>
+    addAndFocus(scene.addGrating(freeX(-25, 0), 0, 25, 25, 180, 600, false));
   document.getElementById("addPolarizer")!.onclick = () => addAndFocus(scene.addPolarizer(freeX(-25, 0), 0, 12, 0, 0, 0));
   document.getElementById("addRetarder")!.onclick = () => addAndFocus(scene.addRetarder(freeX(-15, 0), 0, 12, 0, 45, 90));
   // The polarizing cube is the odd one out: it is the only polarizing part
@@ -1205,6 +1318,16 @@ async function main() {
       refreshActive3d();
       renderView();
       if (!live) refreshReference();
+    },
+    upsideDown: (on) => {
+      viewport3d?.setUpsideDown(on);
+      const s = on ? -1 : 1;
+      if (s === ySign) return;
+      ySign = s;
+      if (!in3dModel()) {
+        fitView();
+        renderView();
+      }
     },
   });
   document.getElementById("addTube")!.onclick = () =>
@@ -1247,15 +1370,7 @@ async function main() {
   // follow it: the source picker reads its first field, the readout its image.
   const gallery = initGallery({
     load: (name, text) => slice3d!.openText(name, text),
-    frame: () => {
-      if (in3dModel()) viewport3d!.resetView();
-      else fitView();
-      refreshActive3d();
-      syncSourcePicker();
-      drawAbbe();
-      renderView();
-      refreshReference();
-    },
+    frame: () => framed(),
     opened: (d) => {
       const approx = d.notes?.length ? ` Approximate: ${d.notes.join("; ")}.` : "";
       flash(`${d.name}, from Optiland's samples (${d.source}).${approx}`);

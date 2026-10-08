@@ -16,6 +16,8 @@ import { createCardManager, type CardSource } from "./cards";
 import type { FastPreview } from "./fastpreview";
 import type { Reference, StandIn } from "./reference";
 import type { RayLayout } from "./rays";
+import { panKeyHeld } from "./pan-key";
+import { commitAperture, commitLink, fieldChanged, renderAperture, renderLink } from "./card-extras";
 
 type V2 = { x: number; y: number };
 
@@ -78,6 +80,8 @@ export function initSlice3d(opts: {
   owns?: () => boolean;
   /** A body was selected/inspected (for the Abbe picker to target). */
   onSelect?: (id: number) => void;
+  /** A file from the open button loaded: frame it, as the gallery does. */
+  onFileOpened?: () => void;
   /** The interactive f32 picture, on WebGPU or the CPU mirror. Without it the
    *  view calls the CPU mirror directly. */
   fast?: FastPreview;
@@ -304,7 +308,7 @@ export function initSlice3d(opts: {
   }
 
   async function open(file: File) {
-    openText(file.name, await file.text());
+    if (openText(file.name, await file.text())) opts.onFileOpened?.();
   }
 
   // The section's extent in the view plane, `[xmin, ymin, xmax, ymax]` in mm:
@@ -370,7 +374,7 @@ export function initSlice3d(opts: {
   }
 
   function onDown(e: PointerEvent) {
-    if (!owns() || !loaded || e.button !== 0 || e.target !== view) return;
+    if (!owns() || !loaded || e.button !== 0 || e.target !== view || panKeyHeld()) return;
     // Draw-mirror tool: a click-drag lays a segment, released into a fold mirror.
     if (drawMode) {
       const w = toWorld(e.clientX, e.clientY);
@@ -581,17 +585,22 @@ export function initSlice3d(opts: {
   function commitCard(id: number, root: HTMLElement) {
     const num = (n: string) => Number((root.querySelector(`input[data-name="${n}"]`) as HTMLInputElement).value);
     const o = objList.find((o) => o.id === id);
-    scene.setObjectPosition(id, num("x"), num("y"), o ? o.pos[2] : 0);
-    if (o) { if (o.body) scene.setObjectRotationZDeg(id, num("rot")); else scene.setSurfaceTiltZDeg(id, num("rot")); }
+    // Only what was changed: an untouched x, y or tilt written back would
+    // flatten a 3D pose, or undo where a link placed the element.
+    if (o && (fieldChanged(root, "x", o.pos[0]) || fieldChanged(root, "y", o.pos[1]))) {
+      scene.setObjectPosition(id, num("x"), num("y"), o.pos[2]);
+    }
+    if (o && fieldChanged(root, "rot", o.rotZ)) {
+      if (o.body) scene.setObjectRotationZDeg(id, num("rot")); else scene.setSurfaceTiltZDeg(id, num("rot"));
+    }
     if (JSON.parse(scene.singletGeomJSON(id))) {
       scene.setSingletGeom(id, num("r1"), num("r2"), num("thickness"), num("semiAperture"), num("conic1"), num("conic2"));
     }
     if (JSON.parse(scene.bodyGlassJSON(id))) {
       scene.setBodyGlassAbbe(id, num("nd"), num("vd"));
     }
-    if (JSON.parse(scene.apertureOpeningJSON(id))) {
-      scene.setApertureOpening(id, num("apMin"), num("apMax")); // min/max radius; refused if invalid
-    }
+    commitAperture(scene, id, root);
+    commitLink(scene, id, root);
     const pick = (n: string) => (root.querySelector(`select[data-name="${n}"]`) as HTMLSelectElement)?.value;
     if (JSON.parse(scene.tubeJSON(id))) {
       scene.setTubeDims(id, num("tubeInner"), num("tubeOuter"), num("tubeLength"));
@@ -704,9 +713,8 @@ export function initSlice3d(opts: {
       }
       q(".c3-glass").style.display = glass ? "block" : "none"; // any glass body (singlet, prism)
       if (glass) { setV("nd", glass.nd); setV("vd", glass.vd); }
-      const ap = JSON.parse(scene.apertureOpeningJSON(id)); // {inner, outer} for a stop
-      q(".c3-aperture").style.display = ap ? "block" : "none";
-      if (ap) { setV("apMin", ap.inner); setV("apMax", ap.outer); }
+      renderAperture(scene, id, root);
+      renderLink(scene, id, root, objList);
       renderSurfaceCard(id, root, o);
       renderSolarCard(id, root);
       return true;

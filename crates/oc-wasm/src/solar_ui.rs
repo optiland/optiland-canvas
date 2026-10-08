@@ -199,6 +199,13 @@ impl Canvas {
         true
     }
 
+    /// Say which way up the model is drawn: `true` when it is the room turned
+    /// over about `+X` (up is world `-Y`), and the sun comes from below.
+    #[wasm_bindgen(js_name = setSunUpsideDown)]
+    pub fn set_sun_upside_down(&mut self, upside_down: bool) -> bool {
+        self.edit_rig(|rig| rig.upside_down = upside_down)
+    }
+
     /// Move the site and turn the canvas on the ground.
     #[wasm_bindgen(js_name = setSunSite)]
     pub fn set_sun_site(
@@ -225,6 +232,67 @@ impl Canvas {
             rig.dni_w_m2 = dni_w_m2;
             rig.band_um = [lo_um, hi_um];
             rig.bands = bands;
+        })
+    }
+
+    /// The sun as it looks: its disc (`"uniform"`, `"limb"` for Neckel &
+    /// Labs's measured limb darkening, `"buie"`) and the circumsolar ratio,
+    /// the share of the direct light in the aureole around it (0 to 0.849).
+    /// False without a sun, for an unknown disc, or for a ratio out of range.
+    #[wasm_bindgen(js_name = setSunShape)]
+    pub fn set_sun_shape(&mut self, disc: &str, csr: f64) -> bool {
+        let Some(disc) = oc_core::solar::sunshape::SunDisc::parse(disc) else {
+            return false;
+        };
+        self.edit_rig(|rig| {
+            rig.disc = disc;
+            rig.csr = csr;
+        })
+    }
+
+    /// How the sun's spectrum is sampled: `continuous`, every ray its own
+    /// wavelength at the table's resolution, or `bands` lines.
+    #[wasm_bindgen(js_name = setSunSpectral)]
+    pub fn set_sun_spectral(&mut self, continuous: bool, bands: u32) -> bool {
+        self.edit_rig(|rig| {
+            rig.continuous = continuous;
+            rig.bands = bands;
+        })
+    }
+
+    /// Use a spectrum read from `text` (see
+    /// [`oc_core::solar::parse_spectrum_table`]) in place of ASTM G173, named
+    /// `name`, and take the DNI to be its total. Returns what was read, or
+    /// `error: ` and why nothing changed.
+    #[wasm_bindgen(js_name = importSunSpectrum)]
+    pub fn import_sun_spectrum(&mut self, name: &str, text: &str) -> String {
+        let parsed = match oc_core::solar::parse_spectrum_table(text) {
+            Ok(p) => p,
+            Err(e) => return format!("error: {e}"),
+        };
+        let rows = parsed.rows;
+        let total = oc_core::solar::table_power(&rows, rows[0][0] / 1000.0, rows[rows.len() - 1][0] / 1000.0);
+        let ok = self.edit_rig(|rig| {
+            rig.spectrum = Some(oc_core::heliostat::SunSpectrum {
+                name: name.to_string(),
+                rows,
+            });
+            rig.dni_w_m2 = total;
+        });
+        if ok {
+            parsed.summary
+        } else {
+            "error: there is no sun to give it to".into()
+        }
+    }
+
+    /// Go back to ASTM G173-03 and its 900 W/m².
+    #[wasm_bindgen(js_name = clearSunSpectrum)]
+    pub fn clear_sun_spectrum(&mut self) -> bool {
+        self.edit_rig(|rig| {
+            if rig.spectrum.take().is_some() {
+                rig.dni_w_m2 = 900.0;
+            }
         })
     }
 
@@ -286,9 +354,20 @@ impl Canvas {
                 "utcOffset": t.utc_offset_h,
             },
             "bearing": rig.x_bearing_deg,
+            "upsideDown": rig.upside_down,
             "dni": rig.dni_w_m2,
             "band": rig.band_um,
             "bands": rig.bands,
+            "continuous": rig.continuous,
+            "disc": rig.disc.name(),
+            "csr": rig.csr,
+            "spectrum": rig.spectrum.as_ref().map(|t| json!({
+                "name": t.name,
+                "rows": t.rows.len(),
+                "from": t.rows.first().map(|r| r[0]),
+                "to": t.rows.last().map(|r| r[0]),
+            })),
+            "wavelengths": scene.sources.iter().find(|s| s.id == rig.source).map_or(0, |s| s.spectrum.samples().len()),
             "beamRadius": rig.beam_radius_mm,
             "standoff": rig.standoff_mm,
             "azimuth": state.azimuth_deg,
@@ -306,8 +385,9 @@ impl Canvas {
 
     /// Add a flat `width` × `height` mm heliostat pivoting at `(x, y, z)`,
     /// sending the sun to object `target_id`, or, when that is negative, to
-    /// the world point `(tx, ty, tz)`. Adds a sun first if there is none (noon
-    /// at the equinox over Almería, so it lights something straight away).
+    /// the world point `(tx, ty, tz)`. Adds a sun first if there is none (solar
+    /// noon at the March equinox over Jena's Deutsches Optisches Museum, so it
+    /// lights something straight away).
     /// Returns the mirror's id, or -1.
     #[wasm_bindgen(js_name = addHeliostat)]
     #[allow(clippy::too_many_arguments)]
@@ -328,14 +408,15 @@ impl Canvas {
             return -1.0;
         };
         if scene.solar.is_none() {
+            // Carl-Zeiss-Platz 12, Jena: 50°55'40.1" N, 11°34'45.4" E, 160 m.
             let site = Site {
-                latitude_deg: 37.094,
-                longitude_deg: -2.358,
-                elevation_m: 500.0,
-                pressure_mbar: 955.0,
-                temperature_c: 15.0,
+                latitude_deg: 50.92781,
+                longitude_deg: 11.57928,
+                elevation_m: 160.0,
+                pressure_mbar: 1013.25 * (-160.0_f64 / 8434.0).exp(),
+                temperature_c: 10.0,
             };
-            scene.add_sun(site, clock(2026, 3, 20, 14.0 * 60.0 + 15.0, 1.0), 180.0);
+            scene.add_sun(site, clock(2026, 3, 20, 12.0 * 60.0 + 21.0, 1.0), 180.0);
         }
         let target = if target_id >= 0.0 {
             HelioTarget::Object(ObjectId(target_id as u64))

@@ -252,6 +252,17 @@ export class MaterialLibrary {
           m.depthWrite = false;
           return m;
         });
+      case "grating":
+        // Grooves: a thin-film sheen, the rainbow a grating throws off
+        // whatever lights it.
+        return this.get("grating", () => new THREE.MeshPhysicalNodeMaterial({
+          color: new THREE.Color(0.55, 0.57, 0.62),
+          metalness: 0.7,
+          roughness: 0.18,
+          iridescence: 1,
+          iridescenceIOR: 1.6,
+          iridescenceThicknessRange: [180, 650],
+        }));
       case "slab_edge":
         // The edge of a display-only slab (a mirror or plate substrate).
         return this.get("slab_edge", () => new THREE.MeshStandardNodeMaterial({

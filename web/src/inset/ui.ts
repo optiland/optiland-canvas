@@ -36,6 +36,12 @@ export type EditorContext = {
   /** A detector's f64 readout (`detectorResultJSON`), or null while the
    *  reference is being traced. */
   readout: (id: number) => string | null;
+  /** Make the window wider for a panel beside the drawing (`on`), or give
+   *  back the width it took. */
+  widen: (on: boolean) => void;
+  /** A trace setting changed (the analysis ray count): trace the reference
+   *  again. The scene's revision does not move. */
+  retrace: () => void;
 };
 
 export interface Editor {
@@ -45,6 +51,9 @@ export interface Editor {
   refresh(): void;
   draw(ctx: CanvasRenderingContext2D, w: number, h: number): void;
   handles(): Handle[];
+  /** Something on the drawing to grab that is not a handle, such as a line
+   *  held anywhere along its length; tried when no handle is under (x, y). */
+  pick?(x: number, y: number): Handle | null;
   drag(h: Handle, x: number, y: number, phase: DragPhase): void;
 }
 

@@ -43,6 +43,8 @@ pub enum SeqAction {
     Tir,
     /// The ideal thin-lens bend of a standalone surface.
     ThinLens,
+    /// A diffraction grating's working order.
+    Diffract,
 }
 
 /// Which kind of scene object the hit surface belongs to.

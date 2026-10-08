@@ -45,10 +45,16 @@ pub const RESP_THIN_LENS: u32 = 4;
 /// A baked thin-film coating: `r.tab_start` points at
 /// `COAT_ANGLES × COAT_LAMBDAS` `(R, T)` pairs in `verts`, row-major by angle.
 pub const RESP_COATING: u32 = 5;
+/// A diffraction grating: `r` its working order's efficiency, `t` the zero
+/// order's, and `ar.value` the order times the groove density per µm.
+pub const RESP_GRATING: u32 = 6;
 /// `Response3Buf::flags`: the reflection is stray light, an AR coat's
 /// residual, and so a ghost rather than a designed path. Must match the
 /// shader's `RESP_FLAG_STRAY`.
 pub const RESP_FLAG_STRAY: u32 = 1;
+/// `Response3Buf::flags`: a transmission grating. Must match the shader's
+/// `RESP_FLAG_TRANSMIT`.
+pub const RESP_FLAG_TRANSMIT: u32 = 2;
 
 // Out-of-range policies of a tabulated response scalar.
 pub const POLICY_ERROR: u32 = 0;
@@ -366,6 +372,7 @@ fn encode_response(resp: &GpuResponse, verts: &mut Vec<Vert3Buf>) -> Response3Bu
     let zero = constant(0.0);
     let flags = match resp {
         GpuResponse::CoatingGrid { stray: true, .. } => RESP_FLAG_STRAY,
+        GpuResponse::Grating { transmit: true, .. } => RESP_FLAG_TRANSMIT,
         _ => 0,
     };
     let (kind, r, t, ar) = match resp {
@@ -377,6 +384,10 @@ fn encode_response(resp: &GpuResponse, verts: &mut Vec<Vert3Buf>) -> Response3Bu
             (RESP_EXPLICIT_RT, r, encode_spectral(t, verts), zero)
         }
         GpuResponse::ThinLens { f } => (RESP_THIN_LENS, constant(*f), zero, zero),
+        GpuResponse::Grating { k, eta, zero: z0, .. } => {
+            let r = encode_spectral(eta, verts);
+            (RESP_GRATING, r, encode_spectral(z0, verts), constant(*k))
+        }
         GpuResponse::CoatingGrid { lambdas, rt, .. } => {
             // Both halves live in `verts`, which is already a list of pairs:
             // the wavelength axis in the `t` slot, the grid itself in `r`. The

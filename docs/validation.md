@@ -226,6 +226,15 @@ well-conditioned result kept its bits (C33 still holds).
 `check_c15` also catches the mutation "a layer's absorption read across the
 wrong pair of interfaces" (C31).
 
+### Slabs and plates (CF-05)
+
+| Check | Tolerance | Result |
+|---|---|---|
+| A coated 2 mm absorbing slab with a rear two-layer AR, both sides, R, T and every element's absorption against `tmm.inc_tmm` (C17) | 1e-9 | 1.5e-15 |
+| A `Plate` under `plate_model: Incoherent` against the same plate in `tmm.inc_tmm` | 1e-9 | passes |
+| The plate Mueller matrix against its series summed to 200 passes; S0 against the incoherent powers; DOP of +45 degree light at most 1 + 1e-12 (C18) | 1e-12 | passes |
+| `PhaseFree` plates against the pre-profile kernel (C33) | bit-identical | passes |
+
 ## Worth adding
 
 - An uncoated N-BK7 and fused-silica window against published internal

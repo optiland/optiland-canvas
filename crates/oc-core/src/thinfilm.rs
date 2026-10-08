@@ -448,6 +448,17 @@ pub struct FilmLayer {
     /// the inline copy, which keeps every layer of one entry in step.
     #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
     pub catalog_ref: Option<u32>,
+    /// A slab: an element far thicker than any coherence length the canvas
+    /// models, whose faces add in intensity, not in amplitude (CF-05). A
+    /// coating with slabs is evaluated by the incoherent transfer-matrix
+    /// method; its films between slabs stay coherent groups. Absent, and
+    /// false, in every older document.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub incoherent: bool,
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 impl FilmLayer {
@@ -456,6 +467,17 @@ impl FilmLayer {
             material,
             thickness_nm,
             catalog_ref: None,
+            incoherent: false,
+        }
+    }
+
+    /// A slab of `material`, `thickness_mm` thick: an incoherent element.
+    pub fn slab(material: FilmMaterial, thickness_mm: f64) -> Self {
+        Self {
+            material,
+            thickness_nm: thickness_mm * 1e6,
+            catalog_ref: None,
+            incoherent: true,
         }
     }
 
@@ -486,6 +508,7 @@ impl FilmLayer {
             material,
             thickness_nm: lambda_nm / (4.0 * n * cos_l),
             catalog_ref: None,
+            incoherent: false,
         }
     }
 }
@@ -962,6 +985,8 @@ pub enum FilmError {
     /// A plate-backed coating adds its two faces incoherently and has no
     /// single complex amplitude to give.
     Incoherent,
+    /// Slabs inside a plate-backed coating: the plate already is the slab.
+    SlabOnPlate,
 }
 
 impl FilmError {
@@ -1003,6 +1028,10 @@ impl std::fmt::Display for FilmError {
                 f,
                 "a plate-backed coating adds its two faces incoherently and has no single complex amplitude"
             ),
+            FilmError::SlabOnPlate => write!(
+                f,
+                "a plate-backed coating cannot hold slabs: write it as its films and a slab on the far medium instead"
+            ),
         }
     }
 }
@@ -1014,12 +1043,16 @@ pub struct FilmContext {
     pub numerics: crate::fidelity::Numerics,
     /// `Nominal`: every material at its nominal constant.
     pub materials: crate::fidelity::FilmMaterials,
+    /// `Incoherent`: a plate is evaluated as its films, its slab and its far
+    /// face by the incoherent transfer-matrix method, and has a Mueller
+    /// matrix; `PhaseFree` keeps the plate's own series.
+    pub plate: crate::fidelity::PlateModel,
 }
 
 impl FilmContext {
     /// The solver's part of a fidelity profile.
     pub fn from_profile(p: &crate::fidelity::FidelityProfile) -> Self {
-        Self { numerics: p.numerics, materials: p.film_materials }
+        Self { numerics: p.numerics, materials: p.film_materials, plate: p.plate_model }
     }
 
     pub fn strict(&self) -> bool {
@@ -1133,6 +1166,9 @@ pub fn coating_eval(
     cos_i: f64,
     ctx: &FilmContext,
 ) -> Result<(FilmRt, FilmNotes), FilmError> {
+    if uses_mixed(c, ctx) {
+        return mixed_eval(c, n_incident, n_far, lambda_um, cos_i, ctx).map(|(p, notes)| (p.rt, notes));
+    }
     let (n0, cos_i, q) = incidence(n_incident, cos_i);
     let n_far = Cx::real(n_far.max(1e-9));
     let mut notes = FilmNotes::default();
@@ -1297,7 +1333,7 @@ pub fn coating_amp_eval(
     cos_i: f64,
     ctx: &FilmContext,
 ) -> Result<(FilmAmp, FilmNotes), FilmError> {
-    if matches!(c.backing, CoatingBacking::Plate { .. }) {
+    if matches!(c.backing, CoatingBacking::Plate { .. }) || has_slab(c) {
         return Err(FilmError::Incoherent);
     }
     if matches!(c.backing, CoatingBacking::Opaque { .. }) && matches!(c.incidence, Incidence::Substrate) {
@@ -1605,8 +1641,13 @@ fn flux_profile(layers: &[(Cx, f64)], n_sub: Cx, lambda_um: f64, q: Cx, p_pol: b
 /// computes it, so the per-layer split shares its R with every other path.
 /// A lossless layer absorbs nothing, by rule rather than by cancellation.
 fn absorbed_by_layer(layers: &[(Cx, f64)], n_sub: Cx, lambda_um: f64, q: Cx, p_pol: bool, r: f64) -> (Vec<f64>, f64) {
+    absorbed_by_layer_from(layers, n_sub, lambda_um, q, p_pol, 1.0 - r)
+}
+
+/// [`absorbed_by_layer`] given the power that enters the front face, which
+/// is `1 − R` from a transparent medium and [`power_entering`] from a lossy one.
+fn absorbed_by_layer_from(layers: &[(Cx, f64)], n_sub: Cx, lambda_um: f64, q: Cx, p_pol: bool, into: f64) -> (Vec<f64>, f64) {
     let (f, opaque) = flux_profile(layers, n_sub, lambda_um, q, p_pol);
-    let into = 1.0 - r;
     let mut a = vec![0.0; layers.len()];
     let evaluated = f.len() - 1;
     for k in 0..evaluated {
@@ -1642,6 +1683,9 @@ pub fn coating_power_flow_eval(
     cos_i: f64,
     ctx: &FilmContext,
 ) -> Result<(FilmPowers, FilmNotes), FilmError> {
+    if uses_mixed(c, ctx) {
+        return mixed_eval(c, n_incident, n_far, lambda_um, cos_i, ctx);
+    }
     let (rt, notes) = coating_eval(c, n_incident, n_far, lambda_um, cos_i, ctx)?;
     let (n0, cos_i, q) = incidence(n_incident, cos_i);
     let n_far = Cx::real(n_far.max(1e-9));
@@ -1739,6 +1783,449 @@ fn plate_tau(n_sub: Cx, q: Cx, lambda_um: f64, thickness_um: f64) -> f64 {
     } else {
         1.0
     }
+}
+
+// ---------------------------------------------------------------------------
+// Coherent films and incoherent slabs together (CF-05)
+// ---------------------------------------------------------------------------
+
+/// One polarization of a stack with slabs: the powers and every element's
+/// absorbed fraction, elements in the walked order.
+struct MixedPol {
+    r: f64,
+    t: f64,
+    /// Per walked element: films and slabs alike.
+    a: Vec<f64>,
+    /// What an opaque exit medium keeps; zero for a transparent one.
+    a_exit: f64,
+}
+
+/// A stack of coherent films and incoherent slabs between `n0` and `n_exit`,
+/// for one polarization, by the incoherent transfer-matrix method of Byrnes'
+/// `inc_tmm` (Katsidis and Siapkas, Appl. Opt. 41, 3978 (2002)).
+///
+/// The films between two incoherent media form one coherent group, met from
+/// either side with its own R and T ([`stack_rt_pol`]); each slab passes `P`
+/// of the power on one crossing, `exp(-4π d |Im(n cos θ)| / λ)`. Intensities
+/// chain through `L = diag(1/P, P) · [[1, −R_b], [R_f, T_b T_f − R_b R_f]] / T_f`,
+/// and the forward and backward intensities at each slab say what each
+/// element absorbs: a slab `V(1 − P) + W(1/P − 1)`, a film its share from
+/// each side weighted by what arrives from that side.
+fn mixed_pol(walked: &[(Cx, f64, bool)], n0: Cx, n_exit: Cx, exit_absorbs: bool, lambda_um: f64, q: Cx, p_pol: bool) -> MixedPol {
+    // Incoherent media, and the coherent groups between them, as walked
+    // indices: groups[i] lies between media[i] and media[i + 1].
+    let mut media: Vec<(Cx, f64, Option<usize>)> = vec![(n0, 0.0, None)];
+    let mut groups: Vec<Vec<usize>> = vec![Vec::new()];
+    for (i, &(n, d, slab)) in walked.iter().enumerate() {
+        if slab {
+            media.push((n, d, Some(i)));
+            groups.push(Vec::new());
+        } else {
+            groups.last_mut().expect("one group per gap").push(i);
+        }
+    }
+    media.push((n_exit, 0.0, None));
+    let m = media.len();
+    let film = |g: &[usize]| -> Vec<(Cx, f64)> { g.iter().map(|&i| (walked[i].0, walked[i].1)).collect() };
+
+    // Each group from the front and from the back: R, T, the power that
+    // crosses its face, and its layers' absorbed fractions.
+    struct Face {
+        rf: f64,
+        tf: f64,
+        rb: f64,
+        tb: f64,
+        pef: f64,
+        peb: f64,
+        af: Vec<f64>,
+        ab: Vec<f64>,
+    }
+    let faces: Vec<Face> = groups
+        .iter()
+        .enumerate()
+        .map(|(i, g)| {
+            let (na, nb) = (media[i].0, media[i + 1].0);
+            let fwd = film(g);
+            let rev: Vec<(Cx, f64)> = fwd.iter().rev().copied().collect();
+            let f = stack_rt_pol(&fwd, na, nb, lambda_um, q, p_pol);
+            let b = stack_rt_pol(&rev, nb, na, lambda_um, q, p_pol);
+            let fa = stack_amp_pol(&fwd, na, nb, lambda_um, q, p_pol);
+            let ba = stack_amp_pol(&rev, nb, na, lambda_um, q, p_pol);
+            let (pef, peb) = (power_entering(fa.r, fa.eta0), power_entering(ba.r, ba.eta0));
+            let (af, _) = absorbed_by_layer_from(&fwd, nb, lambda_um, q, p_pol, pef);
+            let (ab_rev, _) = absorbed_by_layer_from(&rev, na, lambda_um, q, p_pol, peb);
+            Face { rf: f.r, tf: f.t, rb: b.r, tb: b.t, pef, peb, af, ab: ab_rev.into_iter().rev().collect() }
+        })
+        .collect();
+    // One crossing of each slab.
+    let pass: Vec<f64> = media
+        .iter()
+        .map(|&(n, d, slab)| match slab {
+            Some(_) => {
+                let nc = n * snell_cos(q, n);
+                (-4.0 * std::f64::consts::PI * (d / 1000.0) * nc.im.abs() / lambda_um).exp().max(1e-30)
+            }
+            None => 1.0,
+        })
+        .collect();
+
+    let mut a = vec![0.0; walked.len()];
+    // A group that passes nothing ends the light's journey there.
+    if let Some(blocked) = faces.iter().position(|f| f.tf <= 0.0) {
+        if blocked == 0 {
+            for (k, &i) in groups[0].iter().enumerate() {
+                a[i] = faces[0].af[k];
+            }
+            let a_exit = if exit_absorbs && m == 2 { 1.0 - faces[0].rf - a.iter().sum::<f64>() } else { 0.0 };
+            return MixedPol { r: faces[0].rf, t: 0.0, a, a_exit: a_exit.max(0.0) };
+        }
+    }
+    let l_of = |f: &Face| -> [[f64; 2]; 2] {
+        if f.tf <= 0.0 {
+            return [[1e300, 0.0], [0.0, 0.0]];
+        }
+        [[1.0 / f.tf, -f.rb / f.tf], [f.rf / f.tf, (f.tb * f.tf - f.rb * f.rf) / f.tf]]
+    };
+    let mul = |x: [[f64; 2]; 2], y: [[f64; 2]; 2]| -> [[f64; 2]; 2] {
+        [
+            [x[0][0] * y[0][0] + x[0][1] * y[1][0], x[0][0] * y[0][1] + x[0][1] * y[1][1]],
+            [x[1][0] * y[0][0] + x[1][1] * y[1][0], x[1][0] * y[0][1] + x[1][1] * y[1][1]],
+        ]
+    };
+    let mut ls = vec![[[0.0; 2]; 2]; m - 1];
+    let mut total = l_of(&faces[0]);
+    for i in 1..m - 1 {
+        let p = pass[i];
+        let li = mul([[1.0 / p, 0.0], [0.0, p]], l_of(&faces[i]));
+        ls[i] = li;
+        total = mul(total, li);
+    }
+    let t = 1.0 / total[0][0];
+    let r = total[1][0] / total[0][0];
+    // Forward and backward intensity at the start of each incoherent medium.
+    let mut vw = vec![[0.0f64; 2]; m];
+    vw[m - 1] = [t, 0.0];
+    for i in (1..m - 1).rev() {
+        let next = vw[i + 1];
+        vw[i] = [ls[i][0][0] * next[0] + ls[i][0][1] * next[1], ls[i][1][0] * next[0] + ls[i][1][1] * next[1]];
+    }
+    // What arrives at group j: forward from the medium before it, backward
+    // from the medium after it.
+    let forward = |j: usize| if j == 0 { 1.0 } else { vw[j][0] * pass[j] };
+    let backward = |j: usize| vw[j + 1][1];
+    // A slab keeps what crosses into it less what crosses out of it, each the
+    // net Poynting flux at the face, as `tmm.inc_absorp_in_each_layer` books it.
+    for i in 1..m - 1 {
+        if let Some(idx) = media[i].2 {
+            let entering = forward(i - 1) * faces[i - 1].tf - backward(i - 1) * faces[i - 1].peb;
+            let leaving = forward(i) * faces[i].pef - backward(i) * faces[i].tb;
+            a[idx] = entering - leaving;
+        }
+    }
+    for (j, g) in groups.iter().enumerate() {
+        let (forward, backward) = (forward(j), backward(j));
+        for (k, &i) in g.iter().enumerate() {
+            a[i] = forward * faces[j].af[k] + backward * faces[j].ab[k];
+        }
+    }
+    let (t, a_exit) = if exit_absorbs { (0.0, t) } else { (t, 0.0) };
+    MixedPol { r, t, a, a_exit }
+}
+
+/// The net power that crosses a stack's front face, as a fraction of the
+/// incident power, from Macleod's `r` and the incident admittance:
+/// `Re((1 + r)(1 − r̄) η̄₀) / Re(η₀)`. From a transparent medium that is
+/// exactly `1 − |r|²`; from a lossy one (a slab of absorbing glass) the
+/// incident and reflected waves overlap in a medium that absorbs, and the
+/// two differ by a term of the order of its `k`. It is `tmm`'s
+/// `power_entering`.
+fn power_entering(r: Cx, eta0: Cx) -> f64 {
+    let one = Cx::real(1.0);
+    let num = ((one + r) * (one - r.conj()) * eta0.conj()).re;
+    if eta0.re.abs() > 0.0 {
+        num / eta0.re
+    } else {
+        0.0
+    }
+}
+
+/// Does the coating hold a slab?
+pub fn has_slab(c: &Coating) -> bool {
+    c.layers.iter().any(|l| l.incoherent)
+}
+
+/// Is the coating evaluated by the incoherent transfer-matrix method: it
+/// holds slabs, or it is a plate under `plate_model: Incoherent`?
+fn uses_mixed(c: &Coating, ctx: &FilmContext) -> bool {
+    has_slab(c)
+        || (matches!(c.backing, CoatingBacking::Plate { .. }) && ctx.plate == crate::fidelity::PlateModel::Incoherent)
+}
+
+/// The Mueller matrices of a coating with one incoherent slab, reflected and
+/// transmitted, in the ray frame's `(ŝ, p̂)` basis (spec CF-05): the two
+/// faces' amplitudes as Mueller matrices `M(x)` of their diagonal Jones
+/// elements, added incoherently over every pass of the slab,
+///
+/// ```text
+/// M_R = M(r_E) + M(t_E') M(r_O) (I − M(r_E') M(r_O) P²)⁻¹ M(t_E) P²
+/// M_T = M(t_O) (I − M(r_E') M(r_O) P²)⁻¹ M(t_E) P
+/// ```
+///
+/// with `E` the face the light enters by (seen from outside, and `'` from
+/// inside), `O` the other face from inside, and `P` the power one crossing of
+/// the slab keeps. The matrices of diagonal Jones elements in one basis
+/// commute, so the order in the loop is immaterial. The inverse exists
+/// because every eigenvalue of `M(r_E') M(r_O) P²` is below 1 for a passive
+/// slab; that is checked, and a plate that fails it is refused.
+///
+/// A plate's anti-reflected far face (a residual factor on the bare Fresnel
+/// reflectance) scales the bare face's reflection matrix by the residual and
+/// hands what it suppresses to its transmission matrix, unpolarized: the
+/// residual is a single number and says nothing about polarization.
+pub fn coating_mueller_eval(
+    c: &Coating,
+    n_incident: f64,
+    n_far: f64,
+    lambda_um: f64,
+    cos_i: f64,
+    ctx: &FilmContext,
+) -> Result<(crate::polarization::Mueller, crate::polarization::Mueller), FilmError> {
+    use crate::polarization::Mueller;
+    let (n0, cos_i, q) = incidence(n_incident, cos_i);
+    let mut notes = FilmNotes::default();
+    let sampled = sample_layers(c, lambda_um, ctx, &mut notes)?;
+    let mut elements: Vec<(Cx, f64, bool)> =
+        sampled.iter().zip(&c.layers).map(|(&(nl, d), l)| (nl, d, l.incoherent)).collect();
+    let n_far = Cx::real(n_far.max(1e-9));
+    let mut residual = 1.0;
+    match &c.backing {
+        CoatingBacking::Plate { substrate, exit, thickness_mm } => {
+            if has_slab(c) {
+                return Err(FilmError::SlabOnPlate);
+            }
+            let n_sub = sample_index(substrate, lambda_um, ctx, FilmError::SUBSTRATE, &mut notes)?;
+            elements.push((n_sub, thickness_mm.max(0.0) * 1e6, true));
+            if let ExitFace::AntiReflective { residual: r } = exit {
+                residual = r.clamp(0.0, 1.0);
+            }
+        }
+        CoatingBacking::Medium => {}
+        CoatingBacking::Opaque { .. } => return Err(FilmError::Incoherent),
+    }
+    let slabs: Vec<usize> = elements.iter().enumerate().filter(|(_, e)| e.2).map(|(i, _)| i).collect();
+    if slabs.len() != 1 {
+        return Err(FilmError::Incoherent);
+    }
+    let at = slabs[0];
+    let (n_sub, d_sub) = (elements[at].0, elements[at].1);
+    let front: Vec<(Cx, f64)> = elements[..at].iter().map(|e| (e.0, e.1)).collect();
+    let rear: Vec<(Cx, f64)> = elements[at + 1..].iter().map(|e| (e.0, e.1)).collect();
+    let rev = |v: &[(Cx, f64)]| -> Vec<(Cx, f64)> { v.iter().rev().copied().collect() };
+    // Entering face E and other face O, as stacks with their media.
+    let substrate_side = matches!(c.incidence, Incidence::Substrate);
+    let (e_out, e_in, o_in) = if substrate_side {
+        (
+            stack_amp(&rev(&rear), n_far, n_sub, lambda_um, q).0,
+            stack_amp(&rear, n_sub, n_far, lambda_um, q).0,
+            stack_amp(&rev(&front), n_sub, n0, lambda_um, q).0,
+        )
+    } else {
+        (
+            stack_amp(&front, n0, n_sub, lambda_um, q).0,
+            stack_amp(&rev(&front), n_sub, n0, lambda_um, q).0,
+            stack_amp(&rear, n_sub, n_far, lambda_um, q).0,
+        )
+    };
+    let m_r = |a: &FilmAmp| Mueller::from_diagonal_jones(a.r_s, a.r_p);
+    let m_t = |a: &FilmAmp| Mueller::from_diagonal_jones(a.t_s, a.t_p).scaled(a.t_power_scale);
+    // The plate's far face, anti-reflected by a residual factor.
+    let far_face = |a: &FilmAmp, reflect: bool| -> Mueller {
+        if residual == 1.0 || !matches!(c.backing, CoatingBacking::Plate { .. }) {
+            return if reflect { m_r(a) } else { m_t(a) };
+        }
+        if reflect {
+            m_r(a).scaled(residual)
+        } else {
+            let p = a.powers();
+            let gain = |r: f64, t: f64| if t > 0.0 { (t + (1.0 - residual) * r) / t } else { 1.0 };
+            let g = 0.5 * (gain(p.r_s, p.t_s) + gain(p.r_p, p.t_p));
+            m_t(a).scaled(g)
+        }
+    };
+    let (r_e, t_e, r_e_in, t_e_in, r_o, t_o) = if substrate_side {
+        (far_face(&e_out, true), far_face(&e_out, false), far_face(&e_in, true), far_face(&e_in, false), m_r(&o_in), m_t(&o_in))
+    } else {
+        (m_r(&e_out), m_t(&e_out), m_r(&e_in), m_t(&e_in), far_face(&o_in, true), far_face(&o_in, false))
+    };
+    let nc = n_sub * snell_cos(q, n_sub);
+    let p = (-4.0 * std::f64::consts::PI * (d_sub / 1000.0) * nc.im.abs() / lambda_um).exp();
+    if cos_i < GRAZING_COS {
+        return Ok((Mueller::IDENTITY, Mueller::attenuator(0.0)));
+    }
+    let loop_m = r_e_in.times(&r_o).scaled(p * p);
+    if loop_m.spectral_bound() >= 1.0 {
+        return Err(FilmError::Degenerate);
+    }
+    let inv = Mueller::IDENTITY.minus(&loop_m).inverse().ok_or(FilmError::Degenerate)?;
+    let reflected = r_e.plus(&t_e_in.times(&r_o).times(&inv).times(&t_e).scaled(p * p));
+    let transmitted = t_o.times(&inv).times(&t_e).scaled(p);
+    Ok((reflected, transmitted))
+}
+
+/// [`coating_power_flow_eval`] for a coating with slabs, or a plate under
+/// `plate_model: Incoherent` written as its films, its slab and its far face.
+fn mixed_eval(
+    c: &Coating,
+    n_incident: f64,
+    n_far: f64,
+    lambda_um: f64,
+    cos_i: f64,
+    ctx: &FilmContext,
+) -> Result<(FilmPowers, FilmNotes), FilmError> {
+    let (n0, cos_i, q) = incidence(n_incident, cos_i);
+    let mut notes = FilmNotes::default();
+    if matches!(c.backing, CoatingBacking::Opaque { .. }) && matches!(c.incidence, Incidence::Substrate) {
+        return Err(FilmError::AbsorbingIncidentMedium);
+    }
+    let sampled = sample_layers(c, lambda_um, ctx, &mut notes)?;
+    let n = c.layers.len();
+    // Every element in the order written, with its slab flag.
+    let mut elements: Vec<(Cx, f64, bool)> =
+        sampled.iter().zip(&c.layers).map(|(&(nl, d), l)| (nl, d, l.incoherent)).collect();
+    // A plate is its films, its slab, and a far face to the far medium.
+    let (n_exit, exit_absorbs, plate_residual) = match &c.backing {
+        CoatingBacking::Medium => (Cx::real(n_far.max(1e-9)), false, None),
+        CoatingBacking::Opaque { substrate } => (sample_index(substrate, lambda_um, ctx, FilmError::SUBSTRATE, &mut notes)?, true, None),
+        CoatingBacking::Plate { substrate, exit, thickness_mm } => {
+            if has_slab(c) {
+                return Err(FilmError::SlabOnPlate);
+            }
+            let n_sub = sample_index(substrate, lambda_um, ctx, FilmError::SUBSTRATE, &mut notes)?;
+            elements.push((n_sub, thickness_mm.max(0.0) * 1e6, true));
+            let residual = match exit {
+                ExitFace::Bare => 1.0,
+                ExitFace::AntiReflective { residual } => residual.clamp(0.0, 1.0),
+            };
+            (Cx::real(n_far.max(1e-9)), false, Some(residual))
+        }
+    };
+    let total = elements.len();
+    // The plate's far face is bare and, when anti-reflected, scaled; a scaled
+    // face is not a stack, so it is handled by the two-face series below.
+    let walked: Vec<(Cx, f64, bool)> = match (&c.backing, c.incidence) {
+        (CoatingBacking::Medium, Incidence::Substrate) => elements.iter().rev().copied().collect(),
+        (CoatingBacking::Plate { .. }, Incidence::Substrate) => {
+            // Entering through the far face: the slab, then the films reversed.
+            let mut w = vec![elements[total - 1]];
+            w.extend(elements[..total - 1].iter().rev().copied());
+            w
+        }
+        _ => elements.clone(),
+    };
+    let zero_powers = || FilmPowers { rt: FilmRt { r_s: 1.0, r_p: 1.0, t_s: 0.0, t_p: 0.0 }, a_layer_s: vec![0.0; n], a_layer_p: vec![0.0; n], a_substrate_s: 0.0, a_substrate_p: 0.0 };
+    if cos_i < GRAZING_COS {
+        return Ok((zero_powers(), notes));
+    }
+    let mut out = [MixedPol { r: 0.0, t: 0.0, a: Vec::new(), a_exit: 0.0 }, MixedPol { r: 0.0, t: 0.0, a: Vec::new(), a_exit: 0.0 }];
+    for (idx, p_pol) in [false, true].into_iter().enumerate() {
+        out[idx] = match plate_residual {
+            Some(residual) if residual != 1.0 => plate_with_scaled_face(&walked, n0, n_exit, residual, c.incidence, lambda_um, q, p_pol),
+            _ => mixed_pol(&walked, n0, n_exit, exit_absorbs, lambda_um, q, p_pol),
+        };
+        if !out[idx].r.is_finite() || !out[idx].t.is_finite() {
+            return Err(FilmError::Overflow);
+        }
+    }
+    // Back to the written order: the films, and a plate's slab last.
+    let unwalk = |a: &[f64]| -> Vec<f64> {
+        match (&c.backing, c.incidence) {
+            (CoatingBacking::Medium, Incidence::Substrate) => a.iter().rev().copied().collect(),
+            (CoatingBacking::Plate { .. }, Incidence::Substrate) => {
+                let mut w: Vec<f64> = a[1..].iter().rev().copied().collect();
+                w.push(a[0]);
+                w
+            }
+            _ => a.to_vec(),
+        }
+    };
+    let (a_s, a_p) = (unwalk(&out[0].a), unwalk(&out[1].a));
+    let plate = plate_residual.is_some();
+    let split = |a: Vec<f64>, exit: f64| -> (Vec<f64>, f64) {
+        if plate {
+            (a[..n].to_vec(), a[n] + exit)
+        } else {
+            (a, exit)
+        }
+    };
+    let (a_layer_s, a_substrate_s) = split(a_s, out[0].a_exit);
+    let (a_layer_p, a_substrate_p) = split(a_p, out[1].a_exit);
+    let rt = FilmRt { r_s: out[0].r.clamp(0.0, 1.0), r_p: out[1].r.clamp(0.0, 1.0), t_s: out[0].t.clamp(0.0, 1.0), t_p: out[1].t.clamp(0.0, 1.0) };
+    Ok((FilmPowers { rt, a_layer_s, a_layer_p, a_substrate_s, a_substrate_p }, notes))
+}
+
+/// A plate whose far face is anti-reflected by a residual factor: the front
+/// group, the slab, and a far face whose reflectance is the bare Fresnel
+/// value scaled by `residual`, what it suppresses passing on.
+#[allow(clippy::too_many_arguments)]
+fn plate_with_scaled_face(
+    walked: &[(Cx, f64, bool)],
+    n0: Cx,
+    n_exit: Cx,
+    residual: f64,
+    incidence: Incidence,
+    lambda_um: f64,
+    q: Cx,
+    p_pol: bool,
+) -> MixedPol {
+    // The slab is the one incoherent element; the films are the rest.
+    let slab_at = walked.iter().position(|e| e.2).expect("a plate has its slab");
+    let (n_sub, d_sub) = (walked[slab_at].0, walked[slab_at].1);
+    let nc = n_sub * snell_cos(q, n_sub);
+    let p = (-4.0 * std::f64::consts::PI * (d_sub / 1000.0) * nc.im.abs() / lambda_um).exp().max(1e-30);
+    let films: Vec<(Cx, f64)> = walked.iter().filter(|e| !e.2).map(|e| (e.0, e.1)).collect();
+    let rev: Vec<(Cx, f64)> = films.iter().rev().copied().collect();
+    let bare = |from: Cx, to: Cx| {
+        let s = stack_rt_pol(&[], from, to, lambda_um, q, p_pol);
+        let r = (s.r * residual).clamp(0.0, 1.0);
+        (r, s.t + (s.r - r))
+    };
+    let mut a = vec![0.0; walked.len()];
+    let (r, t) = match incidence {
+        Incidence::Film => {
+            // films (from n0 into the slab), slab, far face (slab to exit).
+            let f = stack_rt_pol(&films, n0, n_sub, lambda_um, q, p_pol);
+            let b = stack_rt_pol(&rev, n_sub, n0, lambda_um, q, p_pol);
+            let (af, _) = absorbed_by_layer(&films, n_sub, lambda_um, q, p_pol, f.r);
+            let (ab, _) = absorbed_by_layer(&rev, n0, lambda_um, q, p_pol, b.r);
+            let (r2, t2) = bare(n_sub, n_exit);
+            let (r2b, _) = bare(n_sub, n_exit);
+            let den = 1.0 - b.r * r2b * p * p;
+            let forward = f.t / den;
+            let backward = forward * p * r2b;
+            let at_films_from_inside = backward * p;
+            for k in 0..films.len() {
+                a[k] = af[k] + at_films_from_inside * ab[films.len() - 1 - k];
+            }
+            a[slab_at] = forward * (1.0 - p) + backward * (1.0 - p);
+            (f.r + f.t * b.t * r2 * p * p / den, f.t * t2 * p / den)
+        }
+        Incidence::Substrate => {
+            // far face (exit side into the slab), slab, films reversed out to n0.
+            let (r2, t2) = bare(n_exit, n_sub);
+            let (r2b, t2b) = bare(n_sub, n_exit);
+            let f = stack_rt_pol(&films, n_sub, n0, lambda_um, q, p_pol);
+            let (af, _) = absorbed_by_layer(&films, n0, lambda_um, q, p_pol, f.r);
+            let den = 1.0 - f.r * r2b * p * p;
+            let forward = t2 / den;
+            let backward = forward * p * f.r;
+            for k in 0..films.len() {
+                a[slab_at + 1 + k] = forward * p * af[k];
+            }
+            a[slab_at] = forward * (1.0 - p) + backward * (1.0 - p);
+            (r2 + t2 * t2b * f.r * p * p / den, t2 * f.t * p / den)
+        }
+    };
+    MixedPol { r, t, a, a_exit: 0.0 }
 }
 
 // ---------------------------------------------------------------------------
@@ -3541,6 +4028,7 @@ mod tests {
             FilmError::AbsorbingIncidentMedium,
             FilmError::Overflow,
             FilmError::Incoherent,
+            FilmError::SlabOnPlate,
         ] {
             let text = e.to_string();
             assert!(!text.is_empty());
@@ -3704,6 +4192,150 @@ mod tests {
                 approx(closure(&p, false), 1.0, 1e-12, &format!("{incidence:?} {deg}: p"));
                 assert!(p.a_substrate_s > 0.0 && p.a_layer_s[1] > 0.0);
                 assert_eq!((p.a_layer_s[0], p.a_layer_s[2]), (0.0, 0.0));
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // CF-05: slabs, and the plate's Mueller matrix
+    // -----------------------------------------------------------------------
+
+    fn incoherent_ctx() -> FilmContext {
+        FilmContext { plate: crate::fidelity::PlateModel::Incoherent, ..FilmContext::default() }
+    }
+
+    /// A 2 mm absorbing slab with a front stack and a rear two-layer AR, on air.
+    fn coated_slab() -> Coating {
+        Coating {
+            layers: vec![
+                FilmLayer::new(FilmMaterial::constant("SiO2", 1.46), 94.0),
+                FilmLayer::new(FilmMaterial::absorbing("Al", 0.958, 6.69), 5.0),
+                FilmLayer::new(FilmMaterial::constant("TiO2", 2.35), 61.0),
+                FilmLayer::slab(FilmMaterial::absorbing("glass", 1.5168, 3e-6), 2.0),
+                FilmLayer::new(FilmMaterial::constant("Al2O3", 1.65), 83.0),
+                FilmLayer::new(FilmMaterial::constant("MgF2", 1.38), 99.0),
+            ],
+            backing: CoatingBacking::Medium,
+            incidence: Incidence::Film,
+            design: None,
+        }
+    }
+
+    /// A coated slab closes its books element by element, from either side,
+    /// and its slab and its metal film are where the absorption is.
+    #[test]
+    fn a_stack_with_a_slab_closes_element_by_element() {
+        for c in [coated_slab(), coated_slab().seen_from_behind()] {
+            for deg in [0.0f64, 30.0, 60.0] {
+                let (p, _) = coating_power_flow_eval(&c, 1.0, 1.0, 0.55, deg.to_radians().cos(), &FilmContext::default()).unwrap();
+                approx(closure(&p, true), 1.0, 1e-12, "s");
+                approx(closure(&p, false), 1.0, 1e-12, "p");
+                assert!(p.a_layer_s[1] > 0.0 && p.a_layer_s[3] > 0.0, "{:?}", p.a_layer_s);
+                for k in [0, 2, 4, 5] {
+                    assert_eq!(p.a_layer_s[k], 0.0, "lossless layer {k}");
+                }
+                // The powers through the plain entry point are the same ones.
+                let rt = coating_rt_at(&c, 1.0, 1.0, 0.55, deg.to_radians().cos()).unwrap();
+                assert_eq!(rt, p.rt);
+            }
+        }
+        // A slab has no amplitude.
+        assert_eq!(coating_amp_at(&coated_slab(), 1.0, 1.0, 0.55, 1.0), Err(FilmError::Incoherent));
+    }
+
+    /// A plate under `Incoherent` is its films, its slab and its far face:
+    /// the same powers as the same coating written with a slab.
+    #[test]
+    fn an_incoherent_plate_is_its_films_a_slab_and_a_face() {
+        let films = vec![FilmLayer::new(FilmMaterial::constant("SiO2", 1.46), 94.0), FilmLayer::new(FilmMaterial::absorbing("Al", 0.958, 6.69), 5.0)];
+        let glass = FilmMaterial::absorbing("glass", 1.5168, 3e-6);
+        let plate = Coating {
+            layers: films.clone(),
+            backing: CoatingBacking::Plate { substrate: glass.clone(), exit: ExitFace::Bare, thickness_mm: 2.0 },
+            incidence: Incidence::Film,
+            design: None,
+        };
+        let mut layers = films;
+        layers.push(FilmLayer::slab(glass, 2.0));
+        let written = Coating { layers, backing: CoatingBacking::Medium, incidence: Incidence::Film, design: None };
+        for deg in [0.0f64, 40.0] {
+            let cos = deg.to_radians().cos();
+            let a = coating_eval(&plate, 1.0, 1.0, 0.55, cos, &incoherent_ctx()).unwrap().0;
+            let b = coating_eval(&written, 1.0, 1.0, 0.55, cos, &incoherent_ctx()).unwrap().0;
+            for (x, y) in [(a.r_s, b.r_s), (a.r_p, b.r_p), (a.t_s, b.t_s), (a.t_p, b.t_p)] {
+                approx(x, y, 1e-14, &format!("{deg} deg"));
+            }
+            // And PhaseFree is the plate's own series, a different convention
+            // for the lossy far face, close but not the same.
+            let old = coating_eval(&plate, 1.0, 1.0, 0.55, cos, &FilmContext::default()).unwrap().0;
+            approx(old.r(), a.r(), 1e-6, "PhaseFree and Incoherent agree to the slab's loss");
+        }
+        // A slab inside a plate-backed coating is refused by name.
+        let mut both = plate.clone();
+        both.layers.push(FilmLayer::slab(FilmMaterial::constant("glass", 1.5), 1.0));
+        assert_eq!(coating_eval(&both, 1.0, 1.0, 0.55, 1.0, &incoherent_ctx()).unwrap_err(), FilmError::SlabOnPlate);
+    }
+
+    /// C18: the plate's Mueller matrix is the incoherent series. Against the
+    /// series summed term by term to 200 passes; its S0 is the incoherent
+    /// powers; and the light it hands on is never more than fully polarized.
+    #[test]
+    fn c18_the_plate_mueller_matrix_is_the_incoherent_series() {
+        use crate::polarization::{Mueller, Stokes};
+        let glass = FilmMaterial::absorbing("glass", 1.5168, 2e-6);
+        let films = vec![FilmLayer::new(FilmMaterial::constant("TiO2", 2.35), 58.0), FilmLayer::new(FilmMaterial::constant("SiO2", 1.46), 94.0)];
+        let plate = Coating {
+            layers: films.clone(),
+            backing: CoatingBacking::Plate { substrate: glass.clone(), exit: ExitFace::Bare, thickness_mm: 3.0 },
+            incidence: Incidence::Film,
+            design: None,
+        };
+        let ctx = incoherent_ctx();
+        for deg in [10.0f64, 45.0, 70.0] {
+            for lam in [0.45, 0.6] {
+                let cos = deg.to_radians().cos();
+                let (mr, mt) = coating_mueller_eval(&plate, 1.0, 1.0, lam, cos, &ctx).unwrap();
+
+                // The same series, term by term, from the faces' amplitudes
+                // with the glass's complex index, as the plate's own faces.
+                let n_sub = glass.index_at(lam).unwrap();
+                let q = Cx::real(deg.to_radians().sin());
+                let walked: Vec<(Cx, f64)> = films.iter().map(|l| (l.material.index_at(lam).unwrap(), l.thickness_nm)).collect();
+                let rev: Vec<(Cx, f64)> = walked.iter().rev().copied().collect();
+                let e = stack_amp(&walked, Cx::real(1.0), n_sub, lam, q).0;
+                let e_in = stack_amp(&rev, n_sub, Cx::real(1.0), lam, q).0;
+                let o = stack_amp(&[], n_sub, Cx::real(1.0), lam, q).0;
+                let m_r = |a: &FilmAmp| Mueller::from_diagonal_jones(a.r_s, a.r_p);
+                let m_t = |a: &FilmAmp| Mueller::from_diagonal_jones(a.t_s, a.t_p).scaled(a.t_power_scale);
+                let nc = n_sub * snell_cos(q, n_sub);
+                let p = (-4.0 * std::f64::consts::PI * 3000.0 * nc.im.abs() / lam).exp();
+                let mut sum_r = m_r(&e);
+                let mut sum_t = Mueller::attenuator(0.0);
+                let mut loop_k = Mueller::IDENTITY;
+                for _ in 0..200 {
+                    sum_r = sum_r.plus(&m_t(&e_in).times(&m_r(&o)).times(&loop_k).times(&m_t(&e)).scaled(p * p));
+                    sum_t = sum_t.plus(&m_t(&o).times(&loop_k).times(&m_t(&e)).scaled(p));
+                    loop_k = loop_k.times(&m_r(&e_in).times(&m_r(&o)).scaled(p * p));
+                }
+                for i in 0..4 {
+                    for j in 0..4 {
+                        approx(mr.0[i][j], sum_r.0[i][j], 1e-12, &format!("{deg} deg {lam} um: M_R[{i}][{j}]"));
+                        approx(mt.0[i][j], sum_t.0[i][j], 1e-12, &format!("{deg} deg {lam} um: M_T[{i}][{j}]"));
+                    }
+                }
+
+                // S0 for unpolarized light is the incoherent powers.
+                let rt = coating_eval(&plate, 1.0, 1.0, lam, cos, &ctx).unwrap().0;
+                approx(mr.0[0][0], rt.r(), 1e-12, "S0 of M_R");
+                approx(mt.0[0][0], rt.t(), 1e-12, "S0 of M_T");
+                approx(mr.0[0][1], 0.5 * (rt.r_s - rt.r_p), 1e-12, "S1 row of M_R");
+
+                // +45 degree linear light: never more than fully polarized.
+                let plus45 = Stokes::linear(1.0, std::f64::consts::FRAC_PI_4);
+                for m in [&mr, &mt] {
+                    let out = m.apply(&plus45);
+                    assert!(out.dop() <= 1.0 + 1e-12, "{deg} deg {lam} um: DOP {}", out.dop());
+                }
             }
         }
     }

@@ -154,6 +154,14 @@ pub fn to_v2(scene: &Scene3) -> (Scene3, Vec<String>) {
             if sourced(&layer.material) {
                 losses.push(format!("layer {} ({}): provenance, form and nominal value dropped", i + 1, layer.material.name));
             }
+            if layer.incoherent {
+                losses.push(format!(
+                    "layer {} is a {} mm slab of {}; v2 has no slabs and traces it as a coherent film",
+                    i + 1,
+                    layer.thickness_nm / 1e6,
+                    layer.material.name
+                ));
+            }
             let m = v2_material(&layer.material, &format!("layer {}", i + 1), &mut losses);
             *layer = FilmLayer::new(m, layer.thickness_nm);
         }

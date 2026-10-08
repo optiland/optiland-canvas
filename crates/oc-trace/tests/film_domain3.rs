@@ -102,3 +102,44 @@ fn strict_refuses_a_coating_outside_its_table_and_says_why() {
     assert!(reason.starts_with("layer 1 has no optical constants at 1.6000 um"), "{reason}");
     assert!((strict.ledger.numerical_loss - 1.0).abs() < 1e-12, "the refused ray is named, not lost");
 }
+
+/// C18, the tracer's half: polarized light through a coated plate is
+/// approximated under `PhaseFree` and says so, and under `Incoherent` it goes
+/// through the plate's Mueller matrix with no such note; the power is the
+/// same either way to the slab's lossy-face convention.
+#[test]
+fn an_incoherent_plate_carries_polarization_without_an_approximation() {
+    use oc_core::fidelity::PlateModel;
+    use oc_core::polarization::{PolRay, Stokes};
+    use oc_core::thinfilm::ExitFace;
+    let plate = Coating {
+        layers: vec![
+            FilmLayer::new(FilmMaterial::constant("TiO2", 2.35), 58.0),
+            FilmLayer::new(FilmMaterial::constant("SiO2", 1.46), 94.0),
+        ],
+        backing: CoatingBacking::Plate {
+            substrate: FilmMaterial::absorbing("glass", 1.5168, 2e-6),
+            exit: ExitFace::Bare,
+            thickness_mm: 3.0,
+        },
+        incidence: Incidence::Film,
+        design: None,
+    };
+    let (s, behind, _) = bench(plate);
+    let d = Vec3::new(45f64.to_radians().cos(), 45f64.to_radians().sin(), 0.0);
+    let ray = Ray3::new(Vec3::new(-40.0, -40.0, 0.0), d).unwrap();
+    let mut lr = launch(ray, 0.55, 1.0);
+    lr.pol = Some(PolRay { stokes: Stokes::linear(1.0, std::f64::consts::FRAC_PI_4), x: Vec3::Z });
+    let base = TraceConfig3 { ghosts: false, ..TraceConfig3::default() };
+    let note = "plate-backed stack: faces added incoherently, no relative phase";
+
+    let phase_free = trace3(&s, &[lr], &base);
+    assert!(phase_free.capability_report.approximated.iter().any(|a| a.detail == note));
+
+    let incoherent = trace3(&s, &[lr], &base.with_fidelity(FidelityProfile { plate_model: PlateModel::Incoherent, ..Default::default() }));
+    assert!(!incoherent.capability_report.approximated.iter().any(|a| a.detail == note));
+    let a = detector_named(&phase_free, behind);
+    let b = detector_named(&incoherent, behind);
+    assert!((a.total_incident - b.total_incident).abs() < 1e-5, "{} vs {}", a.total_incident, b.total_incident);
+    assert!(b.stokes_local.dop() <= 1.0 + 1e-12);
+}

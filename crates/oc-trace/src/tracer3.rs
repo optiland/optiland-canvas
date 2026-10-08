@@ -2763,23 +2763,36 @@ fn apply_response(
                     Mueller::from_diagonal_jones(a.t_s, a.t_p).scaled(a.t_power_scale),
                 ),
                 Err(_) => {
-                    if phase_assumed {
-                        r.report.note_approx(
-                            PhysicsFeature::ThinFilmCoating,
-                            "plate-backed stack: faces added incoherently, no relative phase",
-                        );
+                    // Under `plate_model: Incoherent` a plate (or a coating
+                    // with one slab) has a Mueller matrix: its faces with their
+                    // phases, added incoherently over every pass (CF-05).
+                    let incoherent = if cfg.fidelity.plate_model == oc_core::fidelity::PlateModel::Incoherent {
+                        oc_core::thinfilm::coating_mueller_eval(coating, n1, n2, lambda, cos_i, &ctx).ok()
+                    } else {
+                        None
+                    };
+                    match incoherent {
+                        Some(pair) => pair,
+                        None => {
+                            if phase_assumed {
+                                r.report.note_approx(
+                                    PhysicsFeature::ThinFilmCoating,
+                                    "plate-backed stack: faces added incoherently, no relative phase",
+                                );
+                            }
+                            let (v, _) = rt.as_ref().expect("checked above");
+                            (
+                                Mueller::from_diagonal_jones(
+                                    oc_core::thinfilm::Cx::real(v.r_s.max(0.0).sqrt()),
+                                    oc_core::thinfilm::Cx::real(v.r_p.max(0.0).sqrt()),
+                                ),
+                                Mueller::from_diagonal_jones(
+                                    oc_core::thinfilm::Cx::real(v.t_s.max(0.0).sqrt()),
+                                    oc_core::thinfilm::Cx::real(v.t_p.max(0.0).sqrt()),
+                                ),
+                            )
+                        }
                     }
-                    let (v, _) = rt.as_ref().expect("checked above");
-                    (
-                        Mueller::from_diagonal_jones(
-                            oc_core::thinfilm::Cx::real(v.r_s.max(0.0).sqrt()),
-                            oc_core::thinfilm::Cx::real(v.r_p.max(0.0).sqrt()),
-                        ),
-                        Mueller::from_diagonal_jones(
-                            oc_core::thinfilm::Cx::real(v.t_s.max(0.0).sqrt()),
-                            oc_core::thinfilm::Cx::real(v.t_p.max(0.0).sqrt()),
-                        ),
-                    )
                 }
             };
             let pol_r = out(&m_r);

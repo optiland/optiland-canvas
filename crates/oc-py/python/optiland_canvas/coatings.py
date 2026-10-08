@@ -110,12 +110,17 @@ def absorption(
     aois_deg: list[float],
     n_incident: float = 1.0,
     n_far: float | None = None,
+    plate_incoherent: bool = False,
 ) -> dict[str, list]:
     """Absorbed fraction by layer (written order) and substrate, s and p,
     indexed ``[wavelength][angle]``: ``A_s``/``A_p`` hold a list per point,
-    ``sub_s``/``sub_p`` a number, and the powers as :func:`rt` gives them."""
+    ``sub_s``/``sub_p`` a number, and the powers as :func:`rt` gives them.
+    ``plate_incoherent`` evaluates a plate as ``plate_model: Incoherent``
+    does: its films, its slab and its far face."""
     lambdas_um, aois_deg = list(map(float, lambdas_um)), list(map(float, aois_deg))
-    got = json.loads(_native.thinfilm_absorption(_json(stack), lambdas_um, aois_deg, float(n_incident), n_far))
+    got = json.loads(
+        _native.thinfilm_absorption(_json(stack), lambdas_um, aois_deg, float(n_incident), n_far, plate_incoherent)
+    )
     shape = (len(lambdas_um), len(aois_deg))
     return {
         "A_s": _grid(got["a_s"], *shape),

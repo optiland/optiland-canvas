@@ -158,6 +158,36 @@ the layers on the far face and `Incidence::Substrate`, this is a second-surface
 mirror; `a_thick_plate_absorbs_on_every_pass` checks both against the closed
 form.
 
+### Slabs, and a plate's Mueller matrix
+
+A coating can hold **slabs**: layers flagged `"incoherent": true`, far thicker
+than any coherence length the canvas models (a 2 mm window is
+`FilmLayer::slab(glass, 2.0)`). A coating with slabs is evaluated by the
+incoherent transfer-matrix method of Byrnes' `inc_tmm` (Katsidis and
+Siapkas): the films between two slabs are one coherent group, the slabs pass
+intensity, and every element gets its absorbed share. That is how a window
+with a different AR on each face is written: front films, a slab, rear films,
+on a `Medium` backing. It agrees with `tmm.inc_tmm` and
+`tmm.inc_absorp_in_each_layer` to 1.5e-15 from either side (C17). A slab sits
+on the far medium; a plate-backed coating already is a slab and refuses more
+(`SlabOnPlate`), and a body face refuses both, because the body is its own
+substrate.
+
+`plate_model` decides what a `Plate` backing is:
+
+- `PhaseFree` (the default, `Standard`): the plate's own two-face series, as
+  it always was; for polarized light the faces act as phase-free Jones
+  elements and the result says it is approximated.
+- `Incoherent` (`Reference`): the plate is its films, its slab and its far
+  face through the same incoherent method, and it has a **Mueller matrix**,
+  the faces' Mueller matrices with their phases added over every pass:
+  `M_R = M(r_E) + M(t_E') M(r_O) (I − M(r_E') M(r_O) P²)⁻¹ M(t_E) P²` and
+  `M_T = M(t_O) (I − M(r_E') M(r_O) P²)⁻¹ M(t_E) P`, with `P` the power one
+  crossing of the slab keeps. It equals the series summed to 200 passes to
+  1e-12, its S0 is the incoherent powers, and it never hands on more than
+  fully polarized light (C18). The two models differ, for a lossy slab, by
+  the slab's convention at its own faces, a few parts in a million.
+
 ## The two tracers
 
 | | Exact (`oc-trace`) | Preview (`oc-gpu`) |
@@ -321,7 +351,8 @@ sentence each one prints:
 | `NonPhysicalIndex` | n not positive or not finite; a thickness negative or not finite; k negative under `Strict` | layer 1 is not physical: the index must be positive and finite, the extinction coefficient not negative, and the thickness finite and not negative |
 | `AbsorbingIncidentMedium` | an `Opaque`-backed coating lit from its substrate side | light cannot arrive through an absorbing substrate: an opaque-backed coating is lit from its film side only |
 | `Overflow` | the arithmetic left the finite numbers despite the guards below | the coating's arithmetic overflowed, so it has no finite answer |
-| `Incoherent` | amplitudes asked of a plate-backed coating | a plate-backed coating adds its two faces incoherently and has no single complex amplitude |
+| `Incoherent` | amplitudes asked of a plate-backed coating, or of one with slabs | a plate-backed coating adds its two faces incoherently and has no single complex amplitude |
+| `SlabOnPlate` | slabs inside a plate-backed coating | a plate-backed coating cannot hold slabs: write it as its films and a slab on the far medium instead |
 
 Under `Strict` the tracer turns each of these into an
 `UnsupportedSurfaceResponse` that carries the sentence; under `Permissive`

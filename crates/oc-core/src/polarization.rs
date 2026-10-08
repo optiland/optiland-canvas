@@ -353,6 +353,57 @@ impl Mueller {
     }
 
     /// Matrix product, this one applied **after** `rhs`.
+    /// The sum of two Mueller matrices: two beams added incoherently.
+    pub fn plus(&self, rhs: &Self) -> Self {
+        let mut m = [[0.0; 4]; 4];
+        for (i, row) in m.iter_mut().enumerate() {
+            for (j, v) in row.iter_mut().enumerate() {
+                *v = self.0[i][j] + rhs.0[i][j];
+            }
+        }
+        Self(m)
+    }
+
+    pub fn minus(&self, rhs: &Self) -> Self {
+        self.plus(&rhs.scaled(-1.0))
+    }
+
+    /// The inverse, by Gauss-Jordan elimination with partial pivoting;
+    /// `None` for a singular matrix.
+    pub fn inverse(&self) -> Option<Self> {
+        let mut a = self.0;
+        let mut inv = Self::IDENTITY.0;
+        for col in 0..4 {
+            let pivot = (col..4).max_by(|&i, &j| a[i][col].abs().total_cmp(&a[j][col].abs()))?;
+            if a[pivot][col].abs() < 1e-300 {
+                return None;
+            }
+            a.swap(col, pivot);
+            inv.swap(col, pivot);
+            let d = a[col][col];
+            for j in 0..4 {
+                a[col][j] /= d;
+                inv[col][j] /= d;
+            }
+            for i in 0..4 {
+                if i != col {
+                    let f = a[i][col];
+                    for j in 0..4 {
+                        a[i][j] -= f * a[col][j];
+                        inv[i][j] -= f * inv[col][j];
+                    }
+                }
+            }
+        }
+        Some(Self(inv))
+    }
+
+    /// An upper bound on the spectral radius: the largest absolute row sum.
+    /// Below 1 means a geometric series in this matrix converges.
+    pub fn spectral_bound(&self) -> f64 {
+        self.0.iter().map(|row| row.iter().map(|v| v.abs()).sum::<f64>()).fold(0.0, f64::max)
+    }
+
     pub fn times(&self, rhs: &Self) -> Self {
         let mut m = [[0.0; 4]; 4];
         for (i, row) in m.iter_mut().enumerate() {

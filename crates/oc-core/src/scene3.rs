@@ -2296,6 +2296,34 @@ impl Scene3 {
         self.validate_links()?;
         self.validate_figure_errors()?;
         self.validate_film_catalog()?;
+        self.validate_body_coatings()?;
+        Ok(())
+    }
+
+    /// A body is its own substrate: a coating on one of its faces sits on
+    /// the body's glass, so a plate-backed coating (which brings a substrate
+    /// of its own) or one with slabs is refused there by name (CF-05).
+    fn validate_body_coatings(&self) -> Result<(), SceneError> {
+        let wrong = |r: &SurfaceResponse| match r {
+            SurfaceResponse::Coating { coating } => {
+                matches!(coating.backing, crate::thinfilm::CoatingBacking::Plate { .. })
+                    || crate::thinfilm::has_slab(coating)
+            }
+            _ => false,
+        };
+        for b in &self.bodies {
+            let s = &b.surface;
+            let faces = std::iter::once(&s.default).chain(s.overrides.iter().map(|o| &o.response));
+            for f in faces {
+                if wrong(&f.from_outside) || wrong(&f.from_inside) {
+                    return Err(SceneError::OutOfRange {
+                        object: Some(b.common.id.0),
+                        field: "surface.coating".to_string(),
+                        reason: "a plate-backed or slab coating cannot coat a body face: the body is already its substrate".to_string(),
+                    });
+                }
+            }
+        }
         Ok(())
     }
 

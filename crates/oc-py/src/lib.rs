@@ -393,18 +393,26 @@ fn thinfilm_indices(stack_json: &str, lambda_um: Vec<f64>) -> PyResult<String> {
 /// as [`thinfilm_rt`] flattens them, the fraction of the incident power each
 /// layer absorbs (written order), what the substrate takes, and the powers.
 #[pyfunction]
-#[pyo3(signature = (stack_json, lambda_um, aoi_deg, n_incident, n_far=None))]
+#[pyo3(signature = (stack_json, lambda_um, aoi_deg, n_incident, n_far=None, plate_incoherent=false))]
 fn thinfilm_absorption(
     stack_json: &str,
     lambda_um: Vec<f64>,
     aoi_deg: Vec<f64>,
     n_incident: f64,
     n_far: Option<f64>,
+    plate_incoherent: bool,
 ) -> PyResult<String> {
     let coating: oc_core::thinfilm::Coating =
         serde_json::from_str(stack_json).map_err(to_py_err)?;
     let n_far = n_far.unwrap_or(n_incident);
-    let ctx = oc_core::thinfilm::FilmContext::default();
+    let ctx = oc_core::thinfilm::FilmContext {
+        plate: if plate_incoherent {
+            oc_core::fidelity::PlateModel::Incoherent
+        } else {
+            oc_core::fidelity::PlateModel::PhaseFree
+        },
+        ..Default::default()
+    };
     let (mut a_s, mut a_p, mut sub_s, mut sub_p) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let (mut rs, mut rp, mut ts, mut tp) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for &um in &lambda_um {

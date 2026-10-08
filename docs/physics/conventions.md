@@ -76,33 +76,27 @@ fixture, and `test_optiland_diverges_past_the_critical_angle_when_the_stack_abso
 The rescaling of the evanescent `t_p` from tangential to whole field uses the
 same decaying cosine, so it does not flip the sign the admittance fixed.
 
-**The two thin-film oracles, mapped.** Measured on one layer (n = 1.72, 137 nm
-on 1.52, 550 nm, 0 and 35 degrees) in `test_tmm_works_in_the_canvas_ray_frame`:
+**The three thin-film solvers, mapped.** Measured, not remembered: one
+layer (n = 1.72, 137 nm on 1.52, 550 nm, 0 and 35 degrees) in
+`test_tmm_works_in_the_canvas_ray_frame`, and the Fresnel rhomb in
+`test_polarization_outputs.py`.
 
-| Oracle | Time | p basis | `t_p` | Map to the kernel |
-|---|---|---|---|---|
-| Byrnes `tmm` 0.2.0 | `exp(-iωt)`, `n + ik` | `r_p = -r_s` at normal incidence | whole field | none |
-| Optiland `thin_film` | Macleod, `exp(+iωt)` | `r_p = +r_s` at normal incidence | tangential, `t` already conjugated | conjugate `r`; negate `r_p`; `t_p · cos θ₀ / cos θ_exit` |
+| | Canvas (`FilmAmp`) | Byrnes `tmm` 0.2.0 | Optiland `thin_film` 0.6.1 |
+|---|---|---|---|
+| Time convention, index | `exp(-iωt)`, `n + ik` | `exp(-iωt)`, `n + ik` | Macleod, `exp(+iωt)`, `n − ik` inside; `t` conjugated on the way out, `r` not |
+| `r_p` at normal incidence | `−r_s` (p̂ follows each ray) | `−r_s` | `+r_s` (Macleod's admittance) |
+| Evanescent exit medium | decaying | decaying | principal root, the growing wave: phases wrong past the critical angle, and powers too when the stack absorbs |
+| `t_p` | whole field | whole field | tangential field |
+| Transmittance | `\|t\|²` times `t_power_scale` | `\|t\|² Re(n_f cos θ_f) / Re(n₀ cos θ₀)` (s), conjugated cosines (p) | Macleod's admittance ratio |
+| Ellipsometric Δ | `arg(r_p / r_s)`: π at normal incidence on bare glass | `arg(−r_p / r_s)` (`tmm.ellips`): 0 there | not provided |
+| Map to the canvas | none for amplitudes; `Δ = Δ_tmm + π` | conjugate `r`; negate `r_p`; `t_p · cos θ₀ / cos θ_exit`; below the critical angle only | |
 
-**Transmittance into an absorbing exit medium.** The kernel computes
-Macleod's `T = |t_M|² Re(η_exit) / Re(η₀)`; Byrnes' `tmm` computes
-`T = |t|² Re(n_f cos θ_f) / Re(n₀ cos θ₀)` for s and
-`T = |t|² Re(n_f conj(cos θ_f)) / Re(n₀ conj(cos θ₀))` for p. They are the
-same number. Macleod's quantities are the conjugates of the `exp(-iωt)` ones
-(index `n̄ = n − ik`), so his tilted admittances are `η_s = conj(n cos θ)` and
-`η_p = conj(n / cos θ)`, and conjugation leaves every real part and modulus
-alone.
-
-- s: `Re(η_s) = Re(n cos θ)` and `|t_M| = |t|`, which is Byrnes' s form.
-- p: Macleod's `t_M` is the tangential field, `t_M = t · cos θ_f / cos θ₀` up to
-  conjugation, so `|t_M|² = |t|² |cos θ_f|² / |cos θ₀|²`; and
-  `Re(n / cos θ) = Re(n conj(cos θ)) / |cos θ|²`. Then
-  `|t_M|² Re(η_p,f) / Re(η_p,0) = |t|² Re(n_f conj(cos θ_f)) / Re(n₀ conj(cos θ₀))`,
-  the `|cos θ|²` factors cancelling: Byrnes' p form.
-
-Held by the `silica_on_opaque_aluminium` coating fixture (an absorbing exit
-medium against `tmm`, R to 1e-15) and by the 2000-stack sweep of
-`test_thinfilm_stress.py` against the arbitrary-precision oracle.
+The rows are held by `test_thinfilm_tmm.py` (amplitudes, no map),
+`test_thinfilm_parity.py` and `coating_compare.py` (Optiland's map), the
+`total_internal_reflection` and `asymmetric_absorbing_reversed` coating
+fixtures (the evanescent branch), `test_c19_*` (Δ) and
+`test_optiland_puts_the_rhomb_phase_on_the_growing_branch` (Optiland's
+retardance past the critical angle is the negative of the true one).
 
 ## Surfaces and sides
 

@@ -283,7 +283,9 @@ fn thinfilm_rt(
 ///
 /// Returns JSON with eight arrays: `rs_re`, `rs_im`, `rp_re`, `rp_im` and the
 /// same for `ts`/`tp`, flattened the same way as [`thinfilm_rt`], plus `scale`,
-/// the factor turning `|t|²` into a transmittance.
+/// the factor turning `|t|²` into a transmittance, and `psi`, `delta` (the
+/// ellipsometric angles, `FilmAmp::ellipsometric`) and `t_retardance`
+/// (`arg t_p − arg t_s`), radians.
 ///
 /// These are in the **kernel's ray frame** (see `oc_core::polarization`), not
 /// Macleod's: `r_p` carries the opposite sign, `t_p` is the whole field rather
@@ -300,7 +302,7 @@ fn thinfilm_amplitudes(
 ) -> PyResult<String> {
     let coating: oc_core::thinfilm::Coating =
         serde_json::from_str(stack_json).map_err(to_py_err)?;
-    let mut cols: [Vec<f64>; 9] = Default::default();
+    let mut cols: [Vec<f64>; 12] = Default::default();
     for &nm in &lambda_um {
         for &deg in &aoi_deg {
             let a = oc_core::thinfilm::coating_amp_at(
@@ -316,6 +318,10 @@ fn thinfilm_amplitudes(
                 cols[2 * i + 1].push(z.im);
             }
             cols[8].push(a.t_power_scale);
+            let (psi, delta) = a.ellipsometric();
+            cols[9].push(psi);
+            cols[10].push(delta);
+            cols[11].push(a.transmission_retardance());
         }
     }
     let arr = |v: &Vec<f64>| {
@@ -325,7 +331,8 @@ fn thinfilm_amplitudes(
             .join(",")
     };
     let names = [
-        "rs_re", "rs_im", "rp_re", "rp_im", "ts_re", "ts_im", "tp_re", "tp_im", "scale",
+        "rs_re", "rs_im", "rp_re", "rp_im", "ts_re", "ts_im", "tp_re", "tp_im", "scale", "psi", "delta",
+        "t_retardance",
     ];
     let body = names
         .iter()

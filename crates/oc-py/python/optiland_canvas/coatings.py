@@ -85,7 +85,9 @@ def amplitudes(
     n_incident: float = 1.0,
     n_exit: float = 1.0,
 ) -> dict[str, list[list[Any]]]:
-    """Complex ``rs, rp, ts, tp`` and the power ``scale``, ``[wavelength][angle]``.
+    """Complex ``rs, rp, ts, tp``, the power ``scale``, the ellipsometric
+    ``psi`` and ``delta`` and the transmission retardance ``t_retardance``
+    (radians), each ``[wavelength][angle]``.
 
     ``|t|^2 * scale`` is the transmittance. Only a ``Medium``-backed stack has
     amplitudes: a plate adds its two faces incoherently, which no single
@@ -101,6 +103,8 @@ def amplitudes(
         flat = [complex(a, b) for a, b in zip(got[f"{key}_re"], got[f"{key}_im"])]
         out[key] = _grid(flat, *shape)
     out["scale"] = _grid(got["scale"], *shape)
+    for key in ("psi", "delta", "t_retardance"):
+        out[key] = _grid(got[key], *shape)
     return out
 
 

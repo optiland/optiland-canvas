@@ -1299,6 +1299,26 @@ impl FilmAmp {
     pub fn reflection_retardance(&self) -> f64 {
         self.r_p.arg() - self.r_s.arg()
     }
+
+    /// Retardance the coating adds between p and s on transmission,
+    /// `arg t_p − arg t_s`, radians. Both rays travel forward, so there is no
+    /// basis flip in it: zero at normal incidence for any stack.
+    pub fn transmission_retardance(&self) -> f64 {
+        self.t_p.arg() - self.t_s.arg()
+    }
+
+    /// The ellipsometric angles `(ψ, Δ)`, radians: `tan ψ · e^{iΔ} = r_p / r_s`
+    /// on the ray-frame amplitudes, `exp(-iωt)`. ψ in `[0, π/2]`, Δ in
+    /// `(−π, π]`. In the ray frame `r_p = −r_s` at normal incidence, so a bare
+    /// dielectric below Brewster reads Δ = π there, the Azzam and Bashara
+    /// (Nebraska) convention's value. `tmm.ellips` defines Δ from `−r_p / r_s`
+    /// on the same amplitudes, so `Δ_tmm = Δ − π` (mod 2π) and ψ is the same;
+    /// `docs/physics/conventions.md` holds the table.
+    pub fn ellipsometric(&self) -> (f64, f64) {
+        let psi = self.r_p.abs().atan2(self.r_s.abs());
+        let rho = self.r_p / self.r_s;
+        (psi, rho.arg())
+    }
 }
 
 /// [`coating_rt_at`]'s amplitudes: `r` and `t` for s and p, with their phases.

@@ -1246,6 +1246,11 @@ impl Scene3 {
                     }
                     None => return false,
                 }
+                // A hand edit makes the stack the user's: no longer re-solved
+                // for the glass (`crate::coating_edit`).
+                if let Some(d) = coating.design.as_mut() {
+                    d.adapt = None;
+                }
             }
         }
         touched
@@ -1498,6 +1503,9 @@ impl Scene3 {
                             touched = true;
                         }
                         None => return false,
+                    }
+                    if let Some(d) = coating.design.as_mut() {
+                        d.adapt = None;
                     }
                 }
             }

@@ -191,6 +191,24 @@
         border: 1px solid #24344d; border-radius: 4px; padding: 1px 4px; font: inherit; }
       .cv-field .u { opacity: 0.45; min-width: 14px; }
       /* Fixed heights: a longer message must not resize the drawing above. */
+      .cv-stack { grid-column: 1 / -1; max-height: 150px; overflow-y: auto; font-size: 11px; display: flex; flex-direction: column; gap: 2px; }
+      .cv-stack-row { display: flex; align-items: center; gap: 4px; }
+      .cv-stack-row.warn .cv-film-pick { border-color: #ffb454; }
+      .cv-stack-row .m4btn { padding: 0 5px; }
+      .cv-stack-i { width: 14px; opacity: 0.6; text-align: right; }
+      .cv-stack-t { width: 64px; background: #0a1220; color: #e8f6ff; border: 1px solid #24344d; border-radius: 4px; padding: 1px 3px; font: inherit; }
+      .cv-stack-u, .cv-stack-qw { opacity: 0.6; }
+      .cv-film-pick { max-width: 210px; background: #0a1220; color: #e8f6ff; border: 1px solid #24344d; border-radius: 4px; font: inherit; }
+      .cv-report { margin-top: 2px; line-height: 1.35; }
+      .cv-dialog { position: fixed; z-index: 50; left: 50%; top: 12%; transform: translateX(-50%); width: min(560px, 92vw);
+        background: #0d1626; color: #e8f6ff; border: 1px solid #24344d; border-radius: 6px; padding: 10px; font-size: 12px;
+        display: flex; flex-direction: column; gap: 6px; box-shadow: 0 8px 30px rgba(0,0,0,0.5); }
+      .cv-dialog textarea { width: 100%; box-sizing: border-box; background: #0a1220; color: #e8f6ff; border: 1px solid #24344d; font: 11px ui-monospace, monospace; }
+      .cv-dialog-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 10px; }
+      .cv-dialog-grid input, .cv-dialog-grid select { width: 90px; background: #0a1220; color: #e8f6ff; border: 1px solid #24344d; border-radius: 4px; font: inherit; }
+      .cv-dialog-title { font-weight: 600; }
+      .cv-dialog-error { color: #ff8a65; min-height: 1em; }
+      .cv-dialog-buttons { display: flex; gap: 6px; justify-content: flex-end; }
       .cv-read { font-size: 11px; opacity: 0.85; line-height: 1.45; height: 46px; overflow-y: auto; flex: none; }
       .cv-read.tall { height: 78px; }
       .cv-bar .cv-group { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px; }

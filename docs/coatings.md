@@ -273,6 +273,37 @@ Under the plot the stack is drawn as its layers, left to right from the incident
 medium inward, each as wide as it is thick and shaded by index. Every boundary
 drags, changing the thickness of the layer to its left.
 
+Under the fields the stack is also a list, one row per layer: its material,
+picked from the catalogue with each entry's source and wavelength range; its
+thickness in nanometres and its optical thickness in quarter waves at the
+design wavelength; buttons to move it up or down or remove it. A last row adds
+a layer next to the substrate, and another sets what is behind the stack: the
+far medium, a plate of a catalogue material, or an opaque substrate (a body
+face refuses a plate, since the body is its substrate). An entry with no data
+at a wavelength the scene launches says so in the picker.
+
+Every edit goes to every copy of the coating (a surface's front and back, a
+body face's outside and inside), the scene is validated, and an edit it
+refuses is undone and the reason shown. A hand edit makes the stack the
+user's: the design keeps its kind, so an edited AR's reflection is still a
+ghost, but it is no longer re-solved when the glass changes.
+
+Below the rows is the report: the design record ("Bbar adapted to n 1.920,
+band 400 to 700 nm, at 0 degrees"), every material without data at a launched
+wavelength, and every refusal a `Strict` trace would meet at those wavelengths
+at the angle the light arrives at, in the solver's own words.
+
+The plot shows the unpolarized mean, or s solid and p dotted, against
+wavelength at the angle the surface is used at, or against angle (0 to 89
+degrees) at a chosen wavelength, the used angle marked. The same plots read a
+measured table, with gaps outside its data. `table…` opens the CSV dialog for
+CF-09: the text or a file, the wavelength column and unit, percent or
+fraction, which columns hold what (T only with R declared as 1 − T, R and T,
+or Rs, Rp, Ts, Tp), the angle measured at or the column holding it, the side,
+whether the data cover the whole part, the media, what to do outside the data,
+and the source. A wrong column count is said before anything is sent, and the
+importer's own refusal is shown in the dialog.
+
 ## Coating a lens
 
 Select a lens in the component view and each face takes an antireflection

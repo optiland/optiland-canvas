@@ -47,6 +47,7 @@ mod edit_ui;
 mod detector_ui;
 mod fidelity_ui;
 mod catalog_ui;
+mod coating_ui;
 mod grating_ui;
 
 /// The Fresnel lens: add one, read its recipe, rebuild it from an edited one.

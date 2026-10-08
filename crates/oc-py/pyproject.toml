@@ -22,7 +22,9 @@ dependencies = []
 # The Optiland bridge (to_optic / from_optic) needs Optiland itself; the native
 # `.ocanvas` ⇄ prescription functions do not.
 optiland = ["optiland>=0.6"]
-test = ["optiland>=0.6", "pytest", "numpy"]
+# `tmm` is the second thin-film oracle (tests/test_thinfilm_tmm.py), pinned
+# because the frozen coating fixtures were generated with this version.
+test = ["optiland>=0.6", "pytest", "numpy", "tmm==0.2.0"]
 
 [project.urls]
 Repository = "https://github.com/optiland/optiland-canvas"

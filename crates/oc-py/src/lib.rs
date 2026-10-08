@@ -223,7 +223,9 @@ fn scene3_sequence_for_intent(
 
 /// Evaluate a thin-film stack, for cross-checking against `optiland.thin_film`.
 ///
-/// `stack_json` is a serialized `oc_core::thinfilm::Coating`. Returns JSON
+/// `stack_json` is a serialized `oc_core::thinfilm::Coating`. `n_far` is the
+/// medium behind the stack, which only a `Medium`-backed coating reads; it
+/// defaults to `n_incident`, a zero-thickness surface in one medium. Returns JSON
 /// `{"rs": [...], "rp": [...], "ts": [...], "tp": [...]}`, one entry per
 /// `(wavelength, angle)` pair, both flattened row-major over wavelengths then
 /// angles. Raises `ValueError` if the stack does not parse or a layer's optical
@@ -233,20 +235,24 @@ fn scene3_sequence_for_intent(
 /// Optiland evaluates them in Python, and the only way "they agree" means
 /// anything is if something runs both and subtracts.
 #[pyfunction]
+#[pyo3(signature = (stack_json, lambda_um, aoi_deg, n_incident, n_far=None))]
 fn thinfilm_rt(
     stack_json: &str,
     lambda_um: Vec<f64>,
     aoi_deg: Vec<f64>,
     n_incident: f64,
+    n_far: Option<f64>,
 ) -> PyResult<String> {
+    let n_far = n_far.unwrap_or(n_incident);
     let coating: oc_core::thinfilm::Coating =
         serde_json::from_str(stack_json).map_err(to_py_err)?;
     let mut cols: [Vec<f64>; 4] = Default::default();
     for &nm in &lambda_um {
         for &deg in &aoi_deg {
-            let rt = oc_core::thinfilm::coating_rt(
+            let rt = oc_core::thinfilm::coating_rt_at(
                 &coating,
                 n_incident,
+                n_far,
                 nm,
                 deg.to_radians().cos(),
             )
@@ -332,6 +338,39 @@ fn thinfilm_amplitudes(
     Ok(format!("{{{body}}}"))
 }
 
+/// Each layer's complex index `n + ik` at each wavelength, as the kernel
+/// samples it, for feeding the oracles.
+///
+/// Returns JSON `{"n_re": [[...]], "n_im": [[...]]}`, one row per wavelength
+/// and one column per layer in the **written** order. The parity suites hand
+/// these numbers to `tmm` and Optiland unchanged, so that a disagreement is the
+/// solver's and never a second implementation of the material lookup.
+#[pyfunction]
+fn thinfilm_indices(stack_json: &str, lambda_um: Vec<f64>) -> PyResult<String> {
+    let coating: oc_core::thinfilm::Coating =
+        serde_json::from_str(stack_json).map_err(to_py_err)?;
+    let mut re_rows = Vec::with_capacity(lambda_um.len());
+    let mut im_rows = Vec::with_capacity(lambda_um.len());
+    for &um in &lambda_um {
+        let mut re = Vec::with_capacity(coating.layers.len());
+        let mut im = Vec::with_capacity(coating.layers.len());
+        for l in &coating.layers {
+            let n = l.material.index_at(um).ok_or_else(|| {
+                PyValueError::new_err(format!("no optical constants for {} at {um} um", l.material.name))
+            })?;
+            re.push(n.re.to_string());
+            im.push(n.im.to_string());
+        }
+        re_rows.push(format!("[{}]", re.join(",")));
+        im_rows.push(format!("[{}]", im.join(",")));
+    }
+    Ok(format!(
+        "{{\"n_re\":[{}],\"n_im\":[{}]}}",
+        re_rows.join(","),
+        im_rows.join(",")
+    ))
+}
+
 /// The `.ocanvas` version [`seq_to_scene`] writes. The browser writes the
 /// later one; [`READABLE_VERSIONS`] is every version this build reads.
 #[pyfunction]
@@ -372,6 +411,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(scene3_sequence_for_intent, m)?)?;
     m.add_function(wrap_pyfunction!(thinfilm_rt, m)?)?;
     m.add_function(wrap_pyfunction!(thinfilm_amplitudes, m)?)?;
+    m.add_function(wrap_pyfunction!(thinfilm_indices, m)?)?;
     m.add_function(wrap_pyfunction!(normalize, m)?)?;
     m.add_function(wrap_pyfunction!(validate, m)?)?;
     m.add_function(wrap_pyfunction!(format_version, m)?)?;

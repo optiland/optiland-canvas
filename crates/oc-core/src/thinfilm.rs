@@ -53,6 +53,56 @@
 use crate::scene3::SpectralScalar;
 use serde::{Deserialize, Serialize};
 
+/// One-line mistakes the test suite must catch (acceptance case C31).
+///
+/// Each variant is a slip that leaves every number plausible: a sign, a branch,
+/// a unit, a missing factor. The solver carries a hook at the line each one
+/// would sit on, compiled into test builds only, and `tests::mutations` turns
+/// them on one at a time and asserts that the named check fails. A mutation
+/// nothing catches is a test the suite is missing.
+///
+/// Pending, because the code they would mutate lands later: the preview's
+/// outside grid reused inside (C22, `oc-gpu`) and an off-by-one interface in
+/// the per-layer absorption (C15).
+#[cfg(test)]
+pub(crate) mod mutation {
+    use std::cell::Cell;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Mutation {
+        /// `r_p` left in Macleod's basis instead of the ray frame.
+        RpSignDropped,
+        /// The exit medium's cosine on the growing evanescent branch.
+        GrowingBranch,
+        /// `T = |t|²`, without the admittance ratio.
+        NoAdmittanceRatio,
+        /// A layer thickness read as micrometres.
+        ThicknessAsMicrons,
+        /// A stack met from its substrate walked in the written order.
+        NoReverseWalk,
+    }
+
+    thread_local! {
+        static ACTIVE: Cell<Option<Mutation>> = const { Cell::new(None) };
+    }
+
+    /// Is `m` switched on for this thread?
+    pub(crate) fn on(m: Mutation) -> bool {
+        ACTIVE.with(|a| a.get() == Some(m))
+    }
+
+    /// Run `f` with `m` switched on, and off again afterwards.
+    pub(crate) fn with<T>(m: Mutation, f: impl FnOnce() -> T) -> T {
+        ACTIVE.with(|a| a.set(Some(m)));
+        let out = f();
+        ACTIVE.with(|a| a.set(None));
+        out
+    }
+}
+
+#[cfg(test)]
+use mutation::Mutation;
+
 /// A complex number. Enough arithmetic for the transfer matrix and no more; a
 /// dependency for this would be four functions of value.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -481,13 +531,21 @@ pub fn snell_cos(q: Cx, n: Cx) -> Cx {
 /// branch is the *growing* evanescent wave in the `exp(i(ωt − kz))` convention
 /// the characteristic matrix is written in, where decay means `Im(n cos θ) ≤ 0`.
 ///
-/// No power notices: past the critical angle `R = 1` and `T = 0` on either
-/// branch, which is why this went unremarked while the module only computed
-/// powers. The reflection **phase** notices, it is the only thing a polarization
-/// calculation reads, and it is the whole of what a Fresnel rhomb does. A finite
+/// For a lossless stack no power notices: past the critical angle `R = 1` and
+/// `T = 0` on either branch, which is why this went unremarked while the module
+/// only computed powers. The reflection **phase** notices, it is the only thing
+/// a polarization calculation reads, and it is the whole of what a Fresnel
+/// rhomb does. A stack that absorbs notices in power too: the evanescent field
+/// reaches into the absorbing layer, and on the growing branch the attenuated
+/// total reflection of a metal film comes out wrong by tens of percent (the
+/// `asymmetric_absorbing_reversed` coating fixture, against `tmm`). A finite
 /// layer is invariant under the flip (its matrix is even in `cos θ`), so the
 /// exit medium is the only place this can matter.
 fn decaying_cos(n: Cx, cos_t: Cx) -> Cx {
+    #[cfg(test)]
+    if mutation::on(Mutation::GrowingBranch) {
+        return cos_t;
+    }
     if (n * cos_t).im > 0.0 {
         -cos_t
     } else {
@@ -548,6 +606,12 @@ fn stack_amp_pol(
         // δ = 2π/λ · n · d · cos θ, with d in µm to match λ.
         let k0 = std::f64::consts::TAU / lambda_um;
         let delta = n_l * cos_l * (k0 * thickness_nm / 1000.0);
+        #[cfg(test)]
+        let delta = if mutation::on(Mutation::ThicknessAsMicrons) {
+            n_l * cos_l * (k0 * thickness_nm)
+        } else {
+            delta
+        };
         let (cs, sn) = (delta.cos(), delta.sin());
         let m_a = cs;
         let m_b = I * (sn / eta_l);
@@ -596,6 +660,12 @@ fn stack_rt_pol(
     } else {
         0.0
     };
+    #[cfg(test)]
+    let big_t = if mutation::on(Mutation::NoAdmittanceRatio) {
+        t.norm_sqr()
+    } else {
+        big_t
+    };
     (big_r.clamp(0.0, 1.0), big_t.clamp(0.0, 1.0))
 }
 
@@ -605,7 +675,9 @@ fn bare_interface_r(n1: Cx, n2: Cx, q: Cx, p_pol: bool) -> f64 {
     let (c1, c2) = (snell_cos(q, n1), snell_cos(q, n2));
     let (e1, e2) = (admittance(n1, c1, p_pol), admittance(n2, c2, p_pol));
     let denom = e1 + e2;
-    if denom.norm_sqr() == 0.0 {
+    // Exactly at the critical angle the p admittance of the far side is
+    // infinite, the ratio is ∞/∞, and the limit is total reflection.
+    if denom.norm_sqr() == 0.0 || !denom.is_finite() {
         return 1.0;
     }
     ((e1 - e2) / denom).norm_sqr().clamp(0.0, 1.0)
@@ -780,6 +852,10 @@ pub fn coating_amp_at(
 /// wrong way it reflects more than bare glass. A plate-backed stack handles
 /// its own two sides in `plate_rt` and is left alone here.
 fn walk_from_the_incident_side(c: &Coating, layers: &mut [(Cx, f64)]) {
+    #[cfg(test)]
+    if mutation::on(Mutation::NoReverseWalk) {
+        return;
+    }
     if matches!(c.backing, CoatingBacking::Medium) && matches!(c.incidence, Incidence::Substrate) {
         layers.reverse();
     }
@@ -821,7 +897,10 @@ fn stack_amp(layers: &[(Cx, f64)], n0: Cx, n_sub: Cx, lambda_um: f64, q: Cx) -> 
     let (r_s, t_s, eta0_s, eta_s_s) = stack_amp_pol(layers, n0, n_sub, lambda_um, q, false);
     let (r_p, t_p, _, _) = stack_amp_pol(layers, n0, n_sub, lambda_um, q, true);
     let cos0 = snell_cos(q, n0);
-    let cos_sub = snell_cos(q, n_sub);
+    // The branch `stack_amp_pol` used for the exit admittance. Below the
+    // critical angle it is the principal root unchanged; past it, the
+    // principal root is the growing wave and would flip the evanescent `t_p`.
+    let cos_sub = decaying_cos(n_sub, snell_cos(q, n_sub));
     // Tangential field to whole field for p. An evanescent exit carries no
     // transmitted ray at all, so the scale goes to zero and the amplitude with
     // it rather than through a division by nothing.
@@ -830,10 +909,13 @@ fn stack_amp(layers: &[(Cx, f64)], n0: Cx, n_sub: Cx, lambda_um: f64, q: Cx) -> 
     } else {
         (Cx::real(0.0), 0.0)
     };
+    // The one sign that separates Macleod's p basis from the ray frame.
+    let r_p = -r_p.conj();
+    #[cfg(test)]
+    let r_p = if mutation::on(Mutation::RpSignDropped) { -r_p } else { r_p };
     FilmAmp {
         r_s: r_s.conj(),
-        // The one sign that separates Macleod's p basis from the ray frame.
-        r_p: -r_p.conj(),
+        r_p,
         t_s: t_s.conj(),
         t_p: t_p_full.conj(),
         t_power_scale: scale,
@@ -1491,6 +1573,16 @@ mod tests {
         assert!((a - b).abs() <= tol, "{what}: {a} vs {b} (tol {tol})");
     }
 
+    /// [`approx`] for the checks a mutation test also runs: those must report
+    /// a failure rather than panic on it.
+    fn close(a: f64, b: f64, tol: f64, what: &str) -> Result<(), String> {
+        if (a - b).abs() <= tol {
+            Ok(())
+        } else {
+            Err(format!("{what}: {a} vs {b} (tol {tol})"))
+        }
+    }
+
     /// A bare interface with nothing on it, for the amplitude tests.
     fn bare() -> Coating {
         Coating {
@@ -1560,6 +1652,10 @@ mod tests {
     /// them equal, a doubled one makes them equal again.
     #[test]
     fn at_normal_incidence_the_polarizations_are_equal_and_opposite() {
+        check_rp_sign().unwrap();
+    }
+
+    fn check_rp_sign() -> Result<(), String> {
         // Bare interface, and a real stack, since the sign lives in the
         // conversion rather than in the layers.
         let stack = film_coating(
@@ -1579,13 +1675,14 @@ mod tests {
             // has not had room to separate the two.
             for cos_i in [1.0, (1e-6f64).cos()] {
                 let a = coating_amp_at(&c, 1.0, 1.5168, 0.55, cos_i).unwrap();
-                approx(a.r_p.re, -a.r_s.re, 1e-9, "Re r_p = -Re r_s");
-                approx(a.r_p.im, -a.r_s.im, 1e-9, "Im r_p = -Im r_s");
+                close(a.r_p.re, -a.r_s.re, 1e-9, "Re r_p = -Re r_s")?;
+                close(a.r_p.im, -a.r_s.im, 1e-9, "Im r_p = -Im r_s")?;
                 // Transmission has no basis flip: both rays travel forward.
-                approx(a.t_p.re, a.t_s.re, 1e-9, "Re t_p = Re t_s");
-                approx(a.t_p.im, a.t_s.im, 1e-9, "Im t_p = Im t_s");
+                close(a.t_p.re, a.t_s.re, 1e-9, "Re t_p = Re t_s")?;
+                close(a.t_p.im, a.t_s.im, 1e-9, "Im t_p = Im t_s")?;
             }
         }
+        Ok(())
     }
 
     /// The branch correction in [`decaying_cos`] moves the exit medium's cosine,
@@ -1675,6 +1772,10 @@ mod tests {
     /// with no coating at all, which is the check at the end.
     #[test]
     fn total_internal_reflection_puts_the_right_phase_between_s_and_p() {
+        check_tir_phase().unwrap();
+    }
+
+    fn check_tir_phase() -> Result<(), String> {
         let (n1, n2) = (1.51f64, 1.0f64);
         let n = n2 / n1;
         let crit = n.asin();
@@ -1683,9 +1784,9 @@ mod tests {
             assert!(th > crit, "{deg}° must be past critical");
             let a = coating_amp_at(&bare(), n1, n2, 0.55, th.cos()).unwrap();
             // Nothing gets out.
-            approx(a.r_s.norm_sqr(), 1.0, 1e-14, "|r_s|");
-            approx(a.r_p.norm_sqr(), 1.0, 1e-14, "|r_p|");
-            approx(a.powers().t_s, 0.0, 1e-14, "T_s");
+            close(a.r_s.norm_sqr(), 1.0, 1e-14, "|r_s|")?;
+            close(a.r_p.norm_sqr(), 1.0, 1e-14, "|r_p|")?;
+            close(a.powers().t_s, 0.0, 1e-14, "T_s")?;
 
             // Sign as well as size. Under `exp(-iωt)` the evanescent wave must
             // decay, which puts `cos θ_t` on the `+i` branch, and then
@@ -1696,7 +1797,7 @@ mod tests {
             let want =
                 -2.0 * (th.cos() * (th.sin().powi(2) - n * n).sqrt() / th.sin().powi(2)).atan();
             let got = a.reflection_retardance();
-            approx(got, want, 1e-12, &format!("{deg}° retardance"));
+            close(got, want, 1e-12, &format!("{deg}° retardance"))?;
         }
 
         // Two bounces at 54.6231° make a quarter wave, the rhomb's whole point.
@@ -1704,12 +1805,12 @@ mod tests {
         let one = coating_amp_at(&bare(), n1, n2, 0.55, th.cos())
             .unwrap()
             .reflection_retardance();
-        approx(
+        close(
             (2.0 * one).abs(),
             std::f64::consts::FRAC_PI_2,
             2e-5,
             "two bounces make a quarter wave",
-        );
+        )
     }
 
     /// With no layers at all the machinery must reproduce plain Fresnel, at
@@ -1810,15 +1911,20 @@ mod tests {
     /// Energy is conserved in a transparent stack at every angle: R + T = 1.
     #[test]
     fn a_transparent_stack_conserves_energy() {
+        check_energy().unwrap();
+    }
+
+    fn check_energy() -> Result<(), String> {
         let c = quarter_wave_mirror(550.0, 0.0, 6);
         for deg in [0.0f64, 20.0, 45.0, 70.0] {
             for nm in [420.0, 500.0, 550.0, 620.0, 700.0] {
                 let got =
                     coating_rt_at(&c, 1.0, 1.52, nm / 1000.0, deg.to_radians().cos()).unwrap();
-                approx(got.r_s + got.t_s, 1.0, 1e-12, "s energy");
-                approx(got.r_p + got.t_p, 1.0, 1e-12, "p energy");
+                close(got.r_s + got.t_s, 1.0, 1e-12, "s energy")?;
+                close(got.r_p + got.t_p, 1.0, 1e-12, "p energy")?;
             }
         }
+        Ok(())
     }
 
     /// The whole reason this module exists: tilt a quarter-wave stack and its
@@ -2154,6 +2260,10 @@ mod tests {
     /// different coating, and a worse one than none at all.
     #[test]
     fn a_stack_met_from_behind_is_walked_from_behind() {
+        check_reverse_walk().unwrap();
+    }
+
+    fn check_reverse_walk() -> Result<(), String> {
         let n_glass = 1.5168;
         let design = CoatingDesign {
             kind: DesignKind::BroadbandAr,
@@ -2186,20 +2296,18 @@ mod tests {
                 ("T_s", outside.t_s, inside.t_s),
                 ("T_p", outside.t_p, inside.t_p),
             ] {
-                assert!(
-                    (a - b).abs() < 1e-12,
-                    "{name} at {lambda} um, {aoi_air} deg: {a} from air, {b} from glass"
-                );
+                close(a, b, 1e-12, &format!("{name} at {lambda} um, {aoi_air} deg, air against glass"))?;
             }
 
             // Walked the written way from inside, it is another coating.
             let wrong = coating_rt_at(&front, n_glass, 1.0, lambda, cos_glass).unwrap();
-            assert!(
-                (wrong.r() - inside.r()).abs() > 1e-3,
-                "at {lambda} um the wrong walk should show: {} vs {}",
-                wrong.r(),
-                inside.r()
-            );
+            if (wrong.r() - inside.r()).abs() <= 1e-3 {
+                return Err(format!(
+                    "at {lambda} um the wrong walk should show: {} vs {}",
+                    wrong.r(),
+                    inside.r()
+                ));
+            }
         }
 
         // And at the design wavelength the wrong walk reflects more than bare
@@ -2207,8 +2315,13 @@ mod tests {
         let bare = ((n_glass - 1.0) / (n_glass + 1.0)).powi(2);
         let wrong = coating_rt_at(&front, n_glass, 1.0, 0.55, 1.0).unwrap().r();
         let right = coating_rt_at(&back, n_glass, 1.0, 0.55, 1.0).unwrap().r();
-        assert!(right < 0.005, "the AR does its job from inside: {right}");
-        assert!(wrong > bare, "the wrong walk is worse than bare glass: {wrong} vs {bare}");
+        if right >= 0.005 {
+            return Err(format!("the AR does its job from inside: {right}"));
+        }
+        if wrong <= bare {
+            return Err(format!("the wrong walk is worse than bare glass: {wrong} vs {bare}"));
+        }
+        Ok(())
     }
 
     fn quarter_wave_mirror(lambda_nm: f64, aoi_deg: f64, periods: u32) -> Coating {
@@ -2225,6 +2338,307 @@ mod tests {
             backing: CoatingBacking::Medium,
             incidence: Incidence::Film,
             design: None,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // CF-00: the cases the prior spec left open (C02, C03, C04, C08, C09), a
+    // deterministic property sweep, and the mutation checks (C31).
+    // -----------------------------------------------------------------------
+
+    /// A coating on its own medium, layers given as `(n, k, thickness_nm)`.
+    fn on_medium(layers: &[(f64, f64, f64)]) -> Coating {
+        Coating {
+            layers: layers
+                .iter()
+                .map(|&(n, k, d)| FilmLayer::new(FilmMaterial::absorbing("L", n, k), d))
+                .collect(),
+            backing: CoatingBacking::Medium,
+            incidence: Incidence::Film,
+            design: None,
+        }
+    }
+
+    /// Every amplitude of `a` against `b`, to `tol`.
+    fn same_amplitudes(a: &FilmAmp, b: &FilmAmp, tol: f64, what: &str) -> Result<(), String> {
+        for (name, x, y) in [
+            ("r_s", a.r_s, b.r_s),
+            ("r_p", a.r_p, b.r_p),
+            ("t_s", a.t_s, b.t_s),
+            ("t_p", a.t_p, b.t_p),
+        ] {
+            close(x.re, y.re, tol, &format!("{what}: Re {name}"))?;
+            close(x.im, y.im, tol, &format!("{what}: Im {name}"))?;
+        }
+        close(a.t_power_scale, b.t_power_scale, tol, &format!("{what}: scale"))
+    }
+
+    /// An asymmetric stack with an absorbing layer in it: silica, a thin
+    /// aluminium film, titania. Not its own mirror image, and lossy, so
+    /// reflection from the two sides differs while transmission must not.
+    const ASYMMETRIC: [(f64, f64, f64); 3] = [(1.46, 0.0, 94.0), (0.958, 6.69, 8.0), (2.35, 0.0, 61.0)];
+
+    /// C02: a zero-thickness layer is the same coating as no layer at all,
+    /// amplitudes included, wherever it sits in the stack.
+    #[test]
+    fn c02_a_zero_thickness_layer_is_no_layer() {
+        let base = [(1.46, 0.0, 94.0), (2.35, 0.0, 61.0)];
+        let without = on_medium(&base);
+        for at in 0..=base.len() {
+            for ghost in [(1.9, 0.0, 0.0), (0.958, 6.69, 0.0)] {
+                let mut with = base.to_vec();
+                with.insert(at, ghost);
+                let with = on_medium(&with);
+                for deg in [0.0f64, 35.0, 70.0] {
+                    for lam in [0.45, 0.55, 0.8] {
+                        let cos_i = deg.to_radians().cos();
+                        let a = coating_amp_at(&with, 1.0, 1.5168, lam, cos_i).unwrap();
+                        let b = coating_amp_at(&without, 1.0, 1.5168, lam, cos_i).unwrap();
+                        same_amplitudes(&a, &b, 1e-14, &format!("layer at {at}, {deg} deg, {lam} um"))
+                            .unwrap();
+                    }
+                }
+            }
+        }
+    }
+
+    /// C03: one layer split in two of the same material is the same layer.
+    #[test]
+    fn c03_a_split_layer_is_one_layer() {
+        for (n, k) in [(1.46, 0.0), (2.35, 0.0), (0.958, 6.69)] {
+            let whole = on_medium(&[(1.38, 0.0, 100.0), (n, k, 70.0), (1.65, 0.0, 80.0)]);
+            for cut in [0.5, 17.3, 35.0, 69.0] {
+                let split =
+                    on_medium(&[(1.38, 0.0, 100.0), (n, k, cut), (n, k, 70.0 - cut), (1.65, 0.0, 80.0)]);
+                for deg in [0.0f64, 45.0, 80.0] {
+                    for lam in [0.4, 0.55, 1.2] {
+                        let cos_i = deg.to_radians().cos();
+                        let a = coating_amp_at(&split, 1.0, 1.52, lam, cos_i).unwrap();
+                        let b = coating_amp_at(&whole, 1.0, 1.52, lam, cos_i).unwrap();
+                        same_amplitudes(&a, &b, 1e-14, &format!("n {n}, cut {cut}, {deg} deg, {lam} um"))
+                            .unwrap();
+                    }
+                }
+            }
+        }
+    }
+
+    /// C04: the ideal single-layer AR, index √1.5 on n = 1.5, a quarter wave
+    /// at 550 nm, reflects nothing at its design point. Exactly, up to f64:
+    /// the layer is given to the twelfth decimal of a nanometre so that the
+    /// residual is rounding and not a design error.
+    #[test]
+    fn c04_the_ideal_quarter_wave_ar_is_an_exact_null() {
+        check_c04().unwrap();
+    }
+
+    fn check_c04() -> Result<(), String> {
+        let c = on_medium(&[(1.5f64.sqrt(), 0.0, 112.268279877562)]);
+        let rt = coating_rt_at(&c, 1.0, 1.5, 0.55, 1.0).unwrap();
+        if rt.r_s > 1e-28 || rt.r_p > 1e-28 {
+            return Err(format!("R_s {:.3e}, R_p {:.3e}: not a null", rt.r_s, rt.r_p));
+        }
+        close(rt.t_s, 1.0, 1e-15, "T_s at the null")
+    }
+
+    /// C08: an asymmetric absorbing stack met from the substrate is the same
+    /// stack with its layers reversed and its media swapped, and nothing more.
+    /// Transmission is reciprocal; reflection is not, and must not be assumed
+    /// to be.
+    #[test]
+    fn c08_a_reversed_asymmetric_stack_is_its_mirror_image() {
+        check_c08().unwrap();
+    }
+
+    fn check_c08() -> Result<(), String> {
+        let (n0, ns) = (1.0, 1.5168);
+        let front = on_medium(&ASYMMETRIC);
+        let back = front.seen_from_behind();
+        let mut flipped = ASYMMETRIC;
+        flipped.reverse();
+        let mirror = on_medium(&flipped);
+        let mut biggest_r_gap = 0.0f64;
+        for deg in [0.0f64, 30.0, 60.0] {
+            for lam in [0.45, 0.55, 0.7] {
+                let cos_air = deg.to_radians().cos();
+                let sin_glass = deg.to_radians().sin() * n0 / ns;
+                let cos_glass = (1.0 - sin_glass * sin_glass).sqrt();
+                let what = format!("{deg} deg, {lam} um");
+
+                // Met from behind is the mirror-image stack lit from the glass.
+                let a = coating_amp_at(&back, ns, n0, lam, cos_glass).unwrap();
+                let b = coating_amp_at(&mirror, ns, n0, lam, cos_glass).unwrap();
+                same_amplitudes(&a, &b, 1e-15, &what)?;
+
+                let fwd = coating_rt_at(&front, n0, ns, lam, cos_air).unwrap();
+                let rev = coating_rt_at(&back, ns, n0, lam, cos_glass).unwrap();
+                close(fwd.t_s, rev.t_s, 1e-12, &format!("{what}: T_s reciprocal"))?;
+                close(fwd.t_p, rev.t_p, 1e-12, &format!("{what}: T_p reciprocal"))?;
+                biggest_r_gap = biggest_r_gap.max((fwd.r() - rev.r()).abs());
+            }
+        }
+        if biggest_r_gap <= 1e-3 {
+            return Err(format!("R from the two sides differs by only {biggest_r_gap:.2e}"));
+        }
+        Ok(())
+    }
+
+    /// C09: no NaN or infinity anywhere on a grazing sweep, including exact
+    /// grazing and the hair either side of a critical angle, for every kind of
+    /// stack the canvas builds.
+    #[test]
+    fn c09_a_grazing_sweep_stays_finite() {
+        let ar = |kind| {
+            film_coating(
+                CoatingDesign { kind, lambda_nm: 550.0, aoi_deg: 0.0, periods: 1, n_high: 2.35, n_low: 1.38 },
+                1.0,
+                1.5168,
+            )
+        };
+        let stacks = [
+            bare(),
+            ar(DesignKind::SingleLayerAr),
+            ar(DesignKind::BroadbandAr),
+            quarter_wave_mirror(550.0, 45.0, 10),
+            on_medium(&ASYMMETRIC),
+            on_medium(&[(0.958, 6.69, 150.0)]),
+            plate_coating_for_test(),
+        ];
+        let mut cosines: Vec<f64> = (0..=500).map(|i| (85.0 + 0.01 * i as f64).to_radians().cos()).collect();
+        cosines.extend([0.0, 1e-300, f64::MIN_POSITIVE, 1e-12, 1.0]);
+        let crit = (1.0f64 / 1.5168).asin();
+        let near_crit = [crit - 1e-9, crit, crit + 1e-9].map(f64::cos);
+
+        let ok = |rt: FilmRt, what: &str| {
+            for v in [rt.r_s, rt.r_p, rt.t_s, rt.t_p] {
+                assert!(v.is_finite() && (0.0..=1.0).contains(&v), "{what}: {rt:?}");
+            }
+            assert!(rt.r_s + rt.t_s <= 1.0 + 1e-12 && rt.r_p + rt.t_p <= 1.0 + 1e-12, "{what}: gain {rt:?}");
+        };
+        let finite = |a: FilmAmp| a.r_s.is_finite() && a.r_p.is_finite() && a.t_s.is_finite() && a.t_p.is_finite();
+        for (i, c) in stacks.iter().enumerate() {
+            for lam in [0.4, 0.55, 1.0] {
+                for &cos_i in &cosines {
+                    let what = format!("stack {i}, {lam} um, cos {cos_i:e}");
+                    ok(coating_rt_at(c, 1.0, 1.5168, lam, cos_i).unwrap(), &what);
+                    if let Some(a) = coating_amp_at(c, 1.0, 1.5168, lam, cos_i) {
+                        assert!(finite(a), "{what}: {a:?}");
+                    }
+                }
+                // From inside the glass, through the critical angle.
+                let back = c.seen_from_behind();
+                for &cos_i in &near_crit {
+                    let what = format!("stack {i}, {lam} um, critical, cos {cos_i}");
+                    ok(coating_rt_at(&back, 1.5168, 1.0, lam, cos_i).unwrap(), &what);
+                    if let Some(a) = coating_amp_at(&back, 1.5168, 1.0, lam, cos_i) {
+                        assert!(finite(a), "{what}: {a:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Known defect at the baseline, closed by CF-02 (C12). A metal film thick
+    /// enough that its layer phase passes Im δ ≈ 355 overflows |B|² inside the
+    /// complex division, and R comes out NaN, not the bulk metal's reflectance;
+    /// the degenerate-denominator guard never sees it because the denominator
+    /// itself is still finite. CF-02's opacity rule removes the overflow, and
+    /// this test must then be replaced by C12, which asserts the bulk value.
+    #[test]
+    fn known_defect_a_very_thick_metal_film_overflows() {
+        let c = on_medium(&[(0.958, 6.69, 5000.0)]);
+        let rt = coating_rt_at(&c, 1.0, 1.5168, 0.4, 1.0).unwrap();
+        assert!(rt.r_s.is_nan(), "the overflow is gone ({rt:?}): replace this test with C12");
+        assert_eq!(rt.t_s, 0.0);
+    }
+
+    /// A coated plate with a slightly absorbing substrate, for the sweeps.
+    fn plate_coating_for_test() -> Coating {
+        let mut c = quarter_wave_mirror(550.0, 45.0, 4);
+        c.backing = CoatingBacking::Plate {
+            substrate: FilmMaterial::absorbing("glass", 1.5168, 1e-6),
+            exit: ExitFace::Bare,
+            thickness_mm: 2.0,
+        };
+        c
+    }
+
+    /// A deterministic generator for the property sweeps (SplitMix64), so a
+    /// failure reproduces from its case number and no random crate is needed.
+    struct Sweep(u64);
+
+    impl Sweep {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        /// Uniform in `[lo, hi)`.
+        fn range(&mut self, lo: f64, hi: f64) -> f64 {
+            lo + (hi - lo) * ((self.next() >> 11) as f64 / (1u64 << 53) as f64)
+        }
+        fn stack(&mut self, max_layers: u64, k_max: f64) -> Vec<(f64, f64, f64)> {
+            let n = 1 + self.next() % max_layers;
+            (0..n)
+                .map(|_| {
+                    let k = if k_max > 0.0 && self.next() % 3 == 0 { self.range(0.0, k_max) } else { 0.0 };
+                    (self.range(1.3, 2.5), k, self.range(1.0, 400.0))
+                })
+                .collect()
+        }
+    }
+
+    /// Lossless random stacks conserve energy in both polarizations; lossy
+    /// ones never create it, and transmit the same from either side.
+    #[test]
+    fn random_stacks_conserve_or_lose_energy_and_transmit_reciprocally() {
+        let mut g = Sweep(0x0C0A_7146);
+        for case in 0..400 {
+            let lossy = case % 2 == 1;
+            let layers = g.stack(20, if lossy { 3.0 } else { 0.0 });
+            let ns = g.range(1.4, 2.0);
+            let deg = g.range(0.0, 80.0);
+            let lam = g.range(0.4, 1.6);
+            let front = on_medium(&layers);
+            let back = front.seen_from_behind();
+            let cos_air = deg.to_radians().cos();
+            let sin_sub = deg.to_radians().sin() / ns;
+            let cos_sub = (1.0 - sin_sub * sin_sub).sqrt();
+            let fwd = coating_rt_at(&front, 1.0, ns, lam, cos_air).unwrap();
+            let rev = coating_rt_at(&back, ns, 1.0, lam, cos_sub).unwrap();
+            let what = format!("case {case}: {layers:?} on {ns}, {deg} deg, {lam} um");
+            for (r, t) in [(fwd.r_s, fwd.t_s), (fwd.r_p, fwd.t_p), (rev.r_s, rev.t_s), (rev.r_p, rev.t_p)] {
+                if lossy {
+                    assert!(1.0 - r - t >= -1e-12, "{what}: gain");
+                } else {
+                    approx(r + t, 1.0, 1e-12, &what);
+                }
+            }
+            approx(fwd.t_s, rev.t_s, 1e-12, &format!("{what}: T_s reciprocity"));
+            approx(fwd.t_p, rev.t_p, 1e-12, &format!("{what}: T_p reciprocity"));
+        }
+    }
+
+    /// C31: every one-line mistake in [`mutation::Mutation`] is caught by the
+    /// check named next to it, and that check passes on the real code.
+    #[test]
+    fn every_listed_mistake_is_caught() {
+        type Check = fn() -> Result<(), String>;
+        let table: [(Mutation, &str, Check); 7] = [
+            (Mutation::RpSignDropped, "check_rp_sign", check_rp_sign),
+            (Mutation::GrowingBranch, "check_tir_phase", check_tir_phase),
+            (Mutation::NoAdmittanceRatio, "check_energy", check_energy),
+            (Mutation::NoAdmittanceRatio, "check_c08", check_c08),
+            (Mutation::ThicknessAsMicrons, "check_c04", check_c04),
+            (Mutation::NoReverseWalk, "check_c08", check_c08),
+            (Mutation::NoReverseWalk, "check_reverse_walk", check_reverse_walk),
+        ];
+        for (m, name, check) in table {
+            check().unwrap_or_else(|e| panic!("{name} fails on the real code: {e}"));
+            let caught = mutation::with(m, check);
+            assert!(caught.is_err(), "{m:?} is not caught by {name}");
         }
     }
 }

@@ -120,6 +120,64 @@ of the two indices reads 1.730 for this pair, and the stack's own answer is
 1.680. Three percent, which is 1.5 nm on the 45° edge. The geometric mean is a
 rule for a cavity, not a law for an edge.
 
+## Coatings against two oracles
+
+A datasheet validates; an oracle verifies. The thin-film kernel is held to two
+independent libraries and to closed forms, on every pull request, by the
+harness of the coating-fidelity spec's CF-00:
+
+- **Byrnes `tmm` 0.2.0**, a transfer-matrix code that is not Macleod's
+  admittance form, so agreement is evidence rather than one algorithm checked
+  against its own transcription;
+- **Optiland `thin_film`**, the admittance form the kernel mirrors on purpose.
+
+`crates/oc-py/python/optiland_canvas/coatings.py` exposes the kernel
+(`rt`, `amplitudes`, `indices`) and translates a stack for each oracle
+(`to_tmm`, `to_optiland`). Every oracle is fed the complex indices the kernel
+sampled, so a disagreement is the solver's and never a second reading of a
+material table.
+
+The cases live once, in `crates/oc-py/tests/coating_cases.py`.
+`gen_coating_fixtures.py` freezes both oracles' answers into
+`crates/oc-py/tests/data/coatings/*.json` with the oracle versions, the
+generator's hash and the date; `test_coating_fixtures.py` holds the kernel to
+them with no oracle installed. A scheduled CI job regenerates them with the
+versions pinned in `tests/requirements-oracles.txt` and fails if they moved.
+`test_thinfilm_tmm.py` runs `tmm` live, including 200 seeded random absorbing
+stacks met from both sides through the critical angle.
+
+| Comparison | Tolerance | Worst measured |
+|---|---|---|
+| Ten fixed cases, `tmm`, powers | 1e-9 | 8.7e-15 |
+| Ten fixed cases, `tmm`, amplitudes (no map) | 1e-9 | 1.2e-14 |
+| Ten fixed cases, Optiland, below the critical angle | 1e-11 | 1.2e-14 |
+| 200 random absorbing stacks, `tmm` | 1e-9 | 3.4e-13 power, 4.7e-13 amplitude |
+
+Closed-form and self-consistency cases in `thinfilm.rs`: C02 (a zero-thickness
+layer is no layer, to 1e-14 in amplitude), C03 (a split layer is one layer),
+C04 (the ideal quarter-wave AR reflects below 1e-28), C08 (a stack met from its
+substrate is its mirror image; transmission reciprocal to 1e-12, reflection
+not), C09 (no NaN on a grazing sweep, exact grazing and the critical angle
+included). `every_listed_mistake_is_caught` switches five one-line mistakes
+into the solver, test builds only, and requires the named check to fail on
+each (C31).
+
+What the harness found at the baseline:
+
+- **Optiland is wrong in power past the critical angle when the stack
+  absorbs** (attenuated total reflection): 0.69 against 0.48 for `R_s` at 45
+  degrees inside glass, where the kernel and `tmm` agree to 3e-15. Frozen as a
+  known divergence, version-gated.
+- **The kernel's evanescent `t_p` had the wrong sign**: the tangential-to-whole
+  rescaling used the principal cosine while the admittance used the decaying
+  one. No power or traced ray read it. Fixed.
+- **A plate's bare far face returned NaN in p at exactly the critical angle**
+  (∞/∞). Fixed to its limit, total reflection.
+- **A metal film thick enough that its phase passes Im δ ≈ 355 returns NaN**
+  (5 µm of aluminium at 0.4 µm). Pinned by
+  `known_defect_a_very_thick_metal_film_overflows`; the opacity rule of CF-02
+  closes it.
+
 ## Worth adding
 
 - An uncoated N-BK7 and fused-silica window against published internal

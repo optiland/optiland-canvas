@@ -9,6 +9,11 @@ on:
   # while the repo stays private — there is no registry to publish to yet, so
   # a consumer vendors the artifacts this workflow uploads.
   workflow_dispatch:
+  # Weekly: regenerate the coating oracle fixtures with the pinned oracle
+  # versions and fail if they moved (the `coating-fixtures` job). The other
+  # jobs skip scheduled runs.
+  schedule:
+    - cron: "17 4 * * 1"
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -17,6 +22,7 @@ concurrency:
 jobs:
   rust:
     name: rust (clippy, test)
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -46,9 +52,37 @@ jobs:
         run: cargo clippy -p oc-trace --features trace3 --all-targets -- -D warnings
       - name: test (3D tracer)
         run: cargo test -p oc-trace --features trace3
+      # The f32 preview against the f64 kernel. The runner has no GPU, so the
+      # wgpu suites skip and this runs the CPU mirror, which is the preview's
+      # own oracle (coating-fidelity spec CF-00). `gpu3` alone, without the
+      # default `gpu` backend, is the CPU mirror's build.
+      - name: clippy (3D preview)
+        run: cargo clippy -p oc-gpu --features gpu3 --all-targets -- -D warnings
+      - name: test (3D preview, CPU mirror)
+        run: cargo test -p oc-gpu --features gpu3
+
+  # The same preview suites with the wgpu backend on a software Vulkan driver
+  # (lavapipe). Allowed to fail for one release while its reliability on the
+  # runner is measured (coating-fidelity spec K5).
+  gpu3-software-vulkan:
+    name: rust (3D preview on software Vulkan)
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: install lavapipe
+        run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
+      - name: test (3D preview, wgpu on lavapipe)
+        env:
+          WGPU_BACKEND: vulkan
+        run: cargo test -p oc-gpu --features gpu3
 
   python-bridge:
     name: python bridge (optiland round-trip)
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -68,8 +102,30 @@ jobs:
         working-directory: crates/oc-py
         run: pytest tests -q
 
+  # The coating oracle fixtures, regenerated with the pinned oracle versions.
+  # Fails if two runs differ or if the result moved from the committed files;
+  # a deliberate change is a regeneration reviewed in a pull request.
+  coating-fixtures:
+    name: coating oracle fixtures (regenerate and compare)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: build + install with the pinned oracles
+        working-directory: crates/oc-py
+        run: pip install . -r tests/requirements-oracles.txt
+      - name: regenerate and compare
+        working-directory: crates/oc-py
+        run: python tests/gen_coating_fixtures.py --check
+
   web:
     name: web build (wasm + typecheck + browser)
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -141,6 +197,7 @@ jobs:
   # ---------------------------------------------------------------------
   kernel-wheel-linux:
     name: kernel wheel (oc-py, linux/${{ matrix.arch }})
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -172,6 +229,7 @@ jobs:
 
   kernel-wheel:
     name: kernel wheel (oc-py, ${{ matrix.os }})
+    if: github.event_name != 'schedule'
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:

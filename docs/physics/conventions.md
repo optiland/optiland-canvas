@@ -62,10 +62,27 @@ layer against an explicit two-interface Airy sum whose round-trip factor is
 **An evanescent medium needs the decaying branch.** Past the critical angle the
 propagation cosine is a square root of a negative real number, and the principal
 branch (numpy's, and so Optiland's) is the *growing* wave in Macleod's
-convention. Every power is identical on both branches, `R = 1` and `T = 0`, so
-nothing noticed until a reflection phase was needed. `decaying_cos` puts the exit
-medium on the branch where `Im(n cos θ) ≤ 0`. A finite layer needs no such
-correction: its matrix is even in `cos θ`.
+convention. For a lossless stack every power is identical on both branches,
+`R = 1` and `T = 0`, so nothing noticed until a reflection phase was needed.
+`decaying_cos` puts the exit medium on the branch where `Im(n cos θ) ≤ 0`. A
+finite layer needs no such correction: its matrix is even in `cos θ`.
+
+The branch is not only a phase question. When the stack absorbs, the evanescent
+field reaches into the absorbing layer and the reflected power depends on the
+branch: attenuated total reflection off a metal film comes out wrong by tens of
+percent on the growing one. Optiland 0.6.1 is on the growing branch there; the
+canvas and `tmm` agree to rounding (the `asymmetric_absorbing_reversed` coating
+fixture, and `test_optiland_diverges_past_the_critical_angle_when_the_stack_absorbs`).
+The rescaling of the evanescent `t_p` from tangential to whole field uses the
+same decaying cosine, so it does not flip the sign the admittance fixed.
+
+**The two thin-film oracles, mapped.** Measured on one layer (n = 1.72, 137 nm
+on 1.52, 550 nm, 0 and 35 degrees) in `test_tmm_works_in_the_canvas_ray_frame`:
+
+| Oracle | Time | p basis | `t_p` | Map to the kernel |
+|---|---|---|---|---|
+| Byrnes `tmm` 0.2.0 | `exp(-iωt)`, `n + ik` | `r_p = -r_s` at normal incidence | whole field | none |
+| Optiland `thin_film` | Macleod, `exp(+iωt)` | `r_p = +r_s` at normal incidence | tangential, `t` already conjugated | conjugate `r`; negate `r_p`; `t_p · cos θ₀ / cos θ_exit` |
 
 ## Surfaces and sides
 

@@ -637,6 +637,20 @@ pub enum SurfaceResponse {
     Coating {
         coating: crate::thinfilm::Coating,
     },
+    /// Measured or supplied R and T over wavelength and angle, with what the
+    /// numbers mean: resolution, side, scope, media, provenance and what to do
+    /// outside the data (coating-fidelity spec CF-09). See
+    /// [`crate::response_table`].
+    ///
+    /// `from` is the side of the part this copy answers for: a surface's front
+    /// response is met from its front, a body face's outside response from
+    /// outside. A table measured from one side refuses (or, permissively,
+    /// flags) a ray from the other, because an absorbing stack does not
+    /// reflect the same both ways.
+    MeasuredTable {
+        table: Box<crate::response_table::AngularTable>,
+        from: crate::response_table::TableSide,
+    },
     /// An ideal absorbing linear polarizer: it passes the field component along
     /// its transmission axis and absorbs the perpendicular one.
     ///
@@ -825,6 +839,10 @@ impl SurfaceResponse {
                 }
                 Ok(())
             }
+            Self::MeasuredTable { table, .. } => table.validate().map_err(|reason| SceneError::InvalidTable {
+                field: format!("{field}.table"),
+                reason,
+            }),
             Self::Coating { coating } => {
                 // A layer is a thickness and an index; both have to be real
                 // numbers or the transfer matrix has nothing to multiply. There
@@ -2308,24 +2326,31 @@ impl Scene3 {
 
     /// A body is its own substrate: a coating on one of its faces sits on
     /// the body's glass, so a plate-backed coating (which brings a substrate
-    /// of its own) or one with slabs is refused there by name (CF-05).
+    /// of its own) or one with slabs is refused there by name (CF-05), and so
+    /// is a measured table of a whole part, which already holds the substrate
+    /// and its rear face (CF-09).
     fn validate_body_coatings(&self) -> Result<(), SceneError> {
         let wrong = |r: &SurfaceResponse| match r {
             SurfaceResponse::Coating { coating } => {
-                matches!(coating.backing, crate::thinfilm::CoatingBacking::Plate { .. })
-                    || crate::thinfilm::has_slab(coating)
+                (matches!(coating.backing, crate::thinfilm::CoatingBacking::Plate { .. })
+                    || crate::thinfilm::has_slab(coating))
+                .then_some(("surface.coating", "a plate-backed or slab coating cannot coat a body face: the body is already its substrate"))
             }
-            _ => false,
+            SurfaceResponse::MeasuredTable { table, .. } => (table.scope == crate::response_table::TableScope::FiniteAssembly).then_some((
+                "surface.table",
+                "a measured table of a whole part cannot sit on a body face: it already holds the substrate and its rear face, and the body would count them again",
+            )),
+            _ => None,
         };
         for b in &self.bodies {
             let s = &b.surface;
             let faces = std::iter::once(&s.default).chain(s.overrides.iter().map(|o| &o.response));
             for f in faces {
-                if wrong(&f.from_outside) || wrong(&f.from_inside) {
+                if let Some((field, reason)) = wrong(&f.from_outside).or_else(|| wrong(&f.from_inside)) {
                     return Err(SceneError::OutOfRange {
                         object: Some(b.common.id.0),
-                        field: "surface.coating".to_string(),
-                        reason: "a plate-backed or slab coating cannot coat a body face: the body is already its substrate".to_string(),
+                        field: field.to_string(),
+                        reason: reason.to_string(),
                     });
                 }
             }

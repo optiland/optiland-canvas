@@ -175,6 +175,46 @@ fn design_to_v2(c: &mut Coating, losses: &mut Vec<String>) {
     }
 }
 
+/// A v2 reader has no measured table. Each is written as an angle-free
+/// `ExplicitRt` of its unpolarized powers at its first angle, refusing outside
+/// its wavelengths, with a loss line naming the angle.
+fn tables_to_v2(scene: &mut Scene3, losses: &mut Vec<String>) {
+    use crate::scene3::{Interpolation, OutOfRangePolicy, SpectralScalar};
+    let mut visit = |r: &mut SurfaceResponse| {
+        let SurfaceResponse::MeasuredTable { table, .. } = r else {
+            return;
+        };
+        let aoi = table.aoi_deg[0];
+        let cos = aoi.to_radians().cos();
+        let at: Vec<_> = table.lambda_um.iter().map(|&l| table.powers_clamped(l, cos)).collect();
+        let curve = |values: Vec<f64>| SpectralScalar::Tabulated {
+            lambda_um: table.lambda_um.clone(),
+            values,
+            interpolation: Interpolation::Linear,
+            out_of_range: OutOfRangePolicy::Error,
+        };
+        losses.push(format!(
+            "a measured table is written as an angle-free reflectance and transmittance at {aoi} degrees, unpolarized"
+        ));
+        *r = SurfaceResponse::ExplicitRt {
+            reflectance: curve(at.iter().map(|p| p.r()).collect()),
+            transmittance: curve(at.iter().map(|p| p.t()).collect()),
+        };
+    };
+    for s in &mut scene.surfaces {
+        visit(&mut s.response_front);
+        visit(&mut s.response_back);
+    }
+    for b in &mut scene.bodies {
+        visit(&mut b.surface.default.from_outside);
+        visit(&mut b.surface.default.from_inside);
+        for o in &mut b.surface.overrides {
+            visit(&mut o.response.from_outside);
+            visit(&mut o.response.from_inside);
+        }
+    }
+}
+
 pub fn to_v2(scene: &Scene3) -> (Scene3, Vec<String>) {
     let mut s = scene.clone();
     let mut losses = Vec::new();
@@ -214,6 +254,7 @@ pub fn to_v2(scene: &Scene3) -> (Scene3, Vec<String>) {
             CoatingBacking::Medium => {}
         }
     });
+    tables_to_v2(&mut s, &mut losses);
     if !s.film_catalog.is_empty() {
         s.film_catalog.clear();
     }

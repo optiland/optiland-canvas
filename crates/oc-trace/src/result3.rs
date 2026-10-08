@@ -897,6 +897,7 @@ pub enum PhysicsFeature {
     Mirror,
     ExplicitRt,
     ThinFilmCoating,
+    MeasuredTable,
     ThinLens,
     Grating,
     Polarizer,

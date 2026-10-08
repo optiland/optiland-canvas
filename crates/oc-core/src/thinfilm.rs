@@ -312,6 +312,10 @@ pub enum SourceKind {
     Digitized,
     /// A model fitted to data.
     Fitted,
+    /// Supplied by a vendor: a datasheet curve or a file sent with the part.
+    Supplied,
+    /// Computed by the canvas itself, from a model it also holds.
+    Computed,
 }
 
 /// Where a material's data came from (coating-fidelity spec CF-03).

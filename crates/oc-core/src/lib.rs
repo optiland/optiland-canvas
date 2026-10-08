@@ -70,6 +70,8 @@ pub mod solar;
 #[cfg(feature = "scene3")]
 pub mod source3;
 #[cfg(feature = "scene3")]
+pub mod response_table;
+#[cfg(feature = "scene3")]
 pub mod synthesis;
 #[cfg(feature = "scene3")]
 pub mod thinfilm;

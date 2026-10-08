@@ -372,6 +372,52 @@ plates carried films.
 coated, is still on every uncoated face. It is not a coating model and its own
 doc comment says so.
 
+## Measured and vendor data
+
+A vendor's curve is not a coating model and the canvas does not pretend it is
+one. `SurfaceResponse::MeasuredTable` (`crates/oc-core/src/response_table.rs`)
+carries R and T over wavelength and angle with what the numbers mean: s and p
+apart or not, the side and media they were measured from, whether they include
+the substrate, and where they came from. Lookup is bilinear in `(λ, cos θ)`.
+
+A curve measured at 45 degrees is not a curve at 52 degrees, and nothing in the
+data says what it would be. So outside its data a table either refuses or
+reads its edge and says so:
+
+- under `numerics: Strict`, or when the table says `Refuse`, the ray stops and
+  the capability report carries the reason, for example "Data supplied at 45
+  degrees only; this ray is at 52 degrees";
+- otherwise it reads the nearest edge and the result is flagged;
+- a one-angle table holds within half a degree of its angle;
+- a ray from the side the data were not measured from, or between media more
+  than 0.05 away from the ones they were measured between, is out of domain in
+  the same way.
+
+The tracer takes a table's s and p powers as a diagonal Jones element with no
+phase between them, and says so; an unpolarized or scalar table gives both
+polarizations the same number. Two s/p tables in series pass
+`0.5 (Ts1 Ts2 + Tp1 Tp2)` of unpolarized light in the polarized trace and the
+product of the means in the scalar one: the scalar mode's limitation, held in
+`measured_tables3.rs`.
+
+A table of a whole part (`FiniteAssembly`) already holds the substrate and its
+rear face, so it goes on a zero-thickness surface and is refused on a body
+face, where the glass would be counted twice.
+
+The preview resamples a table onto the same 128-row grid as a coating, the
+unpolarized mean, read at the edge outside the data: it cannot refuse one ray.
+A table is piecewise linear in `cos θ`, and the grid cuts the corner at its
+knots, up to 7.5e-3 on an eight-period edge filter tabulated every 5 degrees.
+
+Import goes through `importMeasuredCsv(id, face, csv, map)`. A CSV says none
+of what a table needs, so the map states it all: the wavelength column and its
+unit, the angle (one stated angle, or a column for a table in long form), the
+value columns and whether they are fractions or percent, the side, the scope
+and the media. A transmission-only curve can be read with R declared as
+1 − T, and the provenance records that declaration. `AngularTable::from_coating`
+writes a table from the canvas's own transfer matrix, which reproduces it at
+the knots.
+
 ## Checked against published data
 
 The angle shift of an edge is the one relationship every filter vendor

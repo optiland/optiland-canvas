@@ -239,3 +239,30 @@ fn the_v2_export_writes_new_design_kinds_as_old_ones() {
     assert!(cs.iter().any(|c| thick(c) == thick(&vcoat) && c.design.map(|d| d.kind) == Some(DesignKind::SingleLayerAr)));
     assert!(cs.iter().any(|c| thick(c) == thick(&metal) && c.design.is_none()));
 }
+
+/// A measured table round-trips through v3 and is written to v2 as an
+/// angle-free R and T at its first angle, with a loss line (CF-09).
+#[test]
+fn a_measured_table_round_trips_and_exports_to_v2() {
+    use oc_core::response_table::{AngularTable, TableMedia, TableSide};
+    let mut s = Scene3::default_scene();
+    let mut t = AngularTable::one_angle(vec![0.45, 0.55, 0.65], 45.0, vec![0.1, 0.3, 0.8], vec![0.85, 0.6, 0.15], TableMedia { incident: 1.0, exit: 1.0 });
+    t.side = TableSide::Either;
+    let id = s.add_planar_mirror(Vec3::new(0.0, -10.0, 0.0), Vec3::new(0.0, 10.0, 0.0), 0.5).unwrap();
+    s.set_object_table(id, None, t.clone()).unwrap();
+    let back = Scene3::from_json(&s.to_json()).unwrap();
+    assert_eq!(back.object_table(id), Some(&t));
+
+    let (v2, losses) = s.to_json_v2();
+    assert!(losses.iter().any(|l| l.contains("angle-free reflectance and transmittance at 45 degrees")), "{losses:?}");
+    let old: Scene3 = serde_json::from_str(&v2).unwrap();
+    let surf = old.surfaces.iter().find(|x| x.common.id.0 == id).unwrap();
+    match &surf.response_front {
+        SurfaceResponse::ExplicitRt { reflectance, transmittance } => {
+            assert!((reflectance.sample(0.55).unwrap() - 0.3).abs() < 1e-12);
+            assert!((transmittance.sample(0.55).unwrap() - 0.6).abs() < 1e-12);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(!v2.contains("MeasuredTable"));
+}

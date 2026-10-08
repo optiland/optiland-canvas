@@ -613,6 +613,25 @@ fn compile_body(
             face_resp.push(Some(r));
             continue;
         }
+        // A measured table on a face: each side reads its own copy, the inside
+        // one at the angle in the glass that carries the same `n sin θ`.
+        if let (
+            SurfaceResponse::MeasuredTable { table: outside, .. },
+            SurfaceResponse::MeasuredTable { table: inside, .. },
+        ) = (&two.from_outside, &two.from_inside)
+        {
+            let rt = bake_table(outside, ambient, bake, &body_indices, None)?;
+            let rt_inside = bake_table(inside, ambient, bake, &body_indices, Some(&body_indices))?;
+            let r = GpuResponse::CoatingGrid {
+                lambdas: bake.lambdas.to_vec(),
+                rt: std::sync::Arc::new(rt),
+                rt_inside: Some(std::sync::Arc::new(rt_inside)),
+                stray: outside.reflection == oc_core::response_table::ReflectionRole::Stray,
+            };
+            baked.push((two as *const _, r.clone()));
+            face_resp.push(Some(r));
+            continue;
+        }
         if two.from_outside != two.from_inside {
             return Err("asymmetric per-face response (not yet in the f32 preview)".into());
         }
@@ -1156,6 +1175,9 @@ fn classify_surface(r: &TwoSidedSurfaceResponse) -> Result<u32, String> {
         SurfaceResponse::Coating { .. } => {
             Err("thin-film coating on a body patch (not yet in the f32 preview)".into())
         }
+        SurfaceResponse::MeasuredTable { .. } => {
+            Err("measured table as a body's default response (not yet in the f32 preview)".into())
+        }
     }
 }
 
@@ -1503,6 +1525,15 @@ fn compile_response(
             let far: Vec<f64> = coat_lambdas.iter().map(|_| ambient).collect();
             bake_coating(coating, ambient, bake, &far)?
         }
+        SurfaceResponse::MeasuredTable { table, .. } => {
+            let far: Vec<f64> = coat_lambdas.iter().map(|_| ambient).collect();
+            GpuResponse::CoatingGrid {
+                lambdas: bake.lambdas.to_vec(),
+                rt: std::sync::Arc::new(bake_table(table, ambient, bake, &far, None)?),
+                rt_inside: None,
+                stray: table.reflection == oc_core::response_table::ReflectionRole::Stray,
+            }
+        }
         // The preview carries no polarization state, so all these elements can
         // be there is what they do to unpolarized light: a polarizer passes half
         // of it plus whatever leaks past the blocked axis, and a lossless
@@ -1660,11 +1691,45 @@ fn bake_grid(
     n_far: &[f64],
     from_inside: Option<&[f64]>,
 ) -> Result<Vec<[f32; 2]>, String> {
+    let (lam_design, cos_design, _) = c.nominal_point();
+    bake_grid_with(ambient, bake, n_far, from_inside, &|n_in, n_out, lam, cos_i| {
+        let (lam_eval, cos_eval) = if bake.nominal { (lam_design, cos_design) } else { (lam, cos_i) };
+        let (v, _) = oc_core::thinfilm::coating_eval(c, n_in, n_out, lam_eval, cos_eval, &bake.ctx)
+            .map_err(|e| format!("coating: {e}"))?;
+        Ok([v.r(), v.t()])
+    })
+}
+
+/// A measured table on the same grid as a coating: the unpolarized mean of
+/// its powers, read at the nearest edge outside its data. The preview cannot
+/// refuse a single ray the way the reference does, so it draws the edge; the
+/// f64 trace is the one that says the ray left the data (CF-09).
+fn bake_table(
+    table: &oc_core::response_table::AngularTable,
+    ambient: f64,
+    bake: &Bake,
+    n_far: &[f64],
+    from_inside: Option<&[f64]>,
+) -> Result<Vec<[f32; 2]>, String> {
+    bake_grid_with(ambient, bake, n_far, from_inside, &|_, _, lam, cos_i| {
+        let p = table.powers_clamped(lam, cos_i);
+        Ok([p.r(), p.t()])
+    })
+}
+
+/// The grid walk shared by coatings and tables: `eval(n_in, n_out, λ, cos θ)`
+/// at every row and wavelength.
+fn bake_grid_with(
+    ambient: f64,
+    bake: &Bake,
+    n_far: &[f64],
+    from_inside: Option<&[f64]>,
+    eval: &dyn Fn(f64, f64, f64, f64) -> Result<[f64; 2], String>,
+) -> Result<Vec<[f32; 2]>, String> {
     let lambdas = bake.lambdas;
     if lambdas.is_empty() {
         return Err("a coating in a scene that emits no light".to_string());
     }
-    let (lam_design, cos_design, _) = c.nominal_point();
     let mut rt = Vec::with_capacity(lambdas.len() * COAT_ANGLES);
     for a in 0..COAT_ANGLES {
         // Stop just short of grazing: at exactly 90 degrees the admittances
@@ -1683,10 +1748,8 @@ fn bake_grid(
                 }
                 None => (ambient, far, (1.0 - sin2_amb).max(0.0).sqrt()),
             };
-            let (lam_eval, cos_eval) = if bake.nominal { (lam_design, cos_design) } else { (lam as f64, cos_i) };
-            let (v, _) = oc_core::thinfilm::coating_eval(c, n_in, n_out, lam_eval, cos_eval, &bake.ctx)
-                .map_err(|e| format!("coating: {e}"))?;
-            rt.push([v.r() as f32, v.t() as f32]);
+            let [r, t] = eval(n_in, n_out, lam as f64, cos_i)?;
+            rt.push([r as f32, t as f32]);
         }
     }
     Ok(rt)

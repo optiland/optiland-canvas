@@ -1324,6 +1324,61 @@ impl Scene3 {
         true
     }
 
+    /// Put measured or supplied data on a surface (both sides) or on one face
+    /// of a revolved body (`face`), each side reading its own copy so a ray
+    /// from the side the data were not measured from is named (CF-09).
+    ///
+    /// The table is validated first. A table of a whole part cannot sit on a
+    /// body face, which would count the glass twice.
+    pub fn set_object_table(
+        &mut self,
+        id: u64,
+        face: Option<BodyFace>,
+        table: crate::response_table::AngularTable,
+    ) -> Result<(), String> {
+        use crate::response_table::{TableScope, TableSide};
+        table.validate()?;
+        let copy = |from| SurfaceResponse::MeasuredTable { table: Box::new(table.clone()), from };
+        let (front, back) = (copy(TableSide::Front), copy(TableSide::Back));
+        if self.set_surface_responses(id, front.clone(), back.clone()) {
+            return Ok(());
+        }
+        let face = face.ok_or("a body takes a table on a named face")?;
+        if table.scope == TableScope::FiniteAssembly {
+            return Err("a measured table of a whole part cannot sit on a body face: it already holds the substrate and its rear face".into());
+        }
+        let b = self.bodies.iter_mut().find(|b| b.common.id.0 == id).ok_or("no surface or body with that id")?;
+        let SolidGeometry3::Profile(solid) = &b.geometry else {
+            return Err("only a revolved body has named faces".into());
+        };
+        if solid.profile.edges.len() != 4 {
+            return Err("only a four-edge profile has a front and a back face".into());
+        }
+        let patch = solid.profile.edges[face.edge()].patch;
+        b.surface.overrides.retain(|o| o.patch != patch);
+        b.surface.overrides.push(PatchResponseOverride {
+            patch,
+            response: TwoSidedSurfaceResponse { from_outside: front, from_inside: back },
+        });
+        Ok(())
+    }
+
+    /// The measured table an object carries: a surface's front response, or
+    /// the first face of a body that has one.
+    pub fn object_table(&self, id: u64) -> Option<&crate::response_table::AngularTable> {
+        fn table(r: &SurfaceResponse) -> Option<&crate::response_table::AngularTable> {
+            match r {
+                SurfaceResponse::MeasuredTable { table, .. } => Some(table.as_ref()),
+                _ => None,
+            }
+        }
+        if let Some(s) = self.surfaces.iter().find(|s| s.common.id.0 == id) {
+            return table(&s.response_front).or_else(|| table(&s.response_back));
+        }
+        let b = self.bodies.iter().find(|b| b.common.id.0 == id)?;
+        b.surface.overrides.iter().find_map(|o| table(&o.response.from_outside))
+    }
+
     /// The coating on one named face of a body, if that face carries one.
     pub fn body_face_coating(&self, id: u64, face: BodyFace) -> Option<&Coating> {
         let b = self.bodies.iter().find(|b| b.common.id.0 == id)?;
@@ -2466,8 +2521,9 @@ pub fn axial_aoi_deg(tilt_deg: f64) -> f64 {
 /// The short kind string for a surface response: `mirror`, `absorb`, `clear`
 /// (full transmission), `split` (constant reflectance and transmittance),
 /// `dichroic` (a [`DichroicSpec`] coating), `coated` (any other tabulated
-/// reflectance/transmittance), `film` (a real thin-film stack), `polarizer`,
-/// `retarder`, `refract`, or `thin-lens`.
+/// reflectance/transmittance), `film` (a real thin-film stack), `table` (a
+/// measured or supplied table with an angle axis), `polarizer`, `retarder`,
+/// `refract`, or `thin-lens`.
 pub fn response_kind(r: &SurfaceResponse) -> &'static str {
     match r {
         SurfaceResponse::Mirror { .. } => "mirror",
@@ -2490,6 +2546,7 @@ pub fn response_kind(r: &SurfaceResponse) -> &'static str {
             }
         }
         SurfaceResponse::Coating { .. } => "film",
+        SurfaceResponse::MeasuredTable { .. } => "table",
         SurfaceResponse::Polarizer { .. } => "polarizer",
         SurfaceResponse::Retarder { .. } => "retarder",
         SurfaceResponse::DielectricFresnel { .. } => "refract",

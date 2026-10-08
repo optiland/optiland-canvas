@@ -2750,6 +2750,8 @@ impl Canvas {
                 // reporting a number here would be the very thing this is meant
                 // to stop. `surfaceFilmJSON` carries the stack instead.
                 SurfaceResponse::Coating { .. } => ("null".into(), "null".into()),
+                // A measured table is a function of angle too: `surfaceTableJSON`.
+                SurfaceResponse::MeasuredTable { .. } => ("null".into(), "null".into()),
                 // Nor does a polarizing element: what it passes depends on the
                 // state arriving, which is not a property of the surface. Half
                 // is the answer only for unpolarized light.
@@ -2839,6 +2841,15 @@ impl Canvas {
                         Err(_) => (None, None),
                     }
                 }
+                // Inside its data a table is its data; outside, the curve has a
+                // gap rather than an extrapolation nobody measured.
+                SurfaceResponse::MeasuredTable { table, .. } => match table.outside(um, aoi_deg) {
+                    Some(_) => (None, None),
+                    None => {
+                        let p = table.powers_clamped(um, aoi_deg.to_radians().cos());
+                        (Some(p.r()), Some(p.t()))
+                    }
+                },
                 // What a polarizing element transmits depends on the state
                 // arriving, not on the surface, so there is no curve in
                 // wavelength to plot. Reporting the unpolarized half would read
@@ -3067,6 +3078,56 @@ impl Canvas {
         } else {
             false
         }
+    }
+
+    /// Import measured or supplied coating data from a CSV file onto a surface
+    /// (both sides) or onto one face of a lens (`face` = `front` or `back`;
+    /// empty for a surface). `map` is the JSON of an
+    /// `oc_core::response_table::CsvMap`: which columns hold what, the units,
+    /// the measurement angle (fixed or a column), the side, whether the data
+    /// include the substrate, and the media. A CSV says none of that, so the
+    /// importer asks for all of it (coating-fidelity spec CF-09).
+    ///
+    /// Returns `{"ok":true,"lambdas":n,"angles":m}` or `{"error":"..."}`.
+    #[wasm_bindgen(js_name = importMeasuredCsv)]
+    pub fn import_measured_csv(&mut self, id: f64, face: &str, csv: &str, map: &str) -> String {
+        use oc_core::build3::BodyFace;
+        let fail = |e: String| format!("{{\"error\":{}}}", json_str(&e));
+        let map: oc_core::response_table::CsvMap = match serde_json::from_str(map) {
+            Ok(m) => m,
+            Err(e) => return fail(format!("column map: {e}")),
+        };
+        let table = match oc_core::response_table::parse_csv(csv, &map) {
+            Ok(t) => t,
+            Err(e) => return fail(e),
+        };
+        let face = match face {
+            "front" => Some(BodyFace::Front),
+            "back" => Some(BodyFace::Back),
+            _ => None,
+        };
+        let (nl, na) = (table.lambda_um.len(), table.aoi_deg.len());
+        let Some(scene) = self.scene3.as_mut() else {
+            return fail("no 3D scene".into());
+        };
+        match scene.set_object_table(id as u64, face, table) {
+            Ok(()) => {
+                self.bump();
+                format!("{{\"ok\":true,\"lambdas\":{nl},\"angles\":{na}}}")
+            }
+            Err(e) => fail(e),
+        }
+    }
+
+    /// The measured table an object carries, as stored (axes, powers, side,
+    /// scope, media, provenance, out-of-domain policy), or `null`.
+    #[wasm_bindgen(js_name = surfaceTableJSON)]
+    pub fn surface_table_json(&self, id: f64) -> String {
+        self.scene3
+            .as_ref()
+            .and_then(|s| s.object_table(id as u64))
+            .and_then(|t| serde_json::to_string(t).ok())
+            .unwrap_or_else(|| "null".into())
     }
 
     /// What each face of a body carries: `{front, back}`, each the design kind
@@ -6028,6 +6089,39 @@ mod scene3_tests {
         // Nothing has been promoted, so the badge is legacy-planar, not full 3D.
         assert_eq!(c.preview_mode(), "legacy_planar");
         assert!(c.scene_revision() > rev0, "load must bump the revision");
+    }
+
+    /// CF-09: a vendor's CSV, nm and percent at normal incidence, imported
+    /// onto a lens face with the map the importer asks for; a whole-part
+    /// table is refused there by name, and a bad map says what is wrong.
+    #[test]
+    fn a_vendor_csv_imports_onto_a_lens_face() {
+        let mut c = Canvas::new();
+        c.new_default_scene3();
+        let lens = c.scene3.as_ref().unwrap().bodies[0].common.id.0 as f64;
+        let csv = "Wavelength (nm),T (%)
+400,98.0
+550,99.5
+700,98.5
+";
+        let map = |scope: &str| {
+            format!(
+                r#"{{"lambda_column":0,"lambda_unit":"Nm","aoi":{{"Fixed":0.0}},"columns":{{"UnpolarizedLosslessT":{{"t":1}}}},"value_unit":"Percent","side":"Front","scope":"{scope}","media":{{"incident":1.0,"exit":1.52}}}}"#
+            )
+        };
+        let rev = c.scene_revision();
+        let ok = c.import_measured_csv(lens, "front", csv, &map("Interface"));
+        assert_eq!(ok, r#"{"ok":true,"lambdas":3,"angles":1}"#);
+        assert!(c.scene_revision() > rev);
+        let table: serde_json::Value = serde_json::from_str(&c.surface_table_json(lens)).unwrap();
+        assert_eq!(table["aoi_deg"], serde_json::json!([0.0]));
+        assert_eq!(table["power_resolution"], "Unpolarized");
+        let whole = c.import_measured_csv(lens, "front", csv, &map("FiniteAssembly"));
+        assert!(whole.contains("whole part"), "{whole}");
+        let bad = c.import_measured_csv(lens, "front", csv, "{}");
+        assert!(bad.starts_with(r#"{"error":"column map:"#), "{bad}");
+        // The trace runs through it.
+        assert!(!c.trace_projected_3d().is_empty());
     }
 
     #[test]

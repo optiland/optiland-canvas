@@ -1,7 +1,8 @@
 //! The f32 preview's coatings against the f64 kernel (coating-fidelity spec
 //! CF-07): a grid per side for an absorbing stack (C22), a coating as a
-//! body's default response (C23), the edge of the angle range (C24), and a
-//! nominal coating under `Fast`.
+//! body's default response (C23), the edge of the angle range (C24), a
+//! nominal coating under `Fast`, and a measured table resampled onto the same
+//! grid (CF-09).
 #![cfg(feature = "gpu3")]
 
 use oc_core::fidelity::{CoatingModel, FidelityProfile};
@@ -227,6 +228,73 @@ fn a_nominal_coating_bakes_a_flat_grid() {
     let want = coating_rt_at(&dichroic, 1.0, 1.0, lam_d, cos_d).unwrap();
     for v in rt.iter() {
         assert!((v[0] as f64 - want.r()).abs() < 1e-6 && (v[1] as f64 - want.t()).abs() < 1e-6, "{v:?}");
+    }
+}
+
+/// A measured table on a surface is resampled onto the coating grid: within
+/// 1e-2 of the table itself at every line and angle up to its last angle,
+/// and held at its edge beyond (the preview cannot refuse a ray; the f64
+/// trace does). A one-angle table bakes a grid flat in angle.
+///
+/// The bound is looser than a coating's 2e-3 because a table is piecewise
+/// linear in `cos θ` and the grid's rows, 0.69 degrees apart, cut the corner
+/// at each of its knots: 7.5e-3 on an eight-period edge filter tabulated
+/// every 5 degrees, at the edge where the curve turns fastest.
+#[test]
+fn a_measured_table_previews_on_the_coating_grid() {
+    use oc_core::response_table::{AngularTable, TableMedia, TableSide};
+    let dichroic = film_coating(
+        CoatingDesign { kind: DesignKind::LongPass, lambda_nm: 600.0, aoi_deg: 45.0, periods: 8, n_high: 2.35, n_low: 1.46, adapt: None },
+        1.0,
+        1.0,
+    );
+    let knots: Vec<f64> = (0..=16).map(|i| 5.0 * i as f64).collect();
+    let mut table =
+        AngularTable::from_coating(&dichroic, 1.0, 1.0, &LINES, &knots, &oc_core::thinfilm::FilmContext::default()).unwrap();
+    table.side = TableSide::Either;
+    let mut s = Scene3::new();
+    let id = s.add_planar_mirror(Vec3::new(0.0, -10.0, 0.0), Vec3::new(0.0, 10.0, 0.0), 0.5).unwrap();
+    let copy = |t: &AngularTable, from| SurfaceResponse::MeasuredTable { table: Box::new(t.clone()), from };
+    {
+        let surf = s.surfaces.iter_mut().find(|x| x.common.id.0 == id).unwrap();
+        surf.response_front = copy(&table, TableSide::Front);
+        surf.response_back = copy(&table, TableSide::Back);
+    }
+    let s = lit(s);
+    let g = GpuScene3::build(&s, BuildOpts::default());
+    let (lambdas, rt) = match &g.surfaces[0].front {
+        GpuResponse::CoatingGrid { lambdas, rt, .. } => (lambdas.clone(), rt.to_vec()),
+        other => panic!("{other:?}"),
+    };
+    let mut worst = 0.0f64;
+    for i in 0..=400 {
+        let deg = 80.0 * i as f64 / 400.0;
+        let cos = deg.to_radians().cos();
+        for &lam in &LINES {
+            let want = table.powers_clamped(lam, cos);
+            let got = sample_coating_grid(&lambdas, &rt, lam as f32, cos as f32, 1.0, 1.0);
+            worst = worst.max((got.0 as f64 - want.r()).abs()).max((got.1 as f64 - want.t()).abs());
+        }
+    }
+    assert!(worst <= 1e-2, "table against its grid: {worst:.2e}");
+
+    // One angle: every row the same.
+    let flat = AngularTable::one_angle(LINES.to_vec(), 45.0, vec![0.1, 0.3, 0.8, 0.9], vec![0.85, 0.6, 0.15, 0.05], TableMedia { incident: 1.0, exit: 1.0 });
+    let mut s = Scene3::new();
+    let id = s.add_planar_mirror(Vec3::new(0.0, -10.0, 0.0), Vec3::new(0.0, 10.0, 0.0), 0.5).unwrap();
+    {
+        let surf = s.surfaces.iter_mut().find(|x| x.common.id.0 == id).unwrap();
+        surf.response_front = copy(&flat, TableSide::Front);
+        surf.response_back = copy(&flat, TableSide::Back);
+    }
+    let g = GpuScene3::build(&lit(s), BuildOpts::default());
+    let (lambdas, rt) = match &g.surfaces[0].front {
+        GpuResponse::CoatingGrid { lambdas, rt, .. } => (lambdas.clone(), rt.to_vec()),
+        other => panic!("{other:?}"),
+    };
+    for deg in [0.0f64, 30.0, 45.0, 70.0] {
+        let got = sample_coating_grid(&lambdas, &rt, 0.55, deg.to_radians().cos() as f32, 1.0, 1.0);
+        assert!((got.0 - 0.3).abs() < 1e-6 && (got.1 - 0.6).abs() < 1e-6, "{deg}: {got:?}");
     }
 }
 

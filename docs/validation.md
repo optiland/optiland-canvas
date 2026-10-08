@@ -258,6 +258,18 @@ up to 8e-2 on bare glass and a three-layer AR; the earlier figure of 7.6e-4
 | A solar `BandAr` on low-iron glass, 0.4 to 2.5 µm, 0 to 40 degrees, weighted by the G173 direct sun (C27) | ≤ single + 1e-3; ≤ 0.5 × bare | 0.0211 against 0.0213 single and 0.0445 bare: 0.475 of bare |
 | Seven synthesized layer lists pinned to the bit | identical on Windows and Linux | thicknesses quantized to 1e-6 nm, so an ulp of a platform's `powf` cannot show |
 
+### Measured tables (CF-09)
+
+| Check | Tolerance | Result |
+|---|---|---|
+| A table bilinear in `(λ, cos θ)`, read at and between its knots (C28) | 1e-12 | passes |
+| A one-angle vendor table at 45 degrees, a ray at 52, under `Strict` (C28) | the stated text | "Data supplied at 45 degrees only; this ray is at 52 degrees" |
+| A table written and read back as CSV (C28) | identical | passes |
+| A table from the transfer matrix against the matrix at its knots (C28) | 1e-9 | passes, exactly |
+| A tilted table plate: each arm against the table, absorption the remainder | 1e-12 | passes |
+| Two s/p tables in series, polarized and scalar (earlier spec §9.4) | 1e-12 | `0.5 (Ts1 Ts2 + Tp1 Tp2)` and the product of the means |
+| The preview's grid against the table, 0 to 80 degrees | 1e-2 | 7.5e-3, the grid cutting the corner at the table's 5-degree knots |
+
 ## Worth adding
 
 - An uncoated N-BK7 and fused-silica window against published internal

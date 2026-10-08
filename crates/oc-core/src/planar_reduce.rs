@@ -319,6 +319,8 @@ fn response_to_spec(object: u64, r: &SurfaceResponse) -> Result<SurfaceSpec, Red
         // pick an angle and bake it in, which is exactly the mistake the stack
         // was added to stop making. Refuse instead.
         SurfaceResponse::Coating { .. } => Err(unsupported("thin-film coating")),
+        // The same for a measured table: its angle axis is its meaning.
+        SurfaceResponse::MeasuredTable { .. } => Err(unsupported("measured coating table")),
         // A v1 surface has no polarization state to act on, so there is
         // nothing for these to reduce to. A polarizer would become "half
         // the light", which is the right number and the wrong component.

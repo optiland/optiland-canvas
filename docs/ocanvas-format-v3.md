@@ -149,6 +149,42 @@ high and matched films by catalogue key (`"magnesium_fluoride_bulk"`, ...),
 direct). The layers are what the transfer matrix reads; the design is what the
 editor re-solves from when the glass changes.
 
+## Measured tables
+
+A surface response may be a table of measured or supplied R and T over
+wavelength and angle of incidence, with what the numbers mean:
+
+```json
+"response_front": { "MeasuredTable": {
+  "from": "Front",
+  "table": {
+    "lambda_um": [0.45, 0.55, 0.65], "aoi_deg": [45.0],
+    "power_resolution": "Unpolarized",
+    "r": [0.1, 0.3, 0.8], "t": [0.85, 0.6, 0.15],
+    "phase_information": "Unknown",
+    "scope": "FiniteAssembly", "side": "Either",
+    "media": { "incident": 1.0, "exit": 1.0 },
+    "provenance": { "source_kind": "Supplied", "reference": "vendor datasheet", "retrieved": "2026-10-08" },
+    "out_of_domain": "Refuse",
+    "reflection": "Path"
+  }
+} }
+```
+
+| Field | Meaning |
+|---|---|
+| `lambda_um`, `aoi_deg` | strictly increasing axes; one angle for a table measured at one |
+| `power_resolution` | `Sp` (arrays `rs`, `rp`, `ts`, `tp`), `Unpolarized` or `Scalar` (`r`, `t`); values row-major by wavelength, entry `i * aoi_deg.len() + j` |
+| `phase_information` | `Unknown`: a power table has no phase |
+| `scope` | `Interface`, or `FiniteAssembly` (substrate and rear face included; refused on a body face) |
+| `side` | `Front`, `Back` or `Either`: the side the light came from when measured |
+| `media` | the indices the data were measured between |
+| `out_of_domain` | absent: `Strict` refuses, `Permissive` reads the edge and flags; `Refuse` or `Clamp` overrides (`Strict` always refuses) |
+| `reflection` | `Path`, or `Stray` for an AR's residual (a ghost) |
+
+`from` is the side of the part a copy answers for: a surface carries one copy
+per side, `Front` and `Back`; a body face `Front` outside and `Back` inside.
+
 ## The opaque backing
 
 ```json
@@ -173,3 +209,4 @@ absorbed there. Lit from its film side only.
 | a `VCoat`, `Bbar` or `BandAr` design | `SingleLayerAr`, layers kept (its reflection stays a ghost) | yes |
 | an `EnhancedMetal` design | no design record, layers kept | yes |
 | `adapt` on any other design | dropped | yes |
+| `MeasuredTable` | `ExplicitRt` of its unpolarized R and T at its first angle, refusing outside its wavelengths | yes |

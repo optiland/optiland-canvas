@@ -2890,6 +2890,88 @@ fn apply_response(
             }
             push_event(r, cfg, w, point, opl_at, interact(children));
         }
+        // Measured or supplied data (CF-09): the table's powers at this
+        // wavelength and angle, read bilinearly in (λ, cos θ). Outside the
+        // data it refuses with the reason, or reads the edge and says so.
+        SurfaceResponse::MeasuredTable { table, from } => {
+            r.report.note_exact(PhysicsFeature::MeasuredTable);
+            let refuse = table.refuses(cfg.fidelity.numerics);
+            let look = match table.lookup(w.lambda, cos_i, *from, n1, n2, refuse) {
+                Ok(l) => l,
+                Err(reason) => {
+                    r.report
+                        .reject(CapabilityIssue::UnsupportedSurfaceResponse { surface, reason: Some(reason) });
+                    r.ledger.numerical_loss += flux_at;
+                    r.terminations.record(TerminationReason::UnsupportedPhysics);
+                    push_event(r, cfg, w, point, opl_at, interact(Vec::new()));
+                    return;
+                }
+            };
+            if look.clamped.is_some() {
+                r.report.note_approx(
+                    PhysicsFeature::MeasuredTable,
+                    "a measured table was read outside its data and answered by its nearest edge",
+                );
+            }
+            let p = look.powers;
+            // s and p powers fix the magnitudes of a diagonal Jones element and
+            // say nothing about the phase between them, which is taken as
+            // zero. An unpolarized or scalar table gives both polarizations the
+            // same number: polarization-blind, as two numbers have to be.
+            use oc_core::response_table::PowerResolution;
+            if phase_assumed {
+                r.report.note_approx(
+                    PhysicsFeature::MeasuredTable,
+                    match table.power_resolution {
+                        PowerResolution::Sp => "measured s and p powers: no phase between them, taken as zero",
+                        _ => "power-only measured table: treated as polarization-blind and phase-neutral",
+                    },
+                );
+            }
+            let root = |x: f64| oc_core::thinfilm::Cx::real(x.max(0.0).sqrt());
+            let m_r = Mueller::from_diagonal_jones(root(p.rs), root(p.rp));
+            let m_t = Mueller::from_diagonal_jones(root(p.ts), root(p.tp));
+            let pol_r = out(&m_r);
+            let pol_t = out(&m_t);
+            r.ledger.absorbed_surface += (flux_at - pol_r.stokes.s0 - pol_t.stokes.s0).max(0.0);
+            let stray = table.reflection == oc_core::response_table::ReflectionRole::Stray;
+            let mut children = Vec::new();
+            if p.r() > 0.0 {
+                if stray && !cfg.ghosts {
+                    r.ledger.truncated_flux += pol_r.stokes.s0;
+                } else {
+                    let dir_r = reflect3(w.ray.dir, n_oppose);
+                    if let Some(id) = spawn(
+                        stack,
+                        r,
+                        cfg,
+                        w,
+                        point,
+                        dir_r,
+                        pol_r,
+                        opl_at,
+                        w.ghost || stray,
+                        false,
+                        min_flux,
+                    ) {
+                        children.push((ChildRole::Reflect, id));
+                    }
+                }
+            }
+            if p.t() > 0.0 {
+                let dir_t = if medium_transition {
+                    refract3(w.ray.dir, n_oppose, n1, n2).unwrap_or(w.ray.dir)
+                } else {
+                    w.ray.dir
+                };
+                if let Some(id) = spawn(
+                    stack, r, cfg, w, point, dir_t, pol_t, opl_at, w.ghost, false, min_flux,
+                ) {
+                    children.push((ChildRole::Transmit, id));
+                }
+            }
+            push_event(r, cfg, w, point, opl_at, interact(children));
+        }
         // A thin lens on a body patch has no meaning: the bend depends on the
         // hit position in a lens plane the patch does not define. A polarizer or
         // a retarder on one has none either: their axis is a direction in the

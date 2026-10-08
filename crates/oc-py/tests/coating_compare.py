@@ -52,16 +52,24 @@ def worst(doc: dict, oracle: str, got: dict | None = None) -> dict[str, tuple[fl
     ref = doc["oracles"][oracle]
     n0, nf = doc["n_incident"], doc["n_far"]
     crit = critical_deg(n0, nf)
+    # An opaque substrate keeps what enters it: the canvas reports T = 0 and
+    # books it as absorbed, where an oracle reports it as transmitted into
+    # the exit medium. Reflection is compared; transmission must be zero.
+    opaque = isinstance(doc["stack"].get("backing"), dict) and "Opaque" in doc["stack"]["backing"]
+    powers = ("Rs", "Rp") if opaque else ("Rs", "Rp", "Ts", "Tp")
+    amps = ("rs", "rp") if opaque else ("rs", "rp", "ts", "tp")
+    if opaque:
+        assert all(v == 0.0 for k in ("Ts", "Tp") for row in got["power"][k] for v in row)
     out = {"power": (0.0, None), "amplitude": (0.0, None)}
     for i, lam in enumerate(doc["lambda_um"]):
         for j, deg in enumerate(doc["aoi_deg"]):
             if oracle == "optiland" and crit is not None and deg >= crit:
                 continue  # Optiland's exit sits on the growing branch here (spec section 9)
-            for key in ("Rs", "Rp", "Ts", "Tp"):
+            for key in powers:
                 d = abs(got["power"][key][i][j] - ref[key][i][j])
                 if d > out["power"][0]:
                     out["power"] = (d, (lam, deg, key, got["power"][key][i][j], ref[key][i][j]))
-            for key in ("rs", "rp", "ts", "tp"):
+            for key in amps:
                 pair = ref[key][i][j]
                 want = _to_canvas_frame(oracle, key, complex(*pair), deg, n0, nf)
                 mine = got["amp"][key][i][j]

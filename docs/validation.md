@@ -173,10 +173,25 @@ What the harness found at the baseline:
   one. No power or traced ray read it. Fixed.
 - **A plate's bare far face returned NaN in p at exactly the critical angle**
   (∞/∞). Fixed to its limit, total reflection.
-- **A metal film thick enough that its phase passes Im δ ≈ 355 returns NaN**
-  (5 µm of aluminium at 0.4 µm). Pinned by
-  `known_defect_a_very_thick_metal_film_overflows`; the opacity rule of CF-02
-  closes it.
+- **A metal film thick enough that its phase passes Im δ ≈ 355 returned NaN**
+  (5 µm of aluminium at 0.4 µm). CF-02's opacity rule closed it: the film is
+  now the bulk metal to 1e-12 (C12).
+
+### Thick absorbing stacks (CF-02)
+
+`tmm` cannot judge a thick absorbing stack: its double-precision matrix
+product overflows on every random 64-layer stack with k up to 7 and layers up
+to 3 µm (1200 of 1200 NaN, measured on 0.2.0). The oracle for those is
+`crates/oc-py/tests/mp_tmm.py`, Byrnes' formulation in 40-digit arithmetic,
+with no opacity rule and no rescaling, itself held to `tmm` to 2e-15 on stacks
+`tmm` can do.
+
+| Comparison | Tolerance | Worst measured |
+|---|---|---|
+| 2000 random 64-layer absorbing stacks, n 1.3 to 4, k 0 to 7, d 1 to 3000 nm, 0/30/60/85 degrees, against `mp_tmm` | 1e-9 | 1.6e-13 (400 of them sampled for the number; all 2000 pass) |
+| 5 µm aluminium against bulk Fresnel (C12) | 1e-12 | passes; against `tmm` 8.9e-16 |
+| Silica on an opaque aluminium substrate against `tmm` (C13) | 1e-9 | 1.2e-15 power, 1.9e-15 amplitude |
+| Bare glass at 89.99 degrees against Fresnel in 50 digits (C24) | 1e-11 | 1.3e-12, from re-deriving cos θ₀ near grazing; 89.9 degrees is inside 1e-12 |
 
 ## Worth adding
 

@@ -307,6 +307,44 @@ nm from 10 to 50 degrees. See [`validation.md`](validation.md), which also says
 where a vendor curve is an oracle and where reproducing one would only be a
 test of guessing their design.
 
+## When a coating has no answer
+
+A coating either gives a number or says why it cannot, by name. It never
+reflects everything quietly and never returns NaN. The reasons, with the
+sentence each one prints:
+
+| Reason | When | Sentence |
+|---|---|---|
+| `Degenerate` | the stack's matrix is singular (refused under `numerics: Strict`; under `Permissive` the stack reflects everything and the result is flagged, as it always did) | the coating's transfer matrix is singular at this wavelength and angle, so it has no reflectance |
+| `OutOfTable` | a layer's or the substrate's table does not cover the wavelength: always when the table's policy is `Error`, and under `Strict` whatever its policy | layer 3 has no optical constants at 0.2500 um: its table does not reach that wavelength |
+| | the same for the substrate | the substrate has no optical constants at 0.2500 um: its table does not reach that wavelength |
+| `NonPhysicalIndex` | n not positive or not finite; a thickness negative or not finite; k negative under `Strict` | layer 1 is not physical: the index must be positive and finite, the extinction coefficient not negative, and the thickness finite and not negative |
+| `AbsorbingIncidentMedium` | an `Opaque`-backed coating lit from its substrate side | light cannot arrive through an absorbing substrate: an opaque-backed coating is lit from its film side only |
+| `Overflow` | the arithmetic left the finite numbers despite the guards below | the coating's arithmetic overflowed, so it has no finite answer |
+| `Incoherent` | amplitudes asked of a plate-backed coating | a plate-backed coating adds its two faces incoherently and has no single complex amplitude |
+
+Under `Strict` the tracer turns each of these into an
+`UnsupportedSurfaceResponse` that carries the sentence; under `Permissive`
+the first two are answered as before and flagged in the capability report.
+
+Two guards keep thick absorbing stacks finite. A layer whose phase thickness
+has an imaginary part above 35 is **opaque**: it passes `exp(-70)` of the
+power, so it becomes the substrate and nothing behind it counts. That is
+Byrnes' limit in `tmm`, which clamps where the canvas truncates; the two differ
+by less than `exp(-70)`. And the accumulated matrix is rescaled whenever an
+entry passes `1e100`, which leaves `r` exact and lets `t` underflow to zero
+where it used to overflow. Neither guard touches a stack that gave a finite
+answer before it existed. 5 µm of aluminium used to return NaN; it now
+reflects what bulk aluminium does, to 1e-12.
+
+A ray at exact grazing (cos θ below 1e-9) is reflected entirely by rule, with
+`r = -1` in both polarizations of the ray frame.
+
+An `Opaque` backing is a semi-infinite absorbing substrate: a metal block, or a
+mirror whose metal is far thicker than its skin depth. What the stack sends
+into it is absorbed there; the tracer books it as surface absorption and spawns
+no transmitted ray.
+
 ## What is still missing
 
 - **Polarization** is no longer missing. It has its own page,

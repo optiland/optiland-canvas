@@ -915,6 +915,9 @@ pub enum CapabilityIssue {
     },
     UnsupportedSurfaceResponse {
         surface: SurfaceRef,
+        /// Why, when the response could say (a coating's `FilmError`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     UnsupportedSourceDistribution {
         source: SourceId,

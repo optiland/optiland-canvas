@@ -1568,10 +1568,7 @@ fn bake_coating(
         for (i, &lam) in lambdas.iter().enumerate() {
             let far = n_far.get(i).copied().unwrap_or(ambient);
             let v = oc_core::thinfilm::coating_rt_at(c, ambient, far, lam as f64, cos_i)
-                .ok_or_else(|| {
-                    "coating whose optical constants are tabulated away from this scene's wavelengths"
-                        .to_string()
-                })?;
+                .map_err(|e| format!("coating: {e}"))?;
             rt.push([v.r() as f32, v.t() as f32]);
         }
     }

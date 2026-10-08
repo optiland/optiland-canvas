@@ -2803,8 +2803,8 @@ impl Canvas {
                         let um = w / 1000.0;
                         let (n0, n_far) = scene.coated_face_media(id as u64, um);
                         let v = oc_core::thinfilm::coating_rt_at(coating, n0, n_far, um, cos_i);
-                        out.push(v.map_or(f64::NAN, |x| x.r()));
-                        out.push(v.map_or(f64::NAN, |x| x.t()));
+                        out.push(v.as_ref().map_or(f64::NAN, |x| x.r()));
+                        out.push(v.as_ref().map_or(f64::NAN, |x| x.t()));
                     }
                     return out;
                 }
@@ -2834,8 +2834,8 @@ impl Canvas {
                     let cos_i = aoi_deg.to_radians().cos();
                     let ambient = self.scene3.as_ref().map_or(1.0, |s| s.env.ambient_index);
                     match oc_core::thinfilm::coating_rt(coating, ambient, um, cos_i) {
-                        Some(v) => (Some(v.r()), Some(v.t())),
-                        None => (None, None),
+                        Ok(v) => (Some(v.r()), Some(v.t())),
+                        Err(_) => (None, None),
                     }
                 }
                 // What a polarizing element transmits depends on the state
@@ -2925,7 +2925,7 @@ impl Canvas {
         };
         let plate = scene.plate_geometry(id as u64);
         let substrate = match &coating.backing {
-            CoatingBacking::Plate { substrate, .. } => {
+            CoatingBacking::Plate { substrate, .. } | CoatingBacking::Opaque { substrate } => {
                 json_num(substrate.n.sample(0.55).unwrap_or(f64::NAN))
             }
             // A coating on a solid is backed by that solid's own glass, which is
@@ -2955,7 +2955,7 @@ impl Canvas {
         let peak = (250..=1600)
             .step_by(5)
             .filter_map(|nm| {
-                oc_core::thinfilm::coating_rt(coating, ambient, nm as f64 / 1000.0, aoi.to_radians().cos())
+                oc_core::thinfilm::coating_rt(coating, ambient, nm as f64 / 1000.0, aoi.to_radians().cos()).ok()
             })
             .map(|v| v.r())
             .fold(0.0f64, f64::max);

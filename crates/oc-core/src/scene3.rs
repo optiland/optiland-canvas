@@ -431,6 +431,17 @@ fn interp_table(xs: &[f64], ys: &[f64], x: f64, out_of_range: OutOfRangePolicy) 
 }
 
 impl SpectralScalar {
+    /// Does the curve have data at `lambda_um`, rather than an out-of-range
+    /// policy's answer? A constant covers every wavelength.
+    pub fn covers(&self, lambda_um: f64) -> bool {
+        match self {
+            Self::Constant(_) => true,
+            Self::Tabulated { lambda_um: xs, .. } => {
+                xs.first().is_some_and(|&a| lambda_um >= a) && xs.last().is_some_and(|&b| lambda_um <= b)
+            }
+        }
+    }
+
     /// The value at `lambda_um`, or `None` if out of range under
     /// [`OutOfRangePolicy::Error`].
     pub fn sample(&self, lambda_um: f64) -> Option<f64> {
@@ -852,6 +863,16 @@ impl SurfaceResponse {
                         if !residual.is_finite() || !(0.0..=1.0).contains(residual) {
                             return Err(range("coating.exit.residual", "is outside [0, 1]"));
                         }
+                    }
+                }
+                if let crate::thinfilm::CoatingBacking::Opaque { substrate } = &coating.backing {
+                    substrate.n.validate(&format!("{field}.coating.substrate.n"))?;
+                    substrate.k.validate(&format!("{field}.coating.substrate.k"))?;
+                    if substrate.n.min() <= 0.0 {
+                        return Err(range("coating.substrate.n", "must be positive"));
+                    }
+                    if substrate.k.min() < 0.0 {
+                        return Err(range("coating.substrate.k", "must not be negative"));
                     }
                 }
                 Ok(())

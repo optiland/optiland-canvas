@@ -352,6 +352,15 @@ pub enum CoatingBacking {
         #[serde(default, skip_serializing_if = "is_zero")]
         thickness_mm: f64,
     },
+    /// A semi-infinite absorbing substrate: a metal block, a mirror whose
+    /// metal is far thicker than its skin depth. Nothing comes out the far
+    /// side. What the stack transmits into the substrate is absorbed there,
+    /// and the tracer books it as absorption and spawns no transmitted ray.
+    ///
+    /// Only the film side can be lit: light arriving through the substrate
+    /// would arrive through an absorbing medium, which is
+    /// [`FilmError::AbsorbingIncidentMedium`].
+    Opaque { substrate: FilmMaterial },
 }
 
 fn is_zero(v: &f64) -> bool {
@@ -582,6 +591,28 @@ fn admittance(n: Cx, cos_t: Cx, p_pol: bool) -> Cx {
 /// The imaginary unit, which the characteristic matrix is full of.
 const I: Cx = Cx::new(0.0, 1.0);
 
+/// A layer whose phase thickness has an imaginary part above this is opaque:
+/// it passes `exp(-35)` of the field, `exp(-70)` of the power, and nothing
+/// behind it can be seen from the front. The value is Byrnes' (`tmm`), so the
+/// canvas and that oracle draw the line in the same place. The canvas
+/// truncates the stack there, the opaque layer becoming the substrate, where
+/// `tmm` clamps the phase; the two differ by less than `exp(-70)`.
+pub const OPAQUE_PHASE: f64 = 35.0;
+
+/// One polarization of one coherent stack, as Macleod's amplitudes and what
+/// happened on the way to them.
+#[derive(Debug, Clone, Copy)]
+struct PolAmp {
+    r: Cx,
+    t: Cx,
+    eta0: Cx,
+    eta_s: Cx,
+    /// The first opaque layer, in the order the light meets them.
+    opaque_from: Option<usize>,
+    /// The denominator vanished or overflowed: `r = 1`, `t = 0` by rule.
+    degenerate: bool,
+}
+
 /// One coherent stack, as **complex amplitudes**.
 ///
 /// `r` and `t` are Macleod's coefficients for the *tangential* field: for s
@@ -598,6 +629,14 @@ const I: Cx = Cx::new(0.0, 1.0);
 /// `exp(-iωt)`, as `a_single_layer_matches_the_airy_formula_and_fixes_the_sign`
 /// establishes by comparing against an explicit two-interface sum. Everything
 /// downstream that reads a phase depends on that test.
+///
+/// Two guards keep a thick absorbing stack finite, and neither touches a
+/// stack that gave a finite answer before they existed. A layer past
+/// [`OPAQUE_PHASE`] ends the stack: it becomes the substrate, and `t` is
+/// what enters it. And the accumulated matrix is rescaled whenever an entry
+/// passes `1e100`, which leaves `r` unchanged and divides `t` by the scale,
+/// so many layers that each absorb a little underflow `t` to zero where they
+/// used to overflow to NaN.
 fn stack_amp_pol(
     layers: &[(Cx, f64)],
     n0: Cx,
@@ -605,7 +644,7 @@ fn stack_amp_pol(
     lambda_um: f64,
     q: Cx,
     p_pol: bool,
-) -> (Cx, Cx, Cx, Cx) {
+) -> PolAmp {
     let cos0 = snell_cos(q, n0);
     let cos_s = decaying_cos(n_sub, snell_cos(q, n_sub));
     let eta0 = admittance(n0, cos0, p_pol);
@@ -613,7 +652,9 @@ fn stack_amp_pol(
 
     // The stack matrix, accumulated from the incident side inward.
     let (mut a, mut b, mut c, mut d) = (Cx::real(1.0), Cx::real(0.0), Cx::real(0.0), Cx::real(1.0));
-    for &(n_l, thickness_nm) in layers {
+    // ln of what the matrix has been divided by.
+    let mut log_scale = 0.0f64;
+    for (k, &(n_l, thickness_nm)) in layers.iter().enumerate() {
         let cos_l = snell_cos(q, n_l);
         let eta_l = admittance(n_l, cos_l, p_pol);
         // δ = 2π/λ · n · d · cos θ, with d in µm to match λ.
@@ -625,6 +666,12 @@ fn stack_amp_pol(
         } else {
             delta
         };
+        if delta.im.abs() > OPAQUE_PHASE {
+            // Opaque: the layer is the substrate, and nothing behind it counts.
+            let mut out = stack_amp_pol(&layers[..k], n0, n_l, lambda_um, q, p_pol);
+            out.opaque_from = Some(k);
+            return out;
+        }
         let (cs, sn) = (delta.cos(), delta.sin());
         let m_a = cs;
         let m_b = I * (sn / eta_l);
@@ -640,6 +687,15 @@ fn stack_amp_pol(
         b = nb;
         c = nc;
         d = nd;
+        let big = a.norm_sqr().max(b.norm_sqr()).max(c.norm_sqr()).max(d.norm_sqr());
+        if big > 1e200 {
+            let k = 1.0 / big.sqrt();
+            a = a * k;
+            b = b * k;
+            c = c * k;
+            d = d * k;
+            log_scale += 0.5 * big.ln();
+        }
     }
 
     // [B, C]ᵀ = M · [1, η_sub]ᵀ.
@@ -648,11 +704,22 @@ fn stack_amp_pol(
     let denom = eta0 * big_b + big_c;
     if denom.norm_sqr() == 0.0 || !denom.is_finite() {
         // A degenerate stack reflects everything rather than returning NaN.
-        return (Cx::real(1.0), Cx::real(0.0), eta0, eta_s);
+        return PolAmp { r: Cx::real(1.0), t: Cx::real(0.0), eta0, eta_s, opaque_from: None, degenerate: true };
     }
     let r = (eta0 * big_b - big_c) / denom;
     let t = eta0 * 2.0 / denom;
-    (r, t, eta0, eta_s)
+    let t = if log_scale > 0.0 { t * (-log_scale).exp() } else { t };
+    PolAmp { r, t, eta0, eta_s, opaque_from: None, degenerate: false }
+}
+
+/// One polarization's powers, and what happened on the way to them.
+#[derive(Debug, Clone, Copy)]
+struct PolRt {
+    r: f64,
+    t: f64,
+    opaque_from: Option<usize>,
+    degenerate: bool,
+    finite: bool,
 }
 
 /// One coherent stack: reflectance and transmittance for a single polarization.
@@ -663,8 +730,9 @@ fn stack_rt_pol(
     lambda_um: f64,
     q: Cx,
     p_pol: bool,
-) -> (f64, f64) {
-    let (r, t, eta0, eta_s) = stack_amp_pol(layers, n0, n_sub, lambda_um, q, p_pol);
+) -> PolRt {
+    let PolAmp { r, t, eta0, eta_s, opaque_from, degenerate } =
+        stack_amp_pol(layers, n0, n_sub, lambda_um, q, p_pol);
     let big_r = r.norm_sqr();
     // A substrate whose admittance has no real part carries no power: the wave
     // there is evanescent and everything that is not absorbed comes back.
@@ -679,7 +747,16 @@ fn stack_rt_pol(
     } else {
         big_t
     };
-    (big_r.clamp(0.0, 1.0), big_t.clamp(0.0, 1.0))
+    // Behind an opaque layer nothing is transmitted: what entered it was
+    // absorbed there.
+    let big_t = if opaque_from.is_some() { 0.0 } else { big_t };
+    PolRt {
+        r: big_r.clamp(0.0, 1.0),
+        t: big_t.clamp(0.0, 1.0),
+        opaque_from,
+        degenerate,
+        finite: big_r.is_finite() && big_t.is_finite(),
+    }
 }
 
 /// Unpolarized Fresnel reflectance for one polarization at a bare interface,
@@ -696,53 +773,226 @@ fn bare_interface_r(n1: Cx, n2: Cx, q: Cx, p_pol: bool) -> f64 {
     ((e1 - e2) / denom).norm_sqr().clamp(0.0, 1.0)
 }
 
-/// Reflectance and transmittance of a coating at one wavelength and angle.
+/// Why a coating has no answer at a wavelength and angle (spec CF-02).
 ///
-/// `n_incident` is the index of the medium the ray is arriving through, which
-/// the scene owns: the same coating on the same plate behaves differently in air
-/// and in oil, and the tracer knows which it is. `cos_i` is the cosine of the
-/// angle of incidence, positive.
-///
-/// Returns `None` when a layer's optical constants are tabulated and the
-/// wavelength falls outside the table under the error policy, which is the same
-/// contract the other spectral responses honour.
-pub fn coating_rt_at(
+/// Every refusal has a name and a sentence, so a result can say why a coated
+/// face was not traced rather than reflecting everything or returning NaN.
+/// Under `numerics: Permissive` only the errors that have no number at all are
+/// raised (a table that refuses its wavelength, a non-physical index, an
+/// overflow, an absorbing incident medium); under `Strict` a clamped table, a
+/// negative extinction coefficient and a degenerate stack are refused too.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FilmError {
+    /// The stack's matrix is singular at this wavelength and angle.
+    Degenerate,
+    /// A layer's optical constants do not cover the wavelength. `layer` counts
+    /// from 0 in the written order; [`FilmError::SUBSTRATE`] is the substrate.
+    OutOfTable { layer: usize, lambda_um: f64 },
+    /// A non-positive or non-finite index, a negative extinction coefficient
+    /// (under `Strict`), or a thickness that is negative or not finite.
+    NonPhysicalIndex { layer: usize },
+    /// Light arriving through an absorbing medium.
+    AbsorbingIncidentMedium,
+    /// The arithmetic left the finite numbers.
+    Overflow,
+    /// A plate-backed coating adds its two faces incoherently and has no
+    /// single complex amplitude to give.
+    Incoherent,
+}
+
+impl FilmError {
+    /// The `layer` of an error about the substrate.
+    pub const SUBSTRATE: usize = usize::MAX;
+}
+
+impl std::fmt::Display for FilmError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let which = |layer: usize| {
+            if layer == FilmError::SUBSTRATE {
+                "the substrate".to_string()
+            } else {
+                format!("layer {}", layer + 1)
+            }
+        };
+        match self {
+            FilmError::Degenerate => write!(
+                f,
+                "the coating's transfer matrix is singular at this wavelength and angle, so it has no reflectance"
+            ),
+            FilmError::OutOfTable { layer, lambda_um } => write!(
+                f,
+                "{} has no optical constants at {:.4} um: its table does not reach that wavelength",
+                which(*layer),
+                lambda_um
+            ),
+            FilmError::NonPhysicalIndex { layer } => write!(
+                f,
+                "{} is not physical: the index must be positive and finite, the extinction coefficient not negative, and the thickness finite and not negative",
+                which(*layer)
+            ),
+            FilmError::AbsorbingIncidentMedium => write!(
+                f,
+                "light cannot arrive through an absorbing substrate: an opaque-backed coating is lit from its film side only"
+            ),
+            FilmError::Overflow => write!(f, "the coating's arithmetic overflowed, so it has no finite answer"),
+            FilmError::Incoherent => write!(
+                f,
+                "a plate-backed coating adds its two faces incoherently and has no single complex amplitude"
+            ),
+        }
+    }
+}
+
+/// What a coating is evaluated under: the parts of the fidelity profile that
+/// reach the solver.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct FilmContext {
+    pub numerics: crate::fidelity::Numerics,
+}
+
+impl FilmContext {
+    pub fn strict(&self) -> bool {
+        self.numerics == crate::fidelity::Numerics::Strict
+    }
+}
+
+/// What happened while a coating was evaluated, for the result to say.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FilmNotes {
+    /// The first opaque layer, counted in the written order.
+    pub opaque_from: Option<usize>,
+    /// Layers (and [`FilmError::SUBSTRATE`]) whose tables were read outside
+    /// their range and answered with their out-of-range policy.
+    pub clamped: Vec<usize>,
+    /// The stack was degenerate and reflected everything by rule.
+    pub degenerate: bool,
+}
+
+/// Below this cosine the ray is grazing: it reflects entirely, by rule, and
+/// the matrix is not asked.
+pub const GRAZING_COS: f64 = 1e-9;
+
+/// A material's complex index at `lambda_um` under `ctx`, for layer `layer`.
+fn sample_index(
+    m: &FilmMaterial,
+    lambda_um: f64,
+    ctx: &FilmContext,
+    layer: usize,
+    notes: &mut FilmNotes,
+) -> Result<Cx, FilmError> {
+    let covered = m.n.covers(lambda_um) && m.k.covers(lambda_um);
+    if !covered && ctx.strict() {
+        return Err(FilmError::OutOfTable { layer, lambda_um });
+    }
+    let n = m.index_at(lambda_um).ok_or(FilmError::OutOfTable { layer, lambda_um })?;
+    if !covered {
+        notes.clamped.push(layer);
+    }
+    if !n.is_finite() || n.re <= 0.0 || (ctx.strict() && n.im < 0.0) {
+        return Err(FilmError::NonPhysicalIndex { layer });
+    }
+    Ok(n)
+}
+
+/// The layers' indices and thicknesses in the written order.
+fn sample_layers(
+    c: &Coating,
+    lambda_um: f64,
+    ctx: &FilmContext,
+    notes: &mut FilmNotes,
+) -> Result<Vec<(Cx, f64)>, FilmError> {
+    let mut layers = Vec::with_capacity(c.layers.len());
+    for (i, l) in c.layers.iter().enumerate() {
+        let n = sample_index(&l.material, lambda_um, ctx, i, notes)?;
+        if !l.thickness_nm.is_finite() || l.thickness_nm < 0.0 {
+            return Err(FilmError::NonPhysicalIndex { layer: i });
+        }
+        layers.push((n, l.thickness_nm));
+    }
+    Ok(layers)
+}
+
+/// The conserved `n₀ sin θ₀` and the incident index, as the solver takes them.
+fn incidence(n_incident: f64, cos_i: f64) -> (Cx, f64, Cx) {
+    let n0 = Cx::real(n_incident.max(1e-9));
+    let cos_i = cos_i.clamp(-1.0, 1.0).abs();
+    let sin_i = (1.0 - cos_i * cos_i).max(0.0).sqrt();
+    (n0, cos_i, n0 * sin_i)
+}
+
+/// An opaque layer index in the walked order, back in the written order.
+fn written_index(c: &Coating, walked: usize) -> usize {
+    if matches!(c.backing, CoatingBacking::Medium) && matches!(c.incidence, Incidence::Substrate) {
+        c.layers.len() - 1 - walked
+    } else {
+        walked
+    }
+}
+
+/// Fold one polarization's flags into the notes, or refuse.
+fn take_pol(c: &Coating, p: &PolRt, ctx: &FilmContext, notes: &mut FilmNotes) -> Result<(), FilmError> {
+    if !p.finite {
+        return Err(FilmError::Overflow);
+    }
+    if p.degenerate {
+        if ctx.strict() {
+            return Err(FilmError::Degenerate);
+        }
+        notes.degenerate = true;
+    }
+    if let Some(k) = p.opaque_from {
+        notes.opaque_from = Some(written_index(c, k));
+    }
+    Ok(())
+}
+
+/// [`coating_rt_at`] under a context, with what happened on the way.
+pub fn coating_eval(
     c: &Coating,
     n_incident: f64,
     n_far: f64,
     lambda_um: f64,
     cos_i: f64,
-) -> Option<FilmRt> {
-    let n0 = Cx::real(n_incident.max(1e-9));
+    ctx: &FilmContext,
+) -> Result<(FilmRt, FilmNotes), FilmError> {
+    let (n0, cos_i, q) = incidence(n_incident, cos_i);
     let n_far = Cx::real(n_far.max(1e-9));
-    let cos_i = cos_i.clamp(-1.0, 1.0).abs();
-    let sin_i = (1.0 - cos_i * cos_i).max(0.0).sqrt();
-    let q = n0 * sin_i;
-
-    let mut layers = Vec::with_capacity(c.layers.len());
-    for l in &c.layers {
-        let n = l.material.index_at(lambda_um)?;
-        if !n.is_finite() || n.re <= 0.0 || !l.thickness_nm.is_finite() || l.thickness_nm < 0.0 {
-            return None;
-        }
-        layers.push((n, l.thickness_nm));
+    let mut notes = FilmNotes::default();
+    if matches!(c.backing, CoatingBacking::Opaque { .. }) && matches!(c.incidence, Incidence::Substrate) {
+        return Err(FilmError::AbsorbingIncidentMedium);
     }
+    let mut layers = sample_layers(c, lambda_um, ctx, &mut notes)?;
     walk_from_the_incident_side(c, &mut layers);
+    if cos_i < GRAZING_COS {
+        return Ok((FilmRt { r_s: 1.0, r_p: 1.0, t_s: 0.0, t_p: 0.0 }, notes));
+    }
 
-    match &c.backing {
+    let rt = match &c.backing {
         // The stack sits straight on whatever the scene has on the far side: an
         // AR coating on a lens face is backed by that lens's own glass.
-        CoatingBacking::Medium => Some(rt_both(&layers, n0, n_far, lambda_um, q)),
+        CoatingBacking::Medium => {
+            let s = stack_rt_pol(&layers, n0, n_far, lambda_um, q, false);
+            let p = stack_rt_pol(&layers, n0, n_far, lambda_um, q, true);
+            take_pol(c, &s, ctx, &mut notes)?;
+            take_pol(c, &p, ctx, &mut notes)?;
+            FilmRt { r_s: s.r, r_p: p.r, t_s: s.t, t_p: p.t }
+        }
+        CoatingBacking::Opaque { substrate } => {
+            let n_sub = sample_index(substrate, lambda_um, ctx, FilmError::SUBSTRATE, &mut notes)?;
+            let s = stack_rt_pol(&layers, n0, n_sub, lambda_um, q, false);
+            let p = stack_rt_pol(&layers, n0, n_sub, lambda_um, q, true);
+            take_pol(c, &s, ctx, &mut notes)?;
+            take_pol(c, &p, ctx, &mut notes)?;
+            // Everything that enters the substrate stays there.
+            FilmRt { r_s: s.r, r_p: p.r, t_s: 0.0, t_p: 0.0 }
+        }
         CoatingBacking::Plate { substrate, exit, thickness_mm } => {
-            let n_sub = substrate.index_at(lambda_um)?;
-            if !n_sub.is_finite() || n_sub.re <= 0.0 {
-                return None;
-            }
+            let n_sub = sample_index(substrate, lambda_um, ctx, FilmError::SUBSTRATE, &mut notes)?;
             let residual = match exit {
                 ExitFace::Bare => 1.0,
                 ExitFace::AntiReflective { residual } => residual.clamp(0.0, 1.0),
             };
-            Some(plate_rt(
+            plate_rt(
                 &layers,
                 n0,
                 n_sub,
@@ -752,14 +1002,37 @@ pub fn coating_rt_at(
                 residual,
                 c.incidence,
                 thickness_mm.max(0.0) * 1e3,
-            ))
+                ctx,
+                &mut notes,
+            )?
         }
-    }
+    };
+    Ok((rt, notes))
+}
+
+/// Reflectance and transmittance of a coating at one wavelength and angle.
+///
+/// `n_incident` is the index of the medium the ray is arriving through, which
+/// the scene owns: the same coating on the same plate behaves differently in air
+/// and in oil, and the tracer knows which it is. `cos_i` is the cosine of the
+/// angle of incidence, positive.
+///
+/// Evaluated under `numerics: Permissive`: a table answers outside its range
+/// with its own out-of-range policy, and refuses only where that policy is
+/// `Error`. [`coating_eval`] takes the context and says what happened.
+pub fn coating_rt_at(
+    c: &Coating,
+    n_incident: f64,
+    n_far: f64,
+    lambda_um: f64,
+    cos_i: f64,
+) -> Result<FilmRt, FilmError> {
+    coating_eval(c, n_incident, n_far, lambda_um, cos_i, &FilmContext::default()).map(|(rt, _)| rt)
 }
 
 /// [`coating_rt_at`] for a surface with the same medium on both sides, which is
 /// every zero-thickness surface in the scene (§6.6) and so every plate.
-pub fn coating_rt(c: &Coating, n_incident: f64, lambda_um: f64, cos_i: f64) -> Option<FilmRt> {
+pub fn coating_rt(c: &Coating, n_incident: f64, lambda_um: f64, cos_i: f64) -> Result<FilmRt, FilmError> {
     coating_rt_at(c, n_incident, n_incident, lambda_um, cos_i)
 }
 
@@ -816,42 +1089,81 @@ impl FilmAmp {
 
 /// [`coating_rt_at`]'s amplitudes: `r` and `t` for s and p, with their phases.
 ///
-/// Returns `None` for a coating whose backing is a [`CoatingBacking::Plate`].
-/// That model adds two faces **incoherently**, which is right for millimetres of
-/// glass and is not a single Jones matrix: the relative phase between the two
-/// contributions is exactly what the incoherent sum discards, so there is no
-/// honest amplitude to return. A coating on a real glass body uses
-/// [`CoatingBacking::Medium`] and does have one.
+/// Refuses a coating whose backing is a [`CoatingBacking::Plate`] with
+/// [`FilmError::Incoherent`]. That model adds two faces **incoherently**, which
+/// is right for millimetres of glass and is not a single Jones matrix: the
+/// relative phase between the two contributions is exactly what the
+/// incoherent sum discards, so there is no honest amplitude to return. A
+/// coating on a real glass body uses [`CoatingBacking::Medium`] and does have
+/// one, and so does an [`CoatingBacking::Opaque`] one, whose transmitted
+/// amplitudes are zero.
 ///
-/// The supported domain is a real, non-absorbing incident and exit medium; the
-/// layers themselves may be absorbing. Outside that, `T` and the amplitude
-/// normalisation stop meaning what this returns.
+/// The supported domain is a real, non-absorbing incident medium; the layers
+/// and an opaque substrate may absorb.
 pub fn coating_amp_at(
     c: &Coating,
     n_incident: f64,
     n_far: f64,
     lambda_um: f64,
     cos_i: f64,
-) -> Option<FilmAmp> {
-    if matches!(c.backing, CoatingBacking::Plate { .. }) {
-        return None;
-    }
-    let n0 = Cx::real(n_incident.max(1e-9));
-    let n_far = Cx::real(n_far.max(1e-9));
-    let cos_i = cos_i.clamp(-1.0, 1.0).abs();
-    let sin_i = (1.0 - cos_i * cos_i).max(0.0).sqrt();
-    let q = n0 * sin_i;
+) -> Result<FilmAmp, FilmError> {
+    coating_amp_eval(c, n_incident, n_far, lambda_um, cos_i, &FilmContext::default()).map(|(a, _)| a)
+}
 
-    let mut layers = Vec::with_capacity(c.layers.len());
-    for l in &c.layers {
-        let n = l.material.index_at(lambda_um)?;
-        if !n.is_finite() || n.re <= 0.0 || !l.thickness_nm.is_finite() || l.thickness_nm < 0.0 {
-            return None;
-        }
-        layers.push((n, l.thickness_nm));
+/// [`coating_amp_at`] under a context, with what happened on the way.
+pub fn coating_amp_eval(
+    c: &Coating,
+    n_incident: f64,
+    n_far: f64,
+    lambda_um: f64,
+    cos_i: f64,
+    ctx: &FilmContext,
+) -> Result<(FilmAmp, FilmNotes), FilmError> {
+    if matches!(c.backing, CoatingBacking::Plate { .. }) {
+        return Err(FilmError::Incoherent);
     }
+    if matches!(c.backing, CoatingBacking::Opaque { .. }) && matches!(c.incidence, Incidence::Substrate) {
+        return Err(FilmError::AbsorbingIncidentMedium);
+    }
+    let (n0, cos_i, q) = incidence(n_incident, cos_i);
+    let mut notes = FilmNotes::default();
+    let mut layers = sample_layers(c, lambda_um, ctx, &mut notes)?;
     walk_from_the_incident_side(c, &mut layers);
-    Some(stack_amp(&layers, n0, n_far, lambda_um, q))
+    if cos_i < GRAZING_COS {
+        // Grazing: total reflection, `r = -1` in both polarizations in the ray
+        // frame (Macleod's `r_p` is `+1` there, and the frame flips it).
+        let minus_one = Cx::real(-1.0);
+        let zero = Cx::real(0.0);
+        let a = FilmAmp { r_s: minus_one, r_p: minus_one, t_s: zero, t_p: zero, t_power_scale: 0.0 };
+        return Ok((a, notes));
+    }
+    let (n_sub, opaque) = match &c.backing {
+        CoatingBacking::Opaque { substrate } => {
+            (sample_index(substrate, lambda_um, ctx, FilmError::SUBSTRATE, &mut notes)?, true)
+        }
+        _ => (Cx::real(n_far.max(1e-9)), false),
+    };
+    let (mut a, s, p) = stack_amp(&layers, n0, n_sub, lambda_um, q);
+    for pol in [&s, &p] {
+        if !pol.r.is_finite() || !pol.t.is_finite() {
+            return Err(FilmError::Overflow);
+        }
+        if pol.degenerate {
+            if ctx.strict() {
+                return Err(FilmError::Degenerate);
+            }
+            notes.degenerate = true;
+        }
+        if let Some(k) = pol.opaque_from {
+            notes.opaque_from = Some(written_index(c, k));
+        }
+    }
+    if opaque || notes.opaque_from.is_some() {
+        a.t_s = Cx::real(0.0);
+        a.t_p = Cx::real(0.0);
+        a.t_power_scale = 0.0;
+    }
+    Ok((a, notes))
 }
 
 /// Put a stack's layers in the order the light meets them.
@@ -887,7 +1199,7 @@ pub fn interface_amp(n1: f64, n2: f64, cos_i: f64) -> FilmAmp {
     let cos_i = cos_i.clamp(-1.0, 1.0).abs();
     let sin_i = (1.0 - cos_i * cos_i).max(0.0).sqrt();
     // The wavelength cannot matter with no layer to put a phase thickness in.
-    stack_amp(&[], n0, ns, 0.55, n0 * sin_i)
+    stack_amp(&[], n0, ns, 0.55, n0 * sin_i).0
 }
 
 /// Both polarizations of one coherent stack, converted into the ray frame.
@@ -906,9 +1218,11 @@ pub fn interface_amp(n1: f64, n2: f64, cos_i: f64) -> FilmAmp {
 ///
 /// **The p basis**, and **the tangential-to-whole-field rescaling of `t_p`**,
 /// both as [`FilmAmp`] describes.
-fn stack_amp(layers: &[(Cx, f64)], n0: Cx, n_sub: Cx, lambda_um: f64, q: Cx) -> FilmAmp {
-    let (r_s, t_s, eta0_s, eta_s_s) = stack_amp_pol(layers, n0, n_sub, lambda_um, q, false);
-    let (r_p, t_p, _, _) = stack_amp_pol(layers, n0, n_sub, lambda_um, q, true);
+fn stack_amp(layers: &[(Cx, f64)], n0: Cx, n_sub: Cx, lambda_um: f64, q: Cx) -> (FilmAmp, PolAmp, PolAmp) {
+    let pol_s = stack_amp_pol(layers, n0, n_sub, lambda_um, q, false);
+    let pol_p = stack_amp_pol(layers, n0, n_sub, lambda_um, q, true);
+    let (r_s, t_s, eta0_s, eta_s_s) = (pol_s.r, pol_s.t, pol_s.eta0, pol_s.eta_s);
+    let (r_p, t_p) = (pol_p.r, pol_p.t);
     let cos0 = snell_cos(q, n0);
     // The branch `stack_amp_pol` used for the exit admittance. Below the
     // critical angle it is the principal root unchanged; past it, the
@@ -926,20 +1240,14 @@ fn stack_amp(layers: &[(Cx, f64)], n0: Cx, n_sub: Cx, lambda_um: f64, q: Cx) -> 
     let r_p = -r_p.conj();
     #[cfg(test)]
     let r_p = if mutation::on(Mutation::RpSignDropped) { -r_p } else { r_p };
-    FilmAmp {
+    let amp = FilmAmp {
         r_s: r_s.conj(),
         r_p,
         t_s: t_s.conj(),
         t_p: t_p_full.conj(),
         t_power_scale: scale,
-    }
-}
-
-/// Both polarizations of one coherent stack.
-fn rt_both(layers: &[(Cx, f64)], n0: Cx, n_sub: Cx, lambda_um: f64, q: Cx) -> FilmRt {
-    let (r_s, t_s) = stack_rt_pol(layers, n0, n_sub, lambda_um, q, false);
-    let (r_p, t_p) = stack_rt_pol(layers, n0, n_sub, lambda_um, q, true);
-    FilmRt { r_s, r_p, t_s, t_p }
+    };
+    (amp, pol_s, pol_p)
 }
 
 /// A coated plate: the coherent stack, then the substrate, then the far face,
@@ -960,7 +1268,9 @@ fn plate_rt(
     exit_residual: f64,
     incidence: Incidence,
     thickness_um: f64,
-) -> FilmRt {
+    ctx: &FilmContext,
+    notes: &mut FilmNotes,
+) -> Result<FilmRt, FilmError> {
     let reversed: Vec<(Cx, f64)> = layers.iter().rev().copied().collect();
     // One pass through the glass, by its extinction along the slant path.
     let tau = if thickness_um > 0.0 && n_sub.im > 0.0 {
@@ -972,8 +1282,24 @@ fn plate_rt(
     let mut out = [(0.0, 0.0); 2];
     for (idx, p_pol) in [false, true].into_iter().enumerate() {
         // The coated face, lit from the air side and from inside the glass.
-        let (r1, t1) = stack_rt_pol(layers, n0, n_sub, lambda_um, q, p_pol);
-        let (r1p, t1p) = stack_rt_pol(&reversed, n_sub, n0, lambda_um, q, p_pol);
+        let front = stack_rt_pol(layers, n0, n_sub, lambda_um, q, p_pol);
+        let back = stack_rt_pol(&reversed, n_sub, n0, lambda_um, q, p_pol);
+        for side in [&front, &back] {
+            if !side.finite {
+                return Err(FilmError::Overflow);
+            }
+            if side.degenerate {
+                if ctx.strict() {
+                    return Err(FilmError::Degenerate);
+                }
+                notes.degenerate = true;
+            }
+        }
+        if let Some(k) = front.opaque_from {
+            notes.opaque_from = Some(k);
+        }
+        let (r1, t1) = (front.r, front.t);
+        let (r1p, t1p) = (back.r, back.t);
         // The bare far face, glass to ambient, at the internal angle.
         let r2 = (bare_interface_r(n_sub, n_far, q, p_pol) * exit_residual).clamp(0.0, 1.0);
         let t2 = 1.0 - r2;
@@ -997,12 +1323,12 @@ fn plate_rt(
         let scale = if r + t > 1.0 { 1.0 / (r + t) } else { 1.0 };
         out[idx] = (r * scale, t * scale);
     }
-    FilmRt {
+    Ok(FilmRt {
         r_s: out[0].0,
         t_s: out[0].1,
         r_p: out[1].0,
         t_p: out[1].1,
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1489,7 +1815,7 @@ pub fn crossing_nm(
     let steps = 600usize;
     let at = |i: usize| -> Option<(f64, f64)> {
         let nm = lo_nm + (hi_nm - lo_nm) * (i as f64) / (steps as f64);
-        let r = coating_rt_at(c, n_incident, n_far, nm / 1000.0, cos_i)?.r();
+        let r = coating_rt_at(c, n_incident, n_far, nm / 1000.0, cos_i).ok()?.r();
         Some((nm, r))
     };
 
@@ -2534,7 +2860,7 @@ mod tests {
                 for &cos_i in &cosines {
                     let what = format!("stack {i}, {lam} um, cos {cos_i:e}");
                     ok(coating_rt_at(c, 1.0, 1.5168, lam, cos_i).unwrap(), &what);
-                    if let Some(a) = coating_amp_at(c, 1.0, 1.5168, lam, cos_i) {
+                    if let Ok(a) = coating_amp_at(c, 1.0, 1.5168, lam, cos_i) {
                         assert!(finite(a), "{what}: {a:?}");
                     }
                 }
@@ -2543,7 +2869,7 @@ mod tests {
                 for &cos_i in &near_crit {
                     let what = format!("stack {i}, {lam} um, critical, cos {cos_i}");
                     ok(coating_rt_at(&back, 1.5168, 1.0, lam, cos_i).unwrap(), &what);
-                    if let Some(a) = coating_amp_at(&back, 1.5168, 1.0, lam, cos_i) {
+                    if let Ok(a) = coating_amp_at(&back, 1.5168, 1.0, lam, cos_i) {
                         assert!(finite(a), "{what}: {a:?}");
                     }
                 }
@@ -2551,18 +2877,235 @@ mod tests {
         }
     }
 
-    /// Known defect at the baseline, closed by CF-02 (C12). A metal film thick
-    /// enough that its layer phase passes Im δ ≈ 355 overflows |B|² inside the
-    /// complex division, and R comes out NaN, not the bulk metal's reflectance;
-    /// the degenerate-denominator guard never sees it because the denominator
-    /// itself is still finite. CF-02's opacity rule removes the overflow, and
-    /// this test must then be replaced by C12, which asserts the bulk value.
+    /// The power reflectance of a bare interface from `n0` (real) into the
+    /// complex `n1`, s and p, by Fresnel's formulas written out with complex
+    /// cosines and nothing from this module.
+    fn bulk_fresnel(n0: f64, n1: Cx, deg: f64) -> (f64, f64) {
+        // sin θ₀ from cos θ₀, as the kernel takes it: near grazing the
+        // reflectance is steep enough in angle that the two roundings differ.
+        let c0 = deg.to_radians().cos();
+        let s0 = (1.0 - c0 * c0).max(0.0).sqrt();
+        // cos θ₁ = √(1 − (n₀ sin θ₀ / n₁)²), the root with a positive real part.
+        let ratio = Cx::real(n0 * s0) / n1;
+        let c1 = (Cx::real(1.0) - ratio * ratio).sqrt();
+        let n0c = Cx::real(n0);
+        let rs = (n0c * c0 - n1 * c1) / (n0c * c0 + n1 * c1);
+        let rp = (n1 * c0 - n0c * c1) / (n1 * c0 + n0c * c1);
+        (rs.norm_sqr(), rp.norm_sqr())
+    }
+
+    /// C12: a metal film far past its skin depth is the bulk metal. 5 µm of
+    /// aluminium used to overflow to NaN; the opacity rule makes it the
+    /// semi-infinite metal, to rounding.
     #[test]
-    fn known_defect_a_very_thick_metal_film_overflows() {
-        let c = on_medium(&[(0.958, 6.69, 5000.0)]);
-        let rt = coating_rt_at(&c, 1.0, 1.5168, 0.4, 1.0).unwrap();
-        assert!(rt.r_s.is_nan(), "the overflow is gone ({rt:?}): replace this test with C12");
-        assert_eq!(rt.t_s, 0.0);
+    fn c12_a_thick_metal_film_is_the_bulk_metal() {
+        let al = Cx::new(0.958, 6.69);
+        let c = on_medium(&[(al.re, al.im, 5000.0)]);
+        for deg in [0.0f64, 30.0, 60.0, 85.0] {
+            for lam in [0.4, 0.55, 1.0] {
+                let (rt, notes) =
+                    coating_eval(&c, 1.0, 1.5168, lam, deg.to_radians().cos(), &FilmContext::default()).unwrap();
+                let (rs, rp) = bulk_fresnel(1.0, al, deg);
+                approx(rt.r_s, rs, 1e-12, &format!("{deg} deg, {lam} um: R_s"));
+                approx(rt.r_p, rp, 1e-12, &format!("{deg} deg, {lam} um: R_p"));
+                assert_eq!((rt.t_s, rt.t_p), (0.0, 0.0));
+                approx(rt.a(), 1.0 - rt.r(), 1e-15, "A = 1 - R");
+                assert_eq!(notes.opaque_from, Some(0));
+            }
+        }
+        // Behind the opaque layer nothing counts: a different substrate and a
+        // layer under the metal change nothing.
+        let behind = on_medium(&[(al.re, al.im, 5000.0), (2.35, 0.0, 61.0)]);
+        let a = coating_rt_at(&c, 1.0, 1.5168, 0.55, 1.0).unwrap();
+        let b = coating_rt_at(&behind, 1.0, 1.0, 0.55, 1.0).unwrap();
+        assert_eq!(a, b);
+        // And a film under the opacity limit still transmits.
+        let thin = on_medium(&[(al.re, al.im, 12.0)]);
+        let (rt, notes) = coating_eval(&thin, 1.0, 1.5168, 0.55, 1.0, &FilmContext::default()).unwrap();
+        assert!(rt.t() > 0.05 && notes.opaque_from.is_none());
+    }
+
+    /// The rescaling guard: forty layers that each absorb short of the
+    /// opacity limit add up to a matrix that used to overflow. Now the
+    /// reflectance is finite and the transmittance underflows to nothing.
+    #[test]
+    fn many_absorbing_layers_short_of_opaque_stay_finite() {
+        let layers: Vec<(f64, f64, f64)> =
+            (0..40).map(|i| (1.5 + 0.02 * i as f64, 3.0, 600.0 + i as f64)).collect();
+        let c = on_medium(&layers);
+        for deg in [0.0f64, 45.0, 85.0] {
+            let (rt, notes) =
+                coating_eval(&c, 1.0, 1.5168, 0.4, deg.to_radians().cos(), &FilmContext::default()).unwrap();
+            assert!(notes.opaque_from.is_none(), "no single layer is opaque");
+            for v in [rt.r_s, rt.r_p, rt.t_s, rt.t_p] {
+                assert!(v.is_finite() && (0.0..=1.0).contains(&v), "{deg} deg: {rt:?}");
+            }
+            assert!(rt.t() < 1e-100, "{rt:?}");
+            // The reflectance is the first few layers' and nothing else: the
+            // stack truncated after them gives the same number.
+            let front = on_medium(&layers[..3]);
+            let r_front = coating_eval(&front, 1.0, 1.5168, 0.4, deg.to_radians().cos(), &FilmContext::default())
+                .unwrap()
+                .0;
+            approx(rt.r_s, r_front.r_s, 1e-9, "R_s from the front layers");
+        }
+    }
+
+    /// C13, the closed-form half: a bare opaque substrate is Fresnel into the
+    /// complex medium, and what is not reflected is absorbed.
+    #[test]
+    fn c13_a_bare_opaque_substrate_is_fresnel_into_the_metal() {
+        let al = FilmMaterial::absorbing("Al", 0.958, 6.69);
+        let bare = Coating {
+            layers: vec![],
+            backing: CoatingBacking::Opaque { substrate: al.clone() },
+            incidence: Incidence::Film,
+            design: None,
+        };
+        for deg in [0.0f64, 20.0, 45.0, 70.0, 89.0] {
+            let rt = coating_rt_at(&bare, 1.0, 1.0, 0.55, deg.to_radians().cos()).unwrap();
+            let (rs, rp) = bulk_fresnel(1.0, Cx::new(0.958, 6.69), deg);
+            approx(rt.r_s, rs, 1e-12, &format!("{deg} deg R_s"));
+            approx(rt.r_p, rp, 1e-12, &format!("{deg} deg R_p"));
+            assert_eq!((rt.t_s, rt.t_p), (0.0, 0.0));
+            let amp = coating_amp_at(&bare, 1.0, 1.0, 0.55, deg.to_radians().cos()).unwrap();
+            approx(amp.powers().r_s, rt.r_s, 1e-15, "amplitude R_s");
+            assert_eq!(amp.t_power_scale, 0.0);
+        }
+        // Lit from the metal side, it refuses by name.
+        let behind = bare.seen_from_behind();
+        assert_eq!(coating_rt_at(&behind, 1.0, 1.0, 0.55, 1.0), Err(FilmError::AbsorbingIncidentMedium));
+        assert_eq!(coating_amp_at(&behind, 1.0, 1.0, 0.55, 1.0), Err(FilmError::AbsorbingIncidentMedium));
+        // An overcoat changes the reflectance and still transmits nothing.
+        let over = Coating {
+            layers: vec![FilmLayer::new(FilmMaterial::constant("SiO2", 1.46), 94.0)],
+            ..bare
+        };
+        let rt = coating_rt_at(&over, 1.0, 1.0, 0.55, 1.0).unwrap();
+        assert!(rt.t() == 0.0 && (rt.r() - bulk_fresnel(1.0, Cx::new(0.958, 6.69), 0.0).0).abs() > 1e-3);
+    }
+
+    /// C24, the kernel's half: Brewster, the last hundredth of a degree, and
+    /// exact grazing.
+    #[test]
+    fn c24_the_edges_of_the_angle_range() {
+        let (n1, n2) = (1.0f64, 1.5168f64);
+        let c = bare();
+        // Brewster.
+        let rt = coating_rt_at(&c, n1, n2, 0.55, (n2 / n1).atan().cos()).unwrap();
+        assert!(rt.r_p <= 1e-14, "R_p at Brewster: {:e}", rt.r_p);
+        // 89.99 degrees: finite, and the Fresnel value, which is about
+        // 1 - 6e-4 for glass rather than 1. To 1e-11, not 1e-12: the kernel
+        // rebuilds cos θ₀ from n₀ sin θ₀, which near grazing keeps only about
+        // 7e-9 of cos θ₀'s relative precision, and that is 1.3e-12 in R here
+        // (the closed form, held to 50 digits, is exact to 2e-16). Using the
+        // given cosine directly would move the last bit of every oblique
+        // result, which C33 forbids. Up to 89.9 degrees the error is below
+        // 1e-13, inside §7's 1e-12.
+        let th = 89.99f64.to_radians();
+        let rt = coating_rt_at(&c, n1, n2, 0.55, th.cos()).unwrap();
+        let (rs, rp) = bulk_fresnel(n1, Cx::real(n2), 89.99);
+        approx(rt.r_s, rs, 1e-11, "R_s at 89.99");
+        approx(rt.r_p, rp, 1e-11, "R_p at 89.99");
+        let th = 89.9f64.to_radians();
+        let rt = coating_rt_at(&c, n1, n2, 0.55, th.cos()).unwrap();
+        let (rs, rp) = bulk_fresnel(n1, Cx::real(n2), 89.9);
+        approx(rt.r_s, rs, 1e-12, "R_s at 89.9");
+        approx(rt.r_p, rp, 1e-12, "R_p at 89.9");
+        assert!(rt.r() < 1.0 - 1e-4);
+        // Exactly grazing: reflected entirely, by rule, for every kind of stack.
+        for s in [bare(), on_medium(&ASYMMETRIC), plate_coating_for_test(), quarter_wave_mirror(550.0, 45.0, 6)] {
+            let rt = coating_rt_at(&s, n1, n2, 0.55, 0.0).unwrap();
+            assert_eq!(rt, FilmRt { r_s: 1.0, r_p: 1.0, t_s: 0.0, t_p: 0.0 });
+        }
+        let a = coating_amp_at(&on_medium(&ASYMMETRIC), n1, n2, 0.55, 0.0).unwrap();
+        assert_eq!((a.r_s, a.r_p, a.t_power_scale), (Cx::real(-1.0), Cx::real(-1.0), 0.0));
+        // And the limit approached from inside the range agrees.
+        let near = coating_amp_at(&on_medium(&ASYMMETRIC), n1, n2, 0.55, 1e-7).unwrap();
+        assert!((near.r_s - a.r_s).norm_sqr() < 1e-10 && (near.r_p - a.r_p).norm_sqr() < 1e-10, "{near:?}");
+    }
+
+    /// A table read past its end: `Permissive` answers with the table's own
+    /// policy and says so; `Strict` refuses by name.
+    #[test]
+    fn strict_refuses_what_permissive_clamps_and_flags() {
+        use crate::fidelity::Numerics;
+        let silver = materials::silver(); // Babar and Weaver, 0.21 to 3.54 um, clamped outside
+        let c = Coating {
+            layers: vec![FilmLayer::new(silver, 150.0)],
+            backing: CoatingBacking::Medium,
+            incidence: Incidence::Film,
+            design: None,
+        };
+        let strict = FilmContext { numerics: Numerics::Strict };
+        let permissive = FilmContext::default();
+        let (_, notes) = coating_eval(&c, 1.0, 1.52, 5.0, 1.0, &permissive).unwrap();
+        assert_eq!(notes.clamped, vec![0]);
+        let err = coating_eval(&c, 1.0, 1.52, 5.0, 1.0, &strict).unwrap_err();
+        assert_eq!(err, FilmError::OutOfTable { layer: 0, lambda_um: 5.0 });
+        assert!(err.to_string().starts_with("layer 1 has no optical constants at 5.0000 um"), "{err}");
+        // Inside the table both agree, to the bit.
+        let a = coating_eval(&c, 1.0, 1.52, 0.55, 0.8, &permissive).unwrap();
+        let b = coating_eval(&c, 1.0, 1.52, 0.55, 0.8, &strict).unwrap();
+        assert_eq!(a, b);
+        assert!(a.1.clamped.is_empty());
+        // A gain medium: accepted as before under Permissive, refused under Strict.
+        let gain = on_medium(&[(1.5, -0.01, 100.0)]);
+        assert!(coating_rt_at(&gain, 1.0, 1.52, 0.55, 1.0).is_ok());
+        assert_eq!(
+            coating_eval(&gain, 1.0, 1.52, 0.55, 1.0, &strict).unwrap_err(),
+            FilmError::NonPhysicalIndex { layer: 0 }
+        );
+        // A negative thickness is refused whatever the numerics.
+        assert_eq!(
+            coating_rt_at(&on_medium(&[(1.5, 0.0, -1.0)]), 1.0, 1.52, 0.55, 1.0),
+            Err(FilmError::NonPhysicalIndex { layer: 0 })
+        );
+        // A plate has no amplitude, and says so.
+        assert_eq!(coating_amp_at(&plate_coating_for_test(), 1.0, 1.0, 0.55, 1.0), Err(FilmError::Incoherent));
+    }
+
+    /// Every reason a coating can be refused has a sentence, and
+    /// `docs/coatings.md` carries each one (CF-02's exit criterion).
+    #[test]
+    fn every_film_error_has_its_sentence_in_the_docs() {
+        let docs = include_str!("../../../docs/coatings.md");
+        for e in [
+            FilmError::Degenerate,
+            FilmError::OutOfTable { layer: 2, lambda_um: 0.25 },
+            FilmError::OutOfTable { layer: FilmError::SUBSTRATE, lambda_um: 0.25 },
+            FilmError::NonPhysicalIndex { layer: 0 },
+            FilmError::AbsorbingIncidentMedium,
+            FilmError::Overflow,
+            FilmError::Incoherent,
+        ] {
+            let text = e.to_string();
+            assert!(!text.is_empty());
+            assert!(docs.contains(&text), "docs/coatings.md does not quote: {text}");
+        }
+    }
+
+    /// The deterministic sweep CF-02 asks for, on the kernel's side: 2000
+    /// random 64-layer absorbing stacks, n in [1.3, 4], k in [0, 7], d in
+    /// [1, 3000] nm, at 0, 30, 60 and 85 degrees, never NaN, never gain, and
+    /// R + T + A = 1. Agreement with an oracle is the Python suite's half
+    /// (`test_thinfilm_stress.py`).
+    #[test]
+    fn random_64_layer_absorbing_stacks_stay_physical() {
+        let mut g = Sweep(0xCF02_0064);
+        for case in 0..2000 {
+            let layers: Vec<(f64, f64, f64)> =
+                (0..64).map(|_| (g.range(1.3, 4.0), g.range(0.0, 7.0), g.range(1.0, 3000.0))).collect();
+            let c = on_medium(&layers);
+            for deg in [0.0f64, 30.0, 60.0, 85.0] {
+                let rt = coating_rt_at(&c, 1.0, 1.52, 0.55, deg.to_radians().cos())
+                    .unwrap_or_else(|e| panic!("case {case}, {deg} deg: {e}"));
+                for v in [rt.r_s, rt.r_p, rt.t_s, rt.t_p] {
+                    assert!(v.is_finite() && (0.0..=1.0).contains(&v), "case {case}, {deg} deg: {rt:?}");
+                }
+                assert!(rt.r_s + rt.t_s <= 1.0 + 1e-12 && rt.r_p + rt.t_p <= 1.0 + 1e-12);
+            }
+        }
     }
 
     /// A coated plate with a slightly absorbing substrate, for the sweeps.

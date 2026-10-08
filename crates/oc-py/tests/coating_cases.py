@@ -101,6 +101,23 @@ CASES: dict[str, tuple[dict, float, float, str]] = {
         1.0,
         "C08: the same stack met from its substrate, walked last layer first",
     ),
+    "thick_aluminium": (
+        stack([layer(0.958, 5000.0, k=6.69)]),
+        1.0,
+        1.5168,
+        "C12: 5 um of aluminium, opaque: the bulk metal, which used to overflow to NaN",
+    ),
+    "silica_on_opaque_aluminium": (
+        {
+            "layers": [layer(1.46, 94.0)],
+            "backing": {"Opaque": {"substrate": material(0.958, 6.69, "Al")}},
+            "incidence": "Film",
+            "design": None,
+        },
+        1.0,
+        1.0,
+        "C13: a silica overcoat on a semi-infinite aluminium substrate",
+    ),
     "total_internal_reflection": (
         stack([]),
         1.5,

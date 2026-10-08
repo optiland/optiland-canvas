@@ -1986,7 +1986,7 @@ fn interact_surface(
         if !f.is_finite() || f == 0.0 {
             r.report
                 .reject(CapabilityIssue::UnsupportedSurfaceResponse {
-                    surface: surface_ref,
+                    surface: surface_ref, reason: None
                 });
             r.ledger.numerical_loss += flux_at;
             r.terminations.record(TerminationReason::UnsupportedPhysics);
@@ -2057,7 +2057,7 @@ fn interact_surface(
         };
         let (Some((te_m, te_0)), Some((tm_m, tm_0))) = (te, tm_pair) else {
             r.report
-                .reject(CapabilityIssue::UnsupportedSurfaceResponse { surface: surface_ref });
+                .reject(CapabilityIssue::UnsupportedSurfaceResponse { surface: surface_ref, reason: None });
             r.ledger.numerical_loss += flux_at;
             r.terminations.record(TerminationReason::UnsupportedPhysics);
             push_event(r, cfg, w, point, opl_at, lens_interact(Vec::new()));
@@ -2252,7 +2252,7 @@ fn interact_surface(
             // and no meaningful transmission axis to apply.
             r.report
                 .reject(CapabilityIssue::UnsupportedSurfaceResponse {
-                    surface: surface_ref,
+                    surface: surface_ref, reason: None
                 });
             r.ledger.numerical_loss += flux_at;
             r.terminations.record(TerminationReason::UnsupportedPhysics);
@@ -2271,7 +2271,7 @@ fn interact_surface(
                     // to refuse, so there is no contrast to apply.
                     r.report
                         .reject(CapabilityIssue::UnsupportedSurfaceResponse {
-                            surface: surface_ref,
+                            surface: surface_ref, reason: None
                         });
                     r.ledger.numerical_loss += flux_at;
                     r.terminations.record(TerminationReason::UnsupportedPhysics);
@@ -2515,7 +2515,7 @@ fn apply_response(
                 Some(v) => v.clamp(0.0, 1.0),
                 None => {
                     r.report
-                        .reject(CapabilityIssue::UnsupportedSurfaceResponse { surface });
+                        .reject(CapabilityIssue::UnsupportedSurfaceResponse { surface, reason: None });
                     r.ledger.numerical_loss += flux_at;
                     r.terminations.record(TerminationReason::UnsupportedPhysics);
                     push_event(r, cfg, w, point, opl_at, interact(Vec::new()));
@@ -2623,7 +2623,7 @@ fn apply_response(
                 (Some(a), Some(b)) => (a.clamp(0.0, 1.0), b.clamp(0.0, 1.0)),
                 _ => {
                     r.report
-                        .reject(CapabilityIssue::UnsupportedSurfaceResponse { surface });
+                        .reject(CapabilityIssue::UnsupportedSurfaceResponse { surface, reason: None });
                     r.ledger.numerical_loss += flux_at;
                     r.terminations.record(TerminationReason::UnsupportedPhysics);
                     push_event(r, cfg, w, point, opl_at, interact(Vec::new()));
@@ -2696,12 +2696,29 @@ fn apply_response(
             } else {
                 (w.lambda, cos_i)
             };
-            let rt = oc_core::thinfilm::coating_rt_at(coating, n1, n2, lambda, cos_i);
-            let (refl, tr) = match rt {
-                Some(v) => (v.r().clamp(0.0, 1.0), v.t().clamp(0.0, 1.0)),
-                None => {
-                    r.report
-                        .reject(CapabilityIssue::UnsupportedSurfaceResponse { surface });
+            let ctx = oc_core::thinfilm::FilmContext { numerics: cfg.fidelity.numerics };
+            let rt = oc_core::thinfilm::coating_eval(coating, n1, n2, lambda, cos_i, &ctx);
+            let (refl, tr) = match &rt {
+                Ok((v, notes)) => {
+                    if !notes.clamped.is_empty() {
+                        r.report.note_approx(
+                            PhysicsFeature::ThinFilmCoating,
+                            "a film table was read outside its range and answered by its out-of-range policy",
+                        );
+                    }
+                    if notes.degenerate {
+                        r.report.note_approx(
+                            PhysicsFeature::ThinFilmCoating,
+                            "a degenerate stack reflected everything by rule",
+                        );
+                    }
+                    (v.r().clamp(0.0, 1.0), v.t().clamp(0.0, 1.0))
+                }
+                Err(e) => {
+                    r.report.reject(CapabilityIssue::UnsupportedSurfaceResponse {
+                        surface,
+                        reason: Some(e.to_string()),
+                    });
                     r.ledger.numerical_loss += flux_at;
                     r.terminations.record(TerminationReason::UnsupportedPhysics);
                     push_event(r, cfg, w, point, opl_at, interact(Vec::new()));
@@ -2714,20 +2731,20 @@ fn apply_response(
             // relative phase is exactly what the incoherent sum throws away. In
             // that case the powers still separate s from p, and only the phase
             // between them is declared absent.
-            let amp = oc_core::thinfilm::coating_amp_at(coating, n1, n2, lambda, cos_i);
+            let amp = oc_core::thinfilm::coating_amp_eval(coating, n1, n2, lambda, cos_i, &ctx);
             let (m_r, m_t) = match &amp {
-                Some(a) => (
+                Ok((a, _)) => (
                     Mueller::from_diagonal_jones(a.r_s, a.r_p),
                     Mueller::from_diagonal_jones(a.t_s, a.t_p).scaled(a.t_power_scale),
                 ),
-                None => {
+                Err(_) => {
                     if phase_assumed {
                         r.report.note_approx(
                             PhysicsFeature::ThinFilmCoating,
                             "plate-backed stack: faces added incoherently, no relative phase",
                         );
                     }
-                    let v = rt.as_ref().expect("checked above");
+                    let (v, _) = rt.as_ref().expect("checked above");
                     (
                         Mueller::from_diagonal_jones(
                             oc_core::thinfilm::Cx::real(v.r_s.max(0.0).sqrt()),
@@ -2808,7 +2825,7 @@ fn apply_response(
         | SurfaceResponse::Polarizer { .. }
         | SurfaceResponse::Retarder { .. } => {
             r.report
-                .reject(CapabilityIssue::UnsupportedSurfaceResponse { surface });
+                .reject(CapabilityIssue::UnsupportedSurfaceResponse { surface, reason: None });
             r.ledger.numerical_loss += flux_at;
             r.terminations.record(TerminationReason::UnsupportedPhysics);
             push_event(r, cfg, w, point, opl_at, interact(Vec::new()));

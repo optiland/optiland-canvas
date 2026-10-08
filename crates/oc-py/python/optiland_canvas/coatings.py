@@ -32,7 +32,7 @@ from typing import Any, Union
 
 from . import _native
 
-__all__ = ["rt", "amplitudes", "indices", "layer_order", "to_tmm", "to_optiland"]
+__all__ = ["rt", "amplitudes", "indices", "substrate_index", "layer_order", "to_tmm", "to_optiland"]
 
 Stack = Union[dict, str]
 
@@ -106,6 +106,20 @@ def indices(stack: Stack, lambda_um: float) -> list[complex]:
     return [complex(a, b) for a, b in zip(got["n_re"][0], got["n_im"][0])]
 
 
+def substrate_index(stack: Stack, lambda_um: float) -> complex | None:
+    """The substrate's ``n + ik`` for a ``Plate`` or ``Opaque`` backing, as the
+    kernel samples it; ``None`` for ``Medium``."""
+    got = json.loads(_native.thinfilm_indices(_json(stack), [float(lambda_um)]))
+    return None if got["sub"] is None else complex(*got["sub"][0])
+
+
+def _far_index(c: dict, lambda_um: float, n_far: float) -> complex:
+    """The medium behind the stack: the opaque substrate, or the scene's."""
+    if isinstance(c.get("backing"), dict) and "Opaque" in c["backing"]:
+        return substrate_index(c, lambda_um)
+    return complex(n_far)
+
+
 def layer_order(stack: Stack) -> list[int]:
     """The written layer indices in the order the light meets them.
 
@@ -114,8 +128,9 @@ def layer_order(stack: Stack) -> list[int]:
     single coherent stack and has no order to give here.
     """
     c = _dict(stack)
-    if c.get("backing") != "Medium":
-        raise ValueError("only a Medium-backed stack is one coherent stack")
+    opaque = isinstance(c.get("backing"), dict) and "Opaque" in c["backing"]
+    if c.get("backing") != "Medium" and not opaque:
+        raise ValueError("only a Medium- or Opaque-backed stack is one coherent stack")
     order = list(range(len(c["layers"])))
     if c.get("incidence", "Film") == "Substrate":
         order.reverse()
@@ -134,7 +149,7 @@ def to_tmm(
     n_far = n_incident if n_far is None else n_far
     ns = indices(c, lambda_um)
     order = layer_order(c)
-    n_list = [complex(n_incident)] + [ns[i] for i in order] + [complex(n_far)]
+    n_list = [complex(n_incident)] + [ns[i] for i in order] + [_far_index(c, lambda_um, n_far)]
     d_list = [math.inf] + [c["layers"][i]["thickness_nm"] / 1000.0 for i in order] + [math.inf]
     return n_list, d_list
 
@@ -159,8 +174,9 @@ def to_optiland(
         Layer(IdealMaterial(ns[i].real, k=ns[i].imag), thickness_um=c["layers"][i]["thickness_nm"] / 1000.0)
         for i in layer_order(c)
     ]
+    far = _far_index(c, lambda_um, n_far)
     return ThinFilmStack(
         incident_material=IdealMaterial(n_incident),
-        substrate_material=IdealMaterial(n_far),
+        substrate_material=IdealMaterial(far.real, k=far.imag),
         layers=layers,
     )

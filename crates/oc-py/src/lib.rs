@@ -256,9 +256,7 @@ fn thinfilm_rt(
                 nm,
                 deg.to_radians().cos(),
             )
-            .ok_or_else(|| {
-                PyValueError::new_err(format!("no optical constants at {nm} um"))
-            })?;
+            .map_err(|e| PyValueError::new_err(format!("at {nm} um, {deg} deg: {e}")))?;
             cols[0].push(rt.r_s);
             cols[1].push(rt.r_p);
             cols[2].push(rt.t_s);
@@ -312,7 +310,7 @@ fn thinfilm_amplitudes(
                 nm,
                 deg.to_radians().cos(),
             )
-            .ok_or_else(|| PyValueError::new_err(format!("no amplitudes at {nm} um, {deg} deg")))?;
+            .map_err(|e| PyValueError::new_err(format!("at {nm} um, {deg} deg: {e}")))?;
             for (i, z) in [a.r_s, a.r_p, a.t_s, a.t_p].into_iter().enumerate() {
                 cols[2 * i].push(z.re);
                 cols[2 * i + 1].push(z.im);
@@ -341,8 +339,10 @@ fn thinfilm_amplitudes(
 /// Each layer's complex index `n + ik` at each wavelength, as the kernel
 /// samples it, for feeding the oracles.
 ///
-/// Returns JSON `{"n_re": [[...]], "n_im": [[...]]}`, one row per wavelength
-/// and one column per layer in the **written** order. The parity suites hand
+/// Returns JSON `{"n_re": [[...]], "n_im": [[...]], "sub": [[re, im], ...]}`,
+/// one row per wavelength and one column per layer in the **written** order;
+/// `sub` is the substrate's index per wavelength for a `Plate` or `Opaque`
+/// backing, and `null` for `Medium`, whose far side is the scene's. The parity suites hand
 /// these numbers to `tmm` and Optiland unchanged, so that a disagreement is the
 /// solver's and never a second implementation of the material lookup.
 #[pyfunction]
@@ -351,7 +351,19 @@ fn thinfilm_indices(stack_json: &str, lambda_um: Vec<f64>) -> PyResult<String> {
         serde_json::from_str(stack_json).map_err(to_py_err)?;
     let mut re_rows = Vec::with_capacity(lambda_um.len());
     let mut im_rows = Vec::with_capacity(lambda_um.len());
+    let substrate = match &coating.backing {
+        oc_core::thinfilm::CoatingBacking::Medium => None,
+        oc_core::thinfilm::CoatingBacking::Plate { substrate, .. }
+        | oc_core::thinfilm::CoatingBacking::Opaque { substrate } => Some(substrate),
+    };
+    let mut sub_rows = Vec::with_capacity(lambda_um.len());
     for &um in &lambda_um {
+        if let Some(m) = substrate {
+            let n = m
+                .index_at(um)
+                .ok_or_else(|| PyValueError::new_err(format!("no optical constants for the substrate at {um} um")))?;
+            sub_rows.push(format!("[{},{}]", n.re, n.im));
+        }
         let mut re = Vec::with_capacity(coating.layers.len());
         let mut im = Vec::with_capacity(coating.layers.len());
         for l in &coating.layers {
@@ -364,10 +376,12 @@ fn thinfilm_indices(stack_json: &str, lambda_um: Vec<f64>) -> PyResult<String> {
         re_rows.push(format!("[{}]", re.join(",")));
         im_rows.push(format!("[{}]", im.join(",")));
     }
+    let sub = if substrate.is_some() { format!("[{}]", sub_rows.join(",")) } else { "null".to_string() };
     Ok(format!(
-        "{{\"n_re\":[{}],\"n_im\":[{}]}}",
+        "{{\"n_re\":[{}],\"n_im\":[{}],\"sub\":{}}}",
         re_rows.join(","),
-        im_rows.join(",")
+        im_rows.join(","),
+        sub
     ))
 }
 

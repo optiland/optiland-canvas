@@ -84,6 +84,26 @@ on 1.52, 550 nm, 0 and 35 degrees) in `test_tmm_works_in_the_canvas_ray_frame`:
 | Byrnes `tmm` 0.2.0 | `exp(-iωt)`, `n + ik` | `r_p = -r_s` at normal incidence | whole field | none |
 | Optiland `thin_film` | Macleod, `exp(+iωt)` | `r_p = +r_s` at normal incidence | tangential, `t` already conjugated | conjugate `r`; negate `r_p`; `t_p · cos θ₀ / cos θ_exit` |
 
+**Transmittance into an absorbing exit medium.** The kernel computes
+Macleod's `T = |t_M|² Re(η_exit) / Re(η₀)`; Byrnes' `tmm` computes
+`T = |t|² Re(n_f cos θ_f) / Re(n₀ cos θ₀)` for s and
+`T = |t|² Re(n_f conj(cos θ_f)) / Re(n₀ conj(cos θ₀))` for p. They are the
+same number. Macleod's quantities are the conjugates of the `exp(-iωt)` ones
+(index `n̄ = n − ik`), so his tilted admittances are `η_s = conj(n cos θ)` and
+`η_p = conj(n / cos θ)`, and conjugation leaves every real part and modulus
+alone.
+
+- s: `Re(η_s) = Re(n cos θ)` and `|t_M| = |t|`, which is Byrnes' s form.
+- p: Macleod's `t_M` is the tangential field, `t_M = t · cos θ_f / cos θ₀` up to
+  conjugation, so `|t_M|² = |t|² |cos θ_f|² / |cos θ₀|²`; and
+  `Re(n / cos θ) = Re(n conj(cos θ)) / |cos θ|²`. Then
+  `|t_M|² Re(η_p,f) / Re(η_p,0) = |t|² Re(n_f conj(cos θ_f)) / Re(n₀ conj(cos θ₀))`,
+  the `|cos θ|²` factors cancelling: Byrnes' p form.
+
+Held by the `silica_on_opaque_aluminium` coating fixture (an absorbing exit
+medium against `tmm`, R to 1e-15) and by the 2000-stack sweep of
+`test_thinfilm_stress.py` against the arbitrary-precision oracle.
+
 ## Surfaces and sides
 
 A geometric normal identifies which material is on which side. The tracer hands

@@ -137,6 +137,21 @@ impl Cx {
             return Self::new(0.0, 0.0);
         }
         let m = self.abs();
+        // Near the real axis, but off it, one of the two half-angle formulas
+        // below subtracts two nearly equal numbers: for a film with k = 6e-4
+        // that lost 6e-9 in T (the `dispersive_catalogue_stack` fixture, against
+        // `tmm`, Optiland and the 40-digit oracle). There the small part is
+        // taken from the large one instead, `im / (2 re)`. Only there, so
+        // every result that was well conditioned keeps its bits.
+        if self.im != 0.0 && self.im.abs() < 1e-2 * self.re.abs() {
+            let big = ((m + self.re.abs()) * 0.5).sqrt();
+            let small = self.im.abs() / (2.0 * big);
+            return if self.re > 0.0 {
+                Self::new(big, if self.im < 0.0 { -small } else { small })
+            } else {
+                Self::new(small, if self.im < 0.0 { -big } else { big })
+            };
+        }
         let re = ((m + self.re) * 0.5).max(0.0).sqrt();
         let im = ((m - self.re) * 0.5).max(0.0).sqrt();
         // `im == 0` on the positive real axis; on the negative real axis the
@@ -240,6 +255,104 @@ pub struct FilmMaterial {
     pub n: SpectralScalar,
     #[serde(default = "zero_scalar")]
     pub k: SpectralScalar,
+    /// A dispersion formula for `n`, which replaces the `n` curve over the
+    /// formula's own range. `n` then holds the formula sampled over that
+    /// range, so a reader that knows no formulas (a v2 reader, or the lossy
+    /// v2 export) still has the index. Absent from every v2 document.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub formula: Option<Box<FilmFormula>>,
+    /// Whether the data describe a thin film, a bulk sample, or a crystal. A
+    /// film's index differs from the bulk's by a few percent, and by process.
+    #[serde(default, skip_serializing_if = "FilmForm::is_bulk")]
+    pub form: FilmForm,
+    /// Where the data came from. Absent from a v2 document; migration to v3
+    /// writes `Nominal`, which is what an inline constant was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<Box<Provenance>>,
+    /// The constant index `film_materials: Nominal` uses. When absent, a
+    /// constant material's own constant, and a tabulated one's value at
+    /// 0.55 µm.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nominal: Option<NominalIndex>,
+}
+
+/// A dispersion formula and the wavelengths it is valid over.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FilmFormula {
+    pub formula: crate::material::DispersionFormula,
+    pub range_um: [f64; 2],
+}
+
+/// What a material's data describe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum FilmForm {
+    Film,
+    #[default]
+    Bulk,
+    Crystal,
+}
+
+impl FilmForm {
+    fn is_bulk(&self) -> bool {
+        *self == FilmForm::Bulk
+    }
+}
+
+/// How a material's data were obtained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SourceKind {
+    /// A published database entry, with the paper it cites.
+    Database,
+    /// Measured by the user on their own part.
+    Measured,
+    /// A round constant: a starting point, not a measurement.
+    Nominal,
+    /// Read off a plotted curve.
+    Digitized,
+    /// A model fitted to data.
+    Fitted,
+}
+
+/// Where a material's data came from (coating-fidelity spec CF-03).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Provenance {
+    pub source_kind: SourceKind,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reference: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub url: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub license: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub retrieved: String,
+    /// The wavelengths the data cover, µm; `None` for a constant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range_um: Option<[f64; 2]>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub note: String,
+}
+
+impl Provenance {
+    /// What an inline constant was before the catalogue existed.
+    pub fn nominal(note: &str) -> Self {
+        Self {
+            source_kind: SourceKind::Nominal,
+            reference: String::new(),
+            url: String::new(),
+            license: String::new(),
+            retrieved: String::new(),
+            range_um: None,
+            note: note.to_string(),
+        }
+    }
+}
+
+/// A constant complex index.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct NominalIndex {
+    pub n: f64,
+    #[serde(default)]
+    pub k: f64,
 }
 
 fn zero_scalar() -> SpectralScalar {
@@ -247,31 +360,73 @@ fn zero_scalar() -> SpectralScalar {
 }
 
 impl FilmMaterial {
-    /// A transparent material of constant index.
-    pub fn constant(name: &str, n: f64) -> Self {
+    /// A material from its two curves, with no formula, provenance or
+    /// nominal value: what a v2 document holds.
+    pub fn scalars(name: &str, n: SpectralScalar, k: SpectralScalar) -> Self {
         Self {
             name: name.to_string(),
-            n: SpectralScalar::Constant(n),
-            k: zero_scalar(),
+            n,
+            k,
+            formula: None,
+            form: FilmForm::Bulk,
+            provenance: None,
+            nominal: None,
         }
+    }
+
+    /// A transparent material of constant index.
+    pub fn constant(name: &str, n: f64) -> Self {
+        Self::scalars(name, SpectralScalar::Constant(n), zero_scalar())
     }
 
     /// An absorbing material of constant complex index.
     pub fn absorbing(name: &str, n: f64, k: f64) -> Self {
-        Self {
-            name: name.to_string(),
-            n: SpectralScalar::Constant(n),
-            k: SpectralScalar::Constant(k),
-        }
+        Self::scalars(name, SpectralScalar::Constant(n), SpectralScalar::Constant(k))
     }
 
     /// The complex index at `lambda_um`, or `None` when a table has no value
-    /// there under [`crate::scene3::OutOfRangePolicy::Error`].
+    /// there under [`crate::scene3::OutOfRangePolicy::Error`]. A formula
+    /// answers inside its range; outside it the sampled `n` curve answers,
+    /// with its own out-of-range policy.
     pub fn index_at(&self, lambda_um: f64) -> Option<Cx> {
-        Some(Cx::new(
-            self.n.sample(lambda_um)?,
-            self.k.sample(lambda_um)?,
-        ))
+        let n = match &self.formula {
+            Some(f) if lambda_um >= f.range_um[0] && lambda_um <= f.range_um[1] => f.formula.index(lambda_um),
+            _ => self.n.sample(lambda_um)?,
+        };
+        Some(Cx::new(n, self.k.sample(lambda_um)?))
+    }
+
+    /// Does the material have data at `lambda_um`, rather than an
+    /// out-of-range policy's answer?
+    pub fn covers(&self, lambda_um: f64) -> bool {
+        let n = match &self.formula {
+            Some(f) => lambda_um >= f.range_um[0] && lambda_um <= f.range_um[1],
+            None => self.n.covers(lambda_um),
+        };
+        n && self.k.covers(lambda_um)
+    }
+
+    /// The constant index `film_materials: Nominal` uses: the declared
+    /// nominal, else the constant itself, else the value at 0.55 µm (held at
+    /// the table's end if it does not reach there).
+    pub fn nominal_index(&self) -> Cx {
+        if let Some(v) = self.nominal {
+            return Cx::new(v.n, v.k);
+        }
+        let at = |s: &SpectralScalar| match s {
+            SpectralScalar::Constant(v) => *v,
+            SpectralScalar::Tabulated { lambda_um, values, .. } => {
+                let x = 0.55f64.clamp(lambda_um[0], lambda_um[lambda_um.len() - 1]);
+                let i = lambda_um.partition_point(|&v| v <= x).saturating_sub(1).min(lambda_um.len() - 2);
+                let f = (x - lambda_um[i]) / (lambda_um[i + 1] - lambda_um[i]);
+                values[i] + f * (values[i + 1] - values[i])
+            }
+        };
+        let n = match &self.formula {
+            Some(f) => f.formula.index(0.55f64.clamp(f.range_um[0], f.range_um[1])),
+            None => at(&self.n),
+        };
+        Cx::new(n, at(&self.k))
     }
 
     /// Vacuum, and near enough to air that the difference is below anything the
@@ -286,6 +441,12 @@ impl FilmMaterial {
 pub struct FilmLayer {
     pub material: FilmMaterial,
     pub thickness_nm: f64,
+    /// The scene film catalogue entry this layer's material is (v3). The
+    /// material is still written inline beside it, so a reader that knows no
+    /// catalogue reads the layer whole; on load the catalogue entry replaces
+    /// the inline copy, which keeps every layer of one entry in step.
+    #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub catalog_ref: Option<u32>,
 }
 
 impl FilmLayer {
@@ -293,6 +454,7 @@ impl FilmLayer {
         Self {
             material,
             thickness_nm,
+            catalog_ref: None,
         }
     }
 
@@ -322,6 +484,7 @@ impl FilmLayer {
         Self {
             material,
             thickness_nm: lambda_nm / (4.0 * n * cos_l),
+            catalog_ref: None,
         }
     }
 }
@@ -848,9 +1011,16 @@ impl std::fmt::Display for FilmError {
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct FilmContext {
     pub numerics: crate::fidelity::Numerics,
+    /// `Nominal`: every material at its nominal constant.
+    pub materials: crate::fidelity::FilmMaterials,
 }
 
 impl FilmContext {
+    /// The solver's part of a fidelity profile.
+    pub fn from_profile(p: &crate::fidelity::FidelityProfile) -> Self {
+        Self { numerics: p.numerics, materials: p.film_materials }
+    }
+
     pub fn strict(&self) -> bool {
         self.numerics == crate::fidelity::Numerics::Strict
     }
@@ -880,7 +1050,14 @@ fn sample_index(
     layer: usize,
     notes: &mut FilmNotes,
 ) -> Result<Cx, FilmError> {
-    let covered = m.n.covers(lambda_um) && m.k.covers(lambda_um);
+    if ctx.materials == crate::fidelity::FilmMaterials::Nominal {
+        let n = m.nominal_index();
+        if !n.is_finite() || n.re <= 0.0 || (ctx.strict() && n.im < 0.0) {
+            return Err(FilmError::NonPhysicalIndex { layer });
+        }
+        return Ok(n);
+    }
+    let covered = m.covers(lambda_um);
     if !covered && ctx.strict() {
         return Err(FilmError::OutOfTable { layer, lambda_um });
     }
@@ -1335,7 +1512,10 @@ fn plate_rt(
 // Synthesis: turning a design into layers
 // ---------------------------------------------------------------------------
 
-/// The standard film materials, enough to build every preset here.
+/// The standard film materials, enough to build every preset here: the
+/// **nominal** set, constants that stay exactly as they were so every older
+/// result stays bit for bit. Measured materials with their sources are in
+/// [`materials::catalog`].
 ///
 /// Indices are the usual room-temperature values near the middle of the visible
 /// band, held constant across it. Real films disperse by a percent or two and
@@ -1345,6 +1525,66 @@ fn plate_rt(
 /// these without touching the calculation.
 pub mod materials {
     use super::FilmMaterial;
+
+    /// The film catalogue's measured entries ([`crate::film_catalog`]): real
+    /// n(λ) and k(λ) with their sources. The constants beside this module are
+    /// the nominal set; these are what design synthesis and the editor use.
+    pub mod catalog {
+        use crate::thinfilm::FilmMaterial;
+
+        fn entry(key: &str) -> FilmMaterial {
+            crate::film_catalog::builtin_named(key).expect("a built-in catalogue entry")
+        }
+
+        pub fn magnesium_fluoride() -> FilmMaterial {
+            entry("magnesium_fluoride")
+        }
+        pub fn silica() -> FilmMaterial {
+            entry("silica")
+        }
+        pub fn alumina() -> FilmMaterial {
+            entry("alumina")
+        }
+        pub fn titania() -> FilmMaterial {
+            entry("titania")
+        }
+        pub fn tantala() -> FilmMaterial {
+            entry("tantala")
+        }
+        pub fn hafnia() -> FilmMaterial {
+            entry("hafnia")
+        }
+        pub fn zirconia() -> FilmMaterial {
+            entry("zirconia")
+        }
+        pub fn niobia() -> FilmMaterial {
+            entry("niobia")
+        }
+        pub fn zinc_sulfide() -> FilmMaterial {
+            entry("zinc_sulfide")
+        }
+        pub fn silicon() -> FilmMaterial {
+            entry("silicon")
+        }
+        pub fn silver() -> FilmMaterial {
+            entry("silver")
+        }
+        pub fn silver_johnson() -> FilmMaterial {
+            entry("silver_johnson")
+        }
+        pub fn aluminium() -> FilmMaterial {
+            entry("aluminium")
+        }
+        pub fn gold() -> FilmMaterial {
+            entry("gold")
+        }
+        pub fn chromium() -> FilmMaterial {
+            entry("chromium")
+        }
+        pub fn nickel() -> FilmMaterial {
+            entry("nickel")
+        }
+    }
 
     pub fn titania() -> FilmMaterial {
         FilmMaterial::constant("TiO₂", 2.35)
@@ -1403,11 +1643,7 @@ pub mod materials {
             interpolation: Interpolation::Linear,
             out_of_range: OutOfRangePolicy::Clamp,
         };
-        FilmMaterial {
-            name: name.to_string(),
-            n: column(1),
-            k: column(2),
-        }
+        FilmMaterial::scalars(name, column(1), column(2))
     }
 }
 
@@ -1946,10 +2182,7 @@ mod tests {
         let (n0, n1, n2) = (1.0, 1.72, 1.52);
         let (d_nm, lambda_um) = (137.0, 0.55);
         let c = Coating {
-            layers: vec![FilmLayer {
-                material: FilmMaterial::constant("test", n1),
-                thickness_nm: d_nm,
-            }],
+            layers: vec![FilmLayer::new(FilmMaterial::constant("test", n1), d_nm)],
             backing: CoatingBacking::Medium,
             incidence: Incidence::Film,
             design: None,
@@ -2074,10 +2307,7 @@ mod tests {
                 1.5168,
             ),
             Coating {
-                layers: vec![FilmLayer {
-                    material: materials::aluminium(),
-                    thickness_nm: 12.0,
-                }],
+                layers: vec![FilmLayer::new(materials::aluminium(), 12.0)],
                 backing: CoatingBacking::Medium,
                 incidence: Incidence::Film,
                 design: None,
@@ -3037,7 +3267,7 @@ mod tests {
             incidence: Incidence::Film,
             design: None,
         };
-        let strict = FilmContext { numerics: Numerics::Strict };
+        let strict = FilmContext { numerics: Numerics::Strict, ..FilmContext::default() };
         let permissive = FilmContext::default();
         let (_, notes) = coating_eval(&c, 1.0, 1.52, 5.0, 1.0, &permissive).unwrap();
         assert_eq!(notes.clamped, vec![0]);

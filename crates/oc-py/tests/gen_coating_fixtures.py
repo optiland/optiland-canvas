@@ -106,7 +106,7 @@ def _dist_version(name: str) -> str:
 
 def build(name: str, date: str) -> dict:
     case_stack, n0, nf, description = coating_cases.CASES[name]
-    lambdas = coating_cases.LAMBDAS
+    lambdas = coating_cases.lambdas_for(name)
     angles = coating_cases.angles_for(name)
     sampled = [coatings.indices(case_stack, lam) for lam in lambdas]
     return {

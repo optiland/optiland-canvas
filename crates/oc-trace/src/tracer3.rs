@@ -2696,7 +2696,7 @@ fn apply_response(
             } else {
                 (w.lambda, cos_i)
             };
-            let ctx = oc_core::thinfilm::FilmContext { numerics: cfg.fidelity.numerics };
+            let ctx = oc_core::thinfilm::FilmContext::from_profile(&cfg.fidelity);
             let rt = oc_core::thinfilm::coating_eval(coating, n1, n2, lambda, cos_i, &ctx);
             let (refl, tr) = match &rt {
                 Ok((v, notes)) => {

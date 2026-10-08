@@ -42,6 +42,10 @@ use std::collections::HashSet;
 pub const OCANVAS_FORMAT: &str = crate::scene::OCANVAS_FORMAT;
 /// The v2 schema version.
 pub const OCANVAS_V2_VERSION: u32 = 2;
+/// The current document version: v2 plus the film catalogue, material
+/// provenance, the opaque backing and the fidelity profile
+/// (`crate::migrate_v2`). Every v3 addition is optional on read.
+pub const OCANVAS_V3_VERSION: u32 = 3;
 /// The dimensionality v2 documents declare.
 pub const OCANVAS_V2_DIMENSION: u8 = 3;
 
@@ -104,7 +108,7 @@ impl std::fmt::Display for SceneError {
             }
             Self::UnsupportedVersion { found } => write!(
                 f,
-                "unsupported .ocanvas version {found}; this build reads 1 and {OCANVAS_V2_VERSION}"
+                "unsupported .ocanvas version {found}; this build reads 1, {OCANVAS_V2_VERSION} and {OCANVAS_V3_VERSION}"
             ),
             Self::WrongDimension { found } => {
                 write!(f, "v2 is 3D; document declares dimension {found}")
@@ -1993,6 +1997,11 @@ pub struct Scene3 {
     /// `Standard`, so every older document reads, and writes, unchanged.
     #[serde(default, skip_serializing_if = "crate::fidelity::FidelityProfile::is_default")]
     pub fidelity: crate::fidelity::FidelityProfile,
+    /// The scene's film materials, which coating layers name by id (v3).
+    /// Absent from a v2 document; reading one fills it from the inline
+    /// materials (`crate::migrate_v2`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub film_catalog: Vec<crate::film_catalog::FilmCatalogEntry>,
 }
 
 /// A grating's efficiencies for light polarized across its grooves (TM).
@@ -2029,7 +2038,7 @@ impl Scene3 {
     pub fn new() -> Self {
         Self {
             format: default_format(),
-            version: OCANVAS_V2_VERSION,
+            version: OCANVAS_V3_VERSION,
             dimension: OCANVAS_V2_DIMENSION,
             bodies: Vec::new(),
             surfaces: Vec::new(),
@@ -2046,6 +2055,7 @@ impl Scene3 {
             links: Vec::new(),
             figure_errors: Vec::new(),
             fidelity: crate::fidelity::FidelityProfile::default(),
+            film_catalog: Vec::new(),
         }
     }
 
@@ -2128,20 +2138,36 @@ impl Scene3 {
         }
     }
 
-    /// Serialize to pretty v2 JSON, stamping the header.
+    /// Serialize to pretty v3 JSON, stamping the header.
     pub fn to_json(&self) -> String {
         let mut doc = self.clone();
         doc.format = default_format();
-        doc.version = OCANVAS_V2_VERSION;
+        doc.version = OCANVAS_V3_VERSION;
         doc.dimension = OCANVAS_V2_DIMENSION;
         serde_json::to_string_pretty(&doc).expect("scene3 serializes")
     }
 
-    /// Parse a v2 document. Use [`crate::migrate_v1::load_any`] to accept v1 too.
+    /// Serialize as a v2 document for readers that know no v3, with what v2
+    /// could not hold. Exact for a scene read from v2 and edited without v3
+    /// features; see [`crate::migrate_v2::to_v2`].
+    pub fn to_json_v2(&self) -> (String, Vec<String>) {
+        let (mut doc, losses) = crate::migrate_v2::to_v2(self);
+        doc.format = default_format();
+        doc.version = OCANVAS_V2_VERSION;
+        doc.dimension = OCANVAS_V2_DIMENSION;
+        (serde_json::to_string_pretty(&doc).expect("scene3 serializes"), losses)
+    }
+
+    /// Parse a v2 or v3 document, migrating a v2 one to v3 in memory. Use
+    /// [`crate::migrate_v1::load_any`] to accept v1 too.
     pub fn from_json(s: &str) -> Result<Self, SceneError> {
         let scene: Scene3 = serde_json::from_str(s).map_err(|e| SceneError::Json(e.to_string()))?;
         scene.check_header()?;
         let mut scene = scene;
+        if scene.version == OCANVAS_V2_VERSION {
+            crate::migrate_v2::migrate_v2_to_v3(&mut scene);
+        }
+        crate::migrate_v2::resolve_film_refs(&mut scene)?;
         scene.repair_next_id();
         scene.validate()?;
         Ok(scene)
@@ -2153,7 +2179,7 @@ impl Scene3 {
                 found: self.format.clone(),
             });
         }
-        if self.version != OCANVAS_V2_VERSION {
+        if self.version != OCANVAS_V2_VERSION && self.version != OCANVAS_V3_VERSION {
             return Err(SceneError::UnsupportedVersion {
                 found: self.version,
             });
@@ -2269,6 +2295,26 @@ impl Scene3 {
         }
         self.validate_links()?;
         self.validate_figure_errors()?;
+        self.validate_film_catalog()?;
+        Ok(())
+    }
+
+    /// Catalogue ids are unique and every layer names one that exists.
+    fn validate_film_catalog(&self) -> Result<(), SceneError> {
+        let mut ids: Vec<u32> = self.film_catalog.iter().map(|e| e.id).collect();
+        ids.sort_unstable();
+        if let Some(w) = ids.windows(2).find(|w| w[0] == w[1]) {
+            return Err(SceneError::DuplicateId { id: u64::from(w[0]) });
+        }
+        for c in crate::migrate_v2::coatings(self) {
+            for l in &c.layers {
+                if let Some(id) = l.catalog_ref {
+                    if ids.binary_search(&id).is_err() {
+                        return Err(SceneError::DanglingRef { what: "film catalogue entry", id: u64::from(id) });
+                    }
+                }
+            }
+        }
         Ok(())
     }
 

@@ -191,11 +191,11 @@ fn low_iron_film() -> oc_core::thinfilm::FilmMaterial {
         interpolation: Interpolation::Linear,
         out_of_range: OutOfRangePolicy::Clamp,
     };
-    oc_core::thinfilm::FilmMaterial {
-        name: "Low-iron soda-lime".into(),
-        n: table(lambda_um.iter().map(|&l| g.index(l)).collect()),
-        k: table(lambda_um.iter().zip(&alpha_per_mm).map(|(&l, &a)| a * l * 1e-3 / (4.0 * std::f64::consts::PI)).collect()),
-    }
+    oc_core::thinfilm::FilmMaterial::scalars(
+        "Low-iron soda-lime",
+        table(lambda_um.iter().map(|&l| g.index(l)).collect()),
+        table(lambda_um.iter().zip(&alpha_per_mm).map(|(&l, &a)| a * l * 1e-3 / (4.0 * std::f64::consts::PI)).collect()),
+    )
 }
 
 /// Coat the bore of tube `id` with `coating`, in place of the one it was

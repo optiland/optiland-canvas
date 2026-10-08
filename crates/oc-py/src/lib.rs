@@ -103,7 +103,7 @@ fn scene_to_seq(
             }
             Ok(scene.to_seq().to_json())
         }
-        Document::V2(scene) => {
+        Document::V2(scene) | Document::V3(scene) => {
             let (source, detector) = match (source_id, detector_id) {
                 (Some(s), Some(d)) => (oc_core::id::SourceId(s), oc_core::id::DetectorId(d)),
                 (None, None) => oc_trace::default_path(&scene).map_err(export_err)?,
@@ -385,6 +385,18 @@ fn thinfilm_indices(stack_json: &str, lambda_um: Vec<f64>) -> PyResult<String> {
     ))
 }
 
+/// The built-in film catalogue as JSON: `[{"key": ..., "material": {...}}]`,
+/// each material in the document's own form (curves, formula, form,
+/// provenance, nominal), for the parity suites and for building stacks.
+#[pyfunction]
+fn film_catalog_json() -> String {
+    let rows: Vec<String> = oc_core::film_catalog::builtin()
+        .into_iter()
+        .map(|(key, m)| format!("{{\"key\":\"{key}\",\"material\":{}}}", serde_json::to_string(&m).expect("serializes")))
+        .collect();
+    format!("[{}]", rows.join(","))
+}
+
 /// The `.ocanvas` version [`seq_to_scene`] writes. The browser writes the
 /// later one; [`READABLE_VERSIONS`] is every version this build reads.
 #[pyfunction]
@@ -426,6 +438,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(thinfilm_rt, m)?)?;
     m.add_function(wrap_pyfunction!(thinfilm_amplitudes, m)?)?;
     m.add_function(wrap_pyfunction!(thinfilm_indices, m)?)?;
+    m.add_function(wrap_pyfunction!(film_catalog_json, m)?)?;
     m.add_function(wrap_pyfunction!(normalize, m)?)?;
     m.add_function(wrap_pyfunction!(validate, m)?)?;
     m.add_function(wrap_pyfunction!(format_version, m)?)?;

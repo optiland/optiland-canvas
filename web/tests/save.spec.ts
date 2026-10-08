@@ -54,25 +54,25 @@ function matchFixture(name: string, body: string) {
 }
 
 test.describe("save writes the document the bridge reads", () => {
-  test("the default scene saves as a v2 document", async ({ page }) => {
+  test("the default scene saves as a v3 document", async ({ page }) => {
     await freshApp(page);
     const body = await save(page);
     const doc = JSON.parse(body);
     expect(doc.format).toBe("ocanvas");
-    expect(doc.version).toBe(2);
+    expect(doc.version).toBe(3);
     expect(doc.bodies.length).toBe(1);
     expect(doc.detectors.length).toBe(1);
-    matchFixture("browser-default.ocanvas", body);
+    matchFixture("browser-default-v3.ocanvas", body);
   });
 
-  test("a scene with a beam splitter saves as a v2 document", async ({ page }) => {
+  test("a scene with a beam splitter saves as a v3 document", async ({ page }) => {
     await freshApp(page);
     await page.locator("#addSplitter").click();
     await expect(page.locator("#stat")).toContainText("segs");
     const body = await save(page);
     const doc = JSON.parse(body);
-    expect(doc.version).toBe(2);
+    expect(doc.version).toBe(3);
     expect(doc.surfaces.length).toBe(1);
-    matchFixture("browser-splitter.ocanvas", body);
+    matchFixture("browser-splitter-v3.ocanvas", body);
   });
 });

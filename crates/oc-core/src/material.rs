@@ -107,6 +107,9 @@ pub enum DispersionFormula {
     Polynomial { coefficients: Vec<f64> },
     /// No dispersion: `n` at every wavelength (Optiland's `IdealMaterial`).
     Constant { n: f64 },
+    /// Formula 5, the generalized Cauchy: `n = c₀ + Σ cᵢ λ^cᵢ₊₁`. What thin
+    /// films are often published in (HfO₂, Al-Kuhaili).
+    Cauchy { coefficients: Vec<f64> },
 }
 
 impl DispersionFormula {
@@ -137,6 +140,13 @@ impl DispersionFormula {
                 n2.sqrt()
             }
             Self::Constant { n } => *n,
+            Self::Cauchy { coefficients: c } => {
+                let mut n = c[0];
+                for k in (1..c.len()).step_by(2) {
+                    n += c[k] * lambda_um.powf(c[k + 1]);
+                }
+                n
+            }
         }
     }
 
@@ -153,7 +163,8 @@ impl DispersionFormula {
             }
             Self::Sellmeier { coefficients }
             | Self::Sellmeier2 { coefficients }
-            | Self::Polynomial { coefficients } => coefficients,
+            | Self::Polynomial { coefficients }
+            | Self::Cauchy { coefficients } => coefficients,
         };
         if c.iter().any(|v| !v.is_finite()) {
             return Err("a coefficient that is not finite".into());
@@ -184,7 +195,7 @@ impl DispersionFormula {
             }
             Self::Sellmeier { coefficients } => (coefficients, true),
             Self::Sellmeier2 { coefficients } => (coefficients, false),
-            Self::Polynomial { .. } => return None,
+            Self::Polynomial { .. } | Self::Cauchy { .. } => return None,
         };
         let mut terms: Vec<(f64, f64)> = c[1..]
             .chunks(2)

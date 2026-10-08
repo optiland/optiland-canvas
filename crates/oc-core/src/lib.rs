@@ -27,6 +27,8 @@
 pub mod build3;
 pub mod colorimetry;
 pub mod fidelity;
+#[cfg(feature = "scene3")]
+pub mod film_catalog;
 pub mod coordinates;
 #[cfg(feature = "scene3")]
 pub mod display_mesh;
@@ -48,6 +50,8 @@ pub mod id;
 pub mod material;
 #[cfg(feature = "scene3")]
 pub mod migrate_v1;
+#[cfg(feature = "scene3")]
+pub mod migrate_v2;
 #[cfg(feature = "scene3")]
 pub mod planar_reduce;
 #[cfg(feature = "scene3")]

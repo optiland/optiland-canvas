@@ -45,7 +45,7 @@ def test_the_fixture_describes_the_case(name):
     doc = _load(name)
     stack, n0, nf, _ = coating_cases.CASES[name]
     assert doc["stack"] == stack and doc["n_incident"] == n0 and doc["n_far"] == nf
-    assert doc["lambda_um"] == coating_cases.LAMBDAS and doc["aoi_deg"] == coating_cases.angles_for(name)
+    assert doc["lambda_um"] == coating_cases.lambdas_for(name) and doc["aoi_deg"] == coating_cases.angles_for(name)
 
 
 @pytest.mark.parametrize("name", list(coating_cases.CASES))

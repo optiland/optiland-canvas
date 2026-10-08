@@ -57,7 +57,7 @@ def test_tmm_works_in_the_canvas_ray_frame():
 @pytest.mark.parametrize("name", list(coating_cases.CASES))
 def test_every_case_agrees_with_tmm(name):
     stack, n0, nf, description = coating_cases.CASES[name]
-    lambdas, angles = coating_cases.LAMBDAS, coating_cases.angles_for(name)
+    lambdas, angles = coating_cases.lambdas_for(name), coating_cases.angles_for(name)
     doc = {
         "case": name,
         "stack": stack,

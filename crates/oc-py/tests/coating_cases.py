@@ -127,6 +127,35 @@ CASES: dict[str, tuple[dict, float, float, str]] = {
 }
 
 
+def _catalogue_stack() -> dict:
+    """C11: MgF2 over TiO2 over SiO2 from the measured catalogue, each a
+    quarter wave at 550 nm of its own index there."""
+    from optiland_canvas import coatings
+
+    cat = coatings.catalog()
+    layers = []
+    for key in ("magnesium_fluoride", "titania", "silica"):
+        m = cat[key]
+        n = m["nominal"]["n"]
+        layers.append({"material": m, "thickness_nm": 550.0 / (4.0 * n)})
+    return stack(layers)
+
+
+CASES["dispersive_catalogue_stack"] = (
+    _catalogue_stack(),
+    1.0,
+    1.5168,
+    "C11: MgF2, TiO2 and SiO2 from the catalogue, dispersive, 0.4 to 2.0 um",
+)
+
+C11_LAMBDAS = [round(0.4 + 1.6 * i / 19, 12) for i in range(20)]
+
+
+def lambdas_for(name: str) -> list[float]:
+    """The catalogue stack is swept across its materials' dispersion."""
+    return C11_LAMBDAS if name == "dispersive_catalogue_stack" else LAMBDAS
+
+
 def critical_deg(n_incident: float, n_far: float) -> float | None:
     """The critical angle in the incident medium, or ``None`` if there is none."""
     return math.degrees(math.asin(n_far / n_incident)) if n_far < n_incident else None

@@ -46,6 +46,7 @@ mod solar_ui;
 mod edit_ui;
 mod detector_ui;
 mod fidelity_ui;
+mod catalog_ui;
 mod grating_ui;
 
 /// The Fresnel lens: add one, read its recipe, rebuild it from an edited one.
@@ -4644,7 +4645,7 @@ impl Canvas {
                 .join(",")
         };
         let (migrated, planar, lines, sources, notes, unresolved) = match report {
-            LoadReport::V2 => (false, Vec::new(), Vec::new(), Vec::new(), Vec::new(), false),
+            LoadReport::V2 | LoadReport::V3 => (false, Vec::new(), Vec::new(), Vec::new(), Vec::new(), false),
             LoadReport::MigratedFromV1(r) => (
                 true,
                 r.planar_only_bodies

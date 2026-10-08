@@ -32,7 +32,12 @@ from typing import Any, Union
 
 from . import _native
 
-__all__ = ["rt", "amplitudes", "indices", "substrate_index", "layer_order", "to_tmm", "to_optiland"]
+__all__ = ["rt", "amplitudes", "indices", "substrate_index", "layer_order", "to_tmm", "to_optiland", "catalog"]
+
+
+def catalog() -> dict[str, dict]:
+    """The built-in film catalogue: key to material JSON, with provenance."""
+    return {row["key"]: row["material"] for row in json.loads(_native.film_catalog_json())}
 
 Stack = Union[dict, str]
 

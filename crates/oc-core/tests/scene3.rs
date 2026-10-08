@@ -66,19 +66,24 @@ fn every_v1_corpus_file_loads_through_the_migration() {
         );
         s3.validate()
             .unwrap_or_else(|e| panic!("{name}: migrated scene does not validate: {e}"));
-        assert_eq!(s3.version, 2, "{name}");
+        assert_eq!(s3.version, 3, "{name}: migrated scenes are held as v3");
         assert_eq!(s3.dimension, 3, "{name}");
     }
 }
 
 #[test]
-fn a_migrated_scene_re_emits_as_loadable_v2() {
+fn a_migrated_scene_re_emits_as_loadable_v3_and_v2() {
     for (name, json) in V1_CORPUS {
         let (s3, _) = load_any(json).unwrap();
         let out = s3.to_json();
         let (again, report) = load_any(&out).unwrap_or_else(|e| panic!("{name}: {e}"));
-        assert_eq!(report, LoadReport::V2, "{name}: re-emitted doc is not v2");
-        assert_eq!(again.to_json(), out, "{name}: v2 is not stable on re-emit");
+        assert_eq!(report, LoadReport::V3, "{name}: re-emitted doc is not v3");
+        assert_eq!(again.to_json(), out, "{name}: v3 is not stable on re-emit");
+        // And as v2, for older readers: nothing of v3 is used, so nothing is lost.
+        let (v2, losses) = s3.to_json_v2();
+        assert!(losses.is_empty(), "{name}: {losses:?}");
+        let (_, report) = load_any(&v2).unwrap();
+        assert_eq!(report, LoadReport::V2, "{name}");
     }
 }
 
@@ -361,8 +366,10 @@ fn the_committed_v2_fixture_still_matches_the_code() {
     // describing something the writer no longer emits.
     let v1 = Scene::from_json(V1_CORPUS[2].1).unwrap();
     let (s3, _) = migrate_v1_to_v2(&v1).unwrap();
+    let (v2, losses) = s3.to_json_v2();
+    assert!(losses.is_empty(), "{losses:?}");
     assert_eq!(
-        s3.to_json().replace("\r\n", "\n"),
+        v2.replace("\r\n", "\n"),
         V2_FIXTURE.replace("\r\n", "\n"),
         "the committed fixture is stale; regenerate it with \
          `cargo run -p oc-core --features scene3 --example emit_v2_fixture`"
@@ -373,7 +380,8 @@ fn the_committed_v2_fixture_still_matches_the_code() {
 fn the_committed_v2_fixture_loads_as_v2() {
     let (s3, report) = load_any(V2_FIXTURE).unwrap();
     assert_eq!(report, LoadReport::V2, "fixture was not read as v2");
-    assert_eq!(s3.version, 2);
+    // Read as v2, held as v3 in memory.
+    assert_eq!(s3.version, 3);
     assert_eq!(s3.dimension, 3);
     s3.validate().unwrap();
     // It is a real document, not an empty shell.
@@ -388,10 +396,10 @@ fn the_committed_v2_fixture_loads_as_v2() {
 #[test]
 fn a_document_from_the_future_is_refused_not_guessed_at() {
     let (s3, _) = load_any(V1_CORPUS[2].1).unwrap();
-    let json = s3.to_json().replace("\"version\": 2", "\"version\": 3");
+    let json = s3.to_json().replace("\"version\": 3", "\"version\": 4");
     assert_eq!(
         load_any(&json).unwrap_err(),
-        SceneError::UnsupportedVersion { found: 3 }
+        SceneError::UnsupportedVersion { found: 4 }
     );
 }
 

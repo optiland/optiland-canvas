@@ -22,7 +22,7 @@ fn both_versions_read_and_keep_their_version() {
     // Normalizing never migrates.
     let again = read_document(&v1.to_json()).unwrap();
     assert_eq!(again.version(), 1);
-    assert_eq!(READABLE_VERSIONS, [1, 2]);
+    assert_eq!(READABLE_VERSIONS, [1, 2, 3]);
 }
 
 #[test]

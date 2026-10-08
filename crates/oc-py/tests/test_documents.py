@@ -36,22 +36,28 @@ def test_the_fixtures_are_there():
     assert V1_FILES, "the v1 catalogue documents moved"
 
 
+def _written(path: Path) -> int:
+    """The version the browser wrote the file in: v3 since the film
+    catalogue, v2 for the files kept from before it."""
+    return 3 if path.stem.endswith("-v3") else 2
+
+
 @pytest.mark.parametrize("path", BROWSER_FILES, ids=lambda p: p.name)
-def test_a_file_the_browser_saved_reads_as_version_2(path: Path):
-    assert oc.validate(str(path)) == 2
-    assert _doc(path)["version"] == 2
+def test_a_file_the_browser_saved_reads_as_its_version(path: Path):
+    assert oc.validate(str(path)) == _written(path)
+    assert _doc(path)["version"] == _written(path)
     # `load` validates and hands back the text as it was.
     assert oc.load(str(path)) == path.read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize("path", BROWSER_FILES, ids=lambda p: p.name)
-def test_saving_a_browser_file_keeps_it_version_2_and_changes_nothing(path: Path, tmp_path: Path):
+def test_saving_a_browser_file_keeps_its_version_and_changes_nothing(path: Path, tmp_path: Path):
     out = tmp_path / path.name
     oc.save(str(path), str(out))
     again = _doc(out)
-    assert again["version"] == 2
+    assert again["version"] == _written(path)
     # The browser writes the same normal form the bridge does, so a save is
-    # the identity on what it saved.
+    # the identity on what it saved, v2 files included.
     assert again == _doc(path)
 
 
@@ -64,7 +70,7 @@ def test_a_version_1_document_still_reads_and_stays_version_1(path: Path, tmp_pa
 
 
 def test_the_readable_versions_are_named():
-    assert oc.READABLE_VERSIONS == (1, 2)
+    assert oc.READABLE_VERSIONS == (1, 2, 3)
 
 
 # --------------------------------------------------------------------------- #
@@ -91,8 +97,8 @@ def test_the_wrong_file_is_not_a_document(text: str):
 
 def test_a_document_from_the_future_names_its_version():
     doc = _default()
-    doc["version"] = 3
-    with pytest.raises(oc.UnsupportedVersionError, match="version 3"):
+    doc["version"] = 4
+    with pytest.raises(oc.UnsupportedVersionError, match="version 4"):
         oc.validate(doc)
 
 
@@ -122,7 +128,7 @@ def test_every_document_error_is_still_a_value_error():
 
 def test_every_entry_point_reads_the_same_way():
     doc = _default()
-    doc["version"] = 3
+    doc["version"] = 4
     for call in (oc.validate, oc.scene_to_seq, lambda d: oc.scene3_sequence(d, 5, 6)):
         with pytest.raises(oc.UnsupportedVersionError):
             call(doc)
@@ -139,3 +145,14 @@ def test_the_default_scene_s_axial_ray_threads_the_singlet():
     lens = doc["bodies"][0]["common"]["id"]
     assert [h["object"] for h in seq["hits"]] == [lens, lens]
     assert seq["terminal"]["detector"] == detector
+
+
+def test_the_browser_s_v3_saves_read_through_every_entry_point():
+    """What the app saves now (version 3) reads as cleanly as its v2 files did."""
+    import pathlib
+
+    data = pathlib.Path(__file__).resolve().parent / "data"
+    for name in ("browser-default-v3.ocanvas", "browser-splitter-v3.ocanvas"):
+        text = (data / name).read_text(encoding="utf-8")
+        assert json.loads(text)["version"] == 3
+        oc.validate(text)

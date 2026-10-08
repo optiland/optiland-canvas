@@ -349,8 +349,10 @@ pub fn migrate_v1_to_v2(v1: &Scene) -> Result<(Scene3, MigrationReport), SceneEr
 /// What a document turned out to be.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LoadReport {
-    /// It was already v2.
+    /// It was v2, read and migrated to v3 in memory.
     V2,
+    /// It was v3.
+    V3,
     /// It was v1 and has been migrated.
     MigratedFromV1(MigrationReport),
 }
@@ -385,6 +387,7 @@ pub fn load_any(json: &str) -> Result<(Scene3, LoadReport), SceneError> {
             Ok((s3, LoadReport::MigratedFromV1(report)))
         }
         2 => Ok((Scene3::from_json(json)?, LoadReport::V2)),
+        3 => Ok((Scene3::from_json(json)?, LoadReport::V3)),
         other => Err(SceneError::UnsupportedVersion { found: other }),
     }
 }

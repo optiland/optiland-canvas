@@ -69,7 +69,7 @@ fn strict_refuses_a_coating_outside_its_table_and_says_why() {
     };
     let coating = Coating {
         layers: vec![FilmLayer::new(
-            FilmMaterial { name: "Ag".into(), n: silver_table(vec![0.05, 0.05, 0.04]), k: silver_table(vec![1.3, 3.0, 6.0]) },
+            FilmMaterial::scalars("Ag", silver_table(vec![0.05, 0.05, 0.04]), silver_table(vec![1.3, 3.0, 6.0])),
             150.0,
         )],
         backing: CoatingBacking::Medium,

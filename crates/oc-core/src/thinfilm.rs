@@ -426,6 +426,19 @@ impl Coating {
     /// A layer edit keeps the design, so a hand-thinned AR coat is still an AR
     /// coat. A stack with no design at all reads as a path, which is what a
     /// hand-written dichroic or mirror wants.
+    /// Where `coating_model: Nominal` evaluates this coating: `(lambda_um,
+    /// cos_i, designed)`. The design's own wavelength and angle when it has a
+    /// design record; 0.55 µm at normal incidence when it has none, which
+    /// `designed = false` says so the result can say it too.
+    pub fn nominal_point(&self) -> (f64, f64, bool) {
+        match &self.design {
+            Some(d) if d.lambda_nm.is_finite() && d.lambda_nm > 0.0 => {
+                (d.lambda_nm / 1000.0, d.aoi_deg.to_radians().cos().abs(), true)
+            }
+            _ => (0.55, 1.0, false),
+        }
+    }
+
     pub fn reflection_is_stray(&self) -> bool {
         matches!(
             self.design.map(|d| d.kind),

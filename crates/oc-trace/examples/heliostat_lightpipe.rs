@@ -615,6 +615,8 @@ fn main() {
         max_records: 200_000,
         ..TraceConfig3::default()
     };
+    // `FIDELITY=Fast|Standard|Reference`: the coating physics the trace pays for.
+    let cfg = cfg.with_fidelity(realism::fidelity());
     let t0 = std::time::Instant::now();
     let res = trace_scene3(&s, &cfg);
     eprintln!(

@@ -1967,6 +1967,11 @@ pub struct Scene3 {
     /// document that has none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub figure_errors: Vec<FigureError>,
+    /// How much coating physics a trace of this scene pays for (coating
+    /// fidelity spec §5). Absent from a document that keeps the default,
+    /// `Standard`, so every older document reads, and writes, unchanged.
+    #[serde(default, skip_serializing_if = "crate::fidelity::FidelityProfile::is_default")]
+    pub fidelity: crate::fidelity::FidelityProfile,
 }
 
 /// A grating's efficiencies for light polarized across its grooves (TM).
@@ -2019,6 +2024,7 @@ impl Scene3 {
             solar: None,
             links: Vec::new(),
             figure_errors: Vec::new(),
+            fidelity: crate::fidelity::FidelityProfile::default(),
         }
     }
 

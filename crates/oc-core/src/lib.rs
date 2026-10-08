@@ -26,6 +26,7 @@
 #[cfg(feature = "scene3")]
 pub mod build3;
 pub mod colorimetry;
+pub mod fidelity;
 pub mod coordinates;
 #[cfg(feature = "scene3")]
 pub mod display_mesh;

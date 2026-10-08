@@ -192,6 +192,60 @@ impl Default for BuildOpts {
     }
 }
 
+/// What the f32 preview does with a fidelity profile (coating-fidelity spec
+/// §5.3 rule 2).
+///
+/// The preview carries no Stokes vector, records no deposits, has no
+/// temperature and clamps rather than refuses, so it runs the nearest profile
+/// it can and says, by name, every switch value it could not honour.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreviewFidelity {
+    /// The profile the preview actually runs.
+    pub runs: oc_core::fidelity::FidelityProfile,
+    /// One phrase per switch value refused, for example "polarized coatings".
+    pub refused: Vec<String>,
+    /// The sentence the preview badge shows, `None` when nothing was refused.
+    pub message: Option<String>,
+}
+
+/// The preview's answer to a profile.
+pub fn preview_fidelity(asked: &oc_core::fidelity::FidelityProfile) -> PreviewFidelity {
+    use oc_core::fidelity::{CoatingModel, LayerAbsorption, Numerics, PlateModel, Temperature};
+    let mut refused = Vec::new();
+    let mut runs = *asked;
+    if asked.coating_model == CoatingModel::Polarized {
+        refused.push("polarized coatings".to_string());
+        runs.coating_model = CoatingModel::Unpolarized;
+    }
+    if asked.layer_absorption != LayerAbsorption::Off {
+        if asked.layer_absorption == LayerAbsorption::PerLayer {
+            refused.push("per-layer absorption".to_string());
+        }
+        runs.layer_absorption = LayerAbsorption::Off;
+    }
+    if asked.plate_model == PlateModel::Incoherent {
+        refused.push("the incoherent plate Mueller matrix".to_string());
+        runs.plate_model = PlateModel::PhaseFree;
+    }
+    if asked.temperature == Temperature::Declared {
+        refused.push("the declared temperature".to_string());
+        runs.temperature = Temperature::Off;
+    }
+    runs.numerics = Numerics::Permissive;
+    let message = (!refused.is_empty()).then(|| {
+        let coatings = match runs.coating_model {
+            CoatingModel::Nominal => "nominal coatings",
+            _ => "unpolarized coatings",
+        };
+        let asked_name = asked.preset().map_or("a custom profile", oc_core::fidelity::Preset::name);
+        format!(
+            "Preview: {coatings}, absorption not recorded; it cannot run {}. The f64 trace uses {asked_name}.",
+            refused.join(", ")
+        )
+    });
+    PreviewFidelity { runs, refused, message }
+}
+
 /// The compiled, uploadable 3D scene.
 pub struct GpuScene3 {
     pub bodies: Vec<GpuBody3>,
@@ -1772,6 +1826,24 @@ mod tests {
         // The body sits at the normalized origin, radius scaled down.
         assert!(gpu.bodies[0].pos.length() < 1e-6);
         assert!((gpu.bodies[0].params.x as f64 - 5.0 / gpu.norm.scale).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_preview_names_every_switch_it_cannot_honour() {
+        use oc_core::fidelity::{CoatingModel, Preset};
+        let reference = preview_fidelity(&Preset::Reference.profile(None, true));
+        assert_eq!(reference.refused.len(), 4, "{:?}", reference.refused);
+        let msg = reference.message.unwrap();
+        assert!(msg.starts_with("Preview: unpolarized coatings"), "{msg}");
+        assert!(msg.contains("The f64 trace uses Reference"), "{msg}");
+        assert_eq!(reference.runs.coating_model, CoatingModel::Unpolarized);
+        // Standard is polarized in f64, so the preview says it runs unpolarized.
+        let standard = preview_fidelity(&Preset::Standard.profile(None, false));
+        assert_eq!(standard.refused, vec!["polarized coatings".to_string()]);
+        // Fast asks for nothing the preview lacks.
+        let fast = preview_fidelity(&Preset::Fast.profile(Some(0), false));
+        assert!(fast.refused.is_empty() && fast.message.is_none());
+        assert_eq!(fast.runs.coating_model, CoatingModel::Nominal);
     }
 
     #[test]

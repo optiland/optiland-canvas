@@ -98,6 +98,44 @@ pub struct TraceConfig3 {
     pub deposit_bodies: [usize; 2],
     /// Record where each stop or mask blocks light, too.
     pub deposit_apertures: bool,
+    /// How much coating physics the trace pays for (coating-fidelity spec
+    /// §5). The default reproduces the kernel as it was before the profile
+    /// existed. `polarization` above is the older spelling of one switch and
+    /// stays as an alias: the trace is polarized only when both say so.
+    pub fidelity: oc_core::fidelity::FidelityProfile,
+}
+
+impl TraceConfig3 {
+    /// Is the trace polarized? The deprecated `polarization` flag and the
+    /// profile's `coating_model` must both say so.
+    pub fn polarized(&self) -> bool {
+        self.polarization && self.fidelity.polarized()
+    }
+
+    /// This config with a profile applied: the profile's ghost setting, when
+    /// it has one, replaces the config's own.
+    pub fn with_fidelity(mut self, p: oc_core::fidelity::FidelityProfile) -> Self {
+        self.fidelity = p;
+        if let Some(g) = p.ghosts {
+            self.ghosts = g > 0;
+            if g > 0 {
+                self.max_ghost_bounces = g;
+            }
+        }
+        self
+    }
+
+    /// The profile the trace actually runs under, the alias and the ghost
+    /// setting folded in: what its results are stamped with.
+    pub fn effective_profile(&self) -> oc_core::fidelity::FidelityProfile {
+        use oc_core::fidelity::CoatingModel;
+        let mut p = self.fidelity;
+        if !self.polarization && p.coating_model == CoatingModel::Polarized {
+            p.coating_model = CoatingModel::Unpolarized;
+        }
+        p.ghosts = Some(if self.ghosts { self.max_ghost_bounces } else { 0 });
+        p
+    }
 }
 
 impl Default for TraceConfig3 {
@@ -121,6 +159,7 @@ impl Default for TraceConfig3 {
             count_bodies: [0, 0],
             deposit_bodies: [0, 0],
             deposit_apertures: false,
+            fidelity: oc_core::fidelity::FidelityProfile::default(),
         }
     }
 }
@@ -372,8 +411,11 @@ impl Prepared {
 
 impl Local {
     fn finish(self, cfg: &TraceConfig3) -> TraceResult3 {
-        let r = self.result;
+        let mut r = self.result;
+        let fidelity = oc_core::fidelity::FidelityStamp::new(cfg.effective_profile());
+        r.report.fidelity = Some(fidelity.clone());
         TraceResult3 {
+            fidelity,
             revision: cfg.revision,
             segments: r.segments,
             segments_omitted: r.segments_omitted,
@@ -1490,7 +1532,8 @@ fn after_interaction(
     // Absorbed at the face of a recorded body (a coating, a black face).
     if let ObjectRef3::Body(i, _) = obj {
         let took = r.ledger.absorbed_surface - before.absorbed_surface;
-        if took > 0.0 && (cfg.deposit_bodies[0]..cfg.deposit_bodies[1]).contains(&i) {
+        let recorded = cfg.fidelity.layer_absorption != oc_core::fidelity::LayerAbsorption::Off;
+        if took > 0.0 && recorded && (cfg.deposit_bodies[0]..cfg.deposit_bodies[1]).contains(&i) {
             r.deposits.push(Deposit3 { object: obj, point, lambda_um: w.lambda, flux: took });
         }
     }
@@ -2049,7 +2092,7 @@ fn interact_surface(
                         oc_core::thinfilm::Cx::real(eta_tm.sqrt()),
                     );
                     let s_in = stokes.rotated(polarization::frame_angle(w.ray.dir, w.pol.x, a_in));
-                    let out = if cfg.polarization {
+                    let out = if cfg.polarized() {
                         m.apply(&s_in)
                     } else {
                         Stokes::unpolarized(m.unpolarized_gain() * flux_at)
@@ -2149,7 +2192,7 @@ fn interact_surface(
             .state_at(flux_at)
             .rotated(polarization::frame_angle(dir, w.pol.x, s_hat));
         let make = |m: &Mueller| -> Stokes {
-            if cfg.polarization {
+            if cfg.polarized() {
                 m.apply(&stokes_in)
             } else {
                 // Without a state to act on, all an element like this can do is
@@ -2440,9 +2483,9 @@ fn apply_response(
     // assumption only bites once the light arriving is polarized, so that is
     // when the report says so, rather than decorating every scene with a mirror
     // in it.
-    let phase_assumed = cfg.polarization && stokes_in.dop() > 1e-12;
+    let phase_assumed = cfg.polarized() && stokes_in.dop() > 1e-12;
     let out = |m: &Mueller| -> PolRay {
-        let stokes = if cfg.polarization {
+        let stokes = if cfg.polarized() {
             m.apply(&stokes_in)
         } else {
             Stokes::unpolarized(m.unpolarized_gain() * flux_at)
@@ -2639,7 +2682,21 @@ fn apply_response(
             // is the substrate for a coating sitting straight on glass. For a
             // zero-thickness surface both sides are the same medium and the
             // coating carries its own plate.
-            let rt = oc_core::thinfilm::coating_rt_at(coating, n1, n2, w.lambda, cos_i);
+            // Under `coating_model: Nominal` every ray sees the design point:
+            // no wavelength, no angle. Phenomenological, and the stamp says so.
+            let (lambda, cos_i) = if cfg.fidelity.coating_model == oc_core::fidelity::CoatingModel::Nominal {
+                let (l, c, designed) = coating.nominal_point();
+                if !designed {
+                    r.report.note_approx(
+                        PhysicsFeature::ThinFilmCoating,
+                        "nominal: a stack with no design record answers at 0.55 um, normal incidence",
+                    );
+                }
+                (l, c)
+            } else {
+                (w.lambda, cos_i)
+            };
+            let rt = oc_core::thinfilm::coating_rt_at(coating, n1, n2, lambda, cos_i);
             let (refl, tr) = match rt {
                 Some(v) => (v.r().clamp(0.0, 1.0), v.t().clamp(0.0, 1.0)),
                 None => {
@@ -2657,7 +2714,7 @@ fn apply_response(
             // relative phase is exactly what the incoherent sum throws away. In
             // that case the powers still separate s from p, and only the phase
             // between them is declared absent.
-            let amp = oc_core::thinfilm::coating_amp_at(coating, n1, n2, w.lambda, cos_i);
+            let amp = oc_core::thinfilm::coating_amp_at(coating, n1, n2, lambda, cos_i);
             let (m_r, m_t) = match &amp {
                 Some(a) => (
                     Mueller::from_diagonal_jones(a.r_s, a.r_p),

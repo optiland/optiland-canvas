@@ -21,6 +21,7 @@ import { cellGrid, drawCellGrid } from "./detector-plots";
 import { initGallery } from "./gallery";
 import { createReference, type ReferenceBundle } from "./reference";
 import { initSunPanel } from "./sun-panel";
+import { initFidelityPanel } from "./fidelity-panel";
 
 const SCALE = 6.5; // px per mm
 // Zoom-out floor, px per mm: 0.01 shows 100 m across a 1000 px view, enough
@@ -72,6 +73,8 @@ async function main() {
   // unlimited; this just bounds the stray-light explosion. 2 catches the classic
   // two-surface ghost image.
   scene.setMaxGhostBounces(Number(ghostBounces.value) || 2);
+  // Assigned once the page's panels exist; the closures that read it run later.
+  let fidelityPanel: { sync: () => void } = { sync: () => {} };
   // Stand-in pictures the workers have delivered (for `?debug`).
   let standIns = 0;
   // The f64 reference, traced in a worker (reference.ts). When a trace lands,
@@ -84,6 +87,7 @@ async function main() {
       ghosts: scene.ghostsEnabled(),
       maxGhost: scene.maxGhostBounces(),
       rays: scene.analysisRays(),
+      fidelity: scene.fidelityKey(),
     }),
     (why) => {
       if (why === "result" && slice3d?.active()) {
@@ -92,6 +96,7 @@ async function main() {
         refresh3dDetector();
         // A load, an undo or an edit elsewhere may have moved the sun.
         sunPanel.sync();
+        fidelityPanel.sync();
       } else if (why === "standIn" && slice3d?.active()) {
         standIns++;
         refreshActive3d();
@@ -818,6 +823,7 @@ async function main() {
   // whichever scene is active (the 3D path via `slice3d.refresh()`).
   ghostsBox.addEventListener("change", () => {
     scene.setGhosts(ghostsBox.checked);
+    fidelityPanel.sync();
     refreshActive3d();
     renderView();
   });
@@ -825,6 +831,7 @@ async function main() {
   tirBox.addEventListener("change", renderView);       // a render overlay toggle
   ghostBounces.addEventListener("change", () => {
     scene.setMaxGhostBounces(Number(ghostBounces.value) || 2);
+    fidelityPanel.sync();
     refreshActive3d();
     renderView();
     refreshReference();
@@ -1328,6 +1335,20 @@ async function main() {
         fitView();
         renderView();
       }
+    },
+  });
+  // The fidelity profile (fidelity-panel.ts): presets, switches and their
+  // measured costs, the stamp on the dock, and the final check.
+  fidelityPanel = initFidelityPanel({
+    scene,
+    edited: () => {
+      refreshActive3d();
+      renderView();
+      refreshReference();
+    },
+    ghostsChanged: (on, bounces) => {
+      ghostsBox.checked = on;
+      if (on) ghostBounces.value = String(bounces);
     },
   });
   document.getElementById("addTube")!.onclick = () =>

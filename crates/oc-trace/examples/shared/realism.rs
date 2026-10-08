@@ -9,6 +9,8 @@
 //! Sultanova's), `MIRRORS` (coating stacks instead of constants), `SLOPE`
 //! (figure errors), `HELIO_GLASS` (second-surface mirrors behind real glass). `GHOSTS=1` also
 //! traces every glass face's reflections ([`ghosts`]).
+//! `FIDELITY=Fast|Standard|Reference` picks the coating physics the trace
+//! pays for ([`fidelity`]); Standard, the default, is the kernel as it was.
 //!
 //! The measured data sit in examples/heliostat-lightpipe/materials, written
 //! by its absorption.py from the refractiveindex.info database (CC0).
@@ -245,6 +247,21 @@ pub fn ghosts() -> (bool, u32) {
     } else {
         (false, 0)
     }
+}
+
+/// The coating-fidelity profile the examples trace under: the preset named by
+/// `FIDELITY` (`Fast`, `Standard` or `Reference`), `Standard` when unset.
+/// `Fast` turns ghosts off whatever `GHOSTS` says; the other two leave
+/// [`ghosts`] in charge. An unknown name panics rather than tracing something
+/// nobody asked for.
+pub fn fidelity() -> oc_core::fidelity::FidelityProfile {
+    use oc_core::fidelity::Preset;
+    let name = std::env::var("FIDELITY").unwrap_or_else(|_| "Standard".into());
+    let preset = Preset::ALL
+        .into_iter()
+        .find(|p| p.name().eq_ignore_ascii_case(&name))
+        .unwrap_or_else(|| panic!("FIDELITY={name}: not Fast, Standard or Reference"));
+    preset.profile(if preset == Preset::Fast { Some(0) } else { None }, false)
 }
 
 /// Tungsten's normal spectral emissivity at 3200 K, 0.3 to 2.5 µm: de Vos

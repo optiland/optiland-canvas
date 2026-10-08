@@ -45,6 +45,7 @@ mod xsection;
 mod solar_ui;
 mod edit_ui;
 mod detector_ui;
+mod fidelity_ui;
 mod grating_ui;
 
 /// The Fresnel lens: add one, read its recipe, rebuild it from an edited one.
@@ -218,6 +219,9 @@ fn launch_count(scene: &Scene3) -> f64 {
 #[derive(Clone, Copy, PartialEq)]
 struct ReferenceKey {
     revision: u64,
+    /// The fidelity profile's hash: a result traced under one profile is
+    /// never served under another, even if a revision bump were missed.
+    fidelity: u64,
     ghosts: bool,
     max_ghost: u32,
     analysis_rays: u64,
@@ -270,6 +274,7 @@ impl Canvas {
     #[wasm_bindgen(js_name = setMaxGhostBounces)]
     pub fn set_max_ghost_bounces(&mut self, g: u32) {
         self.max_ghost = g.min(8);
+        self.sync_profile_from_ghosts();
     }
 
     #[wasm_bindgen(js_name = maxGhostBounces)]
@@ -281,6 +286,7 @@ impl Canvas {
     #[wasm_bindgen(js_name = setGhosts)]
     pub fn set_ghosts(&mut self, on: bool) {
         self.ghosts = on;
+        self.sync_profile_from_ghosts();
     }
 
     /// Is the ghost layer on?
@@ -1821,6 +1827,7 @@ impl Canvas {
     pub fn load_scene3_json(&mut self, json: &str) -> Result<String, JsError> {
         let (scene, report) = load_any(json).map_err(|e| JsError::new(&format!("{e:?}")))?;
         self.scene3 = Some(scene);
+        self.sync_ghosts_from_profile();
         self.bump();
         Ok(self.load_report_json(&report))
     }
@@ -1895,11 +1902,12 @@ impl Canvas {
             .map(|r| json_str(&format!("{r:?}")))
             .collect();
         format!(
-            "{{\"supported\":{},\"exact\":{},\"approximated\":{},\"rejected\":{}}}",
+            "{{\"supported\":{},\"exact\":{},\"approximated\":{},\"rejected\":{},\"fidelity\":{}}}",
             arr(&supported),
             arr(&exact),
             arr(&approx),
-            arr(&rejected)
+            arr(&rejected),
+            fidelity_ui::stamp_json(&res.fidelity)
         )
     }
 
@@ -3647,7 +3655,8 @@ impl Canvas {
             .direction_grid()
             .map_or((0, 0), |(_, r, sct)| (r, sct));
         format!(
-            "{{\"colour\":{},\"directionLayout\":{},\"spectral\":{},\"spectralUntracked\":{},\"hits\":{},\"totalIncident\":{},\"totalSignal\":{},\"pixelArea\":{},\"faceArea\":{},\"meanIrradiance\":{},\"face\":{},\"centroid\":{},\"meanOpl\":{},\"bins\":[{},{}],\"incident\":[{}],\"measure\":\"{}\",\"unit\":\"{}\",\"coneDeg\":{},\"coneBins\":[{},{}],\"cells\":[{}],\"solidAngle\":[{}],\"outsideCone\":{},\"peak\":{},\"dop\":{},\"dolp\":{},\"azimuthDeg\":{},\"stokes\":[{},{},{},{}],\"maxTiltDeg\":{}}}",
+            "{{\"fidelity\":{},\"colour\":{},\"directionLayout\":{},\"spectral\":{},\"spectralUntracked\":{},\"hits\":{},\"totalIncident\":{},\"totalSignal\":{},\"pixelArea\":{},\"faceArea\":{},\"meanIrradiance\":{},\"face\":{},\"centroid\":{},\"meanOpl\":{},\"bins\":[{},{}],\"incident\":[{}],\"measure\":\"{}\",\"unit\":\"{}\",\"coneDeg\":{},\"coneBins\":[{},{}],\"cells\":[{}],\"solidAngle\":[{}],\"outsideCone\":{},\"peak\":{},\"dop\":{},\"dolp\":{},\"azimuthDeg\":{},\"stokes\":[{},{},{},{}],\"maxTiltDeg\":{}}}",
+            fidelity_ui::stamp_json(&res.fidelity),
             colour,
             detector_ui::layout_json(&d.measure),
             detector_ui::spectral_json(d),
@@ -4498,7 +4507,11 @@ impl Canvas {
     }
 
     fn cfg3(&self) -> TraceConfig3 {
+        // The scene's profile, its ghost setting already folded into the
+        // app's toggle (`sync_ghosts_from_profile`), which this reads below.
+        let fidelity = oc_core::fidelity::FidelityProfile { ghosts: None, ..self.fidelity() };
         TraceConfig3 {
+            fidelity,
             ghosts: self.ghosts,
             max_ghost_bounces: self.max_ghost,
             max_depth: self.depth3(),
@@ -4596,6 +4609,7 @@ impl Canvas {
         ReferenceKey {
             analysis_rays: self.analysis_rays,
             revision: self.revision,
+            fidelity: self.fidelity().key(),
             ghosts: self.ghosts,
             max_ghost: self.max_ghost,
         }

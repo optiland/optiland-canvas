@@ -966,6 +966,8 @@ fn main() {
         segment_floor: f64::INFINITY,
         ..TraceConfig3::default()
     };
+    // `FIDELITY=Fast|Standard|Reference`: the coating physics the trace pays for.
+    let cfg = cfg.with_fidelity(realism::fidelity());
     // `PASSES` passes of the source's rays, each an independent, evenly
     // spread set (a Cranley-Patterson shift of the same point sets) carrying
     // 1/PASSES of the flux. Each pass's records are folded into the sums

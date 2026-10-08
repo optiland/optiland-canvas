@@ -956,6 +956,10 @@ pub struct CapabilityReport {
     pub exact: Vec<PhysicsFeature>,
     pub approximated: Vec<Approximation>,
     pub rejected: Vec<CapabilityIssue>,
+    /// The profile the trace ran under. Set when a trace finishes; a report
+    /// assembled by hand may leave it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fidelity: Option<oc_core::fidelity::FidelityStamp>,
 }
 
 impl CapabilityReport {
@@ -1021,6 +1025,9 @@ impl CapabilityReport {
 /// The result of a full 3D trace (§9.9).
 #[derive(Debug, Clone)]
 pub struct TraceResult3 {
+    /// The profile these numbers were computed under (coating-fidelity spec
+    /// §5.3). Results of two profiles are never merged without saying so.
+    pub fidelity: oc_core::fidelity::FidelityStamp,
     /// The scene revision that produced these numbers, so a stale result can be
     /// discarded rather than shown (§3.3). The tracer copies it from the config;
     /// the caller that owns the scene sets it.

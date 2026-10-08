@@ -1,0 +1,4 @@
+{
+ "comment": "Relative throughput of each fidelity switch value against Fast, written by bench_throughput3 --fidelity-table. A value with no row has not been measured.",
+ "rows": []
+}

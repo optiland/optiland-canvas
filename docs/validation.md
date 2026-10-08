@@ -214,6 +214,18 @@ and the 40-digit oracle agreed with each other. The root now takes the small
 part from the large one near the real axis, and only there, so every
 well-conditioned result kept its bits (C33 still holds).
 
+### Absorption by layer (CF-04)
+
+| Check | Tolerance | Result |
+|---|---|---|
+| Every layer's absorbed fraction against `tmm.absorp_in_each_layer`, every absorbing fixture case, both sides (C15) | 1e-9 | passes |
+| R + T + Σ A_k + A_substrate = 1 on 2000 random absorbing stacks, both sides; A_k ≥ −1e-15 | 1e-12 | passes |
+| Deposits per object against the object ledger, polarized and not (C16) | 1e-10 relative | passes |
+| A lossless dielectric AR | exactly 0 W deposited | passes |
+
+`check_c15` also catches the mutation "a layer's absorption read across the
+wrong pair of interfaces" (C31).
+
 ## Worth adding
 
 - An uncoated N-BK7 and fused-silica window against published internal

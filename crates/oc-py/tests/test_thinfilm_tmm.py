@@ -108,3 +108,51 @@ def test_random_absorbing_stacks_agree_with_tmm(seed):
         }
         doc["oracles"] = {"tmm": gen_coating_fixtures._tmm(doc["stack"], [lam], angles, n0, nf)}
         coating_compare.assert_agrees(doc, "tmm")
+
+
+def _tmm_layer_absorption(pol, n_list, d_list, deg, lam):
+    o = tmm.coh_tmm(pol, n_list, d_list, math.radians(deg), lam)
+    return [float(x) for x in tmm.absorp_in_each_layer(o)][1:-1]
+
+
+@pytest.mark.parametrize("name", ["aluminium_film", "aluminium_under_dielectric", "asymmetric_absorbing_forward",
+                                  "asymmetric_absorbing_reversed", "dispersive_catalogue_stack"])
+def test_c15_absorption_by_layer_agrees_with_tmm(name):
+    """Each layer's absorbed fraction against ``tmm.absorp_in_each_layer``,
+    to 1e-9, for every absorbing case, from either side."""
+    stack, n0, nf, _ = coating_cases.CASES[name]
+    lambdas, angles = coating_cases.lambdas_for(name), coating_cases.angles_for(name)
+    got = coatings.absorption(stack, lambdas, angles, n0, nf)
+    order = coatings.layer_order(stack)
+    worst = 0.0
+    for i, lam in enumerate(lambdas):
+        n_list, d_list = coatings.to_tmm(stack, lam, n0, nf)
+        for j, deg in enumerate(angles):
+            for pol in "sp":
+                want_walked = _tmm_layer_absorption(pol, n_list, d_list, deg, lam)
+                want = [0.0] * len(order)
+                for walked, written in enumerate(order):
+                    want[written] = want_walked[walked]
+                mine = got[f"A_{pol}"][i][j]
+                for a, b in zip(mine, want):
+                    worst = max(worst, abs(a - b))
+                closes = got[f"R{pol}"][i][j] + got[f"T{pol}"][i][j] + sum(mine)
+                assert abs(closes - 1.0) < 1e-12, (name, lam, deg, pol, closes)
+    assert worst < 1e-9, f"{name}: worst {worst:.3e}"
+
+
+def test_c15_three_layers_with_an_absorbing_middle():
+    """C15 itself: only the absorbing layer absorbs, as tmm says it does."""
+    st = coating_cases.stack(
+        [coating_cases.layer(1.46, 94.0), coating_cases.layer(0.958, 8.0, k=6.69), coating_cases.layer(2.35, 61.0)]
+    )
+    got = coatings.absorption(st, [0.45, 0.55, 0.7], [0.0, 30.0, 60.0], 1.0, 1.5168)
+    for i, lam in enumerate([0.45, 0.55, 0.7]):
+        n_list, d_list = coatings.to_tmm(st, lam, 1.0, 1.5168)
+        for j, deg in enumerate([0.0, 30.0, 60.0]):
+            for pol in "sp":
+                want = _tmm_layer_absorption(pol, n_list, d_list, deg, lam)
+                mine = got[f"A_{pol}"][i][j]
+                assert mine[0] == 0.0 and mine[2] == 0.0
+                assert abs(mine[1] - want[1]) < 1e-9
+                assert min(mine) >= -1e-15

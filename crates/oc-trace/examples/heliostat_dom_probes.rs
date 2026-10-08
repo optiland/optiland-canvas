@@ -1288,11 +1288,14 @@ fn write_budget(
 
 /// The thermal files (`THERMAL=1`): deposits.npy, one row per deposit:
 /// object number (deposits.json names them), x y z in that object's frame
-/// (mm), wavelength (um), W.
+/// (mm), wavelength (um), W, and where in the object (`0` its face as a
+/// whole, `k + 1` coating layer `k`, `-1` its bulk). The layer is the last
+/// column, so a reader of the first six reads them as before; it is filled
+/// per layer under `FIDELITY=Reference` (`layer_absorption: PerLayer`).
 fn write_deposits(dir: &std::path::Path, s: &Scene3, deposits: &[oc_trace::Deposit3]) {
     use oc_trace::ObjectRef3 as O;
     let mut names: Vec<(O, String, String)> = Vec::new();
-    let mut rows: Vec<[f64; 6]> = Vec::with_capacity(deposits.len());
+    let mut rows: Vec<[f64; 7]> = Vec::with_capacity(deposits.len());
     for d in deposits {
         let key = match d.object {
             O::Body(i, _) => O::Body(i, 0),
@@ -1318,9 +1321,14 @@ fn write_deposits(dir: &std::path::Path, s: &Scene3, deposits: &[oc_trace::Depos
             _ => Isometry3::from_pos(Vec3::ZERO),
         };
         let p = t.inverse_transform_point(d.point);
-        rows.push([k as f64, p.x, p.y, p.z, d.lambda_um, d.flux]);
+        let layer = match d.layer {
+            oc_trace::DepositLayer::Face => 0.0,
+            oc_trace::DepositLayer::Film(i) => f64::from(i) + 1.0,
+            oc_trace::DepositLayer::Bulk => -1.0,
+        };
+        rows.push([k as f64, p.x, p.y, p.z, d.lambda_um, d.flux, layer]);
     }
-    let header = format!("{{'descr': '<f8', 'fortran_order': False, 'shape': ({}, 6), }}", rows.len());
+    let header = format!("{{'descr': '<f8', 'fortran_order': False, 'shape': ({}, 7), }}", rows.len());
     let pad = 64 - (10 + header.len() + 1) % 64;
     let mut npy = b"\x93NUMPY\x01\x00".to_vec();
     npy.extend_from_slice(&((header.len() + pad + 1) as u16).to_le_bytes());

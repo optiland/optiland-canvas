@@ -161,6 +161,22 @@ pub struct Deposit3 {
     pub lambda_um: f64,
     /// W.
     pub flux: f64,
+    /// Which part of the object took it.
+    pub layer: DepositLayer,
+}
+
+/// Which part of an object a deposit is in (coating-fidelity spec CF-04).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DepositLayer {
+    /// The face as a whole: a stop's block, a black face, or a coating's
+    /// absorption under `layer_absorption: PerFace`.
+    Face,
+    /// One layer of a coating, counted from 0 in the order the coating is
+    /// written, under `layer_absorption: PerLayer`.
+    Film(u16),
+    /// The bulk: a body's absorption along a path, a plate's slab, or an
+    /// opaque substrate.
+    Bulk,
 }
 
 /// One row of [`TraceResult3::objects`].

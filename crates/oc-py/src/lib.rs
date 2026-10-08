@@ -385,6 +385,49 @@ fn thinfilm_indices(stack_json: &str, lambda_um: Vec<f64>) -> PyResult<String> {
     ))
 }
 
+/// A coating's absorption by layer and substrate (coating-fidelity spec
+/// CF-04), for cross-checking against `tmm.absorp_in_each_layer`.
+///
+/// Returns JSON `{"a_s": [[...]], "a_p": [[...]], "sub_s": [...], "sub_p":
+/// [...], "rs": [...], ...}`: for each `(wavelength, angle)` pair, flattened
+/// as [`thinfilm_rt`] flattens them, the fraction of the incident power each
+/// layer absorbs (written order), what the substrate takes, and the powers.
+#[pyfunction]
+#[pyo3(signature = (stack_json, lambda_um, aoi_deg, n_incident, n_far=None))]
+fn thinfilm_absorption(
+    stack_json: &str,
+    lambda_um: Vec<f64>,
+    aoi_deg: Vec<f64>,
+    n_incident: f64,
+    n_far: Option<f64>,
+) -> PyResult<String> {
+    let coating: oc_core::thinfilm::Coating =
+        serde_json::from_str(stack_json).map_err(to_py_err)?;
+    let n_far = n_far.unwrap_or(n_incident);
+    let ctx = oc_core::thinfilm::FilmContext::default();
+    let (mut a_s, mut a_p, mut sub_s, mut sub_p) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut rs, mut rp, mut ts, mut tp) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for &um in &lambda_um {
+        for &deg in &aoi_deg {
+            let (p, _) = oc_core::thinfilm::coating_power_flow_eval(&coating, n_incident, n_far, um, deg.to_radians().cos(), &ctx)
+                .map_err(|e| PyValueError::new_err(format!("at {um} um, {deg} deg: {e}")))?;
+            a_s.push(p.a_layer_s.clone());
+            a_p.push(p.a_layer_p.clone());
+            sub_s.push(p.a_substrate_s);
+            sub_p.push(p.a_substrate_p);
+            rs.push(p.rt.r_s);
+            rp.push(p.rt.r_p);
+            ts.push(p.rt.t_s);
+            tp.push(p.rt.t_p);
+        }
+    }
+    serde_json::to_string(&serde_json::json!({
+        "a_s": a_s, "a_p": a_p, "sub_s": sub_s, "sub_p": sub_p,
+        "rs": rs, "rp": rp, "ts": ts, "tp": tp,
+    }))
+    .map_err(to_py_err)
+}
+
 /// The built-in film catalogue as JSON: `[{"key": ..., "material": {...}}]`,
 /// each material in the document's own form (curves, formula, form,
 /// provenance, nominal), for the parity suites and for building stacks.
@@ -439,6 +482,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(thinfilm_amplitudes, m)?)?;
     m.add_function(wrap_pyfunction!(thinfilm_indices, m)?)?;
     m.add_function(wrap_pyfunction!(film_catalog_json, m)?)?;
+    m.add_function(wrap_pyfunction!(thinfilm_absorption, m)?)?;
     m.add_function(wrap_pyfunction!(normalize, m)?)?;
     m.add_function(wrap_pyfunction!(validate, m)?)?;
     m.add_function(wrap_pyfunction!(format_version, m)?)?;

@@ -6001,21 +6001,21 @@ mod scene3_tests {
     }
 
     #[test]
-    fn a_migrated_scene_round_trips_as_v2() {
+    fn a_migrated_scene_round_trips_as_v3() {
         let mut c = v1_beam_and_lens();
         let v1_json = c.to_json();
         c.load_scene3_json(&v1_json).unwrap();
 
-        let v2 = c.scene3_json();
+        let v3 = c.scene3_json();
         assert!(
-            v2.contains("\"version\": 2"),
-            "v2 header: {}",
-            &v2[..80.min(v2.len())]
+            v3.contains("\"version\": 3"),
+            "v3 header: {}",
+            &v3[..80.min(v3.len())]
         );
-        assert!(v2.contains("\"dimension\": 3"));
+        assert!(v3.contains("\"dimension\": 3"));
 
-        // Reloading the v2 output is a parse, not a migration.
-        let report = c.load_scene3_json(&v2).unwrap();
+        // Reloading the v3 output is a parse, not a migration.
+        let report = c.load_scene3_json(&v3).unwrap();
         assert!(report.contains("\"migratedFromV1\":false"), "{report}");
     }
 

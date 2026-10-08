@@ -345,6 +345,30 @@ mirror whose metal is far thicker than its skin depth. What the stack sends
 into it is absorbed there; the tracer books it as surface absorption and spawns
 no transmitted ray.
 
+## Where a coating's absorption goes
+
+Under `layer_absorption: PerLayer` (the `Reference` preset) the tracer says
+which layer of a coating absorbed, and books a plate's slab as bulk
+absorption:
+
+- each layer's share comes from the net Poynting flux through the stack's
+  interfaces, `F_k = Re(B_k C_k*) / Re(B_0 C_0*)` from the same characteristic
+  matrices the reflectance uses, so `A_k = (1 − R)(F_{k−1} − F_k)` and
+  `R + T + Σ A_k = 1` to rounding; a lossless layer absorbs exactly nothing;
+- a plate's coating is met from the front and, on every return pass, from
+  inside, and its slab takes the rest: under `PerLayer` that goes to the
+  ledger's `absorbed_volume`, under `PerFace` it stays in `absorbed_surface`
+  as it always did;
+- an opaque substrate keeps what enters it, booked at the surface and
+  deposited as `Bulk`;
+- polarized light weights the s and p shares by its intensity in each.
+
+`TraceConfig3.deposit_bodies` and `deposit_surfaces` choose which objects
+record deposits, and each `Deposit3` says where: `Face`, `Film(k)` (written
+order) or `Bulk`. The heliostat light pipe's `THERMAL=1` export carries this
+as a seventh column. Per-layer absorption agrees with `tmm.absorp_in_each_layer`
+to 1e-9 (C15) and the deposits sum to the ledger to 1e-10 (C16).
+
 ## What is still missing
 
 - **Polarization** is no longer missing. It has its own page,

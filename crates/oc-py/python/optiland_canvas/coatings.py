@@ -32,7 +32,7 @@ from typing import Any, Union
 
 from . import _native
 
-__all__ = ["rt", "amplitudes", "indices", "substrate_index", "layer_order", "to_tmm", "to_optiland", "catalog"]
+__all__ = ["rt", "amplitudes", "absorption", "indices", "substrate_index", "layer_order", "to_tmm", "to_optiland", "catalog"]
 
 
 def catalog() -> dict[str, dict]:
@@ -102,6 +102,31 @@ def amplitudes(
         out[key] = _grid(flat, *shape)
     out["scale"] = _grid(got["scale"], *shape)
     return out
+
+
+def absorption(
+    stack: Stack,
+    lambdas_um: list[float],
+    aois_deg: list[float],
+    n_incident: float = 1.0,
+    n_far: float | None = None,
+) -> dict[str, list]:
+    """Absorbed fraction by layer (written order) and substrate, s and p,
+    indexed ``[wavelength][angle]``: ``A_s``/``A_p`` hold a list per point,
+    ``sub_s``/``sub_p`` a number, and the powers as :func:`rt` gives them."""
+    lambdas_um, aois_deg = list(map(float, lambdas_um)), list(map(float, aois_deg))
+    got = json.loads(_native.thinfilm_absorption(_json(stack), lambdas_um, aois_deg, float(n_incident), n_far))
+    shape = (len(lambdas_um), len(aois_deg))
+    return {
+        "A_s": _grid(got["a_s"], *shape),
+        "A_p": _grid(got["a_p"], *shape),
+        "sub_s": _grid(got["sub_s"], *shape),
+        "sub_p": _grid(got["sub_p"], *shape),
+        "Rs": _grid(got["rs"], *shape),
+        "Rp": _grid(got["rp"], *shape),
+        "Ts": _grid(got["ts"], *shape),
+        "Tp": _grid(got["tp"], *shape),
+    }
 
 
 def indices(stack: Stack, lambda_um: float) -> list[complex]:

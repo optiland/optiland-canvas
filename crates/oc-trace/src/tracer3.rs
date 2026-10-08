@@ -98,6 +98,9 @@ pub struct TraceConfig3 {
     pub deposit_bodies: [usize; 2],
     /// Record where each stop or mask blocks light, too.
     pub deposit_apertures: bool,
+    /// Record what standalone coated surfaces absorb, too, not only bodies
+    /// (coating-fidelity spec CF-04).
+    pub deposit_surfaces: bool,
     /// How much coating physics the trace pays for (coating-fidelity spec
     /// §5). The default reproduces the kernel as it was before the profile
     /// existed. `polarization` above is the older spelling of one switch and
@@ -159,6 +162,7 @@ impl Default for TraceConfig3 {
             count_bodies: [0, 0],
             deposit_bodies: [0, 0],
             deposit_apertures: false,
+            deposit_surfaces: false,
             fidelity: oc_core::fidelity::FidelityProfile::default(),
         }
     }
@@ -1113,6 +1117,9 @@ struct LocalResult {
     events: Vec<TraceEvent3>,
     objects: std::collections::BTreeMap<(ObjectRef3, bool), ObjectLedger3>,
     deposits: Vec<Deposit3>,
+    /// What the coating just met absorbed, layer by layer, for the deposits
+    /// of `after_interaction` (`layer_absorption: PerLayer`).
+    pending_layers: Vec<(DepositLayer, f64)>,
     next_path: u64,
 }
 
@@ -1131,6 +1138,7 @@ impl LocalResult {
             events: Vec::new(),
             objects: std::collections::BTreeMap::new(),
             deposits: Vec::new(),
+            pending_layers: Vec::new(),
             next_path: 0,
         }
     }
@@ -1469,7 +1477,7 @@ fn trace_one(
                     b.blocked += flux_at;
                 }
                 if cfg.deposit_apertures {
-                    r.deposits.push(Deposit3 { object: ObjectRef3::Aperture(ap), point: ev.point, lambda_um: w.lambda, flux: flux_at });
+                    r.deposits.push(Deposit3 { object: ObjectRef3::Aperture(ap), point: ev.point, lambda_um: w.lambda, flux: flux_at, layer: DepositLayer::Face });
                 }
                 r.report.note_exact(PhysicsFeature::Aperture);
                 push_event(
@@ -1529,12 +1537,29 @@ fn after_interaction(
     point: Vec3,
 ) {
     let counts = matches!(obj, ObjectRef3::Body(i, _) if (cfg.count_bodies[0]..cfg.count_bodies[1]).contains(&i));
-    // Absorbed at the face of a recorded body (a coating, a black face).
-    if let ObjectRef3::Body(i, _) = obj {
-        let took = r.ledger.absorbed_surface - before.absorbed_surface;
-        let recorded = cfg.fidelity.layer_absorption != oc_core::fidelity::LayerAbsorption::Off;
-        if took > 0.0 && recorded && (cfg.deposit_bodies[0]..cfg.deposit_bodies[1]).contains(&i) {
-            r.deposits.push(Deposit3 { object: obj, point, lambda_um: w.lambda, flux: took });
+    // Absorbed at the face of a recorded body or surface (a coating, a black
+    // face): one deposit for the face, or, under `layer_absorption:
+    // PerLayer`, one per coating layer and one for the substrate, which the
+    // coating left in `pending_layers`.
+    let wanted = match obj {
+        ObjectRef3::Body(i, _) => (cfg.deposit_bodies[0]..cfg.deposit_bodies[1]).contains(&i),
+        ObjectRef3::Surface(_) => cfg.deposit_surfaces,
+        _ => false,
+    };
+    let recorded = cfg.fidelity.layer_absorption != oc_core::fidelity::LayerAbsorption::Off;
+    let pending = std::mem::take(&mut r.pending_layers);
+    if wanted && recorded {
+        if pending.is_empty() {
+            let took = r.ledger.absorbed_surface - before.absorbed_surface;
+            if took > 0.0 {
+                r.deposits.push(Deposit3 { object: obj, point, lambda_um: w.lambda, flux: took, layer: DepositLayer::Face });
+            }
+        } else {
+            for (layer, flux) in pending {
+                if flux > 0.0 {
+                    r.deposits.push(Deposit3 { object: obj, point, lambda_um: w.lambda, flux, layer });
+                }
+            }
         }
     }
     for c in children.iter_mut() {
@@ -1570,7 +1595,7 @@ fn deposit_segment(r: &mut LocalResult, cfg: &TraceConfig3, w: &RayWork, alpha: 
         let (t0, t1) = (l * k as f64 / STEPS as f64, l * (k + 1) as f64 / STEPS as f64);
         let took = w.flux() * (beer_lambert(alpha, t0) - beer_lambert(alpha, t1));
         if took > 0.0 {
-            r.deposits.push(Deposit3 { object: w.from, point: w.ray.at(0.5 * (t0 + t1)), lambda_um: w.lambda, flux: took });
+            r.deposits.push(Deposit3 { object: w.from, point: w.ray.at(0.5 * (t0 + t1)), lambda_um: w.lambda, flux: took, layer: DepositLayer::Bulk });
         }
     }
 }
@@ -2759,7 +2784,45 @@ fn apply_response(
             };
             let pol_r = out(&m_r);
             let pol_t = out(&m_t);
-            r.ledger.absorbed_surface += (flux_at - pol_r.stokes.s0 - pol_t.stokes.s0).max(0.0);
+            let absorbed = (flux_at - pol_r.stokes.s0 - pol_t.stokes.s0).max(0.0);
+            if cfg.fidelity.layer_absorption == oc_core::fidelity::LayerAbsorption::PerLayer && absorbed > 0.0 {
+                // Where in the coating it was absorbed: each layer, and the
+                // substrate. Polarized light weights the s and p splits by
+                // its intensity in each; the shares are scaled to the total
+                // the ledger books, so they sum to it exactly.
+                let (i_s, i_p) = if cfg.polarized() {
+                    (0.5 * (stokes_in.s0 + stokes_in.s1), 0.5 * (stokes_in.s0 - stokes_in.s1))
+                } else {
+                    (0.5 * flux_at, 0.5 * flux_at)
+                };
+                match oc_core::thinfilm::coating_power_flow_eval(coating, n1, n2, lambda, cos_i, &ctx) {
+                    Ok((p, _)) => {
+                        let films: Vec<f64> =
+                            p.a_layer_s.iter().zip(&p.a_layer_p).map(|(a, b)| a * i_s + b * i_p).collect();
+                        let bulk = p.a_substrate_s * i_s + p.a_substrate_p * i_p;
+                        let sum = films.iter().sum::<f64>() + bulk;
+                        let k = if sum > 0.0 { absorbed / sum } else { 0.0 };
+                        let slab = matches!(coating.backing, oc_core::thinfilm::CoatingBacking::Plate { .. });
+                        // A plate's slab is bulk absorption; an opaque
+                        // substrate's is booked at the surface, tagged bulk.
+                        if slab {
+                            r.ledger.absorbed_volume += bulk * k;
+                            r.ledger.absorbed_surface += absorbed - bulk * k;
+                        } else {
+                            r.ledger.absorbed_surface += absorbed;
+                        }
+                        r.pending_layers = films
+                            .iter()
+                            .enumerate()
+                            .map(|(i, a)| (DepositLayer::Film(i.min(u16::MAX as usize) as u16), a * k))
+                            .chain(std::iter::once((DepositLayer::Bulk, bulk * k)))
+                            .collect();
+                    }
+                    Err(_) => r.ledger.absorbed_surface += absorbed,
+                }
+            } else {
+                r.ledger.absorbed_surface += absorbed;
+            }
             let mut children = Vec::new();
             // Past the critical angle nothing gets through, whatever the stack:
             // the far medium carries only an evanescent wave, and the matrix

@@ -61,9 +61,8 @@ use serde::{Deserialize, Serialize};
 /// them on one at a time and asserts that the named check fails. A mutation
 /// nothing catches is a test the suite is missing.
 ///
-/// Pending, because the code they would mutate lands later: the preview's
-/// outside grid reused inside (C22, `oc-gpu`) and an off-by-one interface in
-/// the per-layer absorption (C15).
+/// The preview's outside grid reused inside (C22) is the same idea in
+/// `oc-gpu`, which holds its own switch.
 #[cfg(test)]
 pub(crate) mod mutation {
     use std::cell::Cell;
@@ -80,6 +79,8 @@ pub(crate) mod mutation {
         ThicknessAsMicrons,
         /// A stack met from its substrate walked in the written order.
         NoReverseWalk,
+        /// A layer's absorption read across the wrong pair of interfaces.
+        AbsorptionOffByOne,
     }
 
     thread_local! {
@@ -1506,6 +1507,238 @@ fn plate_rt(
         r_p: out[1].0,
         t_p: out[1].1,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Where the absorbed power goes: per layer, and into the substrate (CF-04)
+// ---------------------------------------------------------------------------
+
+/// A coating's powers with the absorption resolved by element (spec CF-04).
+///
+/// `a_layer_*[k]` is the fraction of the incident power absorbed in layer `k`,
+/// counted in the **written** order; `a_substrate_*` is what the substrate
+/// takes: the slab of a plate over all its passes, or what enters an opaque
+/// substrate. For each polarization `R + T + Σ A_k + A_substrate = 1` to
+/// rounding, and a lossless layer absorbs exactly nothing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FilmPowers {
+    pub rt: FilmRt,
+    pub a_layer_s: Vec<f64>,
+    pub a_layer_p: Vec<f64>,
+    pub a_substrate_s: f64,
+    pub a_substrate_p: f64,
+}
+
+impl FilmPowers {
+    /// Unpolarized absorption per layer.
+    pub fn a_layer(&self) -> Vec<f64> {
+        self.a_layer_s.iter().zip(&self.a_layer_p).map(|(s, p)| 0.5 * (s + p)).collect()
+    }
+
+    /// Unpolarized absorption in the substrate.
+    pub fn a_substrate(&self) -> f64 {
+        0.5 * (self.a_substrate_s + self.a_substrate_p)
+    }
+}
+
+/// The net flux through each interface of a coherent stack, relative to what
+/// enters its front face, for one polarization: `F_0 = 1` at the front,
+/// `F_N` into the substrate (Macleod's potential transmittance), from the
+/// partial products `[B_k; C_k] = (Π_{j>k} M_j) [1; η_sub]` and
+/// `F_k = Re(B_k C_k*) / Re(B_0 C_0*)`. The same characteristic matrices as
+/// [`stack_amp_pol`], walked from the substrate side, with the same opacity
+/// rule and the same rescaling, so a thick stack underflows rather than
+/// overflowing.
+///
+/// Returns the flux at the `N + 1` interfaces of the stack that is actually
+/// evaluated, and the first opaque layer if the stack was cut there; the
+/// opaque layer is then the substrate, and the flux into it is `F_N`.
+fn flux_profile(layers: &[(Cx, f64)], n_sub: Cx, lambda_um: f64, q: Cx, p_pol: bool) -> (Vec<f64>, Option<usize>) {
+    let k0 = std::f64::consts::TAU / lambda_um;
+    let phase = |n_l: Cx, d_nm: f64| {
+        let cos_l = snell_cos(q, n_l);
+        (n_l * cos_l * (k0 * d_nm / 1000.0), admittance(n_l, cos_l, p_pol))
+    };
+    let opaque = layers.iter().position(|&(n, d)| phase(n, d).0.im.abs() > OPAQUE_PHASE);
+    let (layers, n_sub) = match opaque {
+        Some(k) => (&layers[..k], layers[k].0),
+        None => (layers, n_sub),
+    };
+    let cos_s = decaying_cos(n_sub, snell_cos(q, n_sub));
+    let mut b = Cx::real(1.0);
+    let mut c = admittance(n_sub, cos_s, p_pol);
+    let n = layers.len();
+    // `flux[k]` is Re(B_k C_k*) scaled by exp(-2 log_scale[k]).
+    let mut flux = vec![0.0; n + 1];
+    let mut log_scale = vec![0.0; n + 1];
+    let mut ls = 0.0f64;
+    flux[n] = (b * c.conj()).re;
+    for k in (0..n).rev() {
+        let (delta, eta) = phase(layers[k].0, layers[k].1);
+        let (cs, sn) = (delta.cos(), delta.sin());
+        let nb = cs * b + I * (sn / eta) * c;
+        let nc = I * (eta * sn) * b + cs * c;
+        b = nb;
+        c = nc;
+        let big = b.norm_sqr().max(c.norm_sqr());
+        if big > 1e200 {
+            let s = 1.0 / big.sqrt();
+            b = b * s;
+            c = c * s;
+            ls += 0.5 * big.ln();
+        }
+        flux[k] = (b * c.conj()).re;
+        log_scale[k] = ls;
+    }
+    let f0 = flux[0];
+    let out = flux
+        .iter()
+        .zip(&log_scale)
+        .map(|(f, l)| if f0 == 0.0 { 0.0 } else { f / f0 * (2.0 * (l - log_scale[0])).exp() })
+        .collect();
+    (out, opaque)
+}
+
+/// One coherent stack's absorption by layer for one polarization, in the
+/// walked order, and what goes into the substrate: `(1 − R)(F_{k−1} − F_k)`
+/// and `(1 − R) F_N`. `r` is the stack's reflectance as [`stack_rt_pol`]
+/// computes it, so the per-layer split shares its R with every other path.
+/// A lossless layer absorbs nothing, by rule rather than by cancellation.
+fn absorbed_by_layer(layers: &[(Cx, f64)], n_sub: Cx, lambda_um: f64, q: Cx, p_pol: bool, r: f64) -> (Vec<f64>, f64) {
+    let (f, opaque) = flux_profile(layers, n_sub, lambda_um, q, p_pol);
+    let into = 1.0 - r;
+    let mut a = vec![0.0; layers.len()];
+    let evaluated = f.len() - 1;
+    for k in 0..evaluated {
+        if layers[k].0.im != 0.0 {
+            #[cfg(test)]
+            let k = if mutation::on(Mutation::AbsorptionOffByOne) { (k + 1).min(evaluated - 1) } else { k };
+            a[k.min(layers.len() - 1)] = into * (f[k] - f[k + 1]);
+        }
+    }
+    let beyond = into * f[evaluated];
+    match opaque {
+        // The opaque layer takes everything that reached it.
+        Some(k) => {
+            a[k] = beyond;
+            (a, 0.0)
+        }
+        None => (a, beyond),
+    }
+}
+
+/// [`coating_eval`] with the absorption resolved by layer and substrate.
+///
+/// For a `Medium` backing `a_substrate` is what the far medium carries away,
+/// which is the transmittance and is zero absorption; it is reported as zero
+/// and the transmitted power stays in `rt`. For an `Opaque` backing it is the
+/// power that enters the substrate and stays there. For a `Plate` it is the
+/// slab's absorption over every pass of the incoherent series.
+pub fn coating_power_flow_eval(
+    c: &Coating,
+    n_incident: f64,
+    n_far: f64,
+    lambda_um: f64,
+    cos_i: f64,
+    ctx: &FilmContext,
+) -> Result<(FilmPowers, FilmNotes), FilmError> {
+    let (rt, notes) = coating_eval(c, n_incident, n_far, lambda_um, cos_i, ctx)?;
+    let (n0, cos_i, q) = incidence(n_incident, cos_i);
+    let n_far = Cx::real(n_far.max(1e-9));
+    let n = c.layers.len();
+    let zero = || vec![0.0; n];
+    if cos_i < GRAZING_COS {
+        let p = FilmPowers { rt, a_layer_s: zero(), a_layer_p: zero(), a_substrate_s: 0.0, a_substrate_p: 0.0 };
+        return Ok((p, notes));
+    }
+    let mut scratch = FilmNotes::default();
+    let mut layers = sample_layers(c, lambda_um, ctx, &mut scratch)?;
+    walk_from_the_incident_side(c, &mut layers);
+    let written = |walked: Vec<f64>| -> Vec<f64> {
+        if matches!(c.backing, CoatingBacking::Medium) && matches!(c.incidence, Incidence::Substrate) {
+            walked.into_iter().rev().collect()
+        } else {
+            walked
+        }
+    };
+    let powers = match &c.backing {
+        CoatingBacking::Medium | CoatingBacking::Opaque { .. } => {
+            let n_sub = match &c.backing {
+                CoatingBacking::Opaque { substrate } => sample_index(substrate, lambda_um, ctx, FilmError::SUBSTRATE, &mut scratch)?,
+                _ => n_far,
+            };
+            let opaque = matches!(c.backing, CoatingBacking::Opaque { .. });
+            let (a_s, sub_s) = absorbed_by_layer(&layers, n_sub, lambda_um, q, false, stack_rt_pol(&layers, n0, n_sub, lambda_um, q, false).r);
+            let (a_p, sub_p) = absorbed_by_layer(&layers, n_sub, lambda_um, q, true, stack_rt_pol(&layers, n0, n_sub, lambda_um, q, true).r);
+            FilmPowers {
+                rt,
+                a_layer_s: written(a_s),
+                a_layer_p: written(a_p),
+                a_substrate_s: if opaque { sub_s } else { 0.0 },
+                a_substrate_p: if opaque { sub_p } else { 0.0 },
+            }
+        }
+        CoatingBacking::Plate { substrate, exit, thickness_mm } => {
+            let n_sub = sample_index(substrate, lambda_um, ctx, FilmError::SUBSTRATE, &mut scratch)?;
+            let residual = match exit {
+                ExitFace::Bare => 1.0,
+                ExitFace::AntiReflective { residual } => residual.clamp(0.0, 1.0),
+            };
+            let thickness_um = thickness_mm.max(0.0) * 1e3;
+            let tau = plate_tau(n_sub, q, lambda_um, thickness_um);
+            let reversed: Vec<(Cx, f64)> = layers.iter().rev().copied().collect();
+            let mut a = [Vec::new(), Vec::new()];
+            let mut sub = [0.0; 2];
+            for (idx, p_pol) in [false, true].into_iter().enumerate() {
+                let front = stack_rt_pol(&layers, n0, n_sub, lambda_um, q, p_pol);
+                let back = stack_rt_pol(&reversed, n_sub, n0, lambda_um, q, p_pol);
+                let (a_front, _) = absorbed_by_layer(&layers, n_sub, lambda_um, q, p_pol, front.r);
+                let (a_back_rev, _) = absorbed_by_layer(&reversed, n0, lambda_um, q, p_pol, back.r);
+                let a_back: Vec<f64> = a_back_rev.into_iter().rev().collect();
+                let r2 = (bare_interface_r(n_sub, n_far, q, p_pol) * residual).clamp(0.0, 1.0);
+                let t2 = 1.0 - r2;
+                let tau2 = tau * tau;
+                // Power that enters the slab heading in, and the power that
+                // meets the coating from inside over every pass.
+                let (enter, den) = match c.incidence {
+                    Incidence::Film => (front.t, 1.0 - back.r * r2 * tau2),
+                    Incidence::Substrate => (t2, 1.0 - r2 * back.r * tau2),
+                };
+                let den = if den.abs() < 1e-12 { 1e-12 } else { den };
+                let from_inside = match c.incidence {
+                    Incidence::Film => enter * tau2 * r2 / den,
+                    Incidence::Substrate => enter * tau / den,
+                };
+                a[idx] = (0..n)
+                    .map(|k| {
+                        let first = if matches!(c.incidence, Incidence::Film) { a_front[k] } else { 0.0 };
+                        first + from_inside * a_back[k]
+                    })
+                    .collect();
+            }
+            // The slab takes what the faces and the layers do not. Its
+            // series, (1 − τ) over every pass, is the same number up to the
+            // plate's own convention for a lossy medium on the inner side of
+            // its interfaces (about 1e-8 for k = 2e-6), and the remainder is
+            // the share that makes the books close exactly.
+            for (idx, (r, t)) in [(rt.r_s, rt.t_s), (rt.r_p, rt.t_p)].into_iter().enumerate() {
+                sub[idx] = (1.0 - r - t - a[idx].iter().sum::<f64>()).max(0.0);
+            }
+            let [a_s, a_p] = a;
+            FilmPowers { rt, a_layer_s: a_s, a_layer_p: a_p, a_substrate_s: sub[0], a_substrate_p: sub[1] }
+        }
+    };
+    Ok((powers, notes))
+}
+
+/// One pass through a plate's slab, by its extinction along the slant path.
+fn plate_tau(n_sub: Cx, q: Cx, lambda_um: f64, thickness_um: f64) -> f64 {
+    if thickness_um > 0.0 && n_sub.im > 0.0 {
+        let cos_t = snell_cos(q, Cx::real(n_sub.re)).re.max(1e-6);
+        (-4.0 * std::f64::consts::PI * n_sub.im * thickness_um / (lambda_um * cos_t)).exp()
+    } else {
+        1.0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3338,6 +3571,143 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // CF-04: absorption by layer
+    // -----------------------------------------------------------------------
+
+    fn powers(c: &Coating, n0: f64, nf: f64, lam: f64, deg: f64) -> FilmPowers {
+        coating_power_flow_eval(c, n0, nf, lam, deg.to_radians().cos(), &FilmContext::default()).unwrap().0
+    }
+
+    /// `R + T + Σ A_k + A_substrate` for one polarization.
+    fn closure(p: &FilmPowers, s_pol: bool) -> f64 {
+        if s_pol {
+            p.rt.r_s + p.rt.t_s + p.a_layer_s.iter().sum::<f64>() + p.a_substrate_s
+        } else {
+            p.rt.r_p + p.rt.t_p + p.a_layer_p.iter().sum::<f64>() + p.a_substrate_p
+        }
+    }
+
+    /// C15: three layers with only the middle one absorbing. Everything the
+    /// stack absorbs is in the middle layer, the lossless ones absorb nothing
+    /// at all, and the books close.
+    #[test]
+    fn c15_the_absorption_is_where_the_absorber_is() {
+        check_c15().unwrap();
+    }
+
+    fn check_c15() -> Result<(), String> {
+        let c = on_medium(&[(1.46, 0.0, 94.0), (0.958, 6.69, 8.0), (2.35, 0.0, 61.0)]);
+        for deg in [0.0f64, 30.0, 60.0] {
+            for lam in [0.45, 0.55, 0.7] {
+                let p = powers(&c, 1.0, 1.5168, lam, deg);
+                let what = format!("{deg} deg, {lam} um");
+                for (a, r, t) in [(&p.a_layer_s, p.rt.r_s, p.rt.t_s), (&p.a_layer_p, p.rt.r_p, p.rt.t_p)] {
+                    if a[0] != 0.0 || a[2] != 0.0 {
+                        return Err(format!("{what}: a lossless layer absorbed {a:?}"));
+                    }
+                    close(a[1], 1.0 - r - t, 1e-12, &format!("{what}: the metal takes 1 - R - T"))?;
+                }
+                close(closure(&p, true), 1.0, 1e-12, &format!("{what}: s closes"))?;
+                close(closure(&p, false), 1.0, 1e-12, &format!("{what}: p closes"))?;
+            }
+        }
+        // Met from the substrate the same layer still holds it all, and the
+        // index is the written one.
+        let back = c.seen_from_behind();
+        let p = powers(&back, 1.5168, 1.0, 0.55, 20.0);
+        if p.a_layer_s[0] != 0.0 || p.a_layer_s[2] != 0.0 || p.a_layer_s[1] <= 0.0 {
+            return Err(format!("met from behind: {:?}", p.a_layer_s));
+        }
+        Ok(())
+    }
+
+    /// A dielectric AR deposits exactly nothing.
+    #[test]
+    fn a_lossless_coating_absorbs_exactly_nothing() {
+        let ar = film_coating(
+            CoatingDesign { kind: DesignKind::BroadbandAr, lambda_nm: 550.0, aoi_deg: 0.0, periods: 1, n_high: 2.35, n_low: 1.38 },
+            1.0,
+            1.5168,
+        );
+        for deg in [0.0f64, 40.0, 80.0] {
+            let p = powers(&ar, 1.0, 1.5168, 0.55, deg);
+            assert!(p.a_layer_s.iter().chain(&p.a_layer_p).all(|a| *a == 0.0), "{p:?}");
+            assert_eq!((p.a_substrate_s, p.a_substrate_p), (0.0, 0.0));
+        }
+    }
+
+    /// The per-layer split closes on 2000 random absorbing stacks, both
+    /// sides, and no layer absorbs a negative power.
+    #[test]
+    fn random_stacks_close_layer_by_layer() {
+        let mut g = Sweep(0xCF04_0001);
+        for case in 0..2000 {
+            let layers = g.stack(24, 4.0);
+            let mut c = on_medium(&layers);
+            let ns = g.range(1.4, 2.0);
+            let deg = g.range(0.0, 85.0);
+            let lam = g.range(0.4, 1.6);
+            let (n0, nf) = if case % 2 == 1 {
+                c = c.seen_from_behind();
+                (ns, 1.0)
+            } else {
+                (1.0, ns)
+            };
+            let p = powers(&c, n0, nf, lam, deg.min(if n0 > nf { 40.0 } else { 85.0 }));
+            for s_pol in [true, false] {
+                let total = closure(&p, s_pol);
+                assert!((total - 1.0).abs() <= 1e-12, "case {case}: closes to {total}");
+            }
+            for a in p.a_layer_s.iter().chain(&p.a_layer_p) {
+                assert!(*a >= -1e-15, "case {case}: negative absorption {a}");
+            }
+        }
+    }
+
+    /// An opaque substrate keeps what enters it; an opaque layer inside a
+    /// stack takes everything that reaches it and the layers behind it none.
+    #[test]
+    fn what_an_opaque_element_takes_is_booked_to_it() {
+        let c = Coating {
+            layers: vec![FilmLayer::new(FilmMaterial::constant("SiO2", 1.46), 94.0)],
+            backing: CoatingBacking::Opaque { substrate: FilmMaterial::absorbing("Al", 0.958, 6.69) },
+            incidence: Incidence::Film,
+            design: None,
+        };
+        let p = powers(&c, 1.0, 1.0, 0.55, 30.0);
+        assert_eq!(p.a_layer_s[0], 0.0);
+        approx(p.a_substrate_s, 1.0 - p.rt.r_s, 1e-12, "the substrate keeps the rest");
+        approx(closure(&p, false), 1.0, 1e-12, "p closes");
+
+        let buried = on_medium(&[(1.46, 0.0, 94.0), (0.958, 6.69, 5000.0), (2.35, 0.1, 61.0)]);
+        let p = powers(&buried, 1.0, 1.5168, 0.55, 0.0);
+        assert_eq!(p.a_layer_s[2], 0.0, "behind the opaque layer nothing is absorbed");
+        approx(p.a_layer_s[1], 1.0 - p.rt.r_s, 1e-12, "the opaque layer takes the rest");
+    }
+
+    /// A coated plate: front stack, slab and far face, from either side. The
+    /// slab's share grows with its extinction, and the books close.
+    #[test]
+    fn a_plate_books_its_layers_and_its_slab() {
+        for incidence in [Incidence::Film, Incidence::Substrate] {
+            let mut c = on_medium(&[(1.46, 0.0, 94.0), (0.958, 6.69, 6.0), (2.35, 0.0, 61.0)]);
+            c.backing = CoatingBacking::Plate {
+                substrate: FilmMaterial::absorbing("glass", 1.5168, 2e-6),
+                exit: ExitFace::Bare,
+                thickness_mm: 3.0,
+            };
+            c.incidence = incidence;
+            for deg in [0.0f64, 45.0] {
+                let p = powers(&c, 1.0, 1.0, 0.55, deg);
+                approx(closure(&p, true), 1.0, 1e-12, &format!("{incidence:?} {deg}: s"));
+                approx(closure(&p, false), 1.0, 1e-12, &format!("{incidence:?} {deg}: p"));
+                assert!(p.a_substrate_s > 0.0 && p.a_layer_s[1] > 0.0);
+                assert_eq!((p.a_layer_s[0], p.a_layer_s[2]), (0.0, 0.0));
+            }
+        }
+    }
+
     /// A coated plate with a slightly absorbing substrate, for the sweeps.
     fn plate_coating_for_test() -> Coating {
         let mut c = quarter_wave_mirror(550.0, 45.0, 4);
@@ -3412,7 +3782,7 @@ mod tests {
     #[test]
     fn every_listed_mistake_is_caught() {
         type Check = fn() -> Result<(), String>;
-        let table: [(Mutation, &str, Check); 7] = [
+        let table: [(Mutation, &str, Check); 8] = [
             (Mutation::RpSignDropped, "check_rp_sign", check_rp_sign),
             (Mutation::GrowingBranch, "check_tir_phase", check_tir_phase),
             (Mutation::NoAdmittanceRatio, "check_energy", check_energy),
@@ -3420,6 +3790,7 @@ mod tests {
             (Mutation::ThicknessAsMicrons, "check_c04", check_c04),
             (Mutation::NoReverseWalk, "check_c08", check_c08),
             (Mutation::NoReverseWalk, "check_reverse_walk", check_reverse_walk),
+            (Mutation::AbsorptionOffByOne, "check_c15", check_c15),
         ];
         for (m, name, check) in table {
             check().unwrap_or_else(|e| panic!("{name} fails on the real code: {e}"));

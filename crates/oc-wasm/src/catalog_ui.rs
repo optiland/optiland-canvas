@@ -13,15 +13,22 @@ fn material_json(m: &FilmMaterial) -> String {
 
 #[wasm_bindgen]
 impl Canvas {
-    /// The film catalogue: `{builtin: [{key, material}], scene: [{id,
-    /// material}]}`. Each material carries its curves or formula, its form
-    /// (film, bulk, crystal), its provenance (source, paper, url, licence,
-    /// range) and its nominal index, in the document's own form.
+    /// The film catalogue: `{builtin: [{key, material, thermalNote}], scene:
+    /// [{id, material, thermalNote}]}`. Each material carries its curves or
+    /// formula, its form (film, bulk, crystal), its provenance (source, paper,
+    /// url, licence, range), its nominal index and its thermo-optic model, in
+    /// the document's own form; `thermalNote` is "no thermo-optic data" for a
+    /// material without one.
     #[wasm_bindgen(js_name = filmCatalogJSON)]
     pub fn film_catalog_json(&self) -> String {
+        // Every entry says whether it has a thermo-optic model, and one that
+        // has none says so in words (CF-10).
+        let thermal = |m: &oc_core::thinfilm::FilmMaterial| {
+            if m.thermal.is_some() { "null" } else { "\"no thermo-optic data\"" }
+        };
         let builtin: Vec<String> = film_catalog::builtin()
             .into_iter()
-            .map(|(key, m)| format!("{{\"key\":\"{key}\",\"material\":{}}}", material_json(&m)))
+            .map(|(key, m)| format!("{{\"key\":\"{key}\",\"material\":{},\"thermalNote\":{}}}", material_json(&m), thermal(&m)))
             .collect();
         let scene: Vec<String> = self
             .scene3
@@ -29,7 +36,9 @@ impl Canvas {
             .map(|s| {
                 s.film_catalog
                     .iter()
-                    .map(|e| format!("{{\"id\":{},\"material\":{}}}", e.id, material_json(&e.material)))
+                    .map(|e| {
+                        format!("{{\"id\":{},\"material\":{},\"thermalNote\":{}}}", e.id, material_json(&e.material), thermal(&e.material))
+                    })
                     .collect()
             })
             .unwrap_or_default();

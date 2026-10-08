@@ -139,10 +139,6 @@ fn v2_material(m: &FilmMaterial, what: &str, losses: &mut Vec<String>) -> FilmMa
     FilmMaterial::scalars(&m.name, m.n.clone(), m.k.clone())
 }
 
-/// The scene as a v2 document, and what v2 could not say.
-///
-/// Empty losses means the v2 document holds everything the scene does, which
-/// is the case for any scene read from v2 and not edited with a v3 feature.
 /// A v2 reader knows the six original design kinds and no `adapt` record.
 /// The layers are written as they are either way, since they are what the
 /// transfer matrix reads; only the recipe goes. A substrate-adapted AR is
@@ -215,6 +211,10 @@ fn tables_to_v2(scene: &mut Scene3, losses: &mut Vec<String>) {
     }
 }
 
+/// The scene as a v2 document, and what v2 could not say.
+///
+/// Empty losses means the v2 document holds everything the scene does, which
+/// is the case for any scene read from v2 and not edited with a v3 feature.
 pub fn to_v2(scene: &Scene3) -> (Scene3, Vec<String>) {
     let mut s = scene.clone();
     let mut losses = Vec::new();
@@ -226,6 +226,9 @@ pub fn to_v2(scene: &Scene3) -> (Scene3, Vec<String>) {
         for (i, layer) in c.layers.iter_mut().enumerate() {
             if sourced(&layer.material) {
                 losses.push(format!("layer {} ({}): provenance, form and nominal value dropped", i + 1, layer.material.name));
+            }
+            if layer.material.thermal.is_some() {
+                losses.push(format!("layer {} ({}): thermo-optic model dropped", i + 1, layer.material.name));
             }
             if layer.incoherent {
                 losses.push(format!(
@@ -261,6 +264,11 @@ pub fn to_v2(scene: &Scene3) -> (Scene3, Vec<String>) {
     if !s.fidelity.is_default() {
         losses.push(format!("the fidelity profile ({}) is dropped; v2 traces as Standard", s.fidelity.describe()));
         s.fidelity = crate::fidelity::FidelityProfile::default();
+    }
+    if s.temperature_c.is_some() || !s.object_temperatures.is_empty() {
+        losses.push("the declared temperatures are dropped; v2 has films at their reference temperature".into());
+        s.temperature_c = None;
+        s.object_temperatures.clear();
     }
     s.version = crate::scene3::OCANVAS_V2_VERSION;
     losses.dedup();

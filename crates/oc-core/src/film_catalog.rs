@@ -114,6 +114,9 @@ fn material(e: &Entry) -> FilmMaterial {
             note: e.note.to_string(),
         })),
         nominal: Some(NominalIndex { n: e.nominal[0], k: e.nominal[1] }),
+        // No entry carries a thermo-optic model: the database gives none, and
+        // a bulk value on a film entry would be a guess (CF-10).
+        thermal: None,
     }
 }
 

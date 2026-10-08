@@ -57,6 +57,8 @@ export type FidelityDeps = {
     finalCheckJSON(): string;
     ghostsEnabled(): boolean;
     maxGhostBounces(): number;
+    sceneTemperatureC(): number;
+    setSceneTemperature(c: number): boolean;
   };
   /** After the profile changed: re-trace, redraw, and refresh the reference. */
   edited: () => void;
@@ -147,6 +149,7 @@ export function initFidelityPanel(deps: FidelityDeps): FidelityPanel {
   const stampLine = $<HTMLDivElement>("dockStamp");
   const checkBtn = $<HTMLButtonElement>("fidCheck");
   const checkOut = $<HTMLDivElement>("fidCheckOut");
+  const tempIn = $<HTMLInputElement>("fidTemp");
 
   let costs: CostRow[] = [];
   try {
@@ -193,6 +196,18 @@ export function initFidelityPanel(deps: FidelityDeps): FidelityPanel {
     });
   }
 
+  // The scene's temperature: read only under `temperature: Declared`, which
+  // Reference sets once there is one (CF-10).
+  tempIn.addEventListener("change", () => {
+    const text = tempIn.value.trim();
+    const value = text === "" ? NaN : Number(text);
+    if (!deps.scene.setSceneTemperature(value)) {
+      sync();
+      return;
+    }
+    after();
+  });
+
   presetSel.addEventListener("change", () => {
     if (presetSel.value === "custom") return;
     deps.scene.setFidelityPreset(presetSel.value);
@@ -224,6 +239,8 @@ export function initFidelityPanel(deps: FidelityDeps): FidelityPanel {
       sel.title = help;
       hints.get(sw.key)!.textContent = costOf(sw.key, value);
     }
+    const t = deps.scene.sceneTemperatureC();
+    if (document.activeElement !== tempIn) tempIn.value = Number.isFinite(t) ? String(t) : "";
     previewNote.textContent = state.preview.message ?? "Preview: runs this profile as asked.";
     stampLine.textContent = state.stamp.text;
     stampLine.title = [state.stamp.solverVersion, ...state.stamp.approximations].join("\n");

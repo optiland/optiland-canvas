@@ -2026,6 +2026,23 @@ pub struct Scene3 {
     /// materials (`crate::migrate_v2`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub film_catalog: Vec<crate::film_catalog::FilmCatalogEntry>,
+    /// The temperature the scene's coatings are at, °C, read only under
+    /// `temperature: Declared` (coating-fidelity spec CF-10). Absent: every
+    /// film at its reference temperature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature_c: Option<f64>,
+    /// Objects at a temperature of their own: an eyepiece warmed by the
+    /// light it absorbs, while the rest of the bench stays at room
+    /// temperature.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub object_temperatures: Vec<ObjectTemperature>,
+}
+
+/// One object's coatings at a temperature of their own, °C.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ObjectTemperature {
+    pub object: ObjectId,
+    pub temperature_c: f64,
 }
 
 /// A grating's efficiencies for light polarized across its grooves (TM).
@@ -2080,7 +2097,33 @@ impl Scene3 {
             figure_errors: Vec::new(),
             fidelity: crate::fidelity::FidelityProfile::default(),
             film_catalog: Vec::new(),
+            temperature_c: None,
+            object_temperatures: Vec::new(),
         }
+    }
+
+    /// The temperature object `id`'s coatings are at: its own, else the
+    /// scene's, else none (every film at its reference temperature).
+    pub fn film_temperature_c(&self, id: u64) -> Option<f64> {
+        self.object_temperatures
+            .iter()
+            .find(|t| t.object.0 == id)
+            .map(|t| t.temperature_c)
+            .or(self.temperature_c)
+    }
+
+    /// Set object `id`'s own temperature, or clear it with `None`. False for
+    /// an id that is not a body or a surface.
+    pub fn set_object_temperature(&mut self, id: u64, temperature_c: Option<f64>) -> bool {
+        let optical = self.bodies.iter().any(|b| b.common.id.0 == id) || self.surfaces.iter().any(|s| s.common.id.0 == id);
+        if !optical {
+            return false;
+        }
+        self.object_temperatures.retain(|t| t.object.0 != id);
+        if let Some(t) = temperature_c {
+            self.object_temperatures.push(ObjectTemperature { object: ObjectId(id), temperature_c: t });
+        }
+        true
     }
 
     /// Hand out a fresh id.
@@ -2321,6 +2364,41 @@ impl Scene3 {
         self.validate_figure_errors()?;
         self.validate_film_catalog()?;
         self.validate_body_coatings()?;
+        self.validate_temperatures()?;
+        Ok(())
+    }
+
+    /// Temperatures are finite and above absolute zero, each override names
+    /// a body or surface, and an object has at most one.
+    fn validate_temperatures(&self) -> Result<(), SceneError> {
+        let check = |object: Option<u64>, field: &str, t: f64| {
+            if !t.is_finite() {
+                return Err(SceneError::NonFinite { object, field: field.into() });
+            }
+            if t <= -273.15 {
+                return Err(SceneError::OutOfRange { object, field: field.into(), reason: "is at or below absolute zero".into() });
+            }
+            Ok(())
+        };
+        if let Some(t) = self.temperature_c {
+            check(None, "temperature_c", t)?;
+        }
+        let mut seen = HashSet::new();
+        for o in &self.object_temperatures {
+            let id = o.object.0;
+            let optical = self.bodies.iter().any(|b| b.common.id.0 == id) || self.surfaces.iter().any(|s| s.common.id.0 == id);
+            if !optical {
+                return Err(SceneError::DanglingRef { what: "object temperature", id });
+            }
+            if !seen.insert(id) {
+                return Err(SceneError::OutOfRange {
+                    object: Some(id),
+                    field: "object_temperatures".into(),
+                    reason: "an object has one temperature".into(),
+                });
+            }
+            check(Some(id), "object_temperatures.temperature_c", o.temperature_c)?;
+        }
         Ok(())
     }
 

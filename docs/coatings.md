@@ -418,6 +418,32 @@ and the media. A transmission-only curve can be read with R declared as
 writes a table from the canvas's own transfer matrix, which reproduces it at
 the knots.
 
+## Coatings at a temperature
+
+A film moves when it warms: its index by `dn/dT`, its thickness by the
+expansion coefficient, and with them every edge in the stack. Under
+`temperature: Declared` (`Reference` sets it when the scene has a temperature)
+a film material with a thermo-optic model is evaluated at the scene's
+temperature, or at an object's own (`setSceneTemperature`,
+`setObjectTemperature`):
+
+```text
+n(λ, T) = n(λ) + dn/dT (T − T_ref)        d(T) = d (1 + α (T − T_ref))
+```
+
+One slope and one coefficient, constant over wavelength and temperature: a
+first-order model, declared and not validated, and every result under it says
+so. A quarter-wave stack's centre then moves by its optical thickness,
+`λ₀ (1 + ΔT dn/n)(1 + α ΔT)`, which is what C29 holds the solver to.
+
+No built-in catalogue entry carries a model. The refractiveindex.info database
+gives none for these films, and a bulk crystal's `dn/dT` put on a film entry
+would be a guess; the catalogue says "no thermo-optic data" for each. A film
+without a model is held at its reference index under a declared temperature,
+and the result names it. Under `temperature: Off` the scene's temperatures are
+never read, and the trace is the untempered one bit for bit. The preview
+refuses `Declared` and draws films at their reference.
+
 ## Checked against published data
 
 The angle shift of an edge is the one relationship every filter vendor

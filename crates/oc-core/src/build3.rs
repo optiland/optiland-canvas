@@ -2342,6 +2342,7 @@ impl Scene3 {
         self.apertures.retain(|a| a.common.id.0 != id);
         self.detectors.retain(|d| d.common.id.0 != id);
         self.sources.retain(|s| s.id.0 != id);
+        self.object_temperatures.retain(|t| t.object.0 != id);
         self.object_count() != before
     }
 

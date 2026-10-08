@@ -270,6 +270,14 @@ up to 8e-2 on bare glass and a three-layer AR; the earlier figure of 7.6e-4
 | Two s/p tables in series, polarized and scalar (earlier spec §9.4) | 1e-12 | `0.5 (Ts1 Ts2 + Tp1 Tp2)` and the product of the means |
 | The preview's grid against the table, 0 to 80 degrees | 1e-2 | 7.5e-3, the grid cutting the corner at the table's 5-degree knots |
 
+### Coatings at a temperature (CF-10)
+
+| Check | Tolerance | Result |
+|---|---|---|
+| A quarter-wave stack 50 K above its reference: the centre, where `Im r` crosses zero, against `λ₀ (1 + ΔT dn/n)(1 + α ΔT)` (C29) | 1e-9 relative | passes; the first-order `(dn/n + α) ΔT λ₀` differs by the product term, 2.5e-7 relative here |
+| `temperature: Off` with a declared temperature against no temperature, solver and trace (C29) | bit-identical | passes |
+| An object held at its reference temperature under `Declared` | bit-identical to the cold trace | passes |
+
 ## Worth adding
 
 - An uncoated N-BK7 and fused-silica window against published internal

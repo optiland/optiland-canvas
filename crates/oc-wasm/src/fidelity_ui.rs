@@ -65,8 +65,10 @@ impl Canvas {
         }
     }
 
+    /// Does the scene declare a temperature, for itself or for any object?
+    /// `Reference` declares the temperature only then.
     fn has_temperature(&self) -> bool {
-        false
+        self.scene3.as_ref().is_some_and(|s| s.temperature_c.is_some() || !s.object_temperatures.is_empty())
     }
 
     /// One trace of `scene` with `cfg`, at the reference's analysis ray count,
@@ -208,6 +210,57 @@ impl Canvas {
         self.sync_ghosts_from_profile();
         self.bump();
         Ok(())
+    }
+
+    /// The temperature the scene's coatings are at, °C, or `NaN` when none is
+    /// declared (every film at its reference). Read only under
+    /// `temperature: Declared` (CF-10).
+    #[wasm_bindgen(js_name = sceneTemperatureC)]
+    pub fn scene_temperature_c(&self) -> f64 {
+        self.scene3.as_ref().and_then(|s| s.temperature_c).unwrap_or(f64::NAN)
+    }
+
+    /// Declare the scene's temperature, °C, or clear it with `NaN`. False
+    /// with no scene, or for a temperature at or below absolute zero.
+    #[wasm_bindgen(js_name = setSceneTemperature)]
+    pub fn set_scene_temperature(&mut self, c: f64) -> bool {
+        if c.is_finite() && c <= -273.15 || c.is_infinite() {
+            return false;
+        }
+        let Some(scene) = self.scene3.as_mut() else {
+            return false;
+        };
+        scene.temperature_c = (!c.is_nan()).then_some(c);
+        self.bump();
+        true
+    }
+
+    /// Object `id`'s own temperature, °C, or `NaN` when it takes the scene's.
+    #[wasm_bindgen(js_name = objectTemperatureC)]
+    pub fn object_temperature_c(&self, id: f64) -> f64 {
+        self.scene3
+            .as_ref()
+            .and_then(|s| s.object_temperatures.iter().find(|t| t.object.0 == id as u64).map(|t| t.temperature_c))
+            .unwrap_or(f64::NAN)
+    }
+
+    /// Give object `id` a temperature of its own, °C, or clear it with `NaN`.
+    /// False for an id that is not a body or surface, or a temperature at or
+    /// below absolute zero.
+    #[wasm_bindgen(js_name = setObjectTemperature)]
+    pub fn set_object_temperature(&mut self, id: f64, c: f64) -> bool {
+        if c.is_finite() && c <= -273.15 || c.is_infinite() {
+            return false;
+        }
+        let Some(scene) = self.scene3.as_mut() else {
+            return false;
+        };
+        if scene.set_object_temperature(id as u64, (!c.is_nan()).then_some(c)) {
+            self.bump();
+            true
+        } else {
+            false
+        }
     }
 
     /// The scene's profile as a short hash, for the keys of anything that

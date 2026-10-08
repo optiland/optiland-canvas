@@ -275,6 +275,31 @@ pub struct FilmMaterial {
     /// 0.55 µm.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nominal: Option<NominalIndex>,
+    /// The first-order temperature dependence, when a source gives one; used
+    /// only under `temperature: Declared` (CF-10). Absent means no
+    /// thermo-optic data: the material is held at its reference index.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thermal: Option<ThermoOptic>,
+}
+
+/// A material's first-order thermo-optic model: at temperature `T`,
+/// `n(λ, T) = n(λ) + (dn/dT)(T − T_ref)` and a layer's thickness is
+/// `d (1 + α (T − T_ref))`. Declared, not validated: one slope and one
+/// expansion coefficient, both taken as constant over wavelength and
+/// temperature.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ThermoOptic {
+    pub dn_dt_per_k: f64,
+    pub cte_per_k: f64,
+    pub t_ref_c: f64,
+}
+
+impl ThermoOptic {
+    /// The index shift and the thickness factor at `t_c`.
+    pub fn at(&self, t_c: f64) -> (f64, f64) {
+        let dt = t_c - self.t_ref_c;
+        (self.dn_dt_per_k * dt, 1.0 + self.cte_per_k * dt)
+    }
 }
 
 /// A dispersion formula and the wavelengths it is valid over.
@@ -376,6 +401,7 @@ impl FilmMaterial {
             form: FilmForm::Bulk,
             provenance: None,
             nominal: None,
+            thermal: None,
         }
     }
 
@@ -1076,12 +1102,29 @@ pub struct FilmContext {
     /// face by the incoherent transfer-matrix method, and has a Mueller
     /// matrix; `PhaseFree` keeps the plate's own series.
     pub plate: crate::fidelity::PlateModel,
+    /// The temperature the films are at, °C, under `temperature: Declared`
+    /// with a temperature set; `None` holds every film at its reference.
+    pub temperature_c: Option<f64>,
 }
 
 impl FilmContext {
     /// The solver's part of a fidelity profile.
     pub fn from_profile(p: &crate::fidelity::FidelityProfile) -> Self {
-        Self { numerics: p.numerics, materials: p.film_materials, plate: p.plate_model }
+        Self { numerics: p.numerics, materials: p.film_materials, plate: p.plate_model, temperature_c: None }
+    }
+
+    /// The same context with the films at `temperature_c`, when the profile
+    /// declares temperature; unchanged under `temperature: Off`.
+    pub fn at_temperature(self, p: &crate::fidelity::FidelityProfile, temperature_c: Option<f64>) -> Self {
+        match p.temperature {
+            crate::fidelity::Temperature::Declared => Self { temperature_c, ..self },
+            crate::fidelity::Temperature::Off => self,
+        }
+    }
+
+    /// The index shift and thickness factor `m` has here, if it moves.
+    fn thermal(&self, m: &FilmMaterial) -> Option<(f64, f64)> {
+        Some(m.thermal?.at(self.temperature_c?))
     }
 
     pub fn strict(&self) -> bool {
@@ -1114,7 +1157,10 @@ fn sample_index(
     notes: &mut FilmNotes,
 ) -> Result<Cx, FilmError> {
     if ctx.materials == crate::fidelity::FilmMaterials::Nominal {
-        let n = m.nominal_index();
+        let mut n = m.nominal_index();
+        if let Some((dn, _)) = ctx.thermal(m) {
+            n.re += dn;
+        }
         if !n.is_finite() || n.re <= 0.0 || (ctx.strict() && n.im < 0.0) {
             return Err(FilmError::NonPhysicalIndex { layer });
         }
@@ -1124,7 +1170,10 @@ fn sample_index(
     if !covered && ctx.strict() {
         return Err(FilmError::OutOfTable { layer, lambda_um });
     }
-    let n = m.index_at(lambda_um).ok_or(FilmError::OutOfTable { layer, lambda_um })?;
+    let mut n = m.index_at(lambda_um).ok_or(FilmError::OutOfTable { layer, lambda_um })?;
+    if let Some((dn, _)) = ctx.thermal(m) {
+        n.re += dn;
+    }
     if !covered {
         notes.clamped.push(layer);
     }
@@ -1147,7 +1196,11 @@ fn sample_layers(
         if !l.thickness_nm.is_finite() || l.thickness_nm < 0.0 {
             return Err(FilmError::NonPhysicalIndex { layer: i });
         }
-        layers.push((n, l.thickness_nm));
+        let d = match ctx.thermal(&l.material) {
+            Some((_, grow)) => l.thickness_nm * grow,
+            None => l.thickness_nm,
+        };
+        layers.push((n, d));
     }
     Ok(layers)
 }

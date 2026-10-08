@@ -1917,6 +1917,7 @@ fn interact_body(
         flux_at,
         opl_at,
         min_flux,
+        film_temperature(scene, cfg, b.common.id.0),
     );
 }
 
@@ -2461,7 +2462,17 @@ fn interact_surface(
         flux_at,
         opl_at,
         min_flux,
+        film_temperature(scene, cfg, s.common.id.0),
     );
+}
+
+/// The temperature object `id`'s films are at under `temperature: Declared`;
+/// `None` under `Off`, where the scene's temperature is never read (CF-10).
+fn film_temperature(scene: &Scene3, cfg: &TraceConfig3, id: u64) -> Option<f64> {
+    match cfg.fidelity.temperature {
+        oc_core::fidelity::Temperature::Declared => scene.film_temperature_c(id),
+        oc_core::fidelity::Temperature::Off => None,
+    }
 }
 
 /// Apply a [`SurfaceResponse`] at a point, splitting deterministic branches and
@@ -2482,6 +2493,7 @@ fn apply_response(
     flux_at: f64,
     opl_at: f64,
     min_flux: f64,
+    temperature_c: Option<f64>,
 ) {
     let cos_i = -n_oppose.dot(w.ray.dir).clamp(-1.0, 1.0);
     let sample = |s: &oc_core::scene3::SpectralScalar| s.sample(w.lambda);
@@ -2721,7 +2733,20 @@ fn apply_response(
             } else {
                 (w.lambda, cos_i)
             };
-            let ctx = oc_core::thinfilm::FilmContext::from_profile(&cfg.fidelity);
+            let ctx = oc_core::thinfilm::FilmContext::from_profile(&cfg.fidelity).at_temperature(&cfg.fidelity, temperature_c);
+            if cfg.fidelity.temperature == oc_core::fidelity::Temperature::Declared {
+                match temperature_c {
+                    None => r.report.note_approx(
+                        PhysicsFeature::ThinFilmCoating,
+                        "temperature declared but none is set: films at their reference temperature",
+                    ),
+                    Some(_) if coating.layers.iter().any(|l| l.material.thermal.is_none()) => r.report.note_approx(
+                        PhysicsFeature::ThinFilmCoating,
+                        "a film with no thermo-optic data is held at its reference index",
+                    ),
+                    Some(_) => {}
+                }
+            }
             let rt = oc_core::thinfilm::coating_eval(coating, n1, n2, lambda, cos_i, &ctx);
             let (refl, tr) = match &rt {
                 Ok((v, notes)) => {

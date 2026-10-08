@@ -74,4 +74,24 @@ test.describe("fidelity", () => {
     await expect(page.locator("#fidCheckOut")).toContainText("Fast against Reference");
     await expect(page.locator("#fidPreset")).toHaveValue("Fast");
   });
+
+  test("a scene temperature lets Reference declare it, and the stamp says declared, not validated", async ({ page }) => {
+    await page.goto("/?debug");
+    await expect(page.locator("#stat")).toContainText("segs");
+    await page.locator("#fidSummary").click();
+    // No temperature: Reference leaves films at their reference.
+    await page.locator("#fidPreset").selectOption("Reference");
+    await expect(page.locator("#fid-temperature")).toHaveValue("Off");
+    await page.locator("#fidTemp").fill("70");
+    await page.locator("#fidTemp").dispatchEvent("change");
+    await page.locator("#fidPreset").selectOption("Standard");
+    await page.locator("#fidPreset").selectOption("Reference");
+    await expect(page.locator("#fid-temperature")).toHaveValue("Declared");
+    await expect(page.locator("#dockStamp")).toContainText("temperature declared, not validated");
+    expect(await page.evaluate(() => (window as any).__ocDebug.scene.sceneTemperatureC())).toBe(70);
+    // Cleared, it is gone from the document.
+    await page.locator("#fidTemp").fill("");
+    await page.locator("#fidTemp").dispatchEvent("change");
+    expect(await page.evaluate(() => (window as any).__ocDebug.scene.sceneTemperatureC())).toBeNaN();
+  });
 });

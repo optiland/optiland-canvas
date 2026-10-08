@@ -149,6 +149,24 @@ high and matched films by catalogue key (`"magnesium_fluoride_bulk"`, ...),
 direct). The layers are what the transfer matrix reads; the design is what the
 editor re-solves from when the glass changes.
 
+## Temperature
+
+```json
+"temperature_c": 45.0,
+"object_temperatures": [ { "object": 12, "temperature_c": 80.0 } ]
+```
+
+The temperature the scene's coatings are at, °C, and objects at one of their
+own. Read only under `temperature: Declared`; absent, every film is at its
+reference temperature. A film material may carry a first-order model:
+
+```json
+"thermal": { "dn_dt_per_k": 4.7e-5, "cte_per_k": 5.0e-6, "t_ref_c": 20.0 }
+```
+
+`n(λ, T) = n(λ) + dn/dT (T − T_ref)` and the layer is `d (1 + α (T − T_ref))`
+thick. No built-in catalogue entry carries one: the database gives none.
+
 ## Measured tables
 
 A surface response may be a table of measured or supplied R and T over
@@ -210,3 +228,4 @@ absorbed there. Lit from its film side only.
 | an `EnhancedMetal` design | no design record, layers kept | yes |
 | `adapt` on any other design | dropped | yes |
 | `MeasuredTable` | `ExplicitRt` of its unpolarized R and T at its first angle, refusing outside its wavelengths | yes |
+| `temperature_c`, `object_temperatures`, a material's `thermal` | dropped | yes |

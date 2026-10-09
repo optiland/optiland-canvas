@@ -1110,10 +1110,7 @@ fn revolve_hit(rev: &GpuRevolve, o: Vec3, d: Vec3, tmin: f32) -> Option<(f32, Ve
     // An indexed (many-faced) body passes over the faces whose radii the ray
     // never reaches inside its slab.
     let reach = match &rev.index {
-        Some(ix) => match ray_radii(ix, o, d, tmin) {
-            Some(r) => Some(r),
-            None => return None,
-        },
+        Some(ix) => Some(ray_radii(ix, o, d, tmin)?),
         None => None,
     };
     for (fi, face) in rev.faces.iter().enumerate() {

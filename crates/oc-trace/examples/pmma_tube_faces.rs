@@ -38,11 +38,11 @@ fn wall(outer: &str, pmma: &oc_core::material::Glass) -> Coating {
         interpolation: Interpolation::Linear,
         out_of_range: OutOfRangePolicy::Clamp,
     };
-    let film = FilmMaterial {
-        name: "PMMA".into(),
-        n: table(lambda_um.iter().map(|&l| pmma.index(l)).collect()),
-        k: table(lambda_um.iter().zip(&alpha_per_mm).map(|(&l, &a)| a * l * 1e-3 / (4.0 * std::f64::consts::PI)).collect()),
-    };
+    let film = FilmMaterial::scalars(
+        "PMMA",
+        table(lambda_um.iter().map(|&l| pmma.index(l)).collect()),
+        table(lambda_um.iter().zip(&alpha_per_mm).map(|(&l, &a)| a * l * 1e-3 / (4.0 * std::f64::consts::PI)).collect()),
+    );
     let layers = match outer {
         "bare" => Vec::new(),
         "silver" => vec![FilmLayer::new(materials::silver(), 150.0)],
@@ -81,6 +81,7 @@ fn main() {
                 periods: 1,
                 n_high: 2.35,
                 n_low: 1.38,
+                adapt: None,
             },
             1.0,
             pmma.index(0.55),

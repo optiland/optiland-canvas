@@ -19,8 +19,9 @@ Typical use::
 The pure-format helpers (``scene_to_seq``, ``seq_to_scene``, ``validate``) work
 without Optiland installed; ``to_optic`` / ``from_optic`` require it.
 
-Every function that takes a scene reads version 1 and version 2 documents (the
-browser saves version 2). A document that cannot be read raises one of three
+Every function that takes a scene reads version 1, 2 and 3 documents (the
+browser saves version 3, which adds the film catalogue and the fidelity
+profile to version 2). A document that cannot be read raises one of three
 errors, all ``ValueError`` subclasses under :class:`OcanvasError`:
 
 - :class:`NotADocumentError`: not JSON, or not an ``.ocanvas`` document;
@@ -68,7 +69,7 @@ __all__ = [
     "seq_to_scene3",
 ]
 
-#: The version :func:`seq_to_scene` writes. The browser writes version 2.
+#: The version :func:`seq_to_scene` writes. The browser writes version 3.
 OCANVAS_VERSION: int = _native.OCANVAS_VERSION
 OCANVAS_FORMAT: str = _native.OCANVAS_FORMAT
 #: Every document version this build reads.
@@ -99,7 +100,7 @@ def scene_to_seq(
     ``stop`` is the declared aperture stop's surface index, or ``None`` when
     nothing declares one.
 
-    A version 2 scene exports the path from ``source_id`` to ``detector_id``,
+    A version 2 or 3 scene exports the path from ``source_id`` to ``detector_id``,
     in the order its axial ray meets the surfaces. Leave both out for a scene
     with one declared path, or one source and one area detector. Raises
     :class:`NotExportableError` with every reason when the path has content a
@@ -112,7 +113,7 @@ def scene_to_seq(
 
 def seq_to_scene(seq: dict | str) -> str:
     """Version 1 ``.ocanvas`` JSON rebuilt from a sequential-prescription
-    dict/JSON. :func:`seq_to_scene3` builds the version 2 scene."""
+    dict/JSON. :func:`seq_to_scene3` builds the version 3 scene."""
     seq_json = seq if isinstance(seq, str) else json.dumps(seq)
     return _native.seq_to_scene(seq_json)
 
@@ -331,7 +332,7 @@ def from_optic(
 
 
 def seq_to_scene3(seq: dict | str, *, rays_per_field: int = 64, pixels: int = 64):
-    """A version 2 ``.ocanvas`` scene built from a prescription, and its notes.
+    """A version 3 ``.ocanvas`` scene built from a prescription, and its notes.
 
     Returns ``(scene_json, notes)``: the notes are the prescription's own and
     the builder's, what the scene holds only approximately. Raises

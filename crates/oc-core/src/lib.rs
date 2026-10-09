@@ -26,6 +26,9 @@
 #[cfg(feature = "scene3")]
 pub mod build3;
 pub mod colorimetry;
+pub mod fidelity;
+#[cfg(feature = "scene3")]
+pub mod film_catalog;
 pub mod coordinates;
 #[cfg(feature = "scene3")]
 pub mod display_mesh;
@@ -48,6 +51,8 @@ pub mod material;
 #[cfg(feature = "scene3")]
 pub mod migrate_v1;
 #[cfg(feature = "scene3")]
+pub mod migrate_v2;
+#[cfg(feature = "scene3")]
 pub mod planar_reduce;
 #[cfg(feature = "scene3")]
 pub mod polarization;
@@ -64,6 +69,12 @@ pub mod seq_import;
 pub mod solar;
 #[cfg(feature = "scene3")]
 pub mod source3;
+#[cfg(feature = "scene3")]
+pub mod coating_edit;
+#[cfg(feature = "scene3")]
+pub mod response_table;
+#[cfg(feature = "scene3")]
+pub mod synthesis;
 #[cfg(feature = "scene3")]
 pub mod thinfilm;
 #[cfg(feature = "scene3")]

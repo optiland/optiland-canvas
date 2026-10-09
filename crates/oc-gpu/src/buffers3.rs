@@ -366,6 +366,12 @@ fn encode_spectral(s: &Spectral32, verts: &mut Vec<Vert3Buf>) -> Spectral3Buf {
     }
 }
 
+thread_local! {
+    /// The coating grids already written to `verts` during one pack, by the
+    /// address of their shared grid. Cleared at the start of each pack.
+    static GRIDS: std::cell::RefCell<Vec<(usize, Response3Buf)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Encode one side's response. A thin lens carries its normalized focal length
 /// in the `r` slot.
 fn encode_response(resp: &GpuResponse, verts: &mut Vec<Vert3Buf>) -> Response3Buf {
@@ -388,10 +394,18 @@ fn encode_response(resp: &GpuResponse, verts: &mut Vec<Vert3Buf>) -> Response3Bu
             let r = encode_spectral(eta, verts);
             (RESP_GRATING, r, encode_spectral(z0, verts), constant(*k))
         }
-        GpuResponse::CoatingGrid { lambdas, rt, .. } => {
-            // Both halves live in `verts`, which is already a list of pairs:
-            // the wavelength axis in the `t` slot, the grid itself in `r`. The
-            // grid is `COAT_ANGLES` rows of `t.tab_count` (R, T) pairs.
+        GpuResponse::CoatingGrid { lambdas, rt, rt_inside, .. } => {
+            // Every half lives in `verts`, which is already a list of pairs:
+            // the wavelength axis in the `t` slot, the grid itself in `r`, and
+            // the grid for a ray from inside the body, when it has its own, in
+            // `ar` (`tab_count` 0 when the outside grid serves both sides). A
+            // grid is `COAT_ANGLES` rows of `t.tab_count` (R, T) pairs. Faces
+            // that share a bake share its place in `verts`: a Fresnel lens's
+            // grooves all point at one grid.
+            let key = std::sync::Arc::as_ptr(rt) as usize;
+            if let Some(&(_, cached)) = GRIDS.with(|g| g.borrow().iter().find(|(k, _)| *k == key).copied()).as_ref() {
+                return Response3Buf { kind: RESP_COATING, flags, _pad: [0; 2], ..cached };
+            }
             let lam_start = verts.len() as u32;
             verts.extend(lambdas.iter().map(|l| [*l, 0.0]));
             let axis = Spectral3Buf {
@@ -408,7 +422,17 @@ fn encode_response(resp: &GpuResponse, verts: &mut Vec<Vert3Buf>) -> Response3Bu
                 tab_count: rt.len() as u32,
                 policy: POLICY_CLAMP,
             };
-            (RESP_COATING, grid, axis, zero)
+            let inside = match rt_inside {
+                Some(g) => {
+                    let start = verts.len() as u32;
+                    verts.extend(g.iter().copied());
+                    Spectral3Buf { value: 0.0, tab_start: start, tab_count: g.len() as u32, policy: POLICY_CLAMP }
+                }
+                None => zero,
+            };
+            let packed = Response3Buf { kind: RESP_COATING, flags, _pad: [0; 2], r: grid, t: axis, ar: inside };
+            GRIDS.with(|g| g.borrow_mut().push((key, packed)));
+            (RESP_COATING, grid, axis, inside)
         }
     };
     Response3Buf {
@@ -644,6 +668,8 @@ impl Gpu3Buffers {
     /// Flatten a compiled scene into upload buffers. `max_segs` is the per-ray
     /// segment budget; `max_depth` the interaction cap.
     pub fn from_scene(scene: &GpuScene3, max_depth: u32, max_segs: u32) -> Self {
+        // A grid's address names it only within this pack.
+        GRIDS.with(|g| g.borrow_mut().clear());
         let mut verts: Vec<Vert3Buf> = Vec::new();
         let mut faces: Vec<Face3Buf> = Vec::new();
 
@@ -681,6 +707,7 @@ impl Gpu3Buffers {
             scale: scene.norm.scale as f32,
             _pad: [0; 3],
         };
+        GRIDS.with(|g| g.borrow_mut().clear());
 
         Self {
             params,

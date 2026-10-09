@@ -161,6 +161,22 @@ pub struct Deposit3 {
     pub lambda_um: f64,
     /// W.
     pub flux: f64,
+    /// Which part of the object took it.
+    pub layer: DepositLayer,
+}
+
+/// Which part of an object a deposit is in (coating-fidelity spec CF-04).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DepositLayer {
+    /// The face as a whole: a stop's block, a black face, or a coating's
+    /// absorption under `layer_absorption: PerFace`.
+    Face,
+    /// One layer of a coating, counted from 0 in the order the coating is
+    /// written, under `layer_absorption: PerLayer`.
+    Film(u16),
+    /// The bulk: a body's absorption along a path, a plate's slab, or an
+    /// opaque substrate.
+    Bulk,
 }
 
 /// One row of [`TraceResult3::objects`].
@@ -881,6 +897,7 @@ pub enum PhysicsFeature {
     Mirror,
     ExplicitRt,
     ThinFilmCoating,
+    MeasuredTable,
     ThinLens,
     Grating,
     Polarizer,
@@ -915,6 +932,9 @@ pub enum CapabilityIssue {
     },
     UnsupportedSurfaceResponse {
         surface: SurfaceRef,
+        /// Why, when the response could say (a coating's `FilmError`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     UnsupportedSourceDistribution {
         source: SourceId,
@@ -956,6 +976,10 @@ pub struct CapabilityReport {
     pub exact: Vec<PhysicsFeature>,
     pub approximated: Vec<Approximation>,
     pub rejected: Vec<CapabilityIssue>,
+    /// The profile the trace ran under. Set when a trace finishes; a report
+    /// assembled by hand may leave it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fidelity: Option<oc_core::fidelity::FidelityStamp>,
 }
 
 impl CapabilityReport {
@@ -1021,6 +1045,9 @@ impl CapabilityReport {
 /// The result of a full 3D trace (§9.9).
 #[derive(Debug, Clone)]
 pub struct TraceResult3 {
+    /// The profile these numbers were computed under (coating-fidelity spec
+    /// §5.3). Results of two profiles are never merged without saying so.
+    pub fidelity: oc_core::fidelity::FidelityStamp,
     /// The scene revision that produced these numbers, so a stale result can be
     /// discarded rather than shown (§3.3). The tracer copies it from the config;
     /// the caller that owns the scene sets it.

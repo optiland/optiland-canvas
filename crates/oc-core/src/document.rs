@@ -21,10 +21,10 @@
 
 use crate::migrate_v1::{migrate_v1_to_v2, MigrationReport};
 use crate::scene::{Scene, OCANVAS_FORMAT};
-use crate::scene3::{Scene3, SceneError, OCANVAS_V2_VERSION};
+use crate::scene3::{Scene3, SceneError, OCANVAS_V2_VERSION, OCANVAS_V3_VERSION};
 
 /// The document versions this build reads.
-pub const READABLE_VERSIONS: [u32; 2] = [1, OCANVAS_V2_VERSION];
+pub const READABLE_VERSIONS: [u32; 3] = [1, OCANVAS_V2_VERSION, OCANVAS_V3_VERSION];
 
 /// Why a document could not be read. See the module docs.
 #[derive(Debug, Clone, PartialEq)]
@@ -60,7 +60,9 @@ impl std::error::Error for DocumentError {}
 #[derive(Debug, Clone)]
 pub enum Document {
     V1(Scene),
+    /// A v2 document. Held migrated to v3 in memory, and written back as v2.
     V2(Scene3),
+    V3(Scene3),
 }
 
 /// Read a document of any version this build supports.
@@ -104,8 +106,8 @@ pub fn read_document(json: &str) -> Result<Document, DocumentError> {
         1 => Scene::from_json(json)
             .map(Document::V1)
             .map_err(|e| DocumentError::InvalidScene(e.to_string())),
-        OCANVAS_V2_VERSION => Scene3::from_json(json)
-            .map(Document::V2)
+        OCANVAS_V2_VERSION | OCANVAS_V3_VERSION => Scene3::from_json(json)
+            .map(|s| if version == OCANVAS_V2_VERSION { Document::V2(s) } else { Document::V3(s) })
             .map_err(|e| match e {
                 SceneError::UnsupportedVersion { found } => {
                     DocumentError::UnsupportedVersion { found }
@@ -125,6 +127,7 @@ impl Document {
         match self {
             Self::V1(_) => 1,
             Self::V2(_) => OCANVAS_V2_VERSION,
+            Self::V3(_) => OCANVAS_V3_VERSION,
         }
     }
 
@@ -133,7 +136,8 @@ impl Document {
     pub fn to_json(&self) -> String {
         match self {
             Self::V1(s) => s.to_json(),
-            Self::V2(s) => s.to_json(),
+            Self::V2(s) => s.to_json_v2().0,
+            Self::V3(s) => s.to_json(),
         }
     }
 
@@ -141,7 +145,7 @@ impl Document {
     /// the migration, with the migration's report.
     pub fn into_scene3(self) -> Result<(Scene3, Option<MigrationReport>), DocumentError> {
         match self {
-            Self::V2(s) => Ok((s, None)),
+            Self::V2(s) | Self::V3(s) => Ok((s, None)),
             Self::V1(s) => migrate_v1_to_v2(&s)
                 .map(|(s3, report)| (s3, Some(report)))
                 .map_err(|e| DocumentError::InvalidScene(e.to_string())),

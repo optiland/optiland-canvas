@@ -61,6 +61,18 @@ const FACE_COLOR = ["#7fd6ff", "#ffb46b"];
 /** The wavelength a lens coating here is designed at: the middle of the
  *  visible, which is where a general-purpose AR coating is centred. */
 const AR_LAMBDA_NM = 550;
+
+/** What the faces line calls each coating the segments offer. */
+const COAT_NAMES = {
+  "ar-1": "AR ×1",
+  "ar-matched": "AR ×1 fit",
+  "ar-v": "V-coat",
+  "ar-bbar": "AR ×3 fit",
+  "ar-band": "band AR",
+  "ar-3": "AR ×3 nominal",
+} as const;
+type CoatKind = keyof typeof COAT_NAMES;
+const offered = (v: string): v is CoatKind => v in COAT_NAMES;
 const FACE_NAME = ["front", "back"];
 
 type Mode = "sphere" | "asphere";
@@ -177,12 +189,32 @@ export function createLensEditor(ctx: EditorContext, objectOf: () => SceneObject
       {
         value: "ar-1",
         text: "AR ×1",
-        title: "a single quarter wave of magnesium fluoride, the classic single-layer AR: about 1.3% here, over a wide band",
+        title: "a single quarter wave of magnesium fluoride (n 1.38), the classic single-layer AR: about 1.3% on crown, over a wide band",
+      },
+      {
+        value: "ar-matched",
+        text: "×1 fit",
+        title: "one quarter wave of the catalogue film nearest the ideal index for this glass; re-solved when the glass changes",
+      },
+      {
+        value: "ar-v",
+        text: "V",
+        title: "a V-coat: two layers with an exact null at the design wavelength, solved for this glass",
+      },
+      {
+        value: "ar-bbar",
+        text: "×3 fit",
+        title: "quarter-half-quarter with the inner layer matched to this glass, from real (dispersive) films; re-solved when the glass changes",
+      },
+      {
+        value: "ar-band",
+        text: "band",
+        title: "a broadband AR refined over 400 to 700 nm, never worse than the single fitted layer",
       },
       {
         value: "ar-3",
-        text: "AR ×3",
-        title: "quarter-half-quarter, the broadband three-layer AR: lower again and flatter across the visible",
+        text: "×3 nominal",
+        title: "nominal, not adapted: the old quarter-half-quarter of constant indices; it ignores the glass, and on dense flint it reflects more than one MgF2 layer",
       },
     ],
     (v) => setCoating(v),
@@ -219,9 +251,8 @@ export function createLensEditor(ctx: EditorContext, objectOf: () => SceneObject
     // Anything the segments do not offer (a dichroic's stack, say) selects
     // nothing rather than pretending to be "bare".
     const on = f === 0 ? c.front : c.back;
-    coatPick.set(on === "ar-1" || on === "ar-3" ? on : on ? null : "none");
-    const coatName = (v: string | null) =>
-      v === "ar-1" ? "AR ×1" : v === "ar-3" ? "AR ×3" : v ? v : "bare";
+    coatPick.set(on ? (offered(on) ? on : null) : "none");
+    const coatName = (v: string | null) => (v ? (offered(v) ? COAT_NAMES[v] : v) : "bare");
     ctx.read.innerHTML =
       `n<sub>d</sub> <b>${fmt(shape.nd, 4)}</b> · EFL <b>${fmt(shape.efl, 2)}</b> mm · ` +
       `BFL <b>${fmt(shape.bfl, 2)}</b> mm · edge <b>${fmt(shape.edge, 2)}</b> mm${edgeWarn}` +

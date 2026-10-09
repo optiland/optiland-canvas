@@ -103,7 +103,7 @@ fn scene_to_seq(
             }
             Ok(scene.to_seq().to_json())
         }
-        Document::V2(scene) => {
+        Document::V2(scene) | Document::V3(scene) => {
             let (source, detector) = match (source_id, detector_id) {
                 (Some(s), Some(d)) => (oc_core::id::SourceId(s), oc_core::id::DetectorId(d)),
                 (None, None) => oc_trace::default_path(&scene).map_err(export_err)?,
@@ -223,7 +223,9 @@ fn scene3_sequence_for_intent(
 
 /// Evaluate a thin-film stack, for cross-checking against `optiland.thin_film`.
 ///
-/// `stack_json` is a serialized `oc_core::thinfilm::Coating`. Returns JSON
+/// `stack_json` is a serialized `oc_core::thinfilm::Coating`. `n_far` is the
+/// medium behind the stack, which only a `Medium`-backed coating reads; it
+/// defaults to `n_incident`, a zero-thickness surface in one medium. Returns JSON
 /// `{"rs": [...], "rp": [...], "ts": [...], "tp": [...]}`, one entry per
 /// `(wavelength, angle)` pair, both flattened row-major over wavelengths then
 /// angles. Raises `ValueError` if the stack does not parse or a layer's optical
@@ -233,26 +235,28 @@ fn scene3_sequence_for_intent(
 /// Optiland evaluates them in Python, and the only way "they agree" means
 /// anything is if something runs both and subtracts.
 #[pyfunction]
+#[pyo3(signature = (stack_json, lambda_um, aoi_deg, n_incident, n_far=None))]
 fn thinfilm_rt(
     stack_json: &str,
     lambda_um: Vec<f64>,
     aoi_deg: Vec<f64>,
     n_incident: f64,
+    n_far: Option<f64>,
 ) -> PyResult<String> {
+    let n_far = n_far.unwrap_or(n_incident);
     let coating: oc_core::thinfilm::Coating =
         serde_json::from_str(stack_json).map_err(to_py_err)?;
     let mut cols: [Vec<f64>; 4] = Default::default();
     for &nm in &lambda_um {
         for &deg in &aoi_deg {
-            let rt = oc_core::thinfilm::coating_rt(
+            let rt = oc_core::thinfilm::coating_rt_at(
                 &coating,
                 n_incident,
+                n_far,
                 nm,
                 deg.to_radians().cos(),
             )
-            .ok_or_else(|| {
-                PyValueError::new_err(format!("no optical constants at {nm} um"))
-            })?;
+            .map_err(|e| PyValueError::new_err(format!("at {nm} um, {deg} deg: {e}")))?;
             cols[0].push(rt.r_s);
             cols[1].push(rt.r_p);
             cols[2].push(rt.t_s);
@@ -279,7 +283,9 @@ fn thinfilm_rt(
 ///
 /// Returns JSON with eight arrays: `rs_re`, `rs_im`, `rp_re`, `rp_im` and the
 /// same for `ts`/`tp`, flattened the same way as [`thinfilm_rt`], plus `scale`,
-/// the factor turning `|t|²` into a transmittance.
+/// the factor turning `|t|²` into a transmittance, and `psi`, `delta` (the
+/// ellipsometric angles, `FilmAmp::ellipsometric`) and `t_retardance`
+/// (`arg t_p − arg t_s`), radians.
 ///
 /// These are in the **kernel's ray frame** (see `oc_core::polarization`), not
 /// Macleod's: `r_p` carries the opposite sign, `t_p` is the whole field rather
@@ -296,7 +302,7 @@ fn thinfilm_amplitudes(
 ) -> PyResult<String> {
     let coating: oc_core::thinfilm::Coating =
         serde_json::from_str(stack_json).map_err(to_py_err)?;
-    let mut cols: [Vec<f64>; 9] = Default::default();
+    let mut cols: [Vec<f64>; 12] = Default::default();
     for &nm in &lambda_um {
         for &deg in &aoi_deg {
             let a = oc_core::thinfilm::coating_amp_at(
@@ -306,12 +312,16 @@ fn thinfilm_amplitudes(
                 nm,
                 deg.to_radians().cos(),
             )
-            .ok_or_else(|| PyValueError::new_err(format!("no amplitudes at {nm} um, {deg} deg")))?;
+            .map_err(|e| PyValueError::new_err(format!("at {nm} um, {deg} deg: {e}")))?;
             for (i, z) in [a.r_s, a.r_p, a.t_s, a.t_p].into_iter().enumerate() {
                 cols[2 * i].push(z.re);
                 cols[2 * i + 1].push(z.im);
             }
             cols[8].push(a.t_power_scale);
+            let (psi, delta) = a.ellipsometric();
+            cols[9].push(psi);
+            cols[10].push(delta);
+            cols[11].push(a.transmission_retardance());
         }
     }
     let arr = |v: &Vec<f64>| {
@@ -321,7 +331,8 @@ fn thinfilm_amplitudes(
             .join(",")
     };
     let names = [
-        "rs_re", "rs_im", "rp_re", "rp_im", "ts_re", "ts_im", "tp_re", "tp_im", "scale",
+        "rs_re", "rs_im", "rp_re", "rp_im", "ts_re", "ts_im", "tp_re", "tp_im", "scale", "psi", "delta",
+        "t_retardance",
     ];
     let body = names
         .iter()
@@ -330,6 +341,118 @@ fn thinfilm_amplitudes(
         .collect::<Vec<_>>()
         .join(",");
     Ok(format!("{{{body}}}"))
+}
+
+/// Each layer's complex index `n + ik` at each wavelength, as the kernel
+/// samples it, for feeding the oracles.
+///
+/// Returns JSON `{"n_re": [[...]], "n_im": [[...]], "sub": [[re, im], ...]}`,
+/// one row per wavelength and one column per layer in the **written** order;
+/// `sub` is the substrate's index per wavelength for a `Plate` or `Opaque`
+/// backing, and `null` for `Medium`, whose far side is the scene's. The parity suites hand
+/// these numbers to `tmm` and Optiland unchanged, so that a disagreement is the
+/// solver's and never a second implementation of the material lookup.
+#[pyfunction]
+fn thinfilm_indices(stack_json: &str, lambda_um: Vec<f64>) -> PyResult<String> {
+    let coating: oc_core::thinfilm::Coating =
+        serde_json::from_str(stack_json).map_err(to_py_err)?;
+    let mut re_rows = Vec::with_capacity(lambda_um.len());
+    let mut im_rows = Vec::with_capacity(lambda_um.len());
+    let substrate = match &coating.backing {
+        oc_core::thinfilm::CoatingBacking::Medium => None,
+        oc_core::thinfilm::CoatingBacking::Plate { substrate, .. }
+        | oc_core::thinfilm::CoatingBacking::Opaque { substrate } => Some(substrate),
+    };
+    let mut sub_rows = Vec::with_capacity(lambda_um.len());
+    for &um in &lambda_um {
+        if let Some(m) = substrate {
+            let n = m
+                .index_at(um)
+                .ok_or_else(|| PyValueError::new_err(format!("no optical constants for the substrate at {um} um")))?;
+            sub_rows.push(format!("[{},{}]", n.re, n.im));
+        }
+        let mut re = Vec::with_capacity(coating.layers.len());
+        let mut im = Vec::with_capacity(coating.layers.len());
+        for l in &coating.layers {
+            let n = l.material.index_at(um).ok_or_else(|| {
+                PyValueError::new_err(format!("no optical constants for {} at {um} um", l.material.name))
+            })?;
+            re.push(n.re.to_string());
+            im.push(n.im.to_string());
+        }
+        re_rows.push(format!("[{}]", re.join(",")));
+        im_rows.push(format!("[{}]", im.join(",")));
+    }
+    let sub = if substrate.is_some() { format!("[{}]", sub_rows.join(",")) } else { "null".to_string() };
+    Ok(format!(
+        "{{\"n_re\":[{}],\"n_im\":[{}],\"sub\":{}}}",
+        re_rows.join(","),
+        im_rows.join(","),
+        sub
+    ))
+}
+
+/// A coating's absorption by layer and substrate (coating-fidelity spec
+/// CF-04), for cross-checking against `tmm.absorp_in_each_layer`.
+///
+/// Returns JSON `{"a_s": [[...]], "a_p": [[...]], "sub_s": [...], "sub_p":
+/// [...], "rs": [...], ...}`: for each `(wavelength, angle)` pair, flattened
+/// as [`thinfilm_rt`] flattens them, the fraction of the incident power each
+/// layer absorbs (written order), what the substrate takes, and the powers.
+#[pyfunction]
+#[pyo3(signature = (stack_json, lambda_um, aoi_deg, n_incident, n_far=None, plate_incoherent=false))]
+fn thinfilm_absorption(
+    stack_json: &str,
+    lambda_um: Vec<f64>,
+    aoi_deg: Vec<f64>,
+    n_incident: f64,
+    n_far: Option<f64>,
+    plate_incoherent: bool,
+) -> PyResult<String> {
+    let coating: oc_core::thinfilm::Coating =
+        serde_json::from_str(stack_json).map_err(to_py_err)?;
+    let n_far = n_far.unwrap_or(n_incident);
+    let ctx = oc_core::thinfilm::FilmContext {
+        plate: if plate_incoherent {
+            oc_core::fidelity::PlateModel::Incoherent
+        } else {
+            oc_core::fidelity::PlateModel::PhaseFree
+        },
+        ..Default::default()
+    };
+    let (mut a_s, mut a_p, mut sub_s, mut sub_p) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut rs, mut rp, mut ts, mut tp) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for &um in &lambda_um {
+        for &deg in &aoi_deg {
+            let (p, _) = oc_core::thinfilm::coating_power_flow_eval(&coating, n_incident, n_far, um, deg.to_radians().cos(), &ctx)
+                .map_err(|e| PyValueError::new_err(format!("at {um} um, {deg} deg: {e}")))?;
+            a_s.push(p.a_layer_s.clone());
+            a_p.push(p.a_layer_p.clone());
+            sub_s.push(p.a_substrate_s);
+            sub_p.push(p.a_substrate_p);
+            rs.push(p.rt.r_s);
+            rp.push(p.rt.r_p);
+            ts.push(p.rt.t_s);
+            tp.push(p.rt.t_p);
+        }
+    }
+    serde_json::to_string(&serde_json::json!({
+        "a_s": a_s, "a_p": a_p, "sub_s": sub_s, "sub_p": sub_p,
+        "rs": rs, "rp": rp, "ts": ts, "tp": tp,
+    }))
+    .map_err(to_py_err)
+}
+
+/// The built-in film catalogue as JSON: `[{"key": ..., "material": {...}}]`,
+/// each material in the document's own form (curves, formula, form,
+/// provenance, nominal), for the parity suites and for building stacks.
+#[pyfunction]
+fn film_catalog_json() -> String {
+    let rows: Vec<String> = oc_core::film_catalog::builtin()
+        .into_iter()
+        .map(|(key, m)| format!("{{\"key\":\"{key}\",\"material\":{}}}", serde_json::to_string(&m).expect("serializes")))
+        .collect();
+    format!("[{}]", rows.join(","))
 }
 
 /// The `.ocanvas` version [`seq_to_scene`] writes. The browser writes the
@@ -372,6 +495,9 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(scene3_sequence_for_intent, m)?)?;
     m.add_function(wrap_pyfunction!(thinfilm_rt, m)?)?;
     m.add_function(wrap_pyfunction!(thinfilm_amplitudes, m)?)?;
+    m.add_function(wrap_pyfunction!(thinfilm_indices, m)?)?;
+    m.add_function(wrap_pyfunction!(film_catalog_json, m)?)?;
+    m.add_function(wrap_pyfunction!(thinfilm_absorption, m)?)?;
     m.add_function(wrap_pyfunction!(normalize, m)?)?;
     m.add_function(wrap_pyfunction!(validate, m)?)?;
     m.add_function(wrap_pyfunction!(format_version, m)?)?;

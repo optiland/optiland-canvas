@@ -16,6 +16,15 @@
 //!   cargo run --release -p oc-trace --features trace3 --example bench_throughput3
 //!   RAYON_NUM_THREADS=1 cargo run --release -p oc-trace --features trace3 \
 //!       --example bench_throughput3
+//!
+//! `-- --fidelity-table` instead measures what each fidelity switch costs
+//! (coating-fidelity spec §11) on the scenes in `examples/bench-scenes/`, and
+//! prints the table `docs/performance.md` carries; `--write-costs` also writes
+//! `web/public/fidelity-costs.json`, which the app's fidelity panel reads.
+//! `--write-scenes` rewrites the two small bench scenes. The heliostat light
+//! pipe is 12 MB, so it is not committed; write it with
+//!   cargo run --release -p oc-trace --features trace3 --example heliostat_dom_probes \
+//!       -- silver crates/oc-trace/examples/bench-scenes/heliostat-light-pipe.ocanvas
 
 use oc_core::{build3::SingletGeom, scene3::Scene3, Spectrum, Vec3, LAMBDA_D};
 use oc_trace::{trace_scene3, TraceConfig3};
@@ -50,7 +59,19 @@ fn build_scene(nrays: u32, ghosts: bool) -> Scene3 {
     scene
 }
 
+#[path = "shared/fidelity_bench.rs"]
+mod fidelity;
+
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--write-scenes") {
+        fidelity::write_scenes();
+        return;
+    }
+    if args.iter().any(|a| a == "--fidelity-table") {
+        fidelity::table(args.iter().any(|a| a == "--write-costs"));
+        return;
+    }
     let threads = std::env::var("RAYON_NUM_THREADS").unwrap_or_else(|_| "default".into());
     println!("# oc-trace THROUGHPUT (3D trace3 kernel, biconvex n=1.5, rayon threads={threads}, best of 3)");
     println!(

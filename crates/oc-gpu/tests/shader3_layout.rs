@@ -274,4 +274,10 @@ fn the_coating_grid_constants_agree() {
     let rhs = line.split('=').nth(1).expect("a value").trim().trim_end_matches(';');
     assert_eq!(rhs.trim(), format!("{}u", oc_gpu::scene3::COAT_ANGLES));
     assert_eq!(oc_gpu::buffers3::RESP_COATING, 5);
+    // The last baked angle, which both sides index the grid by.
+    let at = SRC.find("const COAT_THETA_MAX:").expect("COAT_THETA_MAX is missing from the shader");
+    let line = &SRC[at..SRC[at..].find('\n').map(|e| at + e).unwrap_or(SRC.len())];
+    let rhs: f32 = line.split('=').nth(1).expect("a value").trim().trim_end_matches(';').parse().unwrap();
+    assert_eq!(rhs, oc_gpu::scene3::COAT_THETA_MAX);
+    assert!((f64::from(rhs) - 0.999f64.sqrt().asin()).abs() < 1e-6);
 }

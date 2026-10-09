@@ -1,0 +1,6 @@
+# The oracle versions the frozen coating fixtures were generated with
+# (tests/data/coatings/*.json). Bumping one is a deliberate regeneration:
+#   python tests/gen_coating_fixtures.py && git diff tests/data/coatings
+tmm==0.2.0
+optiland==0.6.1
+mpmath==1.3.0

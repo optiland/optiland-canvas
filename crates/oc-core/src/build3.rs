@@ -676,6 +676,7 @@ impl Scene3 {
             periods,
             n_high,
             n_low,
+            adapt: None,
         }
         .sanitized()?;
         let coating = film_coating(design, n0, n0);
@@ -1245,6 +1246,11 @@ impl Scene3 {
                     }
                     None => return false,
                 }
+                // A hand edit makes the stack the user's: no longer re-solved
+                // for the glass (`crate::coating_edit`).
+                if let Some(d) = coating.design.as_mut() {
+                    d.adapt = None;
+                }
             }
         }
         touched
@@ -1289,7 +1295,15 @@ impl Scene3 {
             Some(d) => match d.sanitized() {
                 None => return false,
                 Some(d) => Some(SurfaceResponse::Coating {
-                    coating: film_coating(d, ambient, glass),
+                    coating: match d.adapt {
+                        // An adapted design is solved against the glass at its
+                        // own wavelength, not at the d line.
+                        Some(_) => {
+                            let (_, n_s) = self.coated_face_media(id, d.lambda_nm / 1000.0);
+                            film_coating(d, ambient, n_s)
+                        }
+                        None => film_coating(d, ambient, glass),
+                    },
                 }),
             },
         };
@@ -1313,6 +1327,61 @@ impl Scene3 {
             });
         }
         true
+    }
+
+    /// Put measured or supplied data on a surface (both sides) or on one face
+    /// of a revolved body (`face`), each side reading its own copy so a ray
+    /// from the side the data were not measured from is named (CF-09).
+    ///
+    /// The table is validated first. A table of a whole part cannot sit on a
+    /// body face, which would count the glass twice.
+    pub fn set_object_table(
+        &mut self,
+        id: u64,
+        face: Option<BodyFace>,
+        table: crate::response_table::AngularTable,
+    ) -> Result<(), String> {
+        use crate::response_table::{TableScope, TableSide};
+        table.validate()?;
+        let copy = |from| SurfaceResponse::MeasuredTable { table: Box::new(table.clone()), from };
+        let (front, back) = (copy(TableSide::Front), copy(TableSide::Back));
+        if self.set_surface_responses(id, front.clone(), back.clone()) {
+            return Ok(());
+        }
+        let face = face.ok_or("a body takes a table on a named face")?;
+        if table.scope == TableScope::FiniteAssembly {
+            return Err("a measured table of a whole part cannot sit on a body face: it already holds the substrate and its rear face".into());
+        }
+        let b = self.bodies.iter_mut().find(|b| b.common.id.0 == id).ok_or("no surface or body with that id")?;
+        let SolidGeometry3::Profile(solid) = &b.geometry else {
+            return Err("only a revolved body has named faces".into());
+        };
+        if solid.profile.edges.len() != 4 {
+            return Err("only a four-edge profile has a front and a back face".into());
+        }
+        let patch = solid.profile.edges[face.edge()].patch;
+        b.surface.overrides.retain(|o| o.patch != patch);
+        b.surface.overrides.push(PatchResponseOverride {
+            patch,
+            response: TwoSidedSurfaceResponse { from_outside: front, from_inside: back },
+        });
+        Ok(())
+    }
+
+    /// The measured table an object carries: a surface's front response, or
+    /// the first face of a body that has one.
+    pub fn object_table(&self, id: u64) -> Option<&crate::response_table::AngularTable> {
+        fn table(r: &SurfaceResponse) -> Option<&crate::response_table::AngularTable> {
+            match r {
+                SurfaceResponse::MeasuredTable { table, .. } => Some(table.as_ref()),
+                _ => None,
+            }
+        }
+        if let Some(s) = self.surfaces.iter().find(|s| s.common.id.0 == id) {
+            return table(&s.response_front).or_else(|| table(&s.response_back));
+        }
+        let b = self.bodies.iter().find(|b| b.common.id.0 == id)?;
+        b.surface.overrides.iter().find_map(|o| table(&o.response.from_outside))
     }
 
     /// The coating on one named face of a body, if that face carries one.
@@ -1391,10 +1460,16 @@ impl Scene3 {
             return self.set_surface_coating_design(id, design);
         }
         let ambient = self.env.ambient_index;
+        // An adapted design is solved against the body's own glass at the
+        // design wavelength; a fixed recipe keeps the plate glass it always had.
+        let n_s = match design.adapt {
+            Some(_) => self.coated_face_media(id, design.lambda_nm / 1000.0).1,
+            None => PLATE_ND,
+        };
         let Some(b) = self.bodies.iter_mut().find(|b| b.common.id.0 == id) else {
             return false;
         };
-        let coating = film_coating(design, ambient, PLATE_ND);
+        let coating = film_coating(design, ambient, n_s);
         let mut touched = false;
         for o in &mut b.surface.overrides {
             if matches!(o.response.from_outside, SurfaceResponse::Coating { .. }) {
@@ -1428,6 +1503,9 @@ impl Scene3 {
                             touched = true;
                         }
                         None => return false,
+                    }
+                    if let Some(d) = coating.design.as_mut() {
+                        d.adapt = None;
                     }
                 }
             }
@@ -2246,14 +2324,22 @@ impl Scene3 {
 
     /// Set a body's bulk glass to an Abbe point `(nd, vd)`. Returns false if `id`
     /// is not a body.
+    ///
+    /// A face coated with a substrate-adapted design is re-synthesized for the
+    /// new glass: the design is what was asked for, the layers follow from it.
+    /// A face with a fixed recipe keeps its layers.
     pub fn set_body_glass_abbe(&mut self, id: u64, nd: f64, vd: f64) -> bool {
         match self.bodies.iter_mut().find(|b| b.common.id.0 == id) {
-            Some(b) => {
-                b.material = Material::AbbePoint { nd, vd };
-                true
-            }
-            None => false,
+            Some(b) => b.material = Material::AbbePoint { nd, vd },
+            None => return false,
         }
+        for face in [BodyFace::Front, BodyFace::Back] {
+            let adapted = self.body_face_coating(id, face).and_then(|c| c.design).filter(|d| d.adapt.is_some());
+            if let Some(d) = adapted {
+                self.set_body_face_coating(id, face, Some(d));
+            }
+        }
+        true
     }
 
     /// Delete any object or source by id. Returns false if nothing matched.
@@ -2264,6 +2350,7 @@ impl Scene3 {
         self.apertures.retain(|a| a.common.id.0 != id);
         self.detectors.retain(|d| d.common.id.0 != id);
         self.sources.retain(|s| s.id.0 != id);
+        self.object_temperatures.retain(|t| t.object.0 != id);
         self.object_count() != before
     }
 
@@ -2443,8 +2530,9 @@ pub fn axial_aoi_deg(tilt_deg: f64) -> f64 {
 /// The short kind string for a surface response: `mirror`, `absorb`, `clear`
 /// (full transmission), `split` (constant reflectance and transmittance),
 /// `dichroic` (a [`DichroicSpec`] coating), `coated` (any other tabulated
-/// reflectance/transmittance), `film` (a real thin-film stack), `polarizer`,
-/// `retarder`, `refract`, or `thin-lens`.
+/// reflectance/transmittance), `film` (a real thin-film stack), `table` (a
+/// measured or supplied table with an angle axis), `polarizer`, `retarder`,
+/// `refract`, or `thin-lens`.
 pub fn response_kind(r: &SurfaceResponse) -> &'static str {
     match r {
         SurfaceResponse::Mirror { .. } => "mirror",
@@ -2467,6 +2555,7 @@ pub fn response_kind(r: &SurfaceResponse) -> &'static str {
             }
         }
         SurfaceResponse::Coating { .. } => "film",
+        SurfaceResponse::MeasuredTable { .. } => "table",
         SurfaceResponse::Polarizer { .. } => "polarizer",
         SurfaceResponse::Retarder { .. } => "retarder",
         SurfaceResponse::DielectricFresnel { .. } => "refract",

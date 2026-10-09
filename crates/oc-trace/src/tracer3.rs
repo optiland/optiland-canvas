@@ -98,6 +98,47 @@ pub struct TraceConfig3 {
     pub deposit_bodies: [usize; 2],
     /// Record where each stop or mask blocks light, too.
     pub deposit_apertures: bool,
+    /// Record what standalone coated surfaces absorb, too, not only bodies
+    /// (coating-fidelity spec CF-04).
+    pub deposit_surfaces: bool,
+    /// How much coating physics the trace pays for (coating-fidelity spec
+    /// §5). The default reproduces the kernel as it was before the profile
+    /// existed. `polarization` above is the older spelling of one switch and
+    /// stays as an alias: the trace is polarized only when both say so.
+    pub fidelity: oc_core::fidelity::FidelityProfile,
+}
+
+impl TraceConfig3 {
+    /// Is the trace polarized? The deprecated `polarization` flag and the
+    /// profile's `coating_model` must both say so.
+    pub fn polarized(&self) -> bool {
+        self.polarization && self.fidelity.polarized()
+    }
+
+    /// This config with a profile applied: the profile's ghost setting, when
+    /// it has one, replaces the config's own.
+    pub fn with_fidelity(mut self, p: oc_core::fidelity::FidelityProfile) -> Self {
+        self.fidelity = p;
+        if let Some(g) = p.ghosts {
+            self.ghosts = g > 0;
+            if g > 0 {
+                self.max_ghost_bounces = g;
+            }
+        }
+        self
+    }
+
+    /// The profile the trace actually runs under, the alias and the ghost
+    /// setting folded in: what its results are stamped with.
+    pub fn effective_profile(&self) -> oc_core::fidelity::FidelityProfile {
+        use oc_core::fidelity::CoatingModel;
+        let mut p = self.fidelity;
+        if !self.polarization && p.coating_model == CoatingModel::Polarized {
+            p.coating_model = CoatingModel::Unpolarized;
+        }
+        p.ghosts = Some(if self.ghosts { self.max_ghost_bounces } else { 0 });
+        p
+    }
 }
 
 impl Default for TraceConfig3 {
@@ -121,6 +162,8 @@ impl Default for TraceConfig3 {
             count_bodies: [0, 0],
             deposit_bodies: [0, 0],
             deposit_apertures: false,
+            deposit_surfaces: false,
+            fidelity: oc_core::fidelity::FidelityProfile::default(),
         }
     }
 }
@@ -372,8 +415,11 @@ impl Prepared {
 
 impl Local {
     fn finish(self, cfg: &TraceConfig3) -> TraceResult3 {
-        let r = self.result;
+        let mut r = self.result;
+        let fidelity = oc_core::fidelity::FidelityStamp::new(cfg.effective_profile());
+        r.report.fidelity = Some(fidelity.clone());
         TraceResult3 {
+            fidelity,
             revision: cfg.revision,
             segments: r.segments,
             segments_omitted: r.segments_omitted,
@@ -1071,6 +1117,9 @@ struct LocalResult {
     events: Vec<TraceEvent3>,
     objects: std::collections::BTreeMap<(ObjectRef3, bool), ObjectLedger3>,
     deposits: Vec<Deposit3>,
+    /// What the coating just met absorbed, layer by layer, for the deposits
+    /// of `after_interaction` (`layer_absorption: PerLayer`).
+    pending_layers: Vec<(DepositLayer, f64)>,
     next_path: u64,
 }
 
@@ -1089,6 +1138,7 @@ impl LocalResult {
             events: Vec::new(),
             objects: std::collections::BTreeMap::new(),
             deposits: Vec::new(),
+            pending_layers: Vec::new(),
             next_path: 0,
         }
     }
@@ -1427,7 +1477,7 @@ fn trace_one(
                     b.blocked += flux_at;
                 }
                 if cfg.deposit_apertures {
-                    r.deposits.push(Deposit3 { object: ObjectRef3::Aperture(ap), point: ev.point, lambda_um: w.lambda, flux: flux_at });
+                    r.deposits.push(Deposit3 { object: ObjectRef3::Aperture(ap), point: ev.point, lambda_um: w.lambda, flux: flux_at, layer: DepositLayer::Face });
                 }
                 r.report.note_exact(PhysicsFeature::Aperture);
                 push_event(
@@ -1487,11 +1537,29 @@ fn after_interaction(
     point: Vec3,
 ) {
     let counts = matches!(obj, ObjectRef3::Body(i, _) if (cfg.count_bodies[0]..cfg.count_bodies[1]).contains(&i));
-    // Absorbed at the face of a recorded body (a coating, a black face).
-    if let ObjectRef3::Body(i, _) = obj {
-        let took = r.ledger.absorbed_surface - before.absorbed_surface;
-        if took > 0.0 && (cfg.deposit_bodies[0]..cfg.deposit_bodies[1]).contains(&i) {
-            r.deposits.push(Deposit3 { object: obj, point, lambda_um: w.lambda, flux: took });
+    // Absorbed at the face of a recorded body or surface (a coating, a black
+    // face): one deposit for the face, or, under `layer_absorption:
+    // PerLayer`, one per coating layer and one for the substrate, which the
+    // coating left in `pending_layers`.
+    let wanted = match obj {
+        ObjectRef3::Body(i, _) => (cfg.deposit_bodies[0]..cfg.deposit_bodies[1]).contains(&i),
+        ObjectRef3::Surface(_) => cfg.deposit_surfaces,
+        _ => false,
+    };
+    let recorded = cfg.fidelity.layer_absorption != oc_core::fidelity::LayerAbsorption::Off;
+    let pending = std::mem::take(&mut r.pending_layers);
+    if wanted && recorded {
+        if pending.is_empty() {
+            let took = r.ledger.absorbed_surface - before.absorbed_surface;
+            if took > 0.0 {
+                r.deposits.push(Deposit3 { object: obj, point, lambda_um: w.lambda, flux: took, layer: DepositLayer::Face });
+            }
+        } else {
+            for (layer, flux) in pending {
+                if flux > 0.0 {
+                    r.deposits.push(Deposit3 { object: obj, point, lambda_um: w.lambda, flux, layer });
+                }
+            }
         }
     }
     for c in children.iter_mut() {
@@ -1527,7 +1595,7 @@ fn deposit_segment(r: &mut LocalResult, cfg: &TraceConfig3, w: &RayWork, alpha: 
         let (t0, t1) = (l * k as f64 / STEPS as f64, l * (k + 1) as f64 / STEPS as f64);
         let took = w.flux() * (beer_lambert(alpha, t0) - beer_lambert(alpha, t1));
         if took > 0.0 {
-            r.deposits.push(Deposit3 { object: w.from, point: w.ray.at(0.5 * (t0 + t1)), lambda_um: w.lambda, flux: took });
+            r.deposits.push(Deposit3 { object: w.from, point: w.ray.at(0.5 * (t0 + t1)), lambda_um: w.lambda, flux: took, layer: DepositLayer::Bulk });
         }
     }
 }
@@ -1849,6 +1917,7 @@ fn interact_body(
         flux_at,
         opl_at,
         min_flux,
+        film_temperature(scene, cfg, b.common.id.0),
     );
 }
 
@@ -1943,7 +2012,7 @@ fn interact_surface(
         if !f.is_finite() || f == 0.0 {
             r.report
                 .reject(CapabilityIssue::UnsupportedSurfaceResponse {
-                    surface: surface_ref,
+                    surface: surface_ref, reason: None
                 });
             r.ledger.numerical_loss += flux_at;
             r.terminations.record(TerminationReason::UnsupportedPhysics);
@@ -2014,7 +2083,7 @@ fn interact_surface(
         };
         let (Some((te_m, te_0)), Some((tm_m, tm_0))) = (te, tm_pair) else {
             r.report
-                .reject(CapabilityIssue::UnsupportedSurfaceResponse { surface: surface_ref });
+                .reject(CapabilityIssue::UnsupportedSurfaceResponse { surface: surface_ref, reason: None });
             r.ledger.numerical_loss += flux_at;
             r.terminations.record(TerminationReason::UnsupportedPhysics);
             push_event(r, cfg, w, point, opl_at, lens_interact(Vec::new()));
@@ -2049,7 +2118,7 @@ fn interact_surface(
                         oc_core::thinfilm::Cx::real(eta_tm.sqrt()),
                     );
                     let s_in = stokes.rotated(polarization::frame_angle(w.ray.dir, w.pol.x, a_in));
-                    let out = if cfg.polarization {
+                    let out = if cfg.polarized() {
                         m.apply(&s_in)
                     } else {
                         Stokes::unpolarized(m.unpolarized_gain() * flux_at)
@@ -2149,7 +2218,7 @@ fn interact_surface(
             .state_at(flux_at)
             .rotated(polarization::frame_angle(dir, w.pol.x, s_hat));
         let make = |m: &Mueller| -> Stokes {
-            if cfg.polarization {
+            if cfg.polarized() {
                 m.apply(&stokes_in)
             } else {
                 // Without a state to act on, all an element like this can do is
@@ -2209,7 +2278,7 @@ fn interact_surface(
             // and no meaningful transmission axis to apply.
             r.report
                 .reject(CapabilityIssue::UnsupportedSurfaceResponse {
-                    surface: surface_ref,
+                    surface: surface_ref, reason: None
                 });
             r.ledger.numerical_loss += flux_at;
             r.terminations.record(TerminationReason::UnsupportedPhysics);
@@ -2228,7 +2297,7 @@ fn interact_surface(
                     // to refuse, so there is no contrast to apply.
                     r.report
                         .reject(CapabilityIssue::UnsupportedSurfaceResponse {
-                            surface: surface_ref,
+                            surface: surface_ref, reason: None
                         });
                     r.ledger.numerical_loss += flux_at;
                     r.terminations.record(TerminationReason::UnsupportedPhysics);
@@ -2393,7 +2462,17 @@ fn interact_surface(
         flux_at,
         opl_at,
         min_flux,
+        film_temperature(scene, cfg, s.common.id.0),
     );
+}
+
+/// The temperature object `id`'s films are at under `temperature: Declared`;
+/// `None` under `Off`, where the scene's temperature is never read (CF-10).
+fn film_temperature(scene: &Scene3, cfg: &TraceConfig3, id: u64) -> Option<f64> {
+    match cfg.fidelity.temperature {
+        oc_core::fidelity::Temperature::Declared => scene.film_temperature_c(id),
+        oc_core::fidelity::Temperature::Off => None,
+    }
 }
 
 /// Apply a [`SurfaceResponse`] at a point, splitting deterministic branches and
@@ -2414,6 +2493,7 @@ fn apply_response(
     flux_at: f64,
     opl_at: f64,
     min_flux: f64,
+    temperature_c: Option<f64>,
 ) {
     let cos_i = -n_oppose.dot(w.ray.dir).clamp(-1.0, 1.0);
     let sample = |s: &oc_core::scene3::SpectralScalar| s.sample(w.lambda);
@@ -2440,9 +2520,9 @@ fn apply_response(
     // assumption only bites once the light arriving is polarized, so that is
     // when the report says so, rather than decorating every scene with a mirror
     // in it.
-    let phase_assumed = cfg.polarization && stokes_in.dop() > 1e-12;
+    let phase_assumed = cfg.polarized() && stokes_in.dop() > 1e-12;
     let out = |m: &Mueller| -> PolRay {
-        let stokes = if cfg.polarization {
+        let stokes = if cfg.polarized() {
             m.apply(&stokes_in)
         } else {
             Stokes::unpolarized(m.unpolarized_gain() * flux_at)
@@ -2472,7 +2552,7 @@ fn apply_response(
                 Some(v) => v.clamp(0.0, 1.0),
                 None => {
                     r.report
-                        .reject(CapabilityIssue::UnsupportedSurfaceResponse { surface });
+                        .reject(CapabilityIssue::UnsupportedSurfaceResponse { surface, reason: None });
                     r.ledger.numerical_loss += flux_at;
                     r.terminations.record(TerminationReason::UnsupportedPhysics);
                     push_event(r, cfg, w, point, opl_at, interact(Vec::new()));
@@ -2580,7 +2660,7 @@ fn apply_response(
                 (Some(a), Some(b)) => (a.clamp(0.0, 1.0), b.clamp(0.0, 1.0)),
                 _ => {
                     r.report
-                        .reject(CapabilityIssue::UnsupportedSurfaceResponse { surface });
+                        .reject(CapabilityIssue::UnsupportedSurfaceResponse { surface, reason: None });
                     r.ledger.numerical_loss += flux_at;
                     r.terminations.record(TerminationReason::UnsupportedPhysics);
                     push_event(r, cfg, w, point, opl_at, interact(Vec::new()));
@@ -2639,12 +2719,56 @@ fn apply_response(
             // is the substrate for a coating sitting straight on glass. For a
             // zero-thickness surface both sides are the same medium and the
             // coating carries its own plate.
-            let rt = oc_core::thinfilm::coating_rt_at(coating, n1, n2, w.lambda, cos_i);
-            let (refl, tr) = match rt {
-                Some(v) => (v.r().clamp(0.0, 1.0), v.t().clamp(0.0, 1.0)),
-                None => {
-                    r.report
-                        .reject(CapabilityIssue::UnsupportedSurfaceResponse { surface });
+            // Under `coating_model: Nominal` every ray sees the design point:
+            // no wavelength, no angle. Phenomenological, and the stamp says so.
+            let (lambda, cos_i) = if cfg.fidelity.coating_model == oc_core::fidelity::CoatingModel::Nominal {
+                let (l, c, designed) = coating.nominal_point();
+                if !designed {
+                    r.report.note_approx(
+                        PhysicsFeature::ThinFilmCoating,
+                        "nominal: a stack with no design record answers at 0.55 um, normal incidence",
+                    );
+                }
+                (l, c)
+            } else {
+                (w.lambda, cos_i)
+            };
+            let ctx = oc_core::thinfilm::FilmContext::from_profile(&cfg.fidelity).at_temperature(&cfg.fidelity, temperature_c);
+            if cfg.fidelity.temperature == oc_core::fidelity::Temperature::Declared {
+                match temperature_c {
+                    None => r.report.note_approx(
+                        PhysicsFeature::ThinFilmCoating,
+                        "temperature declared but none is set: films at their reference temperature",
+                    ),
+                    Some(_) if coating.layers.iter().any(|l| l.material.thermal.is_none()) => r.report.note_approx(
+                        PhysicsFeature::ThinFilmCoating,
+                        "a film with no thermo-optic data is held at its reference index",
+                    ),
+                    Some(_) => {}
+                }
+            }
+            let rt = oc_core::thinfilm::coating_eval(coating, n1, n2, lambda, cos_i, &ctx);
+            let (refl, tr) = match &rt {
+                Ok((v, notes)) => {
+                    if !notes.clamped.is_empty() {
+                        r.report.note_approx(
+                            PhysicsFeature::ThinFilmCoating,
+                            "a film table was read outside its range and answered by its out-of-range policy",
+                        );
+                    }
+                    if notes.degenerate {
+                        r.report.note_approx(
+                            PhysicsFeature::ThinFilmCoating,
+                            "a degenerate stack reflected everything by rule",
+                        );
+                    }
+                    (v.r().clamp(0.0, 1.0), v.t().clamp(0.0, 1.0))
+                }
+                Err(e) => {
+                    r.report.reject(CapabilityIssue::UnsupportedSurfaceResponse {
+                        surface,
+                        reason: Some(e.to_string()),
+                    });
                     r.ledger.numerical_loss += flux_at;
                     r.terminations.record(TerminationReason::UnsupportedPhysics);
                     push_event(r, cfg, w, point, opl_at, interact(Vec::new()));
@@ -2657,35 +2781,86 @@ fn apply_response(
             // relative phase is exactly what the incoherent sum throws away. In
             // that case the powers still separate s from p, and only the phase
             // between them is declared absent.
-            let amp = oc_core::thinfilm::coating_amp_at(coating, n1, n2, w.lambda, cos_i);
+            let amp = oc_core::thinfilm::coating_amp_eval(coating, n1, n2, lambda, cos_i, &ctx);
             let (m_r, m_t) = match &amp {
-                Some(a) => (
+                Ok((a, _)) => (
                     Mueller::from_diagonal_jones(a.r_s, a.r_p),
                     Mueller::from_diagonal_jones(a.t_s, a.t_p).scaled(a.t_power_scale),
                 ),
-                None => {
-                    if phase_assumed {
-                        r.report.note_approx(
-                            PhysicsFeature::ThinFilmCoating,
-                            "plate-backed stack: faces added incoherently, no relative phase",
-                        );
+                Err(_) => {
+                    // Under `plate_model: Incoherent` a plate (or a coating
+                    // with one slab) has a Mueller matrix: its faces with their
+                    // phases, added incoherently over every pass (CF-05).
+                    let incoherent = if cfg.fidelity.plate_model == oc_core::fidelity::PlateModel::Incoherent {
+                        oc_core::thinfilm::coating_mueller_eval(coating, n1, n2, lambda, cos_i, &ctx).ok()
+                    } else {
+                        None
+                    };
+                    match incoherent {
+                        Some(pair) => pair,
+                        None => {
+                            if phase_assumed {
+                                r.report.note_approx(
+                                    PhysicsFeature::ThinFilmCoating,
+                                    "plate-backed stack: faces added incoherently, no relative phase",
+                                );
+                            }
+                            let (v, _) = rt.as_ref().expect("checked above");
+                            (
+                                Mueller::from_diagonal_jones(
+                                    oc_core::thinfilm::Cx::real(v.r_s.max(0.0).sqrt()),
+                                    oc_core::thinfilm::Cx::real(v.r_p.max(0.0).sqrt()),
+                                ),
+                                Mueller::from_diagonal_jones(
+                                    oc_core::thinfilm::Cx::real(v.t_s.max(0.0).sqrt()),
+                                    oc_core::thinfilm::Cx::real(v.t_p.max(0.0).sqrt()),
+                                ),
+                            )
+                        }
                     }
-                    let v = rt.as_ref().expect("checked above");
-                    (
-                        Mueller::from_diagonal_jones(
-                            oc_core::thinfilm::Cx::real(v.r_s.max(0.0).sqrt()),
-                            oc_core::thinfilm::Cx::real(v.r_p.max(0.0).sqrt()),
-                        ),
-                        Mueller::from_diagonal_jones(
-                            oc_core::thinfilm::Cx::real(v.t_s.max(0.0).sqrt()),
-                            oc_core::thinfilm::Cx::real(v.t_p.max(0.0).sqrt()),
-                        ),
-                    )
                 }
             };
             let pol_r = out(&m_r);
             let pol_t = out(&m_t);
-            r.ledger.absorbed_surface += (flux_at - pol_r.stokes.s0 - pol_t.stokes.s0).max(0.0);
+            let absorbed = (flux_at - pol_r.stokes.s0 - pol_t.stokes.s0).max(0.0);
+            if cfg.fidelity.layer_absorption == oc_core::fidelity::LayerAbsorption::PerLayer && absorbed > 0.0 {
+                // Where in the coating it was absorbed: each layer, and the
+                // substrate. Polarized light weights the s and p splits by
+                // its intensity in each; the shares are scaled to the total
+                // the ledger books, so they sum to it exactly.
+                let (i_s, i_p) = if cfg.polarized() {
+                    (0.5 * (stokes_in.s0 + stokes_in.s1), 0.5 * (stokes_in.s0 - stokes_in.s1))
+                } else {
+                    (0.5 * flux_at, 0.5 * flux_at)
+                };
+                match oc_core::thinfilm::coating_power_flow_eval(coating, n1, n2, lambda, cos_i, &ctx) {
+                    Ok((p, _)) => {
+                        let films: Vec<f64> =
+                            p.a_layer_s.iter().zip(&p.a_layer_p).map(|(a, b)| a * i_s + b * i_p).collect();
+                        let bulk = p.a_substrate_s * i_s + p.a_substrate_p * i_p;
+                        let sum = films.iter().sum::<f64>() + bulk;
+                        let k = if sum > 0.0 { absorbed / sum } else { 0.0 };
+                        let slab = matches!(coating.backing, oc_core::thinfilm::CoatingBacking::Plate { .. });
+                        // A plate's slab is bulk absorption; an opaque
+                        // substrate's is booked at the surface, tagged bulk.
+                        if slab {
+                            r.ledger.absorbed_volume += bulk * k;
+                            r.ledger.absorbed_surface += absorbed - bulk * k;
+                        } else {
+                            r.ledger.absorbed_surface += absorbed;
+                        }
+                        r.pending_layers = films
+                            .iter()
+                            .enumerate()
+                            .map(|(i, a)| (DepositLayer::Film(i.min(u16::MAX as usize) as u16), a * k))
+                            .chain(std::iter::once((DepositLayer::Bulk, bulk * k)))
+                            .collect();
+                    }
+                    Err(_) => r.ledger.absorbed_surface += absorbed,
+                }
+            } else {
+                r.ledger.absorbed_surface += absorbed;
+            }
             let mut children = Vec::new();
             // Past the critical angle nothing gets through, whatever the stack:
             // the far medium carries only an evanescent wave, and the matrix
@@ -2740,6 +2915,88 @@ fn apply_response(
             }
             push_event(r, cfg, w, point, opl_at, interact(children));
         }
+        // Measured or supplied data (CF-09): the table's powers at this
+        // wavelength and angle, read bilinearly in (λ, cos θ). Outside the
+        // data it refuses with the reason, or reads the edge and says so.
+        SurfaceResponse::MeasuredTable { table, from } => {
+            r.report.note_exact(PhysicsFeature::MeasuredTable);
+            let refuse = table.refuses(cfg.fidelity.numerics);
+            let look = match table.lookup(w.lambda, cos_i, *from, n1, n2, refuse) {
+                Ok(l) => l,
+                Err(reason) => {
+                    r.report
+                        .reject(CapabilityIssue::UnsupportedSurfaceResponse { surface, reason: Some(reason) });
+                    r.ledger.numerical_loss += flux_at;
+                    r.terminations.record(TerminationReason::UnsupportedPhysics);
+                    push_event(r, cfg, w, point, opl_at, interact(Vec::new()));
+                    return;
+                }
+            };
+            if look.clamped.is_some() {
+                r.report.note_approx(
+                    PhysicsFeature::MeasuredTable,
+                    "a measured table was read outside its data and answered by its nearest edge",
+                );
+            }
+            let p = look.powers;
+            // s and p powers fix the magnitudes of a diagonal Jones element and
+            // say nothing about the phase between them, which is taken as
+            // zero. An unpolarized or scalar table gives both polarizations the
+            // same number: polarization-blind, as two numbers have to be.
+            use oc_core::response_table::PowerResolution;
+            if phase_assumed {
+                r.report.note_approx(
+                    PhysicsFeature::MeasuredTable,
+                    match table.power_resolution {
+                        PowerResolution::Sp => "measured s and p powers: no phase between them, taken as zero",
+                        _ => "power-only measured table: treated as polarization-blind and phase-neutral",
+                    },
+                );
+            }
+            let root = |x: f64| oc_core::thinfilm::Cx::real(x.max(0.0).sqrt());
+            let m_r = Mueller::from_diagonal_jones(root(p.rs), root(p.rp));
+            let m_t = Mueller::from_diagonal_jones(root(p.ts), root(p.tp));
+            let pol_r = out(&m_r);
+            let pol_t = out(&m_t);
+            r.ledger.absorbed_surface += (flux_at - pol_r.stokes.s0 - pol_t.stokes.s0).max(0.0);
+            let stray = table.reflection == oc_core::response_table::ReflectionRole::Stray;
+            let mut children = Vec::new();
+            if p.r() > 0.0 {
+                if stray && !cfg.ghosts {
+                    r.ledger.truncated_flux += pol_r.stokes.s0;
+                } else {
+                    let dir_r = reflect3(w.ray.dir, n_oppose);
+                    if let Some(id) = spawn(
+                        stack,
+                        r,
+                        cfg,
+                        w,
+                        point,
+                        dir_r,
+                        pol_r,
+                        opl_at,
+                        w.ghost || stray,
+                        false,
+                        min_flux,
+                    ) {
+                        children.push((ChildRole::Reflect, id));
+                    }
+                }
+            }
+            if p.t() > 0.0 {
+                let dir_t = if medium_transition {
+                    refract3(w.ray.dir, n_oppose, n1, n2).unwrap_or(w.ray.dir)
+                } else {
+                    w.ray.dir
+                };
+                if let Some(id) = spawn(
+                    stack, r, cfg, w, point, dir_t, pol_t, opl_at, w.ghost, false, min_flux,
+                ) {
+                    children.push((ChildRole::Transmit, id));
+                }
+            }
+            push_event(r, cfg, w, point, opl_at, interact(children));
+        }
         // A thin lens on a body patch has no meaning: the bend depends on the
         // hit position in a lens plane the patch does not define. A polarizer or
         // a retarder on one has none either: their axis is a direction in the
@@ -2751,7 +3008,7 @@ fn apply_response(
         | SurfaceResponse::Polarizer { .. }
         | SurfaceResponse::Retarder { .. } => {
             r.report
-                .reject(CapabilityIssue::UnsupportedSurfaceResponse { surface });
+                .reject(CapabilityIssue::UnsupportedSurfaceResponse { surface, reason: None });
             r.ledger.numerical_loss += flux_at;
             r.terminations.record(TerminationReason::UnsupportedPhysics);
             push_event(r, cfg, w, point, opl_at, interact(Vec::new()));

@@ -29,7 +29,7 @@ pub use tracer::{trace, DetectorResult, Segment, TraceConfig, TraceResult};
 #[cfg(feature = "trace3")]
 pub use result3::{
     Approximation, CapabilityIssue, CapabilityReport, ChildRole, DetectorHit3, DetectorResult3,
-    Deposit3, EnergyLedger, LaunchRay3, ObjectEntry3, ObjectLedger3, ObjectRef3, PhysicsFeature, Segment3,
+    Deposit3, DepositLayer, EnergyLedger, LaunchRay3, ObjectEntry3, ObjectLedger3, ObjectRef3, PhysicsFeature, Segment3,
     SegmentFlags, SpectralSums3,
     TerminationReason, TerminationSummary, TraceEvent3, TraceEventKind, TraceResult3,
 };

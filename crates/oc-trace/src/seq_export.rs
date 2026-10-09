@@ -742,6 +742,7 @@ fn surface_kind(scene: &Scene3, id: ObjectId) -> &'static str {
         SurfaceResponse::Mirror { .. } => "a mirror",
         SurfaceResponse::ExplicitRt { .. } => "a beam splitter or filter",
         SurfaceResponse::Coating { .. } => "a coated plate (a dichroic, filter or mirror)",
+        SurfaceResponse::MeasuredTable { .. } => "a surface with measured coating data",
         SurfaceResponse::Polarizer { .. } => "a polarizer",
         SurfaceResponse::Retarder { .. } => "a waveplate",
         SurfaceResponse::Absorber => "an absorber",

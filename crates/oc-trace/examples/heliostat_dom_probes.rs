@@ -241,11 +241,11 @@ fn pmma_wall_coating(outer: &str, wall_mm: f64) -> Coating {
         interpolation: Interpolation::Linear,
         out_of_range: OutOfRangePolicy::Clamp,
     };
-    let film = FilmMaterial {
-        name: "PMMA".into(),
-        n: table(lambda_um.iter().map(|&l| pmma.index(l)).collect()),
-        k: table(lambda_um.iter().zip(&alpha_per_mm).map(|(&l, &a)| a * l * 1e-3 / (4.0 * std::f64::consts::PI)).collect()),
-    };
+    let film = FilmMaterial::scalars(
+        "PMMA",
+        table(lambda_um.iter().map(|&l| pmma.index(l)).collect()),
+        table(lambda_um.iter().zip(&alpha_per_mm).map(|(&l, &a)| a * l * 1e-3 / (4.0 * std::f64::consts::PI)).collect()),
+    );
     let layers = match outer {
         "bare" => Vec::new(),
         "silver" => vec![FilmLayer::new(materials::silver(), 150.0)],
@@ -332,11 +332,11 @@ fn face_probe(s: &mut Scene3, parent: u64, side: f64, name: &'static str) -> Pro
 /// `EYE_AR_NM` (650).
 fn eye_ar() -> CoatingDesign {
     let kind = match std::env::var("EYE_AR").as_deref() {
-        Ok("bbar") => DesignKind::BroadbandAr,
+        Ok("bbar") => DesignKind::BroadbandArLegacy,
         Ok(other) if other != "single" => panic!("EYE_AR: single or bbar, not {other}"),
         _ => DesignKind::SingleLayerAr,
     };
-    CoatingDesign { kind, lambda_nm: env_f64("EYE_AR_NM", 650.0), aoi_deg: 0.0, periods: 1, n_high: 2.1, n_low: 1.38 }
+    CoatingDesign { kind, lambda_nm: env_f64("EYE_AR_NM", 650.0), aoi_deg: 0.0, periods: 1, n_high: 2.1, n_low: 1.38, adapt: None }
 }
 
 /// An air-spaced doublet eyepiece (`EYE_DESIGN`): two glasses (Sellmeier),
@@ -531,7 +531,7 @@ fn build(kind: TubeKind) -> (Scene3, Vec<Probe>) {
     // `FRESNEL_SLOPE` (0 mrad): a figure error on the Fresnel lens's faces, for the tolerance study.
     realism::slope(&mut s, f, env_f64("FRESNEL_SLOPE", 0.0));
     let film = oc_core::thinfilm::film_coating(
-        CoatingDesign { kind: DesignKind::SingleLayerAr, lambda_nm: 550.0, aoi_deg: 0.0, periods: 1, n_high: 2.35, n_low: 1.38 },
+        CoatingDesign { kind: DesignKind::SingleLayerAr, lambda_nm: 550.0, aoi_deg: 0.0, periods: 1, n_high: 2.35, n_low: 1.38, adapt: None },
         1.0,
         pmma.index(0.55),
     );
@@ -716,7 +716,7 @@ fn build(kind: TubeKind) -> (Scene3, Vec<Probe>) {
                     assert!(!(ar_faces.contains(&OUTER) && outer_set), "TUBE_AR outer and TUBE_OUTER both coat the outer face");
                     for &face in ar_faces {
                         let mut c = oc_core::thinfilm::film_coating(
-                            CoatingDesign { kind: DesignKind::SingleLayerAr, lambda_nm: 550.0, aoi_deg: 0.0, periods: 1, n_high: 2.35, n_low: 1.38 },
+                            CoatingDesign { kind: DesignKind::SingleLayerAr, lambda_nm: 550.0, aoi_deg: 0.0, periods: 1, n_high: 2.35, n_low: 1.38, adapt: None },
                             1.0,
                             pmma.index(0.55),
                         );
@@ -966,6 +966,8 @@ fn main() {
         segment_floor: f64::INFINITY,
         ..TraceConfig3::default()
     };
+    // `FIDELITY=Fast|Standard|Reference`: the coating physics the trace pays for.
+    let cfg = cfg.with_fidelity(realism::fidelity());
     // `PASSES` passes of the source's rays, each an independent, evenly
     // spread set (a Cranley-Patterson shift of the same point sets) carrying
     // 1/PASSES of the flux. Each pass's records are folded into the sums
@@ -1286,11 +1288,14 @@ fn write_budget(
 
 /// The thermal files (`THERMAL=1`): deposits.npy, one row per deposit:
 /// object number (deposits.json names them), x y z in that object's frame
-/// (mm), wavelength (um), W.
+/// (mm), wavelength (um), W, and where in the object (`0` its face as a
+/// whole, `k + 1` coating layer `k`, `-1` its bulk). The layer is the last
+/// column, so a reader of the first six reads them as before; it is filled
+/// per layer under `FIDELITY=Reference` (`layer_absorption: PerLayer`).
 fn write_deposits(dir: &std::path::Path, s: &Scene3, deposits: &[oc_trace::Deposit3]) {
     use oc_trace::ObjectRef3 as O;
     let mut names: Vec<(O, String, String)> = Vec::new();
-    let mut rows: Vec<[f64; 6]> = Vec::with_capacity(deposits.len());
+    let mut rows: Vec<[f64; 7]> = Vec::with_capacity(deposits.len());
     for d in deposits {
         let key = match d.object {
             O::Body(i, _) => O::Body(i, 0),
@@ -1316,9 +1321,14 @@ fn write_deposits(dir: &std::path::Path, s: &Scene3, deposits: &[oc_trace::Depos
             _ => Isometry3::from_pos(Vec3::ZERO),
         };
         let p = t.inverse_transform_point(d.point);
-        rows.push([k as f64, p.x, p.y, p.z, d.lambda_um, d.flux]);
+        let layer = match d.layer {
+            oc_trace::DepositLayer::Face => 0.0,
+            oc_trace::DepositLayer::Film(i) => f64::from(i) + 1.0,
+            oc_trace::DepositLayer::Bulk => -1.0,
+        };
+        rows.push([k as f64, p.x, p.y, p.z, d.lambda_um, d.flux, layer]);
     }
-    let header = format!("{{'descr': '<f8', 'fortran_order': False, 'shape': ({}, 6), }}", rows.len());
+    let header = format!("{{'descr': '<f8', 'fortran_order': False, 'shape': ({}, 7), }}", rows.len());
     let pad = 64 - (10 + header.len() + 1) % 64;
     let mut npy = b"\x93NUMPY\x01\x00".to_vec();
     npy.extend_from_slice(&((header.len() + pad + 1) as u16).to_le_bytes());

@@ -42,6 +42,10 @@ use std::collections::HashSet;
 pub const OCANVAS_FORMAT: &str = crate::scene::OCANVAS_FORMAT;
 /// The v2 schema version.
 pub const OCANVAS_V2_VERSION: u32 = 2;
+/// The current document version: v2 plus the film catalogue, material
+/// provenance, the opaque backing and the fidelity profile
+/// (`crate::migrate_v2`). Every v3 addition is optional on read.
+pub const OCANVAS_V3_VERSION: u32 = 3;
 /// The dimensionality v2 documents declare.
 pub const OCANVAS_V2_DIMENSION: u8 = 3;
 
@@ -104,7 +108,7 @@ impl std::fmt::Display for SceneError {
             }
             Self::UnsupportedVersion { found } => write!(
                 f,
-                "unsupported .ocanvas version {found}; this build reads 1 and {OCANVAS_V2_VERSION}"
+                "unsupported .ocanvas version {found}; this build reads 1, {OCANVAS_V2_VERSION} and {OCANVAS_V3_VERSION}"
             ),
             Self::WrongDimension { found } => {
                 write!(f, "v2 is 3D; document declares dimension {found}")
@@ -269,6 +273,12 @@ impl SpectralScalar {
     pub(crate) fn min(&self) -> f64 {
         self.values().iter().copied().fold(f64::INFINITY, f64::min)
     }
+
+    /// The largest sample, for a caller outside this crate: whether a film's
+    /// extinction coefficient is ever non-zero, say.
+    pub fn values_max(&self) -> f64 {
+        self.max()
+    }
 }
 
 /// A wavelength table is a function: strictly increasing, at least two samples,
@@ -431,6 +441,17 @@ fn interp_table(xs: &[f64], ys: &[f64], x: f64, out_of_range: OutOfRangePolicy) 
 }
 
 impl SpectralScalar {
+    /// Does the curve have data at `lambda_um`, rather than an out-of-range
+    /// policy's answer? A constant covers every wavelength.
+    pub fn covers(&self, lambda_um: f64) -> bool {
+        match self {
+            Self::Constant(_) => true,
+            Self::Tabulated { lambda_um: xs, .. } => {
+                xs.first().is_some_and(|&a| lambda_um >= a) && xs.last().is_some_and(|&b| lambda_um <= b)
+            }
+        }
+    }
+
     /// The value at `lambda_um`, or `None` if out of range under
     /// [`OutOfRangePolicy::Error`].
     pub fn sample(&self, lambda_um: f64) -> Option<f64> {
@@ -615,6 +636,20 @@ pub enum SurfaceResponse {
     /// this variant exists. See [`crate::thinfilm`].
     Coating {
         coating: crate::thinfilm::Coating,
+    },
+    /// Measured or supplied R and T over wavelength and angle, with what the
+    /// numbers mean: resolution, side, scope, media, provenance and what to do
+    /// outside the data (coating-fidelity spec CF-09). See
+    /// [`crate::response_table`].
+    ///
+    /// `from` is the side of the part this copy answers for: a surface's front
+    /// response is met from its front, a body face's outside response from
+    /// outside. A table measured from one side refuses (or, permissively,
+    /// flags) a ray from the other, because an absorbing stack does not
+    /// reflect the same both ways.
+    MeasuredTable {
+        table: Box<crate::response_table::AngularTable>,
+        from: crate::response_table::TableSide,
     },
     /// An ideal absorbing linear polarizer: it passes the field component along
     /// its transmission axis and absorbs the perpendicular one.
@@ -804,6 +839,10 @@ impl SurfaceResponse {
                 }
                 Ok(())
             }
+            Self::MeasuredTable { table, .. } => table.validate().map_err(|reason| SceneError::InvalidTable {
+                field: format!("{field}.table"),
+                reason,
+            }),
             Self::Coating { coating } => {
                 // A layer is a thickness and an index; both have to be real
                 // numbers or the transfer matrix has nothing to multiply. There
@@ -852,6 +891,16 @@ impl SurfaceResponse {
                         if !residual.is_finite() || !(0.0..=1.0).contains(residual) {
                             return Err(range("coating.exit.residual", "is outside [0, 1]"));
                         }
+                    }
+                }
+                if let crate::thinfilm::CoatingBacking::Opaque { substrate } = &coating.backing {
+                    substrate.n.validate(&format!("{field}.coating.substrate.n"))?;
+                    substrate.k.validate(&format!("{field}.coating.substrate.k"))?;
+                    if substrate.n.min() <= 0.0 {
+                        return Err(range("coating.substrate.n", "must be positive"));
+                    }
+                    if substrate.k.min() < 0.0 {
+                        return Err(range("coating.substrate.k", "must not be negative"));
                     }
                 }
                 Ok(())
@@ -1967,6 +2016,33 @@ pub struct Scene3 {
     /// document that has none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub figure_errors: Vec<FigureError>,
+    /// How much coating physics a trace of this scene pays for (coating
+    /// fidelity spec §5). Absent from a document that keeps the default,
+    /// `Standard`, so every older document reads, and writes, unchanged.
+    #[serde(default, skip_serializing_if = "crate::fidelity::FidelityProfile::is_default")]
+    pub fidelity: crate::fidelity::FidelityProfile,
+    /// The scene's film materials, which coating layers name by id (v3).
+    /// Absent from a v2 document; reading one fills it from the inline
+    /// materials (`crate::migrate_v2`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub film_catalog: Vec<crate::film_catalog::FilmCatalogEntry>,
+    /// The temperature the scene's coatings are at, °C, read only under
+    /// `temperature: Declared` (coating-fidelity spec CF-10). Absent: every
+    /// film at its reference temperature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature_c: Option<f64>,
+    /// Objects at a temperature of their own: an eyepiece warmed by the
+    /// light it absorbs, while the rest of the bench stays at room
+    /// temperature.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub object_temperatures: Vec<ObjectTemperature>,
+}
+
+/// One object's coatings at a temperature of their own, °C.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ObjectTemperature {
+    pub object: ObjectId,
+    pub temperature_c: f64,
 }
 
 /// A grating's efficiencies for light polarized across its grooves (TM).
@@ -2003,7 +2079,7 @@ impl Scene3 {
     pub fn new() -> Self {
         Self {
             format: default_format(),
-            version: OCANVAS_V2_VERSION,
+            version: OCANVAS_V3_VERSION,
             dimension: OCANVAS_V2_DIMENSION,
             bodies: Vec::new(),
             surfaces: Vec::new(),
@@ -2019,7 +2095,35 @@ impl Scene3 {
             solar: None,
             links: Vec::new(),
             figure_errors: Vec::new(),
+            fidelity: crate::fidelity::FidelityProfile::default(),
+            film_catalog: Vec::new(),
+            temperature_c: None,
+            object_temperatures: Vec::new(),
         }
+    }
+
+    /// The temperature object `id`'s coatings are at: its own, else the
+    /// scene's, else none (every film at its reference temperature).
+    pub fn film_temperature_c(&self, id: u64) -> Option<f64> {
+        self.object_temperatures
+            .iter()
+            .find(|t| t.object.0 == id)
+            .map(|t| t.temperature_c)
+            .or(self.temperature_c)
+    }
+
+    /// Set object `id`'s own temperature, or clear it with `None`. False for
+    /// an id that is not a body or a surface.
+    pub fn set_object_temperature(&mut self, id: u64, temperature_c: Option<f64>) -> bool {
+        let optical = self.bodies.iter().any(|b| b.common.id.0 == id) || self.surfaces.iter().any(|s| s.common.id.0 == id);
+        if !optical {
+            return false;
+        }
+        self.object_temperatures.retain(|t| t.object.0 != id);
+        if let Some(t) = temperature_c {
+            self.object_temperatures.push(ObjectTemperature { object: ObjectId(id), temperature_c: t });
+        }
+        true
     }
 
     /// Hand out a fresh id.
@@ -2101,20 +2205,36 @@ impl Scene3 {
         }
     }
 
-    /// Serialize to pretty v2 JSON, stamping the header.
+    /// Serialize to pretty v3 JSON, stamping the header.
     pub fn to_json(&self) -> String {
         let mut doc = self.clone();
         doc.format = default_format();
-        doc.version = OCANVAS_V2_VERSION;
+        doc.version = OCANVAS_V3_VERSION;
         doc.dimension = OCANVAS_V2_DIMENSION;
         serde_json::to_string_pretty(&doc).expect("scene3 serializes")
     }
 
-    /// Parse a v2 document. Use [`crate::migrate_v1::load_any`] to accept v1 too.
+    /// Serialize as a v2 document for readers that know no v3, with what v2
+    /// could not hold. Exact for a scene read from v2 and edited without v3
+    /// features; see [`crate::migrate_v2::to_v2`].
+    pub fn to_json_v2(&self) -> (String, Vec<String>) {
+        let (mut doc, losses) = crate::migrate_v2::to_v2(self);
+        doc.format = default_format();
+        doc.version = OCANVAS_V2_VERSION;
+        doc.dimension = OCANVAS_V2_DIMENSION;
+        (serde_json::to_string_pretty(&doc).expect("scene3 serializes"), losses)
+    }
+
+    /// Parse a v2 or v3 document, migrating a v2 one to v3 in memory. Use
+    /// [`crate::migrate_v1::load_any`] to accept v1 too.
     pub fn from_json(s: &str) -> Result<Self, SceneError> {
         let scene: Scene3 = serde_json::from_str(s).map_err(|e| SceneError::Json(e.to_string()))?;
         scene.check_header()?;
         let mut scene = scene;
+        if scene.version == OCANVAS_V2_VERSION {
+            crate::migrate_v2::migrate_v2_to_v3(&mut scene);
+        }
+        crate::migrate_v2::resolve_film_refs(&mut scene)?;
         scene.repair_next_id();
         scene.validate()?;
         Ok(scene)
@@ -2126,7 +2246,7 @@ impl Scene3 {
                 found: self.format.clone(),
             });
         }
-        if self.version != OCANVAS_V2_VERSION {
+        if self.version != OCANVAS_V2_VERSION && self.version != OCANVAS_V3_VERSION {
             return Err(SceneError::UnsupportedVersion {
                 found: self.version,
             });
@@ -2242,6 +2362,96 @@ impl Scene3 {
         }
         self.validate_links()?;
         self.validate_figure_errors()?;
+        self.validate_film_catalog()?;
+        self.validate_body_coatings()?;
+        self.validate_temperatures()?;
+        Ok(())
+    }
+
+    /// Temperatures are finite and above absolute zero, each override names
+    /// a body or surface, and an object has at most one.
+    fn validate_temperatures(&self) -> Result<(), SceneError> {
+        let check = |object: Option<u64>, field: &str, t: f64| {
+            if !t.is_finite() {
+                return Err(SceneError::NonFinite { object, field: field.into() });
+            }
+            if t <= -273.15 {
+                return Err(SceneError::OutOfRange { object, field: field.into(), reason: "is at or below absolute zero".into() });
+            }
+            Ok(())
+        };
+        if let Some(t) = self.temperature_c {
+            check(None, "temperature_c", t)?;
+        }
+        let mut seen = HashSet::new();
+        for o in &self.object_temperatures {
+            let id = o.object.0;
+            let optical = self.bodies.iter().any(|b| b.common.id.0 == id) || self.surfaces.iter().any(|s| s.common.id.0 == id);
+            if !optical {
+                return Err(SceneError::DanglingRef { what: "object temperature", id });
+            }
+            if !seen.insert(id) {
+                return Err(SceneError::OutOfRange {
+                    object: Some(id),
+                    field: "object_temperatures".into(),
+                    reason: "an object has one temperature".into(),
+                });
+            }
+            check(Some(id), "object_temperatures.temperature_c", o.temperature_c)?;
+        }
+        Ok(())
+    }
+
+    /// A body is its own substrate: a coating on one of its faces sits on
+    /// the body's glass, so a plate-backed coating (which brings a substrate
+    /// of its own) or one with slabs is refused there by name (CF-05), and so
+    /// is a measured table of a whole part, which already holds the substrate
+    /// and its rear face (CF-09).
+    fn validate_body_coatings(&self) -> Result<(), SceneError> {
+        let wrong = |r: &SurfaceResponse| match r {
+            SurfaceResponse::Coating { coating } => {
+                (matches!(coating.backing, crate::thinfilm::CoatingBacking::Plate { .. })
+                    || crate::thinfilm::has_slab(coating))
+                .then_some(("surface.coating", "a plate-backed or slab coating cannot coat a body face: the body is already its substrate"))
+            }
+            SurfaceResponse::MeasuredTable { table, .. } => (table.scope == crate::response_table::TableScope::FiniteAssembly).then_some((
+                "surface.table",
+                "a measured table of a whole part cannot sit on a body face: it already holds the substrate and its rear face, and the body would count them again",
+            )),
+            _ => None,
+        };
+        for b in &self.bodies {
+            let s = &b.surface;
+            let faces = std::iter::once(&s.default).chain(s.overrides.iter().map(|o| &o.response));
+            for f in faces {
+                if let Some((field, reason)) = wrong(&f.from_outside).or_else(|| wrong(&f.from_inside)) {
+                    return Err(SceneError::OutOfRange {
+                        object: Some(b.common.id.0),
+                        field: field.to_string(),
+                        reason: reason.to_string(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Catalogue ids are unique and every layer names one that exists.
+    fn validate_film_catalog(&self) -> Result<(), SceneError> {
+        let mut ids: Vec<u32> = self.film_catalog.iter().map(|e| e.id).collect();
+        ids.sort_unstable();
+        if let Some(w) = ids.windows(2).find(|w| w[0] == w[1]) {
+            return Err(SceneError::DuplicateId { id: u64::from(w[0]) });
+        }
+        for c in crate::migrate_v2::coatings(self) {
+            for l in &c.layers {
+                if let Some(id) = l.catalog_ref {
+                    if ids.binary_search(&id).is_err() {
+                        return Err(SceneError::DanglingRef { what: "film catalogue entry", id: u64::from(id) });
+                    }
+                }
+            }
+        }
         Ok(())
     }
 

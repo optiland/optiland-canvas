@@ -1,0 +1,5 @@
+{
+ "comment": "Absolute tolerances, |canvas - oracle| <= atol, per oracle and quantity. Spec SPEC-OPTILAND-CANVAS-COATING-FIDELITY.md section 7. Optiland amplitudes are compared after the three-step convention map of test_thinfilm_parity.py and only below the critical angle; tmm needs no map.",
+ "tmm": {"power": 1e-9, "amplitude": 1e-9},
+ "optiland": {"power": 1e-11, "amplitude": 1e-11}
+}

@@ -140,8 +140,8 @@ pub(crate) fn coat_colors(r: &SurfaceResponse) -> Option<([f32; 3], [f32; 3])> {
         let (rv, tv) = match (&film, &table) {
             (Some((coating, aoi)), _) => {
                 match oc_core::thinfilm::coating_rt(coating, 1.0, um, aoi.to_radians().cos()) {
-                    Some(v) => (v.r(), v.t()),
-                    None => (0.0, 0.0),
+                    Ok(v) => (v.r(), v.t()),
+                    Err(_) => (0.0, 0.0),
                 }
             }
             (_, Some((reflectance, transmittance))) => (

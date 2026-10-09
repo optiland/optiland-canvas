@@ -262,12 +262,13 @@ pub(crate) fn build() -> Built {
     if fresnel_ar > 0.5 {
         let broadband = fresnel_ar > 1.5;
         let ar = CoatingDesign {
-            kind: if broadband { DesignKind::BroadbandAr } else { DesignKind::SingleLayerAr },
+            kind: if broadband { DesignKind::BroadbandArLegacy } else { DesignKind::SingleLayerAr },
             lambda_nm: 550.0,
             aoi_deg: 0.0,
             periods: 1,
             n_high: 2.35,
             n_low: 1.38,
+            adapt: None,
         };
         let film = oc_core::thinfilm::film_coating(ar, 1.0, pmma.index(0.55));
         if let Some(body) = s.bodies.iter_mut().find(|q| q.common.id.0 == f) {
@@ -318,6 +319,7 @@ pub(crate) fn build() -> Built {
                 periods: 1,
                 n_high: 2.1,
                 n_low: 1.38,
+                adapt: None,
             };
             assert!(s.set_body_face_coating(eye.0, face, Some(ar)), "AR coating");
         }
@@ -615,6 +617,8 @@ fn main() {
         max_records: 200_000,
         ..TraceConfig3::default()
     };
+    // `FIDELITY=Fast|Standard|Reference`: the coating physics the trace pays for.
+    let cfg = cfg.with_fidelity(realism::fidelity());
     let t0 = std::time::Instant::now();
     let res = trace_scene3(&s, &cfg);
     eprintln!(

@@ -13,6 +13,10 @@
 !web/public/demo-*.ocanvas
 !web/public/gallery/*.ocanvas
 !crates/*/tests/data/**/*.ocanvas
+# The fidelity bench scenes; the heliostat light pipe is 12 MB and is written
+# on demand (see bench_throughput3.rs).
+!crates/oc-trace/examples/bench-scenes/*.ocanvas
+crates/oc-trace/examples/bench-scenes/heliostat-light-pipe.ocanvas
 
 # web shell
 web/node_modules

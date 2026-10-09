@@ -191,6 +191,24 @@
         border: 1px solid #24344d; border-radius: 4px; padding: 1px 4px; font: inherit; }
       .cv-field .u { opacity: 0.45; min-width: 14px; }
       /* Fixed heights: a longer message must not resize the drawing above. */
+      .cv-stack { grid-column: 1 / -1; max-height: 150px; overflow-y: auto; font-size: 11px; display: flex; flex-direction: column; gap: 2px; }
+      .cv-stack-row { display: flex; align-items: center; gap: 4px; }
+      .cv-stack-row.warn .cv-film-pick { border-color: #ffb454; }
+      .cv-stack-row .m4btn { padding: 0 5px; }
+      .cv-stack-i { width: 14px; opacity: 0.6; text-align: right; }
+      .cv-stack-t { width: 64px; background: #0a1220; color: #e8f6ff; border: 1px solid #24344d; border-radius: 4px; padding: 1px 3px; font: inherit; }
+      .cv-stack-u, .cv-stack-qw { opacity: 0.6; }
+      .cv-film-pick { max-width: 210px; background: #0a1220; color: #e8f6ff; border: 1px solid #24344d; border-radius: 4px; font: inherit; }
+      .cv-report { margin-top: 2px; line-height: 1.35; }
+      .cv-dialog { position: fixed; z-index: 50; left: 50%; top: 12%; transform: translateX(-50%); width: min(560px, 92vw);
+        background: #0d1626; color: #e8f6ff; border: 1px solid #24344d; border-radius: 6px; padding: 10px; font-size: 12px;
+        display: flex; flex-direction: column; gap: 6px; box-shadow: 0 8px 30px rgba(0,0,0,0.5); }
+      .cv-dialog textarea { width: 100%; box-sizing: border-box; background: #0a1220; color: #e8f6ff; border: 1px solid #24344d; font: 11px ui-monospace, monospace; }
+      .cv-dialog-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 10px; }
+      .cv-dialog-grid input, .cv-dialog-grid select { width: 90px; background: #0a1220; color: #e8f6ff; border: 1px solid #24344d; border-radius: 4px; font: inherit; }
+      .cv-dialog-title { font-weight: 600; }
+      .cv-dialog-error { color: #ff8a65; min-height: 1em; }
+      .cv-dialog-buttons { display: flex; gap: 6px; justify-content: flex-end; }
       .cv-read { font-size: 11px; opacity: 0.85; line-height: 1.45; height: 46px; overflow-y: auto; flex: none; }
       .cv-read.tall { height: 78px; }
       .cv-bar .cv-group { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px; }
@@ -261,6 +279,16 @@
       #m4dock h4 .h4-sub { text-transform: none; letter-spacing: 0; opacity: 0.5; font-weight: normal; }
       .m4hint { opacity: 0.5; font-size: 10px; line-height: 1.35; margin-top: 5px; }
       .m4-sec { border-top: 1px solid #16202f; padding-top: 7px; margin-top: 7px; }
+      #fidelityFold > summary { cursor: pointer; opacity: 0.75; user-select: none; }
+      #fidelityFold > summary:hover { opacity: 1; }
+      .fid-label { width: 86px; flex: none; }
+      .fid-select { flex: 1; min-width: 0; background:#0a1220; color:#e8f6ff; border:1px solid #24344d; border-radius:4px; padding:2px 4px; font:inherit; }
+      .fid-row { flex-wrap: wrap; }
+      .fid-cost { width: 100%; padding-left: 90px; font-size: 10px; opacity: 0.55; }
+      .fid-note, .fid-stamp, .fid-check-notes { font-size: 10px; opacity: 0.7; margin: 4px 0; }
+      .fid-check { width: 100%; border-collapse: collapse; font-size: 10px; margin-top: 4px; }
+      .fid-check td, .fid-check th { padding: 1px 3px; text-align: right; white-space: pre; }
+      .fid-check td:first-child, .fid-check th:first-child { text-align: left; }
       .m4-sec:first-child { border-top: none; padding-top: 0; margin-top: 0; }
       .m4row { display: flex; gap: 6px; align-items: center; margin: 5px 0 2px; }
       .m4btn { background: #12203a; color: #cdd6e4; border: 1px solid #24344d; border-radius: 6px;
@@ -363,6 +391,22 @@
           title="ghost reflection generations G (§4.2): 2 = the classic two-surface ghost. Element count is unlimited; this bounds stray-light."
           style="width:52px; background:#0a1220; color:#e8f6ff; border:1px solid #24344d; border-radius:4px; padding:2px 4px; font:inherit" /></label>
       <label class="row">ghost opacity <input type="range" id="ghostOpacity" min="0" max="100" value="45" /></label>
+      <details id="fidelityFold" title="how much coating physics the f64 trace pays for: a sketch in Fast, a sign-off in Reference">
+        <summary id="fidSummary">physics fidelity</summary>
+        <label class="row"><span class="fid-label">preset</span>
+          <select id="fidPreset" class="fid-select">
+            <option value="Fast" title="nominal coatings, nothing deposited, no ghosts: for sketching (nominal, not verified)">Fast</option>
+            <option value="Standard" title="the kernel as it was before the profile existed">Standard</option>
+            <option value="Reference" title="everything the kernel models: for a final check">Reference</option>
+            <option value="custom" disabled>custom</option>
+          </select></label>
+        <div id="fidSwitches"></div>
+        <label class="row"><span class="fid-label">scene °C</span>
+          <input type="number" id="fidTemp" class="fid-select" step="1" placeholder="none" title="the temperature the coatings are at, read only under temperature: Declared (first order, declared, not validated); empty for none" /></label>
+        <div id="fidPreview" class="fid-note"></div>
+        <button class="m4btn" id="fidCheck" type="button" title="one f64 trace under Reference, beside the profile being edited, which stays as it is">final check (Reference)</button>
+        <div id="fidCheckOut"></div>
+      </details>
       <label class="row"><input type="checkbox" id="tir" checked /> TIR highlight</label>
       <label class="row"><input type="checkbox" id="gridBox" checked /> grid
         <span style="opacity:0.6">spacing</span>
@@ -378,6 +422,7 @@
       </div>
       <canvas id="hist" width="228" height="150"></canvas>
       <div id="dockNums">—</div>
+      <div id="dockStamp" class="fid-stamp" title="the fidelity profile these numbers were computed under"></div>
       <div id="refStatus" title="the f64 reference these numbers come from: current, or being traced for the scene as it is now"></div>
     </div>
 

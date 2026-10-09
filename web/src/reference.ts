@@ -39,7 +39,15 @@ import type { Canvas } from "../pkg/oc_wasm.js";
 /** What a reference trace is of: the scene's revision and the trace settings
  *  that move no revision (the ghost layer, and how many times the scene's
  *  rays the numbers are traced with). */
-export type ReferenceKey = { revision: number; ghosts: boolean; maxGhost: number; rays: number };
+export type ReferenceKey = {
+  revision: number;
+  ghosts: boolean;
+  maxGhost: number;
+  rays: number;
+  /** The fidelity profile's hash (`Canvas.fidelityKey`): a result traced under
+   *  one profile is never served under another. */
+  fidelity: string;
+};
 
 /** The reference's numbers, as the page reads them. */
 export type ReferenceNumbers = {
@@ -94,10 +102,15 @@ export type Reference = {
 };
 
 export const sameKey = (a: ReferenceKey, b: ReferenceKey) =>
-  a.revision === b.revision && a.ghosts === b.ghosts && a.maxGhost === b.maxGhost && a.rays === b.rays;
+  a.revision === b.revision &&
+  a.ghosts === b.ghosts &&
+  a.maxGhost === b.maxGhost &&
+  a.rays === b.rays &&
+  a.fidelity === b.fidelity;
 
 /** The same trace settings, at any revision. */
-const sameSettings = (a: ReferenceKey, b: ReferenceKey) => a.ghosts === b.ghosts && a.maxGhost === b.maxGhost;
+const sameSettings = (a: ReferenceKey, b: ReferenceKey) =>
+  a.ghosts === b.ghosts && a.maxGhost === b.maxGhost && a.fidelity === b.fidelity;
 
 /** A stand-in picture and the scene revision it was traced at. */
 export type StandIn = { segs: Float32Array; revision: number };

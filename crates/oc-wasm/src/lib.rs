@@ -45,6 +45,9 @@ mod xsection;
 mod solar_ui;
 mod edit_ui;
 mod detector_ui;
+mod fidelity_ui;
+mod catalog_ui;
+mod coating_ui;
 mod grating_ui;
 
 /// The Fresnel lens: add one, read its recipe, rebuild it from an edited one.
@@ -218,6 +221,9 @@ fn launch_count(scene: &Scene3) -> f64 {
 #[derive(Clone, Copy, PartialEq)]
 struct ReferenceKey {
     revision: u64,
+    /// The fidelity profile's hash: a result traced under one profile is
+    /// never served under another, even if a revision bump were missed.
+    fidelity: u64,
     ghosts: bool,
     max_ghost: u32,
     analysis_rays: u64,
@@ -270,6 +276,7 @@ impl Canvas {
     #[wasm_bindgen(js_name = setMaxGhostBounces)]
     pub fn set_max_ghost_bounces(&mut self, g: u32) {
         self.max_ghost = g.min(8);
+        self.sync_profile_from_ghosts();
     }
 
     #[wasm_bindgen(js_name = maxGhostBounces)]
@@ -281,6 +288,7 @@ impl Canvas {
     #[wasm_bindgen(js_name = setGhosts)]
     pub fn set_ghosts(&mut self, on: bool) {
         self.ghosts = on;
+        self.sync_profile_from_ghosts();
     }
 
     /// Is the ghost layer on?
@@ -1821,6 +1829,7 @@ impl Canvas {
     pub fn load_scene3_json(&mut self, json: &str) -> Result<String, JsError> {
         let (scene, report) = load_any(json).map_err(|e| JsError::new(&format!("{e:?}")))?;
         self.scene3 = Some(scene);
+        self.sync_ghosts_from_profile();
         self.bump();
         Ok(self.load_report_json(&report))
     }
@@ -1895,11 +1904,12 @@ impl Canvas {
             .map(|r| json_str(&format!("{r:?}")))
             .collect();
         format!(
-            "{{\"supported\":{},\"exact\":{},\"approximated\":{},\"rejected\":{}}}",
+            "{{\"supported\":{},\"exact\":{},\"approximated\":{},\"rejected\":{},\"fidelity\":{}}}",
             arr(&supported),
             arr(&exact),
             arr(&approx),
-            arr(&rejected)
+            arr(&rejected),
+            fidelity_ui::stamp_json(&res.fidelity)
         )
     }
 
@@ -2741,6 +2751,8 @@ impl Canvas {
                 // reporting a number here would be the very thing this is meant
                 // to stop. `surfaceFilmJSON` carries the stack instead.
                 SurfaceResponse::Coating { .. } => ("null".into(), "null".into()),
+                // A measured table is a function of angle too: `surfaceTableJSON`.
+                SurfaceResponse::MeasuredTable { .. } => ("null".into(), "null".into()),
                 // Nor does a polarizing element: what it passes depends on the
                 // state arriving, which is not a property of the surface. Half
                 // is the answer only for unpolarized light.
@@ -2795,8 +2807,8 @@ impl Canvas {
                         let um = w / 1000.0;
                         let (n0, n_far) = scene.coated_face_media(id as u64, um);
                         let v = oc_core::thinfilm::coating_rt_at(coating, n0, n_far, um, cos_i);
-                        out.push(v.map_or(f64::NAN, |x| x.r()));
-                        out.push(v.map_or(f64::NAN, |x| x.t()));
+                        out.push(v.as_ref().map_or(f64::NAN, |x| x.r()));
+                        out.push(v.as_ref().map_or(f64::NAN, |x| x.t()));
                     }
                     return out;
                 }
@@ -2826,10 +2838,19 @@ impl Canvas {
                     let cos_i = aoi_deg.to_radians().cos();
                     let ambient = self.scene3.as_ref().map_or(1.0, |s| s.env.ambient_index);
                     match oc_core::thinfilm::coating_rt(coating, ambient, um, cos_i) {
-                        Some(v) => (Some(v.r()), Some(v.t())),
-                        None => (None, None),
+                        Ok(v) => (Some(v.r()), Some(v.t())),
+                        Err(_) => (None, None),
                     }
                 }
+                // Inside its data a table is its data; outside, the curve has a
+                // gap rather than an extrapolation nobody measured.
+                SurfaceResponse::MeasuredTable { table, .. } => match table.outside(um, aoi_deg) {
+                    Some(_) => (None, None),
+                    None => {
+                        let p = table.powers_clamped(um, aoi_deg.to_radians().cos());
+                        (Some(p.r()), Some(p.t()))
+                    }
+                },
                 // What a polarizing element transmits depends on the state
                 // arriving, not on the surface, so there is no curve in
                 // wavelength to plot. Reporting the unpolarized half would read
@@ -2898,26 +2919,22 @@ impl Canvas {
 
         let design = match &coating.design {
             Some(d) => format!(
-                "{{\"kind\":\"{}\",\"lambdaNm\":{},\"aoiDeg\":{},\"periods\":{},\"nHigh\":{},\"nLow\":{}}}",
-                match d.kind {
-                    DesignKind::QuarterWaveStack => "mirror",
-                    DesignKind::Polarizing => "polarizing",
-                    DesignKind::LongPass => "long-pass",
-                    DesignKind::ShortPass => "short-pass",
-                    DesignKind::SingleLayerAr => "ar-1",
-                    DesignKind::BroadbandAr => "ar-3",
-                },
+                "{{\"kind\":\"{}\",\"lambdaNm\":{},\"aoiDeg\":{},\"periods\":{},\"nHigh\":{},\"nLow\":{},\"adapt\":{}}}",
+                design_kind_name(d),
                 json_num(d.lambda_nm),
                 json_num(d.aoi_deg),
                 d.periods,
                 json_num(d.n_high),
-                json_num(d.n_low)
+                json_num(d.n_low),
+                // What an adapted design was adapted to and its R and T at the
+                // design point; null for a fixed recipe.
+                serde_json::to_string(&d.adapt).unwrap_or_else(|_| "null".into())
             ),
             None => "null".into(),
         };
         let plate = scene.plate_geometry(id as u64);
         let substrate = match &coating.backing {
-            CoatingBacking::Plate { substrate, .. } => {
+            CoatingBacking::Plate { substrate, .. } | CoatingBacking::Opaque { substrate } => {
                 json_num(substrate.n.sample(0.55).unwrap_or(f64::NAN))
             }
             // A coating on a solid is backed by that solid's own glass, which is
@@ -2947,7 +2964,7 @@ impl Canvas {
         let peak = (250..=1600)
             .step_by(5)
             .filter_map(|nm| {
-                oc_core::thinfilm::coating_rt(coating, ambient, nm as f64 / 1000.0, aoi.to_radians().cos())
+                oc_core::thinfilm::coating_rt(coating, ambient, nm as f64 / 1000.0, aoi.to_radians().cos()).ok()
             })
             .map(|v| v.r())
             .fold(0.0f64, f64::max);
@@ -2983,14 +3000,9 @@ impl Canvas {
         n_high: f64,
         n_low: f64,
     ) -> bool {
-        use oc_core::thinfilm::{CoatingDesign, DesignKind};
-        let kind = match kind {
-            "long-pass" => DesignKind::LongPass,
-            "short-pass" => DesignKind::ShortPass,
-            "mirror" => DesignKind::QuarterWaveStack,
-            "ar-1" => DesignKind::SingleLayerAr,
-            "ar-3" => DesignKind::BroadbandAr,
-            _ => return false,
+        use oc_core::thinfilm::CoatingDesign;
+        let Some((kind, adapt)) = design_kind_named(kind, periods, aoi_deg) else {
+            return false;
         };
         let design = CoatingDesign {
             kind,
@@ -2999,6 +3011,7 @@ impl Canvas {
             periods,
             n_high,
             n_low,
+            adapt,
         };
         let Some(scene) = self.scene3.as_mut() else {
             return false;
@@ -3031,7 +3044,7 @@ impl Canvas {
         lambda_nm: f64,
     ) -> bool {
         use oc_core::build3::BodyFace;
-        use oc_core::thinfilm::{CoatingDesign, DesignKind};
+        use oc_core::thinfilm::CoatingDesign;
         let face = match face {
             "front" => BodyFace::Front,
             "back" => BodyFace::Back,
@@ -3040,13 +3053,8 @@ impl Canvas {
         let design = match kind {
             "none" => None,
             _ => {
-                let kind = match kind {
-                    "ar-1" => DesignKind::SingleLayerAr,
-                    "ar-3" => DesignKind::BroadbandAr,
-                    "mirror" => DesignKind::QuarterWaveStack,
-                    "long-pass" => DesignKind::LongPass,
-                    "short-pass" => DesignKind::ShortPass,
-                    _ => return false,
+                let Some((kind, adapt)) = design_kind_named(kind, 2, 0.0) else {
+                    return false;
                 };
                 Some(CoatingDesign {
                     kind,
@@ -3058,6 +3066,7 @@ impl Canvas {
                     periods: 4,
                     n_high: 2.35,
                     n_low: 1.38,
+                    adapt,
                 })
             }
         };
@@ -3072,13 +3081,62 @@ impl Canvas {
         }
     }
 
+    /// Import measured or supplied coating data from a CSV file onto a surface
+    /// (both sides) or onto one face of a lens (`face` = `front` or `back`;
+    /// empty for a surface). `map` is the JSON of an
+    /// `oc_core::response_table::CsvMap`: which columns hold what, the units,
+    /// the measurement angle (fixed or a column), the side, whether the data
+    /// include the substrate, and the media. A CSV says none of that, so the
+    /// importer asks for all of it (coating-fidelity spec CF-09).
+    ///
+    /// Returns `{"ok":true,"lambdas":n,"angles":m}` or `{"error":"..."}`.
+    #[wasm_bindgen(js_name = importMeasuredCsv)]
+    pub fn import_measured_csv(&mut self, id: f64, face: &str, csv: &str, map: &str) -> String {
+        use oc_core::build3::BodyFace;
+        let fail = |e: String| format!("{{\"error\":{}}}", json_str(&e));
+        let map: oc_core::response_table::CsvMap = match serde_json::from_str(map) {
+            Ok(m) => m,
+            Err(e) => return fail(format!("column map: {e}")),
+        };
+        let table = match oc_core::response_table::parse_csv(csv, &map) {
+            Ok(t) => t,
+            Err(e) => return fail(e),
+        };
+        let face = match face {
+            "front" => Some(BodyFace::Front),
+            "back" => Some(BodyFace::Back),
+            _ => None,
+        };
+        let (nl, na) = (table.lambda_um.len(), table.aoi_deg.len());
+        let Some(scene) = self.scene3.as_mut() else {
+            return fail("no 3D scene".into());
+        };
+        match scene.set_object_table(id as u64, face, table) {
+            Ok(()) => {
+                self.bump();
+                format!("{{\"ok\":true,\"lambdas\":{nl},\"angles\":{na}}}")
+            }
+            Err(e) => fail(e),
+        }
+    }
+
+    /// The measured table an object carries, as stored (axes, powers, side,
+    /// scope, media, provenance, out-of-domain policy), or `null`.
+    #[wasm_bindgen(js_name = surfaceTableJSON)]
+    pub fn surface_table_json(&self, id: f64) -> String {
+        self.scene3
+            .as_ref()
+            .and_then(|s| s.object_table(id as u64))
+            .and_then(|t| serde_json::to_string(t).ok())
+            .unwrap_or_else(|| "null".into())
+    }
+
     /// What each face of a body carries: `{front, back}`, each the design kind
     /// as a string, `"film"` for a stack with no recorded recipe, or null for
     /// bare glass. `null` for anything that is not a body with two faces.
     #[wasm_bindgen(js_name = lensFaceCoatingsJSON)]
     pub fn lens_face_coatings_json(&self, id: f64) -> String {
         use oc_core::build3::BodyFace;
-        use oc_core::thinfilm::DesignKind;
         let Some(scene) = self.scene3.as_ref() else {
             return "null".into();
         };
@@ -3087,15 +3145,7 @@ impl Canvas {
                 None => "null".into(),
                 Some(c) => format!(
                     "\"{}\"",
-                    match c.design.map(|d| d.kind) {
-                        Some(DesignKind::SingleLayerAr) => "ar-1",
-                        Some(DesignKind::BroadbandAr) => "ar-3",
-                        Some(DesignKind::QuarterWaveStack) => "mirror",
-                        Some(DesignKind::Polarizing) => "polarizing",
-                        Some(DesignKind::LongPass) => "long-pass",
-                        Some(DesignKind::ShortPass) => "short-pass",
-                        None => "film",
-                    }
+                    c.design.as_ref().map_or("film", design_kind_name)
                 ),
             }
         };
@@ -3647,7 +3697,8 @@ impl Canvas {
             .direction_grid()
             .map_or((0, 0), |(_, r, sct)| (r, sct));
         format!(
-            "{{\"colour\":{},\"directionLayout\":{},\"spectral\":{},\"spectralUntracked\":{},\"hits\":{},\"totalIncident\":{},\"totalSignal\":{},\"pixelArea\":{},\"faceArea\":{},\"meanIrradiance\":{},\"face\":{},\"centroid\":{},\"meanOpl\":{},\"bins\":[{},{}],\"incident\":[{}],\"measure\":\"{}\",\"unit\":\"{}\",\"coneDeg\":{},\"coneBins\":[{},{}],\"cells\":[{}],\"solidAngle\":[{}],\"outsideCone\":{},\"peak\":{},\"dop\":{},\"dolp\":{},\"azimuthDeg\":{},\"stokes\":[{},{},{},{}],\"maxTiltDeg\":{}}}",
+            "{{\"fidelity\":{},\"colour\":{},\"directionLayout\":{},\"spectral\":{},\"spectralUntracked\":{},\"hits\":{},\"totalIncident\":{},\"totalSignal\":{},\"pixelArea\":{},\"faceArea\":{},\"meanIrradiance\":{},\"face\":{},\"centroid\":{},\"meanOpl\":{},\"bins\":[{},{}],\"incident\":[{}],\"measure\":\"{}\",\"unit\":\"{}\",\"coneDeg\":{},\"coneBins\":[{},{}],\"cells\":[{}],\"solidAngle\":[{}],\"outsideCone\":{},\"peak\":{},\"dop\":{},\"dolp\":{},\"azimuthDeg\":{},\"stokes\":[{},{},{},{}],\"maxTiltDeg\":{}}}",
+            fidelity_ui::stamp_json(&res.fidelity),
             colour,
             detector_ui::layout_json(&d.measure),
             detector_ui::spectral_json(d),
@@ -4400,6 +4451,57 @@ pub(crate) fn pack_world_iter(segs: &mut dyn Iterator<Item = oc_gpu::cpu3::SegOu
 
 /// A finite number for JSON, or `null`. `serde_json` refuses NaN and infinity,
 /// and a silent `0` there would be a lie about a measurement that failed.
+/// The editor's name for a coating design.
+fn design_kind_name(d: &oc_core::thinfilm::CoatingDesign) -> &'static str {
+    use oc_core::synthesis::MetalKind;
+    use oc_core::thinfilm::DesignKind;
+    match d.kind {
+        DesignKind::QuarterWaveStack => "mirror",
+        DesignKind::Polarizing => "polarizing",
+        DesignKind::LongPass => "long-pass",
+        DesignKind::ShortPass => "short-pass",
+        DesignKind::SingleLayerAr if d.adapt.is_some() => "ar-matched",
+        DesignKind::SingleLayerAr => "ar-1",
+        DesignKind::BroadbandArLegacy => "ar-3",
+        DesignKind::VCoat => "ar-v",
+        DesignKind::Bbar => "ar-bbar",
+        DesignKind::BandAr => "ar-band",
+        DesignKind::EnhancedMetal { metal: MetalKind::Silver, .. } => "enhanced-silver",
+        DesignKind::EnhancedMetal { metal: MetalKind::Aluminium, .. } => "enhanced-aluminium",
+        DesignKind::EnhancedMetal { metal: MetalKind::Gold, .. } => "enhanced-gold",
+    }
+}
+
+/// The design an editor name asks for, and for a substrate-adapted kind what
+/// it is adapted to: the visible at the design angle, the substrate filled in
+/// when the coating is built. `periods` is the number of high/low pairs over
+/// an enhanced metal. None for a name the editor does not offer.
+fn design_kind_named(
+    name: &str,
+    periods: u32,
+    aoi_deg: f64,
+) -> Option<(oc_core::thinfilm::DesignKind, Option<oc_core::synthesis::DesignAdapt>)> {
+    use oc_core::synthesis::{DesignAdapt, MetalKind};
+    use oc_core::thinfilm::DesignKind;
+    let adapted = Some(DesignAdapt::visible(f64::NAN, aoi_deg));
+    let metal = |metal| (DesignKind::EnhancedMetal { metal, pairs: periods.clamp(1, 20) }, adapted);
+    Some(match name {
+        "long-pass" => (DesignKind::LongPass, None),
+        "short-pass" => (DesignKind::ShortPass, None),
+        "mirror" => (DesignKind::QuarterWaveStack, None),
+        "ar-1" => (DesignKind::SingleLayerAr, None),
+        "ar-3" => (DesignKind::BroadbandArLegacy, None),
+        "ar-matched" => (DesignKind::SingleLayerAr, adapted),
+        "ar-v" => (DesignKind::VCoat, adapted),
+        "ar-bbar" => (DesignKind::Bbar, adapted),
+        "ar-band" => (DesignKind::BandAr, adapted),
+        "enhanced-silver" => metal(MetalKind::Silver),
+        "enhanced-aluminium" => metal(MetalKind::Aluminium),
+        "enhanced-gold" => metal(MetalKind::Gold),
+        _ => return None,
+    })
+}
+
 fn json_num(v: f64) -> String {
     if v.is_finite() {
         format!("{v}")
@@ -4498,7 +4600,11 @@ impl Canvas {
     }
 
     fn cfg3(&self) -> TraceConfig3 {
+        // The scene's profile, its ghost setting already folded into the
+        // app's toggle (`sync_ghosts_from_profile`), which this reads below.
+        let fidelity = oc_core::fidelity::FidelityProfile { ghosts: None, ..self.fidelity() };
         TraceConfig3 {
+            fidelity,
             ghosts: self.ghosts,
             max_ghost_bounces: self.max_ghost,
             max_depth: self.depth3(),
@@ -4596,6 +4702,7 @@ impl Canvas {
         ReferenceKey {
             analysis_rays: self.analysis_rays,
             revision: self.revision,
+            fidelity: self.fidelity().key(),
             ghosts: self.ghosts,
             max_ghost: self.max_ghost,
         }
@@ -4630,7 +4737,7 @@ impl Canvas {
                 .join(",")
         };
         let (migrated, planar, lines, sources, notes, unresolved) = match report {
-            LoadReport::V2 => (false, Vec::new(), Vec::new(), Vec::new(), Vec::new(), false),
+            LoadReport::V2 | LoadReport::V3 => (false, Vec::new(), Vec::new(), Vec::new(), Vec::new(), false),
             LoadReport::MigratedFromV1(r) => (
                 true,
                 r.planar_only_bodies
@@ -5985,22 +6092,55 @@ mod scene3_tests {
         assert!(c.scene_revision() > rev0, "load must bump the revision");
     }
 
+    /// CF-09: a vendor's CSV, nm and percent at normal incidence, imported
+    /// onto a lens face with the map the importer asks for; a whole-part
+    /// table is refused there by name, and a bad map says what is wrong.
     #[test]
-    fn a_migrated_scene_round_trips_as_v2() {
+    fn a_vendor_csv_imports_onto_a_lens_face() {
+        let mut c = Canvas::new();
+        c.new_default_scene3();
+        let lens = c.scene3.as_ref().unwrap().bodies[0].common.id.0 as f64;
+        let csv = "Wavelength (nm),T (%)
+400,98.0
+550,99.5
+700,98.5
+";
+        let map = |scope: &str| {
+            format!(
+                r#"{{"lambda_column":0,"lambda_unit":"Nm","aoi":{{"Fixed":0.0}},"columns":{{"UnpolarizedLosslessT":{{"t":1}}}},"value_unit":"Percent","side":"Front","scope":"{scope}","media":{{"incident":1.0,"exit":1.52}}}}"#
+            )
+        };
+        let rev = c.scene_revision();
+        let ok = c.import_measured_csv(lens, "front", csv, &map("Interface"));
+        assert_eq!(ok, r#"{"ok":true,"lambdas":3,"angles":1}"#);
+        assert!(c.scene_revision() > rev);
+        let table: serde_json::Value = serde_json::from_str(&c.surface_table_json(lens)).unwrap();
+        assert_eq!(table["aoi_deg"], serde_json::json!([0.0]));
+        assert_eq!(table["power_resolution"], "Unpolarized");
+        let whole = c.import_measured_csv(lens, "front", csv, &map("FiniteAssembly"));
+        assert!(whole.contains("whole part"), "{whole}");
+        let bad = c.import_measured_csv(lens, "front", csv, "{}");
+        assert!(bad.starts_with(r#"{"error":"column map:"#), "{bad}");
+        // The trace runs through it.
+        assert!(!c.trace_projected_3d().is_empty());
+    }
+
+    #[test]
+    fn a_migrated_scene_round_trips_as_v3() {
         let mut c = v1_beam_and_lens();
         let v1_json = c.to_json();
         c.load_scene3_json(&v1_json).unwrap();
 
-        let v2 = c.scene3_json();
+        let v3 = c.scene3_json();
         assert!(
-            v2.contains("\"version\": 2"),
-            "v2 header: {}",
-            &v2[..80.min(v2.len())]
+            v3.contains("\"version\": 3"),
+            "v3 header: {}",
+            &v3[..80.min(v3.len())]
         );
-        assert!(v2.contains("\"dimension\": 3"));
+        assert!(v3.contains("\"dimension\": 3"));
 
-        // Reloading the v2 output is a parse, not a migration.
-        let report = c.load_scene3_json(&v2).unwrap();
+        // Reloading the v3 output is a parse, not a migration.
+        let report = c.load_scene3_json(&v3).unwrap();
         assert!(report.contains("\"migratedFromV1\":false"), "{report}");
     }
 

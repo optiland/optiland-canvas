@@ -8,6 +8,7 @@
 !examples/**/*.ocanvas
 !web/public/catalog/**/*.ocanvas
 !web/public/demo-*.ocanvas
+!web/public/gallery/*.ocanvas
 !crates/*/tests/data/**/*.ocanvas
 
 # web shell

@@ -17,6 +17,8 @@ pub mod result3;
 #[cfg(feature = "trace3")]
 pub mod sequence3;
 #[cfg(feature = "trace3")]
+pub mod seq_export;
+#[cfg(feature = "trace3")]
 pub mod tracer3;
 
 pub use fresnel::{
@@ -33,4 +35,9 @@ pub use result3::{
 #[cfg(feature = "trace3")]
 pub use sequence3::{axial_launch, extract_for_intent, extract_sequence3, SequenceError};
 #[cfg(feature = "trace3")]
-pub use tracer3::{launch_from_scene, launch_from_source, trace3, trace_scene3, TraceConfig3};
+pub use seq_export::{default_path, export_seq, ExportError};
+#[cfg(feature = "trace3")]
+pub use tracer3::{
+    depth_for_scene3, launch_from_scene, launch_from_source, trace3, trace_scene3, EncodedPart3,
+    TraceBlocks3, TraceConfig3, TraceJob3, TraceMerge3, TracePart3, TRACE_BLOCKS,
+};

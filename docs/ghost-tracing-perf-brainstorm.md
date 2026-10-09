@@ -1,7 +1,9 @@
 # Ghost-tracing performance — brainstorm
 
-Status: lever 2 (the WebGPU preview) is implemented and measured; the other
-levers are still analysis. Captured 2026-07-21 after the user observed severe
+Status: lever 2 (the WebGPU preview) is implemented and measured. Levers 3
+(off the main thread) and 5 (a BVH) have landed in the form described in
+[performance](performance.md), along with a picture budget in the spirit of
+lever 4 that leaves every number whole. Lever 1 is still analysis. Captured 2026-07-21 after the user observed severe
 slowdown when enabling ghosts with ~7 lenses; measurements added 2026-09-16.
 
 ## Why it explodes

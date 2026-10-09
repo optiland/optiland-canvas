@@ -28,6 +28,8 @@ pub mod build3;
 pub mod coordinates;
 #[cfg(feature = "scene3")]
 pub mod display_mesh;
+#[cfg(feature = "scene3")]
+pub mod document;
 pub mod fragment;
 pub mod geom;
 #[cfg(feature = "scene3")]
@@ -49,6 +51,8 @@ pub mod seq;
 #[cfg(feature = "scene3")]
 pub mod seq3;
 #[cfg(feature = "scene3")]
+pub mod seq_import;
+#[cfg(feature = "scene3")]
 pub mod source3;
 #[cfg(feature = "scene3")]
 pub mod thinfilm;
@@ -68,7 +72,7 @@ pub use scene::{
     Layer, LayerId, Region, Scene, Source, SourceId, SourceKind, Spectrum, SurfaceProps,
     SurfaceSpec, OCANVAS_FORMAT, OCANVAS_VERSION,
 };
-pub use seq::{FieldType, SeqAperture, SeqMaterial, SeqSurface, SeqSystem};
+pub use seq::{AimedBeam, FieldType, SeqAperture, SeqMaterial, SeqSurface, SeqSystem};
 #[cfg(feature = "scene3")]
 pub use seq3::{
     SeqAction, SeqHit3, SeqHitKind, SeqLaunch3, SeqTerminal3, SequencePrescription3, SEQ3_FORMAT,

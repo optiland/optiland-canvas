@@ -13,7 +13,7 @@ use super::primitives::{
 };
 use super::profile::{
     extrude_aabb, extrude_contains, extrude_intersect, revolve_aabb, revolve_contains,
-    revolve_intersect,
+    revolve_intersect, revolve_intersect_with, revolve_tolerance,
 };
 use super::{ray_to_local, Containment, Intersect3, LocalHit3, ToleranceContext};
 use crate::id::PatchId;
@@ -109,6 +109,52 @@ fn raw_to_local(raw: RawHit3) -> LocalHit3 {
         normal_local: raw.normal,
         patch: PatchId(raw.face as u64),
         uv: raw.uv,
+    }
+}
+
+/// What intersecting a solid needs that depends on its shape alone: found once
+/// for a trace ([`SolidGeometry3::prepare`]) instead of at every step.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SolidPrep {
+    /// A revolved profile's own tolerances ([`revolve_tolerance`]).
+    revolve_tol: Option<ToleranceContext>,
+}
+
+impl SolidGeometry3 {
+    /// What [`SolidGeometry3::intersect_prepared`] can reuse from one step to
+    /// the next.
+    pub fn prepare(&self) -> SolidPrep {
+        match self {
+            SolidGeometry3::Profile(p) if p.construction == ProfileConstruction3::RevolveLocalX => {
+                SolidPrep {
+                    revolve_tol: Some(revolve_tolerance(&p.profile)),
+                }
+            }
+            _ => SolidPrep::default(),
+        }
+    }
+
+    /// [`Intersect3::intersect`], with the work that depends on the shape
+    /// alone taken from `prep` rather than done again. The same hits, to the
+    /// bit, for a `prep` this geometry prepared.
+    pub fn intersect_prepared(
+        &self,
+        prep: &SolidPrep,
+        ray_world: &Ray3,
+        transform: &Isometry3,
+        t_min_mm: f64,
+        t_max_mm: f64,
+        out: &mut dyn FnMut(LocalHit3),
+    ) {
+        match (self, &prep.revolve_tol) {
+            (SolidGeometry3::Profile(p), Some(tol))
+                if p.construction == ProfileConstruction3::RevolveLocalX =>
+            {
+                let ray = ray_to_local(transform, ray_world);
+                revolve_intersect_with(&p.profile, tol, &ray, t_min_mm, t_max_mm, out)
+            }
+            _ => self.intersect(ray_world, transform, t_min_mm, t_max_mm, out),
+        }
     }
 }
 

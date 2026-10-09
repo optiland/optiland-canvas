@@ -6,4 +6,6 @@ import { defineConfig } from "vite";
 export default defineConfig({
   server: { fs: { allow: [".."] } },
   build: { target: "esnext" },
+  // The f64 reference worker imports the wasm glue as a module.
+  worker: { format: "es" },
 });

@@ -295,6 +295,22 @@ impl Gpu3Tracer {
         max_depth: u32,
         max_segs: u32,
     ) -> Result<Gpu3Trace, Gpu3Error> {
+        self.trace_async_with(scene, max_depth, max_segs, |raw| raw.decode())
+            .await
+    }
+
+    /// [`Gpu3Tracer::trace_async`], handing `read` the read-back as it lies
+    /// in the staging buffer. A caller that packs the segments into its own
+    /// layout reads them once from there, instead of from per-ray lists
+    /// built first: for a ghost-lit lens that is millions of segments less
+    /// to allocate and copy on the thread that waits.
+    pub async fn trace_async_with<T>(
+        &self,
+        scene: &GpuScene3,
+        max_depth: u32,
+        max_segs: u32,
+        read: impl FnOnce(RawTrace<'_>) -> T,
+    ) -> Result<T, Gpu3Error> {
         self.check_device()?;
         if self.busy.replace(true) {
             return Err(Gpu3Error::Busy);
@@ -305,11 +321,12 @@ impl Gpu3Tracer {
         let n_rays = bufs.rays.len();
         let n_segs = n_rays * max_segs as usize;
         if n_segs == 0 {
-            return Ok(Gpu3Trace {
-                segments: vec![Vec::new(); n_rays],
-                budget_truncated: 0,
-                stack_truncated: 0,
-            });
+            return Ok(read(RawTrace {
+                raw: &[],
+                scene,
+                n_rays,
+                max_segs: 0,
+            }));
         }
         let seg_bytes = (n_segs * std::mem::size_of::<Seg3Buf>()) as wgpu::BufferAddress;
         let signal = MapSignal::default();
@@ -466,7 +483,12 @@ impl Gpu3Tracer {
         }
         let data = b.staging.slice(0..seg_bytes).get_mapped_range();
         let raw: &[Seg3Buf] = &cast_slice::<u8, Seg3Buf>(&data)[..n_segs];
-        let out = decode(raw, scene, n_rays, max_segs as usize);
+        let out = read(RawTrace {
+            raw,
+            scene,
+            n_rays,
+            max_segs: max_segs as usize,
+        });
         drop(data);
         b.staging.unmap();
         self.check_device()?;
@@ -609,42 +631,97 @@ impl Drop for BusyGuard<'_> {
 
 /// Decode the raw segment buffer into per-ray world-millimetre segment lists,
 /// counting the rays the shader marked as cut short.
-fn decode(raw: &[Seg3Buf], scene: &GpuScene3, n_rays: usize, max_segs: usize) -> Gpu3Trace {
-    let mut segments = Vec::with_capacity(n_rays);
-    let mut budget_truncated = 0;
-    let mut stack_truncated = 0;
-    for r in 0..n_rays {
-        let first = raw[r * max_segs].flags;
-        if first & SEG_VALID != 0 {
-            if first & SEG_TRUNC_BUDGET != 0 {
-                budget_truncated += 1;
-            }
-            if first & SEG_TRUNC_STACK != 0 {
-                stack_truncated += 1;
+/// A GPU trace's read-back as it lies in the staging buffer: each ray's
+/// segment slots, `max_segs` of them, the used ones marked valid.
+pub struct RawTrace<'a> {
+    raw: &'a [Seg3Buf],
+    scene: &'a GpuScene3,
+    n_rays: usize,
+    max_segs: usize,
+}
+
+impl<'a> RawTrace<'a> {
+    /// Rays that used their whole segment budget with branches left, and
+    /// rays that lost a branch to the full stack (see [`Gpu3Trace`]).
+    pub fn truncated(&self) -> (usize, usize) {
+        let (mut budget, mut stack) = (0, 0);
+        if self.max_segs == 0 {
+            return (0, 0);
+        }
+        for r in 0..self.n_rays {
+            let first = self.raw[r * self.max_segs].flags;
+            if first & SEG_VALID != 0 {
+                if first & SEG_TRUNC_BUDGET != 0 {
+                    budget += 1;
+                }
+                if first & SEG_TRUNC_STACK != 0 {
+                    stack += 1;
+                }
             }
         }
-        let mut v = Vec::new();
-        for i in 0..max_segs {
-            let s = raw[r * max_segs + i];
-            if s.flags & SEG_VALID == 0 {
-                continue;
-            }
-            let a = glam::Vec3::new(s.a[0], s.a[1], s.a[2]);
-            let b = glam::Vec3::new(s.b[0], s.b[1], s.b[2]);
-            v.push(SegOut3 {
-                a: scene.norm.world_point(a),
-                b: scene.norm.world_point(b),
-                flux: s.flux,
-                lambda_um: s.lambda,
-                flags: s.flags & (SEG_TIR | SEG_GHOST),
-            });
-        }
-        segments.push(v);
+        (budget, stack)
     }
-    Gpu3Trace {
-        segments,
-        budget_truncated,
-        stack_truncated,
+
+    /// Every segment, ray after ray, in world millimetres: the per-ray lists
+    /// of [`RawTrace::decode`] one after another.
+    pub fn segments(&self) -> RawSegments<'a> {
+        let valid = self.raw.iter().filter(|s| s.flags & SEG_VALID != 0).count();
+        RawSegments {
+            slots: self.raw.iter(),
+            scene: self.scene,
+            left: valid,
+        }
+    }
+
+    /// The per-ray segment lists and the truncation counts.
+    pub fn decode(&self) -> Gpu3Trace {
+        let (budget_truncated, stack_truncated) = self.truncated();
+        let segments = (0..self.n_rays)
+            .map(|r| {
+                let slots = &self.raw[r * self.max_segs..(r + 1) * self.max_segs];
+                RawSegments {
+                    slots: slots.iter(),
+                    scene: self.scene,
+                    left: 0,
+                }
+                .collect()
+            })
+            .collect();
+        Gpu3Trace {
+            segments,
+            budget_truncated,
+            stack_truncated,
+        }
+    }
+}
+
+/// The valid segment slots of a read-back, decoded one at a time.
+pub struct RawSegments<'a> {
+    slots: std::slice::Iter<'a, Seg3Buf>,
+    scene: &'a GpuScene3,
+    /// Segments still to come, when counted (0 when not).
+    left: usize,
+}
+
+impl Iterator for RawSegments<'_> {
+    type Item = SegOut3;
+
+    fn next(&mut self) -> Option<SegOut3> {
+        let s = self.slots.by_ref().find(|s| s.flags & SEG_VALID != 0)?;
+        self.left = self.left.saturating_sub(1);
+        let a = glam::Vec3::new(s.a[0], s.a[1], s.a[2]);
+        let b = glam::Vec3::new(s.b[0], s.b[1], s.b[2]);
+        Some(SegOut3 {
+            a: self.scene.norm.world_point(a),
+            b: self.scene.norm.world_point(b),
+            flux: s.flux,
+            lambda_um: s.lambda,
+            flags: s.flags & (SEG_TIR | SEG_GHOST),
+        })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.left, None)
     }
 }
 

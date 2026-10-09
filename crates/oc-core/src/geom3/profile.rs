@@ -477,10 +477,38 @@ pub fn revolve_intersect(
     tmax: f64,
     out: &mut dyn FnMut(LocalHit3),
 ) {
-    let tol = ToleranceContext::from_aabb(&revolve_aabb(profile));
+    revolve_intersect_with(profile, &revolve_tolerance(profile), ray, tmin, tmax, out)
+}
+
+/// The tolerances a revolved body's hits are oriented with: its own size's.
+/// It depends on the profile alone, and finding it samples every face, so a
+/// tracer that meets the body at every step works it out once
+/// ([`revolve_intersect_with`]).
+pub fn revolve_tolerance(profile: &ClosedProfile2) -> ToleranceContext {
+    ToleranceContext::from_aabb(&revolve_aabb(profile))
+}
+
+/// [`revolve_intersect`] with the body's [`revolve_tolerance`] already found.
+pub fn revolve_intersect_with(
+    profile: &ClosedProfile2,
+    tol: &ToleranceContext,
+    ray: &Ray3,
+    tmin: f64,
+    tmax: f64,
+    out: &mut dyn FnMut(LocalHit3),
+) {
+    let tol = *tol;
     let probe = 8.0 * tol.medium_abs_mm;
+    // Outward when a point just off the hit along `n` is outside the body:
+    // what `revolve_contains` calls `Outside`, neither inside nor on the
+    // boundary band. Asked inside-first, since a point inside needs no
+    // boundary probes to be not outside.
     let orient = |n: Vec3, p: Vec3| -> Vec3 {
-        if revolve_contains(profile, p + n * probe, &tol) == Containment::Outside {
+        let q = p + n * probe;
+        let xr = Vec2::new(q.x, (q.y * q.y + q.z * q.z).sqrt());
+        let outside =
+            !profile_contains_2d(profile, xr) && !near_profile_boundary(profile, xr, &tol);
+        if outside {
             n
         } else {
             -n
@@ -813,9 +841,40 @@ fn is_mirror_symmetric_y(profile: &ClosedProfile2, scale: f64) -> bool {
 /// Does the closed profile cross itself? Sampled into a polygon, then tested for
 /// a proper intersection between non-adjacent segments.
 fn profile_self_intersects(profile: &ClosedProfile2) -> bool {
+    // A conic is sampled from `-half_ap` to `+half_ap` whichever way the loop
+    // runs through it, so each curve is turned to run on from where the loop
+    // has got to. Unturned, a face running against the loop joins it by a
+    // chord straight across the body, and a meniscus whose back rim sits
+    // within its front face's depth reads as crossing itself.
+    let samples: Vec<Vec<Vec2>> = profile
+        .edges
+        .iter()
+        .map(|e| sample_curve(&e.curve, 12))
+        .collect();
+    let dist = |a: Vec2, b: Vec2| (a - b).length();
     let mut poly: Vec<Vec2> = Vec::new();
-    for e in &profile.edges {
-        let s = sample_curve(&e.curve, 12);
+    for s in &samples {
+        let mut s = s.clone();
+        let (Some(&first), Some(&end)) = (s.first(), s.last()) else {
+            continue;
+        };
+        let reverse = match poly.last() {
+            Some(&last) => dist(last, end) < dist(last, first),
+            // The first curve runs toward whichever end the next one starts
+            // from.
+            None => samples
+                .get(1)
+                .is_some_and(|next| match (next.first(), next.last()) {
+                    (Some(&a), Some(&b)) => {
+                        let near = |p: Vec2| dist(p, a).min(dist(p, b));
+                        near(first) < near(end)
+                    }
+                    _ => false,
+                }),
+        };
+        if reverse {
+            s.reverse();
+        }
         // Drop the shared endpoint with the previous edge to avoid a false
         // adjacency crossing at the seam.
         let start = if poly.last().is_some_and(|last| {

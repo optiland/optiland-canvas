@@ -15,6 +15,7 @@
 
 import type { Canvas } from "../../pkg/oc_wasm.js";
 import type { FastPreview } from "../fastpreview";
+import type { Reference, StandIn } from "../reference";
 import { CameraRig, type Bounds3, type CameraPreset, type CameraState, type V2, type V3 } from "./camera";
 import { createScene3Cards, type SceneObject } from "./cards3d";
 import { drawAxisLabels, drawNotice, drawSelectionDot, drawTirRings } from "./overlays";
@@ -174,6 +175,12 @@ export type View3dOptions = {
   onSelect?: (id: number) => void;
   detectorRefresh?: () => void;
   fast?: FastPreview;
+  /** The f64 reference, traced off this thread. Without it the view traces
+   *  the reference itself, blocking the page while it does. */
+  reference?: Reference;
+  /** Counts the documents loaded; when it moves, the picture on screen is of
+   *  another design and is dropped. */
+  loads?: () => number;
   rayOptions: () => { ghostOpacity: number; showTir: boolean };
   grid: () => { on: boolean; spacing: number };
   /** Write the status line for a finished frame. */
@@ -305,6 +312,10 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
   let segs: Float32Array<ArrayBufferLike> = new Float32Array(0);
   let tracedRevision = -1;
   let shownExact = false;
+  // The workers' stand-in on screen, when the picture is one, and the load
+  // count the picture belongs to.
+  let shownStandIn: StandIn | null = null;
+  let seenLoads = 0;
   let objList: SceneObject[] = [];
   let selected = -1;
   let hovered = -1;
@@ -356,11 +367,55 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
   // the same scene.
   function retrace(fast = false) {
     const t0 = performance.now();
+    const loads = opts.loads?.() ?? 0;
+    if (loads !== seenLoads) {
+      seenLoads = loads;
+      segs = new Float32Array(0);
+      tracedRevision = -1;
+      shownExact = false;
+      shownStandIn = null;
+    }
+    if (!fast && opts.reference) {
+      // The reference of the scene as it is, when it has arrived; until then
+      // the fast picture stands in (it may replace whatever is on screen,
+      // which is not this scene's reference), and the reference is asked for.
+      const b = opts.reference.current();
+      if (b) {
+        opts.fast?.settled();
+        segs = b.projected;
+        tracedRevision = b.key.revision;
+        shownExact = true;
+        shownStandIn = null;
+        maps = parseDetectorMaps(b.maps);
+        mapsRevision = tracedRevision;
+        mapsUploaded = false;
+        lastTraceMs = performance.now() - t0;
+        traceSinceFrame += lastTraceMs;
+        return;
+      }
+      opts.reference.request();
+      shownExact = false;
+      // Where tracing that frame here would stall the page, the workers trace
+      // it; the picture on screen holds until one lands. During a drag that
+      // may be the frame of an earlier position, newer than the one shown.
+      const s = opts.reference.standIn(shownStandIn);
+      if (s === "coming") return;
+      if (s !== "here") {
+        segs = s.segs;
+        tracedRevision = s.revision;
+        shownStandIn = s;
+        lastTraceMs = performance.now() - t0;
+        traceSinceFrame += lastTraceMs;
+        return;
+      }
+      fast = true;
+    }
     if (!fast) {
       opts.fast?.settled();
       segs = scene.traceProjected3D();
       tracedRevision = scene.sceneRevision();
       shownExact = true;
+      shownStandIn = null;
       // The same trace left the detector maps behind; no second trace.
       maps = parseDetectorMaps(scene.lastDetectorMapsF32());
       mapsRevision = tracedRevision;
@@ -369,12 +424,14 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
       segs = scene.traceProjected3DFast();
       tracedRevision = scene.sceneRevision();
       shownExact = false;
+      shownStandIn = null;
     } else {
       opts.fast.requestProjected(scene, (f) => {
         if (f.revision < tracedRevision || (f.revision === tracedRevision && shownExact)) return;
         segs = f.segs;
         tracedRevision = f.revision;
         shownExact = false;
+        shownStandIn = null;
         if (f.late) invalidate();
       });
     }
@@ -533,8 +590,9 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
       const ts = performance.now();
       syncRender();
       syncMs = performance.now() - ts;
-      if (segs !== uploadedSegs) {
-        const up = renderer.updateRays(segs);
+      if (segs !== uploadedSegs || renderer.raysPending()) {
+        // A large picture goes up a chunk per frame.
+        const up = segs !== uploadedSegs ? renderer.updateRays(segs) : renderer.stepRays();
         uploadedSegs = segs;
         rayCount = up.count;
         tirPoints = up.tir;
@@ -601,6 +659,7 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
       });
     }
     opts.status({ count: renderer ? rayCount : 0, ms: t1 - t0, traceMs });
+    if (renderer?.raysPending()) invalidate();
   }
 
   // --- picking -------------------------------------------------------------

@@ -651,6 +651,7 @@ dependencies = [
  "glam",
  "oc-core",
  "rayon",
+ "serde",
  "serde_json",
 ]
 

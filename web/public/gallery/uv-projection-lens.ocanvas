@@ -1,0 +1,3035 @@
+{
+  "format": "ocanvas",
+  "version": 2,
+  "dimension": 3,
+  "bodies": [
+    {
+      "common": {
+        "id": 4,
+        "transform": {
+          "rot_xyzw": [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          "pos": [
+            13.742,
+            0.0,
+            0.0
+          ]
+        },
+        "layer": 0,
+        "locked": false,
+        "label": "L1 · S1–S2 · n = 1.5084",
+        "visible": true
+      },
+      "geometry": {
+        "Profile": {
+          "profile": {
+            "edges": [
+              {
+                "patch": 0,
+                "curve": {
+                  "Conic": {
+                    "vertex": [
+                      -13.742,
+                      0.0
+                    ],
+                    "axis": [
+                      1.0,
+                      0.0
+                    ],
+                    "c": -0.0013554089695815051,
+                    "k": 0.0,
+                    "half_ap": 65.63714922082534
+                  }
+                }
+              },
+              {
+                "patch": 1,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      -16.667510633592805,
+                      65.63714922082534
+                    ],
+                    "b": [
+                      4.40140125852375,
+                      65.63714922082534
+                    ]
+                  }
+                }
+              },
+              {
+                "patch": 2,
+                "curve": {
+                  "Conic": {
+                    "vertex": [
+                      13.742,
+                      0.0
+                    ],
+                    "axis": [
+                      1.0,
+                      0.0
+                    ],
+                    "c": -0.0042500906331827525,
+                    "k": 0.0,
+                    "half_ap": 65.63714922082534
+                  }
+                }
+              },
+              {
+                "patch": 3,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      4.40140125852375,
+                      -65.63714922082534
+                    ],
+                    "b": [
+                      -16.667510633592805,
+                      -65.63714922082534
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "construction": "RevolveLocalX"
+        }
+      },
+      "material": {
+        "Catalog": 5
+      },
+      "absorption": "None",
+      "surface": {
+        "default": {
+          "from_outside": {
+            "DielectricFresnel": {
+              "ar_residual": {
+                "Constant": 1.0
+              }
+            }
+          },
+          "from_inside": {
+            "DielectricFresnel": {
+              "ar_residual": {
+                "Constant": 1.0
+              }
+            }
+          }
+        },
+        "overrides": []
+      },
+      "priority": 0
+    },
+    {
+      "common": {
+        "id": 9,
+        "transform": {
+          "rot_xyzw": [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          "pos": [
+            46.723000000000006,
+            0.0,
+            0.0
+          ]
+        },
+        "layer": 0,
+        "locked": false,
+        "label": "L2 · S3–S4 · n = 1.5084",
+        "visible": true
+      },
+      "geometry": {
+        "Profile": {
+          "profile": {
+            "edges": [
+              {
+                "patch": 5,
+                "curve": {
+                  "Conic": {
+                    "vertex": [
+                      -18.323000000000004,
+                      0.0
+                    ],
+                    "axis": [
+                      1.0,
+                      0.0
+                    ],
+                    "c": 0.004735328295575404,
+                    "k": 0.0,
+                    "half_ap": 66.3182837318179
+                  }
+                }
+              },
+              {
+                "patch": 6,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      -7.63950303452825,
+                      66.3182837318179
+                    ],
+                    "b": [
+                      13.532057978735718,
+                      66.3182837318179
+                    ]
+                  }
+                }
+              },
+              {
+                "patch": 7,
+                "curve": {
+                  "Conic": {
+                    "vertex": [
+                      18.323,
+                      0.0
+                    ],
+                    "axis": [
+                      1.0,
+                      0.0
+                    ],
+                    "c": -0.002167323437912469,
+                    "k": 0.0,
+                    "half_ap": 66.3182837318179
+                  }
+                }
+              },
+              {
+                "patch": 8,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      13.532057978735718,
+                      -66.3182837318179
+                    ],
+                    "b": [
+                      -7.63950303452825,
+                      -66.3182837318179
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "construction": "RevolveLocalX"
+        }
+      },
+      "material": {
+        "Catalog": 5
+      },
+      "absorption": "None",
+      "surface": {
+        "default": {
+          "from_outside": {
+            "DielectricFresnel": {
+              "ar_residual": {
+                "Constant": 1.0
+              }
+            }
+          },
+          "from_inside": {
+            "DielectricFresnel": {
+              "ar_residual": {
+                "Constant": 1.0
+              }
+            }
+          }
+        },
+        "overrides": []
+      },
+      "priority": 0
+    },
+    {
+      "common": {
+        "id": 14,
+        "transform": {
+          "rot_xyzw": [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          "pos": [
+            76.4975,
+            0.0,
+            0.0
+          ]
+        },
+        "layer": 0,
+        "locked": false,
+        "label": "L3 · S5–S6 · n = 1.5084",
+        "visible": true
+      },
+      "geometry": {
+        "Profile": {
+          "profile": {
+            "edges": [
+              {
+                "patch": 10,
+                "curve": {
+                  "Conic": {
+                    "vertex": [
+                      -10.535499999999999,
+                      0.0
+                    ],
+                    "axis": [
+                      1.0,
+                      0.0
+                    ],
+                    "c": 0.002423197952494658,
+                    "k": 0.0,
+                    "half_ap": 62.28258680967897
+                  }
+                }
+              },
+              {
+                "patch": 11,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      -5.808488690418887,
+                      62.28258680967897
+                    ],
+                    "b": [
+                      23.109462183334536,
+                      62.28258680967897
+                    ]
+                  }
+                }
+              },
+              {
+                "patch": 12,
+                "curve": {
+                  "Conic": {
+                    "vertex": [
+                      10.535499999999999,
+                      0.0
+                    ],
+                    "axis": [
+                      1.0,
+                      0.0
+                    ],
+                    "c": 0.006229012122280491,
+                    "k": 0.0,
+                    "half_ap": 62.28258680967897
+                  }
+                }
+              },
+              {
+                "patch": 13,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      23.109462183334536,
+                      -62.28258680967897
+                    ],
+                    "b": [
+                      -5.808488690418887,
+                      -62.28258680967897
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "construction": "RevolveLocalX"
+        }
+      },
+      "material": {
+        "Catalog": 5
+      },
+      "absorption": "None",
+      "surface": {
+        "default": {
+          "from_outside": {
+            "DielectricFresnel": {
+              "ar_residual": {
+                "Constant": 1.0
+              }
+            }
+          },
+          "from_inside": {
+            "DielectricFresnel": {
+              "ar_residual": {
+                "Constant": 1.0
+              }
+            }
+          }
+        },
+        "overrides": []
+      },
+      "priority": 0
+    },
+    {
+      "common": {
+        "id": 19,
+        "transform": {
+          "rot_xyzw": [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          "pos": [
+            106.8375,
+            0.0,
+            0.0
+          ]
+        },
+        "layer": 0,
+        "locked": false,
+        "label": "L4 · S7–S8 · n = 1.5084",
+        "visible": true
+      },
+      "geometry": {
+        "Profile": {
+          "profile": {
+            "edges": [
+              {
+                "patch": 15,
+                "curve": {
+                  "Conic": {
+                    "vertex": [
+                      -3.6075000000000017,
+                      0.0
+                    ],
+                    "axis": [
+                      1.0,
+                      0.0
+                    ],
+                    "c": -0.0016552775296240882,
+                    "k": 0.0,
+                    "half_ap": 56.839314849901854
+                  }
+                }
+              },
+              {
+                "patch": 16,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      -6.287302497276393,
+                      56.839314849901854
+                    ],
+                    "b": [
+                      11.141064700728636,
+                      56.839314849901854
+                    ]
+                  }
+                }
+              },
+              {
+                "patch": 17,
+                "curve": {
+                  "Conic": {
+                    "vertex": [
+                      3.6075000000000017,
+                      0.0
+                    ],
+                    "axis": [
+                      1.0,
+                      0.0
+                    ],
+                    "c": 0.004583209777636411,
+                    "k": 0.0,
+                    "half_ap": 56.839314849901854
+                  }
+                }
+              },
+              {
+                "patch": 18,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      11.141064700728636,
+                      -56.839314849901854
+                    ],
+                    "b": [
+                      -6.287302497276393,
+                      -56.839314849901854
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "construction": "RevolveLocalX"
+        }
+      },
+      "material": {
+        "Catalog": 5
+      },
+      "absorption": "None",
+      "surface": {
+        "default": {
+          "from_outside": {
+            "DielectricFresnel": {
+              "ar_residual": {
+                "Constant": 1.0
+              }
+            }
+          },
+          "from_inside": {
+            "DielectricFresnel": {
+              "ar_residual": {
+                "Constant": 1.0
+              }
+            }
+          }
+        },
+        "overrides": []
+      },
+      "priority": 0
+    },
+    {
+      "common": {
+        "id": 24,
+        "transform": {
+          "rot_xyzw": [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          "pos": [
+            140.375,
+            0.0,
+            0.0
+          ]
+        },
+        "layer": 0,
+        "locked": false,
+        "label": "L5 · S9–S10 · n = 1.5084",
+        "visible": true
+      },
+      "geometry": {
+        "Profile": {
+          "profile": {
+            "edges": [
+              {
+                "patch": 20,
+                "curve": {
+                  "Conic": {
+                    "vertex": [
+                      -5.989000000000004,
+                      0.0
+                    ],
+                    "axis": [
+                      1.0,
+                      0.0
+                    ],
+                    "c": -0.0002788573429970416,
+                    "k": 0.0,
+                    "half_ap": 58.888684646978795
+                  }
+                }
+              },
+              {
+                "patch": 21,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      -6.472554109901102,
+                      58.888684646978795
+                    ],
+                    "b": [
+                      12.97152220624686,
+                      58.888684646978795
+                    ]
+                  }
+                }
+              },
+              {
+                "patch": 22,
+                "curve": {
+                  "Conic": {
+                    "vertex": [
+                      5.989000000000004,
+                      0.0
+                    ],
+                    "axis": [
+                      1.0,
+                      0.0
+                    ],
+                    "c": 0.003971140924672222,
+                    "k": 0.0,
+                    "half_ap": 58.888684646978795
+                  }
+                }
+              },
+              {
+                "patch": 23,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      12.97152220624686,
+                      -58.888684646978795
+                    ],
+                    "b": [
+                      -6.472554109901102,
+                      -58.888684646978795
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "construction": "RevolveLocalX"
+        }
+      },
+      "material": {
+        "Catalog": 5
+      },
+      "absorption": "None",
+      "surface": {
+        "default": {
+          "from_outside": {
+            "DielectricFresnel": {
+              "ar_residual": {
+                "Constant": 1.0
+              }
+            }
+          },
+          "from_inside": {
+            "DielectricFresnel": {
+              "ar_residual": {
+                "Constant": 1.0
+              }
+            }
+          }
+        },
+        "overrides": []
+      },
+      "priority": 0
+    },
+    {
+      "common": {
+        "id": 31,
+        "transform": {
+          "rot_xyzw": [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          "pos": [
+            199.8505,
+            0.0,
+            0.0
+          ]
+        },
+        "layer": 0,
+        "locked": false,
+        "label": "L6 · S11–S12 · n = 1.5084",
+        "visible": true
+      },
+      "geometry": {
+        "Profile": {
+          "profile": {
+            "edges": [
+              {
+                "patch": 25,
+                "curve": {
+                  "Conic": {
+                    "vertex": [
+                      -5.980500000000006,
+                      0.0
+                    ],
+                    "axis": [
+                      1.0,
+                      0.0
+                    ],
+                    "c": -0.01172584505233831,
+                    "k": 0.0,
+                    "half_ap": 62.16582954915439
+                  }
+                }
+              },
+              {
+                "patch": 26,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      -32.88088456984305,
+                      62.16582954915439
+                    ],
+                    "b": [
+                      -32.88088456984305,
+                      82.6147937273357
+                    ]
+                  }
+                }
+              },
+              {
+                "patch": 27,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      -32.88088456984305,
+                      82.6147937273357
+                    ],
+                    "b": [
+                      11.84480749546567,
+                      82.6147937273357
+                    ]
+                  }
+                }
+              },
+              {
+                "patch": 28,
+                "curve": {
+                  "Conic": {
+                    "vertex": [
+                      5.980500000000006,
+                      0.0
+                    ],
+                    "axis": [
+                      1.0,
+                      0.0
+                    ],
+                    "c": 0.0017098117719514612,
+                    "k": 0.0,
+                    "half_ap": 82.6147937273357
+                  }
+                }
+              },
+              {
+                "patch": 29,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      11.84480749546567,
+                      -82.6147937273357
+                    ],
+                    "b": [
+                      -32.88088456984305,
+                      -82.6147937273357
+                    ]
+                  }
+                }
+              },
+              {
+                "patch": 30,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      -32.88088456984305,
+                      -82.6147937273357
+                    ],
+                    "b": [
+                      -32.88088456984305,
+                      -62.16582954915439
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "construction": "RevolveLocalX"
+        }
+      },
+      "material": {
+        "Catalog": 5
+      },
+      "absorption": "None",
+      "surface": {
+        "default": {
+          "from_outside": {
+            "DielectricFresnel": {
+              "ar_residual": {
+                "Constant": 1.0
+              }
+            }
+          },
+          "from_inside": {
+            "DielectricFresnel": {
+              "ar_residual": {
+                "Constant": 1.0
+              }
+            }
+          }
+        },
+        "overrides": []
+      },
+      "priority": 0
+    },
+    {
+      "common": {
+        "id": 36,
+        "transform": {
+          "rot_xyzw": [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          "pos": [
+            233.4445,
+            0.0,
+            0.0
+          ]
+        },
+        "layer": 0,
+        "locked": false,
+        "label": "L7 · S13–S14 · n = 1.5084",
+        "visible": true
+      },
+      "geometry": {
+        "Profile": {
+          "profile": {
+            "edges": [
+              {
+                "patch": 32,
+                "curve": {
+                  "Conic": {
+                    "vertex": [
+                      -17.6455,
+                      0.0
+                    ],
+                    "axis": [
+                      1.0,
+                      0.0
+                    ],
+                    "c": 0.00024541075748238996,
+                    "k": 0.0,
+                    "half_ap": 91.68418027145901
+                  }
+                }
+              },
+              {
+                "patch": 33,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      -16.613909366336557,
+                      91.68418027145901
+                    ],
+                    "b": [
+                      -10.791543838597846,
+                      91.68418027145901
+                    ]
+                  }
+                }
+              },
+              {
+                "patch": 34,
+                "curve": {
+                  "Conic": {
+                    "vertex": [
+                      17.6455,
+                      0.0
+                    ],
+                    "axis": [
+                      1.0,
+                      0.0
+                    ],
+                    "c": -0.006172134663634091,
+                    "k": 0.0,
+                    "half_ap": 91.68418027145901
+                  }
+                }
+              },
+              {
+                "patch": 35,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      -10.791543838597846,
+                      -91.68418027145901
+                    ],
+                    "b": [
+                      -16.613909366336557,
+                      -91.68418027145901
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "construction": "RevolveLocalX"
+        }
+      },
+      "material": {
+        "Catalog": 5
+      },
+      "absorption": "None",
+      "surface": {
+        "default": {
+          "from_outside": {
+            "DielectricFresnel": {
+              "ar_residual": {
+                "Constant": 1.0
+              }
+            }
+          },
+          "from_inside": {
+            "DielectricFresnel": {
+              "ar_residual": {
+                "Constant": 1.0
+              }
+            }
+          }
+        },
+        "overrides": []
+      },
+      "priority": 0
+    },
+    {
+      "common": {
+        "id": 41,
+        "transform": {
+          "rot_xyzw": [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          "pos": [
+            272.6265,
+            0.0,
+            0.0
+          ]
+        },
+        "layer": 0,
+        "locked": false,
+        "label": "L8 · S15–S16 · n = 1.5084",
+        "visible": true
+      },
+      "geometry": {
+        "Profile": {
+          "profile": {
+            "edges": [
+              {
+                "patch": 37,
+                "curve": {
+                  "Conic": {
+                    "vertex": [
+                      -20.613500000000016,
+                      0.0
+                    ],
+                    "axis": [
+                      1.0,
+                      0.0
+                    ],
+                    "c": 0.0015884513234976428,
+                    "k": 0.0,
+                    "half_ap": 110.68565941947097
+                  }
+                }
+              },
+              {
+                "patch": 38,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      -10.806809458513154,
+                      110.68565941947097
+                    ],
+                    "b": [
+                      -8.238412719008672,
+                      110.68565941947097
+                    ]
+                  }
+                }
+              },
+              {
+                "patch": 39,
+                "curve": {
+                  "Conic": {
+                    "vertex": [
+                      20.613499999999988,
+                      0.0
+                    ],
+                    "axis": [
+                      1.0,
+                      0.0
+                    ],
+                    "c": -0.00441034366720958,
+                    "k": 0.0,
+                    "half_ap": 110.68565941947097
+                  }
+                }
+              },
+              {
+                "patch": 40,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      -8.238412719008672,
+                      -110.68565941947097
+                    ],
+                    "b": [
+                      -10.806809458513154,
+                      -110.68565941947097
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "construction": "RevolveLocalX"
+        }
+      },
+      "material": {
+        "Catalog": 5
+      },
+      "absorption": "None",
+      "surface": {
+        "default": {
+          "from_outside": {
+            "DielectricFresnel": {
+              "ar_residual": {
+                "Constant": 1.0
+              }
+            }
+          },
+          "from_inside": {
+            "DielectricFresnel": {
+              "ar_residual": {
+                "Constant": 1.0
+              }
+            }
+          }
+        },
+        "overrides": []
+      },
+      "priority": 0
+    },
+    {
+      "common": {
+        "id": 46,
+        "transform": {
+          "rot_xyzw": [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          "pos": [
+            308.077,
+            0.0,
+            0.0
+          ]
+        },
+        "layer": 0,
+        "locked": false,
+        "label": "L9 · S17–S18 · n = 1.5084",
+        "visible": true
+      },
+      "geometry": {
+        "Profile": {
+          "profile": {
+            "edges": [
+              {
+                "patch": 42,
+                "curve": {
+                  "Conic": {
+                    "vertex": [
+                      -13.920999999999992,
+                      0.0
+                    ],
+                    "axis": [
+                      1.0,
+                      0.0
+                    ],
+                    "c": 0.0019147041427879125,
+                    "k": 0.0,
+                    "half_ap": 113.40826475885437
+                  }
+                }
+              },
+              {
+                "patch": 43,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      -1.4594106650089351,
+                      113.40826475885437
+                    ],
+                    "b": [
+                      2.7730114518949236,
+                      113.40826475885437
+                    ]
+                  }
+                }
+              },
+              {
+                "patch": 44,
+                "curve": {
+                  "Conic": {
+                    "vertex": [
+                      13.920999999999992,
+                      0.0
+                    ],
+                    "axis": [
+                      1.0,
+                      0.0
+                    ],
+                    "c": -0.0017169622130956143,
+                    "k": 0.0,
+                    "half_ap": 113.40826475885437
+                  }
+                }
+              },
+              {
+                "patch": 45,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      2.7730114518949236,
+                      -113.40826475885437
+                    ],
+                    "b": [
+                      -1.4594106650089351,
+                      -113.40826475885437
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "construction": "RevolveLocalX"
+        }
+      },
+      "material": {
+        "Catalog": 5
+      },
+      "absorption": "None",
+      "surface": {
+        "default": {
+          "from_outside": {
+            "DielectricFresnel": {
+              "ar_residual": {
+                "Constant": 1.0
+              }
+            }
+          },
+          "from_inside": {
+            "DielectricFresnel": {
+              "ar_residual": {
+                "Constant": 1.0
+              }
+            }
+          }
+        },
+        "overrides": []
+      },
+      "priority": 0
+    },
+    {
+      "common": {
+        "id": 51,
+        "transform": {
+          "rot_xyzw": [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          "pos": [
+            334.366,
+            0.0,
+            0.0
+          ]
+        },
+        "layer": 0,
+        "locked": false,
+        "label": "L10 · S19–S20 · n = 1.5084",
+        "visible": true
+      },
+      "geometry": {
+        "Profile": {
+          "profile": {
+            "edges": [
+              {
+                "patch": 47,
+                "curve": {
+                  "Conic": {
+                    "vertex": [
+                      -11.451999999999998,
+                      0.0
+                    ],
+                    "axis": [
+                      1.0,
+                      0.0
+                    ],
+                    "c": 0.002359998961600457,
+                    "k": 0.0,
+                    "half_ap": 109.32135180044273
+                  }
+                }
+              },
+              {
+                "patch": 48,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      2.893185613642226,
+                      109.32135180044273
+                    ],
+                    "b": [
+                      7.131887780408691,
+                      109.32135180044273
+                    ]
+                  }
+                }
+              },
+              {
+                "patch": 49,
+                "curve": {
+                  "Conic": {
+                    "vertex": [
+                      11.451999999999998,
+                      0.0
+                    ],
+                    "axis": [
+                      1.0,
+                      0.0
+                    ],
+                    "c": -0.0007218340359184616,
+                    "k": 0.0,
+                    "half_ap": 109.32135180044273
+                  }
+                }
+              },
+              {
+                "patch": 50,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      7.131887780408691,
+                      -109.32135180044273
+                    ],
+                    "b": [
+                      2.893185613642226,
+                      -109.32135180044273
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "construction": "RevolveLocalX"
+        }
+      },
+      "material": {
+        "Catalog": 5
+      },
+      "absorption": "None",
+      "surface": {
+        "default": {
+          "from_outside": {
+            "DielectricFresnel": {
+              "ar_residual": {
+                "Constant": 1.0
+              }
+            }
+          },
+          "from_inside": {
+            "DielectricFresnel": {
+              "ar_residual": {
+                "Constant": 1.0
+              }
+            }
+          }
+        },
+        "overrides": []
+      },
+      "priority": 0
+    },
+    {
+      "common": {
+        "id": 56,
+        "transform": {
+          "rot_xyzw": [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          "pos": [
+            363.557,
+            0.0,
+            0.0
+          ]
+        },
+        "layer": 0,
+        "locked": false,
+        "label": "L11 · S21–S22 · n = 1.5084",
+        "visible": true
+      },
+      "geometry": {
+        "Profile": {
+          "profile": {
+            "edges": [
+              {
+                "patch": 52,
+                "curve": {
+                  "Conic": {
+                    "vertex": [
+                      -16.823000000000036,
+                      0.0
+                    ],
+                    "axis": [
+                      1.0,
+                      0.0
+                    ],
+                    "c": 0.004716113545149714,
+                    "k": 0.0,
+                    "half_ap": 98.54945967183538
+                  }
+                }
+              },
+              {
+                "patch": 53,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      7.470050591259611,
+                      98.54945967183538
+                    ],
+                    "b": [
+                      22.89807045233619,
+                      98.54945967183538
+                    ]
+                  }
+                }
+              },
+              {
+                "patch": 54,
+                "curve": {
+                  "Conic": {
+                    "vertex": [
+                      16.82299999999998,
+                      0.0
+                    ],
+                    "axis": [
+                      1.0,
+                      0.0
+                    ],
+                    "c": 0.0012463085897457468,
+                    "k": 0.0,
+                    "half_ap": 98.54945967183538
+                  }
+                }
+              },
+              {
+                "patch": 55,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      22.89807045233619,
+                      -98.54945967183538
+                    ],
+                    "b": [
+                      7.470050591259611,
+                      -98.54945967183538
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "construction": "RevolveLocalX"
+        }
+      },
+      "material": {
+        "Catalog": 5
+      },
+      "absorption": "None",
+      "surface": {
+        "default": {
+          "from_outside": {
+            "DielectricFresnel": {
+              "ar_residual": {
+                "Constant": 1.0
+              }
+            }
+          },
+          "from_inside": {
+            "DielectricFresnel": {
+              "ar_residual": {
+                "Constant": 1.0
+              }
+            }
+          }
+        },
+        "overrides": []
+      },
+      "priority": 0
+    },
+    {
+      "common": {
+        "id": 63,
+        "transform": {
+          "rot_xyzw": [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          "pos": [
+            440.03549999999996,
+            0.0,
+            0.0
+          ]
+        },
+        "layer": 0,
+        "locked": false,
+        "label": "L12 · S23–S24 · n = 1.5084",
+        "visible": true
+      },
+      "geometry": {
+        "Profile": {
+          "profile": {
+            "edges": [
+              {
+                "patch": 57,
+                "curve": {
+                  "Conic": {
+                    "vertex": [
+                      -4.351499999999987,
+                      0.0
+                    ],
+                    "axis": [
+                      1.0,
+                      0.0
+                    ],
+                    "c": -0.0012877144189375404,
+                    "k": 0.0,
+                    "half_ap": 65.20012626057013
+                  }
+                }
+              },
+              {
+                "patch": 58,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      -7.093413930195104,
+                      65.20012626057013
+                    ],
+                    "b": [
+                      20.6973544257671,
+                      65.20012626057013
+                    ]
+                  }
+                }
+              },
+              {
+                "patch": 59,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      20.6973544257671,
+                      65.20012626057013
+                    ],
+                    "b": [
+                      20.6973544257671,
+                      56.60197265682356
+                    ]
+                  }
+                }
+              },
+              {
+                "patch": 60,
+                "curve": {
+                  "Conic": {
+                    "vertex": [
+                      4.351499999999987,
+                      0.0
+                    ],
+                    "axis": [
+                      1.0,
+                      0.0
+                    ],
+                    "c": 0.009418608155761175,
+                    "k": 0.0,
+                    "half_ap": 56.60197265682356
+                  }
+                }
+              },
+              {
+                "patch": 61,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      20.6973544257671,
+                      -56.60197265682356
+                    ],
+                    "b": [
+                      20.6973544257671,
+                      -65.20012626057013
+                    ]
+                  }
+                }
+              },
+              {
+                "patch": 62,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      20.6973544257671,
+                      -65.20012626057013
+                    ],
+                    "b": [
+                      -7.093413930195104,
+                      -65.20012626057013
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "construction": "RevolveLocalX"
+        }
+      },
+      "material": {
+        "Catalog": 5
+      },
+      "absorption": "None",
+      "surface": {
+        "default": {
+          "from_outside": {
+            "DielectricFresnel": {
+              "ar_residual": {
+                "Constant": 1.0
+              }
+            }
+          },
+          "from_inside": {
+            "DielectricFresnel": {
+              "ar_residual": {
+                "Constant": 1.0
+              }
+            }
+          }
+        },
+        "overrides": []
+      },
+      "priority": 0
+    },
+    {
+      "common": {
+        "id": 68,
+        "transform": {
+          "rot_xyzw": [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          "pos": [
+            474.2029999999999,
+            0.0,
+            0.0
+          ]
+        },
+        "layer": 0,
+        "locked": false,
+        "label": "L13 · S25–S26 · n = 1.5084",
+        "visible": true
+      },
+      "geometry": {
+        "Profile": {
+          "profile": {
+            "edges": [
+              {
+                "patch": 64,
+                "curve": {
+                  "Conic": {
+                    "vertex": [
+                      -5.725999999999999,
+                      0.0
+                    ],
+                    "axis": [
+                      1.0,
+                      0.0
+                    ],
+                    "c": -0.0049829831126702315,
+                    "k": 0.0,
+                    "half_ap": 56.58217406301624
+                  }
+                }
+              },
+              {
+                "patch": 65,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      -13.8677730710575,
+                      56.58217406301624
+                    ],
+                    "b": [
+                      10.90249976316227,
+                      56.58217406301624
+                    ]
+                  }
+                }
+              },
+              {
+                "patch": 66,
+                "curve": {
+                  "Conic": {
+                    "vertex": [
+                      5.725999999999999,
+                      0.0
+                    ],
+                    "axis": [
+                      1.0,
+                      0.0
+                    ],
+                    "c": 0.003206912564170321,
+                    "k": 0.0,
+                    "half_ap": 56.58217406301624
+                  }
+                }
+              },
+              {
+                "patch": 67,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      10.90249976316227,
+                      -56.58217406301624
+                    ],
+                    "b": [
+                      -13.8677730710575,
+                      -56.58217406301624
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "construction": "RevolveLocalX"
+        }
+      },
+      "material": {
+        "Catalog": 5
+      },
+      "absorption": "None",
+      "surface": {
+        "default": {
+          "from_outside": {
+            "DielectricFresnel": {
+              "ar_residual": {
+                "Constant": 1.0
+              }
+            }
+          },
+          "from_inside": {
+            "DielectricFresnel": {
+              "ar_residual": {
+                "Constant": 1.0
+              }
+            }
+          }
+        },
+        "overrides": []
+      },
+      "priority": 0
+    },
+    {
+      "common": {
+        "id": 75,
+        "transform": {
+          "rot_xyzw": [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          "pos": [
+            545.355,
+            0.0,
+            0.0
+          ]
+        },
+        "layer": 0,
+        "locked": false,
+        "label": "L14 · S27–S28 · n = 1.5084",
+        "visible": true
+      },
+      "geometry": {
+        "Profile": {
+          "profile": {
+            "edges": [
+              {
+                "patch": 69,
+                "curve": {
+                  "Conic": {
+                    "vertex": [
+                      -5.886000000000081,
+                      0.0
+                    ],
+                    "axis": [
+                      1.0,
+                      0.0
+                    ],
+                    "c": -0.012948738533892029,
+                    "k": 0.0,
+                    "half_ap": 58.62579802988778
+                  }
+                }
+              },
+              {
+                "patch": 70,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      -32.84315135351588,
+                      58.62579802988778
+                    ],
+                    "b": [
+                      -32.84315135351588,
+                      73.99959930413705
+                    ]
+                  }
+                }
+              },
+              {
+                "patch": 71,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      -32.84315135351588,
+                      73.99959930413705
+                    ],
+                    "b": [
+                      7.067579356467434,
+                      73.99959930413705
+                    ]
+                  }
+                }
+              },
+              {
+                "patch": 72,
+                "curve": {
+                  "Conic": {
+                    "vertex": [
+                      5.885999999999967,
+                      0.0
+                    ],
+                    "axis": [
+                      1.0,
+                      0.0
+                    ],
+                    "c": 0.00043144301466146914,
+                    "k": 0.0,
+                    "half_ap": 73.99959930413705
+                  }
+                }
+              },
+              {
+                "patch": 73,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      7.067579356467434,
+                      -73.99959930413705
+                    ],
+                    "b": [
+                      -32.84315135351588,
+                      -73.99959930413705
+                    ]
+                  }
+                }
+              },
+              {
+                "patch": 74,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      -32.84315135351588,
+                      -73.99959930413705
+                    ],
+                    "b": [
+                      -32.84315135351588,
+                      -58.62579802988778
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "construction": "RevolveLocalX"
+        }
+      },
+      "material": {
+        "Catalog": 5
+      },
+      "absorption": "None",
+      "surface": {
+        "default": {
+          "from_outside": {
+            "DielectricFresnel": {
+              "ar_residual": {
+                "Constant": 1.0
+              }
+            }
+          },
+          "from_inside": {
+            "DielectricFresnel": {
+              "ar_residual": {
+                "Constant": 1.0
+              }
+            }
+          }
+        },
+        "overrides": []
+      },
+      "priority": 0
+    },
+    {
+      "common": {
+        "id": 80,
+        "transform": {
+          "rot_xyzw": [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          "pos": [
+            574.555,
+            0.0,
+            0.0
+          ]
+        },
+        "layer": 0,
+        "locked": false,
+        "label": "L15 · S29–S30 · n = 1.5084",
+        "visible": true
+      },
+      "geometry": {
+        "Profile": {
+          "profile": {
+            "edges": [
+              {
+                "patch": 76,
+                "curve": {
+                  "Conic": {
+                    "vertex": [
+                      -11.451999999999998,
+                      0.0
+                    ],
+                    "axis": [
+                      1.0,
+                      0.0
+                    ],
+                    "c": -0.003437774055050451,
+                    "k": 0.0,
+                    "half_ap": 79.86965918883152
+                  }
+                }
+              },
+              {
+                "patch": 77,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      -22.631903711272038,
+                      79.86965918883152
+                    ],
+                    "b": [
+                      -11.882323424457535,
+                      79.86965918883152
+                    ]
+                  }
+                }
+              },
+              {
+                "patch": 78,
+                "curve": {
+                  "Conic": {
+                    "vertex": [
+                      11.451999999999998,
+                      0.0
+                    ],
+                    "axis": [
+                      1.0,
+                      0.0
+                    ],
+                    "c": -0.0067404657796663065,
+                    "k": 0.0,
+                    "half_ap": 79.86965918883152
+                  }
+                }
+              },
+              {
+                "patch": 79,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      -11.882323424457535,
+                      -79.86965918883152
+                    ],
+                    "b": [
+                      -22.631903711272038,
+                      -79.86965918883152
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "construction": "RevolveLocalX"
+        }
+      },
+      "material": {
+        "Catalog": 5
+      },
+      "absorption": "None",
+      "surface": {
+        "default": {
+          "from_outside": {
+            "DielectricFresnel": {
+              "ar_residual": {
+                "Constant": 1.0
+              }
+            }
+          },
+          "from_inside": {
+            "DielectricFresnel": {
+              "ar_residual": {
+                "Constant": 1.0
+              }
+            }
+          }
+        },
+        "overrides": []
+      },
+      "priority": 0
+    },
+    {
+      "common": {
+        "id": 85,
+        "transform": {
+          "rot_xyzw": [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          "pos": [
+            607.9935,
+            0.0,
+            0.0
+          ]
+        },
+        "layer": 0,
+        "locked": false,
+        "label": "L16 · S31–S32 · n = 1.5084",
+        "visible": true
+      },
+      "geometry": {
+        "Profile": {
+          "profile": {
+            "edges": [
+              {
+                "patch": 81,
+                "curve": {
+                  "Conic": {
+                    "vertex": [
+                      -20.613500000000045,
+                      0.0
+                    ],
+                    "axis": [
+                      1.0,
+                      0.0
+                    ],
+                    "c": -0.00017672514625463836,
+                    "k": 0.0,
+                    "half_ap": 94.10339890912627
+                  }
+                }
+              },
+              {
+                "patch": 82,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      -21.396044431576914,
+                      94.10339890912627
+                    ],
+                    "b": [
+                      -12.023090889131417,
+                      94.10339890912627
+                    ]
+                  }
+                }
+              },
+              {
+                "patch": 83,
+                "curve": {
+                  "Conic": {
+                    "vertex": [
+                      20.61349999999993,
+                      0.0
+                    ],
+                    "axis": [
+                      1.0,
+                      0.0
+                    ],
+                    "c": -0.0065795620380325,
+                    "k": 0.0,
+                    "half_ap": 94.10339890912627
+                  }
+                }
+              },
+              {
+                "patch": 84,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      -12.023090889131417,
+                      -94.10339890912627
+                    ],
+                    "b": [
+                      -21.396044431576914,
+                      -94.10339890912627
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "construction": "RevolveLocalX"
+        }
+      },
+      "material": {
+        "Catalog": 5
+      },
+      "absorption": "None",
+      "surface": {
+        "default": {
+          "from_outside": {
+            "DielectricFresnel": {
+              "ar_residual": {
+                "Constant": 1.0
+              }
+            }
+          },
+          "from_inside": {
+            "DielectricFresnel": {
+              "ar_residual": {
+                "Constant": 1.0
+              }
+            }
+          }
+        },
+        "overrides": []
+      },
+      "priority": 0
+    },
+    {
+      "common": {
+        "id": 90,
+        "transform": {
+          "rot_xyzw": [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          "pos": [
+            646.0135,
+            0.0,
+            0.0
+          ]
+        },
+        "layer": 0,
+        "locked": false,
+        "label": "L17 · S33–S34 · n = 1.5084",
+        "visible": true
+      },
+      "geometry": {
+        "Profile": {
+          "profile": {
+            "edges": [
+              {
+                "patch": 86,
+                "curve": {
+                  "Conic": {
+                    "vertex": [
+                      -16.490499999999997,
+                      0.0
+                    ],
+                    "axis": [
+                      1.0,
+                      0.0
+                    ],
+                    "c": 0.0014747076576407184,
+                    "k": 0.0,
+                    "half_ap": 97.73302236239986
+                  }
+                }
+              },
+              {
+                "patch": 87,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      -9.410524604248334,
+                      97.73302236239986
+                    ],
+                    "b": [
+                      2.913640193246204,
+                      97.73302236239986
+                    ]
+                  }
+                }
+              },
+              {
+                "patch": 88,
+                "curve": {
+                  "Conic": {
+                    "vertex": [
+                      16.490499999999997,
+                      0.0
+                    ],
+                    "axis": [
+                      1.0,
+                      0.0
+                    ],
+                    "c": -0.0027889801815068303,
+                    "k": 0.0,
+                    "half_ap": 97.73302236239986
+                  }
+                }
+              },
+              {
+                "patch": 89,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      2.913640193246204,
+                      -97.73302236239986
+                    ],
+                    "b": [
+                      -9.410524604248334,
+                      -97.73302236239986
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "construction": "RevolveLocalX"
+        }
+      },
+      "material": {
+        "Catalog": 5
+      },
+      "absorption": "None",
+      "surface": {
+        "default": {
+          "from_outside": {
+            "DielectricFresnel": {
+              "ar_residual": {
+                "Constant": 1.0
+              }
+            }
+          },
+          "from_inside": {
+            "DielectricFresnel": {
+              "ar_residual": {
+                "Constant": 1.0
+              }
+            }
+          }
+        },
+        "overrides": []
+      },
+      "priority": 0
+    },
+    {
+      "common": {
+        "id": 95,
+        "transform": {
+          "rot_xyzw": [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          "pos": [
+            679.827,
+            0.0,
+            0.0
+          ]
+        },
+        "layer": 0,
+        "locked": false,
+        "label": "L18 · S35–S36 · n = 1.5084",
+        "visible": true
+      },
+      "geometry": {
+        "Profile": {
+          "profile": {
+            "edges": [
+              {
+                "patch": 91,
+                "curve": {
+                  "Conic": {
+                    "vertex": [
+                      -16.406999999999925,
+                      0.0
+                    ],
+                    "axis": [
+                      1.0,
+                      0.0
+                    ],
+                    "c": 0.0037839600958704134,
+                    "k": 0.0,
+                    "half_ap": 93.582148404609
+                  }
+                }
+              },
+              {
+                "patch": 92,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      0.7170292795029205,
+                      93.582148404609
+                    ],
+                    "b": [
+                      18.30362286876636,
+                      93.582148404609
+                    ]
+                  }
+                }
+              },
+              {
+                "patch": 93,
+                "curve": {
+                  "Conic": {
+                    "vertex": [
+                      16.40700000000004,
+                      0.0
+                    ],
+                    "axis": [
+                      1.0,
+                      0.0
+                    ],
+                    "c": 0.0004329588354862067,
+                    "k": 0.0,
+                    "half_ap": 93.582148404609
+                  }
+                }
+              },
+              {
+                "patch": 94,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      18.30362286876636,
+                      -93.582148404609
+                    ],
+                    "b": [
+                      0.7170292795029205,
+                      -93.582148404609
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "construction": "RevolveLocalX"
+        }
+      },
+      "material": {
+        "Catalog": 5
+      },
+      "absorption": "None",
+      "surface": {
+        "default": {
+          "from_outside": {
+            "DielectricFresnel": {
+              "ar_residual": {
+                "Constant": 1.0
+              }
+            }
+          },
+          "from_inside": {
+            "DielectricFresnel": {
+              "ar_residual": {
+                "Constant": 1.0
+              }
+            }
+          }
+        },
+        "overrides": []
+      },
+      "priority": 0
+    },
+    {
+      "common": {
+        "id": 100,
+        "transform": {
+          "rot_xyzw": [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          "pos": [
+            711.6575,
+            0.0,
+            0.0
+          ]
+        },
+        "layer": 0,
+        "locked": false,
+        "label": "L19 · S37–S38 · n = 1.5084",
+        "visible": true
+      },
+      "geometry": {
+        "Profile": {
+          "profile": {
+            "edges": [
+              {
+                "patch": 96,
+                "curve": {
+                  "Conic": {
+                    "vertex": [
+                      -14.507499999999936,
+                      0.0
+                    ],
+                    "axis": [
+                      1.0,
+                      0.0
+                    ],
+                    "c": 0.00583879893570373,
+                    "k": 0.0,
+                    "half_ap": 83.71007771203074
+                  }
+                }
+              },
+              {
+                "patch": 97,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      7.343783787581138,
+                      83.71007771203074
+                    ],
+                    "b": [
+                      24.242428009203774,
+                      83.71007771203074
+                    ]
+                  }
+                }
+              },
+              {
+                "patch": 98,
+                "curve": {
+                  "Conic": {
+                    "vertex": [
+                      14.50750000000005,
+                      0.0
+                    ],
+                    "axis": [
+                      1.0,
+                      0.0
+                    ],
+                    "c": 0.0027414046683380097,
+                    "k": 0.0,
+                    "half_ap": 83.71007771203074
+                  }
+                }
+              },
+              {
+                "patch": 99,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      24.242428009203774,
+                      -83.71007771203074
+                    ],
+                    "b": [
+                      7.343783787581138,
+                      -83.71007771203074
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "construction": "RevolveLocalX"
+        }
+      },
+      "material": {
+        "Catalog": 5
+      },
+      "absorption": "None",
+      "surface": {
+        "default": {
+          "from_outside": {
+            "DielectricFresnel": {
+              "ar_residual": {
+                "Constant": 1.0
+              }
+            }
+          },
+          "from_inside": {
+            "DielectricFresnel": {
+              "ar_residual": {
+                "Constant": 1.0
+              }
+            }
+          }
+        },
+        "overrides": []
+      },
+      "priority": 0
+    },
+    {
+      "common": {
+        "id": 107,
+        "transform": {
+          "rot_xyzw": [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          "pos": [
+            765.2125000000001,
+            0.0,
+            0.0
+          ]
+        },
+        "layer": 0,
+        "locked": false,
+        "label": "L20 · S39–S40 · n = 1.5084",
+        "visible": true
+      },
+      "geometry": {
+        "Profile": {
+          "profile": {
+            "edges": [
+              {
+                "patch": 101,
+                "curve": {
+                  "Conic": {
+                    "vertex": [
+                      -38.12950000000001,
+                      0.0
+                    ],
+                    "axis": [
+                      1.0,
+                      0.0
+                    ],
+                    "c": 0.008820675663755844,
+                    "k": 0.0,
+                    "half_ap": 70.27512717088734
+                  }
+                }
+              },
+              {
+                "patch": 102,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      -13.721083850084486,
+                      70.27512717088734
+                    ],
+                    "b": [
+                      49.20391047648067,
+                      70.27512717088734
+                    ]
+                  }
+                }
+              },
+              {
+                "patch": 103,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      49.20391047648067,
+                      70.27512717088734
+                    ],
+                    "b": [
+                      49.20391047648067,
+                      40.25456214789519
+                    ]
+                  }
+                }
+              },
+              {
+                "patch": 104,
+                "curve": {
+                  "Conic": {
+                    "vertex": [
+                      38.12950000000001,
+                      0.0
+                    ],
+                    "axis": [
+                      1.0,
+                      0.0
+                    ],
+                    "c": 0.012706770929957737,
+                    "k": 0.0,
+                    "half_ap": 40.25456214789519
+                  }
+                }
+              },
+              {
+                "patch": 105,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      49.20391047648067,
+                      -40.25456214789519
+                    ],
+                    "b": [
+                      49.20391047648067,
+                      -70.27512717088734
+                    ]
+                  }
+                }
+              },
+              {
+                "patch": 106,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      49.20391047648067,
+                      -70.27512717088734
+                    ],
+                    "b": [
+                      -13.721083850084486,
+                      -70.27512717088734
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "construction": "RevolveLocalX"
+        }
+      },
+      "material": {
+        "Catalog": 5
+      },
+      "absorption": "None",
+      "surface": {
+        "default": {
+          "from_outside": {
+            "DielectricFresnel": {
+              "ar_residual": {
+                "Constant": 1.0
+              }
+            }
+          },
+          "from_inside": {
+            "DielectricFresnel": {
+              "ar_residual": {
+                "Constant": 1.0
+              }
+            }
+          }
+        },
+        "overrides": []
+      },
+      "priority": 0
+    },
+    {
+      "common": {
+        "id": 114,
+        "transform": {
+          "rot_xyzw": [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          "pos": [
+            866.971,
+            0.0,
+            0.0
+          ]
+        },
+        "layer": 0,
+        "locked": false,
+        "label": "L21 · S41–S42 · n = 1.5084",
+        "visible": true
+      },
+      "geometry": {
+        "Profile": {
+          "profile": {
+            "edges": [
+              {
+                "patch": 108,
+                "curve": {
+                  "Conic": {
+                    "vertex": [
+                      -9.324999999999932,
+                      0.0
+                    ],
+                    "axis": [
+                      1.0,
+                      0.0
+                    ],
+                    "c": 0.020183956580272604,
+                    "k": 0.0,
+                    "half_ap": 23.99644642846692
+                  }
+                }
+              },
+              {
+                "patch": 109,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      -3.1259214355367115,
+                      23.99644642846692
+                    ],
+                    "b": [
+                      10.86986087420249,
+                      23.99644642846692
+                    ]
+                  }
+                }
+              },
+              {
+                "patch": 110,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      10.86986087420249,
+                      23.99644642846692
+                    ],
+                    "b": [
+                      10.86986087420249,
+                      18.35502310186488
+                    ]
+                  }
+                }
+              },
+              {
+                "patch": 111,
+                "curve": {
+                  "Conic": {
+                    "vertex": [
+                      9.325000000000045,
+                      0.0
+                    ],
+                    "axis": [
+                      1.0,
+                      0.0
+                    ],
+                    "c": 0.009106340198299664,
+                    "k": 0.0,
+                    "half_ap": 18.35502310186488
+                  }
+                }
+              },
+              {
+                "patch": 112,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      10.86986087420249,
+                      -18.35502310186488
+                    ],
+                    "b": [
+                      10.86986087420249,
+                      -23.99644642846692
+                    ]
+                  }
+                }
+              },
+              {
+                "patch": 113,
+                "curve": {
+                  "Line": {
+                    "a": [
+                      10.86986087420249,
+                      -23.99644642846692
+                    ],
+                    "b": [
+                      -3.1259214355367115,
+                      -23.99644642846692
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "construction": "RevolveLocalX"
+        }
+      },
+      "material": {
+        "Catalog": 5
+      },
+      "absorption": "None",
+      "surface": {
+        "default": {
+          "from_outside": {
+            "DielectricFresnel": {
+              "ar_residual": {
+                "Constant": 1.0
+              }
+            }
+          },
+          "from_inside": {
+            "DielectricFresnel": {
+              "ar_residual": {
+                "Constant": 1.0
+              }
+            }
+          }
+        },
+        "overrides": []
+      },
+      "priority": 0
+    }
+  ],
+  "surfaces": [],
+  "apertures": [
+    {
+      "common": {
+        "id": 115,
+        "transform": {
+          "rot_xyzw": [
+            0.0,
+            0.7071067811865476,
+            0.0,
+            0.7071067811865476
+          ],
+          "pos": [
+            345.818,
+            0.0,
+            0.0
+          ]
+        },
+        "layer": 0,
+        "locked": false,
+        "label": "stop · S20",
+        "visible": true
+      },
+      "shape": {
+        "plane_local": {
+          "origin": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "u": [
+            1.0,
+            0.0,
+            0.0
+          ],
+          "v": [
+            0.0,
+            1.0,
+            0.0
+          ],
+          "normal": [
+            0.0,
+            0.0,
+            1.0
+          ]
+        },
+        "clear_opening": {
+          "Disc": {
+            "radius_mm": 108.4304012821854
+          }
+        },
+        "outer_extent": {
+          "Disc": {
+            "radius_mm": 140.95952166684103
+          }
+        }
+      },
+      "interaction": "Absorb",
+      "primary_stop_for": [
+        120
+      ]
+    }
+  ],
+  "detectors": [
+    {
+      "common": {
+        "id": 119,
+        "transform": {
+          "rot_xyzw": [
+            0.0,
+            -0.7071067811865476,
+            0.0,
+            0.7071067811865476
+          ],
+          "pos": [
+            889.4352136739869,
+            0.0,
+            0.0
+          ]
+        },
+        "layer": 0,
+        "locked": false,
+        "label": "image",
+        "visible": true
+      },
+      "geometry": {
+        "Disc": {
+          "radius_mm": 28.352066189713593
+        }
+      },
+      "bins": [
+        64,
+        64
+      ],
+      "response": "Unity",
+      "termination": "Terminate",
+      "measure": "Power"
+    }
+  ],
+  "sources": [
+    {
+      "id": 116,
+      "transform": {
+        "rot_xyzw": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "pos": [
+          -110.85883544,
+          0.0,
+          0.0
+        ]
+      },
+      "spatial": "Point",
+      "angular": {
+        "UniformConeSolidAngle": {
+          "half_angle_rad": 0.1333952606156793
+        }
+      },
+      "spectrum": {
+        "Monochromatic": 0.248
+      },
+      "flux": 1.0,
+      "samples": {
+        "spatial_samples": 1,
+        "angular_samples": 64,
+        "seed": 1,
+        "sequence": "Grid"
+      }
+    },
+    {
+      "id": 117,
+      "transform": {
+        "rot_xyzw": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "pos": [
+          -110.85883544,
+          32.0,
+          0.0
+        ]
+      },
+      "spatial": "Point",
+      "angular": {
+        "UniformConeSolidAngle": {
+          "half_angle_rad": 0.1333952606156793
+        }
+      },
+      "spectrum": {
+        "Monochromatic": 0.248
+      },
+      "flux": 1.0,
+      "samples": {
+        "spatial_samples": 1,
+        "angular_samples": 64,
+        "seed": 1,
+        "sequence": "Grid"
+      }
+    },
+    {
+      "id": 118,
+      "transform": {
+        "rot_xyzw": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "pos": [
+          -110.85883544,
+          48.0,
+          0.0
+        ]
+      },
+      "spatial": "Point",
+      "angular": {
+        "UniformConeSolidAngle": {
+          "half_angle_rad": 0.1333952606156793
+        }
+      },
+      "spectrum": {
+        "Monochromatic": 0.248
+      },
+      "flux": 1.0,
+      "samples": {
+        "spatial_samples": 1,
+        "angular_samples": 64,
+        "seed": 1,
+        "sequence": "Grid"
+      }
+    }
+  ],
+  "views": [],
+  "env": {
+    "ambient_index": 1.0,
+    "ambient_absorption": "None",
+    "wavelengths": [
+      [
+        0.248,
+        1.0
+      ]
+    ]
+  },
+  "layers": [
+    {
+      "name": "Layer 0",
+      "visible": true,
+      "opacity": 1.0
+    }
+  ],
+  "catalog": {
+    "glasses": [
+      {
+        "name": "N-BK7",
+        "sell": {
+          "b": [
+            1.03961212,
+            0.231792344,
+            1.01046945
+          ],
+          "c": [
+            0.00600069867,
+            0.0200179144,
+            103.560653
+          ]
+        },
+        "nd": 1.5168001097398938,
+        "vd": 64.16641023507295
+      },
+      {
+        "name": "F2",
+        "sell": {
+          "b": [
+            1.34533359,
+            0.209073176,
+            0.937357162
+          ],
+          "c": [
+            0.00997743871,
+            0.0470450767,
+            111.886764
+          ]
+        },
+        "nd": 1.6200402929345499,
+        "vd": 36.365893010309826
+      },
+      {
+        "name": "N-SF11",
+        "sell": {
+          "b": [
+            1.73759695,
+            0.313747346,
+            1.89878101
+          ],
+          "c": [
+            0.013188707,
+            0.0623068142,
+            155.23629
+          ]
+        },
+        "nd": 1.7847202174912626,
+        "vd": 25.67954760100289
+      },
+      {
+        "name": "N-LAK22",
+        "sell": {
+          "b": [
+            1.14229176,
+            0.535138441,
+            1.04083092
+          ],
+          "c": [
+            0.00585673287,
+            0.019808638,
+            75.8450272
+          ]
+        },
+        "nd": 1.6507449312219062,
+        "vd": 54.97829369154724
+      },
+      {
+        "name": "FusedSilica",
+        "sell": {
+          "b": [
+            0.6961663,
+            0.4079426,
+            0.8974794
+          ],
+          "c": [
+            0.00467914825849,
+            0.013512063073959999,
+            97.93400253792099
+          ]
+        },
+        "nd": 1.4584637505239135,
+        "vd": 67.82047811745134
+      },
+      {
+        "name": "n = 1.5084",
+        "sell": {
+          "b": [
+            1.27527056,
+            0.0,
+            0.0
+          ],
+          "c": [
+            0.0,
+            0.0,
+            0.0
+          ]
+        },
+        "nd": 1.5084,
+        "vd": 0.0,
+        "formula": {
+          "kind": "constant",
+          "n": 1.5084
+        }
+      }
+    ]
+  },
+  "intent": {
+    "primary_paths": [
+      {
+        "id": 120,
+        "source": 116,
+        "detector": 119,
+        "stop": 115,
+        "label": "the design's path"
+      }
+    ]
+  },
+  "next_id": 121
+}

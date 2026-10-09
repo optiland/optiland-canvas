@@ -7,8 +7,10 @@
 
 import { test, expect } from "@playwright/test";
 
-/** The detector's f64 readout line. */
+/** The detector's f64 readout line, once the reference of the scene as it is
+ *  has come back from its worker. */
 async function readout(page: import("@playwright/test").Page): Promise<string> {
+  await page.waitForFunction(() => (window as any).__ocDebug.referenceCurrent());
   return (await page.locator("#dockNums").textContent()) ?? "";
 }
 
@@ -23,7 +25,7 @@ function dopOf(line: string): number {
 
 test.describe("polarization", () => {
   test("the default singlet already polarizes its light a little", async ({ page }) => {
-    await page.goto("/");
+    await page.goto("/?debug");
     await expect(page.locator("#stat")).toContainText("segs");
     const line = await readout(page);
     // A lens is two glass surfaces, and a ray away from the axis meets them
@@ -35,7 +37,7 @@ test.describe("polarization", () => {
   });
 
   test("a polarizer halves the light and says what comes out", async ({ page }) => {
-    await page.goto("/");
+    await page.goto("/?debug");
     await expect(page.locator("#stat")).toContainText("segs");
     const fluxBefore = fluxOf(await readout(page));
     expect(fluxBefore).toBeGreaterThan(0);
@@ -55,7 +57,7 @@ test.describe("polarization", () => {
   });
 
   test("a polarizing cube sorts the beam instead of absorbing half of it", async ({ page }) => {
-    await page.goto("/");
+    await page.goto("/?debug");
     await expect(page.locator("#stat")).toContainText("segs");
     const before = fluxOf(await readout(page));
 
@@ -73,7 +75,7 @@ test.describe("polarization", () => {
   });
 
   test("a waveplate changes the state and not the flux", async ({ page }) => {
-    await page.goto("/");
+    await page.goto("/?debug");
     await expect(page.locator("#stat")).toContainText("segs");
 
     await page.locator("#addPolarizer").click();
@@ -99,7 +101,7 @@ test.describe("polarization", () => {
   });
 
   test("both elements land in the object list and can be picked", async ({ page }) => {
-    await page.goto("/");
+    await page.goto("/?debug");
     await expect(page.locator("#stat")).toContainText("segs");
     const before = await page.locator("#objects3d .row").count();
 

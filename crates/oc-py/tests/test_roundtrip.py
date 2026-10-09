@@ -115,6 +115,15 @@ def _close(a, b, tol=1e-6):
     return abs(a - b) <= tol + tol * abs(b)
 
 
+def _same_material(expect: dict, got: dict) -> bool:
+    """The same medium. A glass read back from Optiland also carries the
+    catalog it is from and its published formula, which a prescription
+    written by name leaves out; the name is what identifies it."""
+    if expect.get("kind") == "glass":
+        return got.get("kind") == "glass" and got.get("name") == expect.get("name")
+    return expect == got
+
+
 def _assert_systems_equal(name, expect, got):
     assert len(got["surfaces"]) == len(expect["surfaces"]), f"{name}: surface count"
     for i, (a, b) in enumerate(zip(expect["surfaces"], got["surfaces"])):
@@ -123,7 +132,9 @@ def _assert_systems_equal(name, expect, got):
         assert _close(a["conic"], b["conic"]), f"{where}: conic"
         assert _close(a["thickness"], b["thickness"]), f"{where}: thickness"
         assert _close(a["semi_aperture"], b["semi_aperture"]), f"{where}: semi_aperture"
-        assert a["material"] == b["material"], f"{where}: material {a['material']} vs {b['material']}"
+        assert _same_material(a["material"], b["material"]), (
+            f"{where}: material {a['material']} vs {b['material']}"
+        )
         ca, cb = a["coefficients"], b["coefficients"]
         assert len(ca) == len(cb), f"{where}: n coeffs {ca} vs {cb}"
         for x, y in zip(ca, cb):
@@ -147,6 +158,7 @@ def test_prescription_optic_roundtrip(name):
     optic = oc.optic_from_seq(seq)
     back = oc.seq_from_optic(optic)
     _assert_systems_equal(name, seq, back)
+    assert back["stop"] == seq["stop"], f"{name}: the Optic's stop came back as {back['stop']}"
 
 
 @pytest.mark.parametrize("name", list(CORPUS))
@@ -156,7 +168,9 @@ def test_full_ocanvas_optic_roundtrip(name):
     ocanvas = oc.seq_to_scene(seq)          # prescription -> .ocanvas
     assert oc.validate(ocanvas) == oc.OCANVAS_VERSION
 
-    optic = oc.to_optic(ocanvas)            # export (must not warn: exact subset)
+    # A version 1 scene has no apertures, so the stop cannot travel through
+    # it; the corpus names it, and the export is told.
+    optic = oc.to_optic(ocanvas, stop=seq["stop"])  # must not warn: exact subset
     back_ocanvas = oc.from_optic(optic)     # import
     final = oc.scene_to_seq(back_ocanvas)   # read the prescription back out
 
@@ -173,8 +187,31 @@ def test_exported_optic_is_traceable(name):
 
 
 def test_to_optic_does_not_warn_on_exact_subset(recwarn):
-    oc.to_optic(oc.seq_to_scene(CORPUS["cemented_doublet"]))
+    oc.to_optic(oc.seq_to_scene(CORPUS["cemented_doublet"]), stop=0)
     assert not [w for w in recwarn if issubclass(w.category, oc.FidelityWarning)]
+
+
+def test_a_stop_nothing_declared_is_inferred_out_loud_or_refused():
+    """A version 1 scene cannot declare a stop, and the export says so.
+
+    It used to write surface zero without a word. An inferred stop moves the
+    pupils and changes every off-axis ray, so default export names the
+    inference in its warning and strict export refuses it.
+    """
+    scene = oc.seq_to_scene(CORPUS["cemented_doublet"])
+    assert oc.scene_to_seq(scene)["stop"] is None
+    with pytest.warns(oc.FidelityWarning, match="inferred"):
+        optic = oc.to_optic(scene)
+    assert optic.surfaces.stop_index == 1
+    with pytest.raises(oc.NotExportableError, match="no aperture stop is declared"):
+        oc.to_optic(scene, strict=True)
+    # Naming it satisfies strict, and a name outside the system does not.
+    assert oc.to_optic(scene, strict=True, stop=1).surfaces.stop_index == 2
+    with pytest.raises(ValueError, match="not a surface index"):
+        oc.to_optic(scene, stop=99)
+    # The builder will not guess either.
+    with pytest.raises(oc.NotExportableError):
+        oc.optic_from_seq(oc.scene_to_seq(scene))
 
 
 @pytest.mark.parametrize("name", list(CORPUS))

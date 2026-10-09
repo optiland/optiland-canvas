@@ -355,7 +355,6 @@ impl DetectorResult3 {
             .fold(None, |m: Option<f64>, (_, v)| Some(m.map_or(v, |m| m.max(v))))
     }
 
-    #[cfg(feature = "parallel")]
     pub(crate) fn merge(&mut self, other: &DetectorResult3) {
         for (a, b) in self.incident_flux.iter_mut().zip(&other.incident_flux) {
             *a += *b;
@@ -428,7 +427,6 @@ impl EnergyLedger {
         }
     }
 
-    #[cfg(feature = "parallel")]
     pub(crate) fn merge(&mut self, o: &EnergyLedger) {
         self.launched += o.launched;
         self.detected_incident += o.detected_incident;
@@ -492,7 +490,6 @@ impl TerminationSummary {
         }
     }
 
-    #[cfg(feature = "parallel")]
     pub(crate) fn merge(&mut self, o: &TerminationSummary) {
         self.detector += o.detector;
         self.absorbed_volume += o.absorbed_volume;
@@ -510,7 +507,7 @@ impl TerminationSummary {
 
 /// A physics feature a backend can run (§3.5). Coarse on purpose: the report
 /// exists to say what was and was not handled, not to enumerate every constant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PhysicsFeature {
     AnalyticSolid,
     ProfileBody,
@@ -531,7 +528,7 @@ pub enum PhysicsFeature {
 /// A feature that ran, but not exactly (§3.5). None are emitted yet — the
 /// reference path is exact or it refuses — but the field exists so a later
 /// approximate backend has somewhere honest to record itself.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Approximation {
     pub feature: PhysicsFeature,
     pub detail: String,
@@ -542,7 +539,7 @@ pub struct Approximation {
 /// The tracer emits these instead of substituting a superficially similar
 /// geometry or surface. A backend that cannot trace a required feature rejects
 /// the scene; it never traces it wrong and stays quiet.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum CapabilityIssue {
     /// A profile body whose third dimension is unresolved (§3.2).
     PlanarOnlyObject {
@@ -589,7 +586,7 @@ pub enum CapabilityIssue {
 /// A backend's structured statement of what it can and cannot do for a scene
 /// (§3.5). For the reference tracer, `rejected` is the load-bearing field: a
 /// non-empty `rejected` means some flux could not be traced honestly.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CapabilityReport {
     pub supported: Vec<PhysicsFeature>,
     pub exact: Vec<PhysicsFeature>,
@@ -637,7 +634,6 @@ impl CapabilityReport {
         }
     }
 
-    #[cfg(feature = "parallel")]
     pub(crate) fn merge(&mut self, o: &CapabilityReport) {
         for f in &o.exact {
             self.note_exact(*f);
@@ -666,6 +662,10 @@ pub struct TraceResult3 {
     /// the caller that owns the scene sets it.
     pub revision: u64,
     pub segments: Vec<Segment3>,
+    /// Segments not recorded for being dimmer than the configured floor
+    /// ([`crate::TraceConfig3::segment_floor`]). Their flux is in the ledger and
+    /// the detectors all the same.
+    pub segments_omitted: u64,
     pub detectors: Vec<DetectorResult3>,
     pub ledger: EnergyLedger,
     pub terminations: TerminationSummary,

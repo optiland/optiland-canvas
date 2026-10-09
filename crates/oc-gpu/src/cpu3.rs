@@ -135,22 +135,7 @@ struct Work {
 
 /// Trace every launch ray, returning segments and detector readouts.
 pub fn trace(scene: &GpuScene3, max_depth: u32) -> Cpu3Result {
-    let mut detectors: Vec<DetReadout3> = scene
-        .detectors
-        .iter()
-        .map(|d| DetReadout3 {
-            object: d.object,
-            bins: d.bins,
-            geometry: d.geometry.clone(),
-            incident: vec![0.0; d.bins[0].max(1) * d.bins[1].max(1)],
-            hits: 0,
-            total: 0.0,
-            direction: vec![0.0; d.solid_angle_sr.len()],
-            solid_angle_sr: d.solid_angle_sr.clone(),
-            outside: 0.0,
-        })
-        .collect();
-
+    let mut detectors = blank_readouts(scene);
     let segments = scene
         .rays
         .iter()
@@ -166,6 +151,39 @@ pub fn trace(scene: &GpuScene3, max_depth: u32) -> Cpu3Result {
 /// Trace segments only, for the many call sites that do not read detectors.
 pub fn trace_segments(scene: &GpuScene3, max_depth: u32) -> Vec<Vec<SegOut3>> {
     trace(scene, max_depth).segments
+}
+
+/// The segments of the launch rays in `rays` only, per ray, in order. A ray's
+/// segments do not depend on any other ray, so the ranges of a split, one
+/// after another, are [`trace_segments`] of the whole scene.
+pub fn trace_segments_range(
+    scene: &GpuScene3,
+    max_depth: u32,
+    rays: std::ops::Range<usize>,
+) -> Vec<Vec<SegOut3>> {
+    let mut detectors = blank_readouts(scene);
+    scene.rays[rays]
+        .iter()
+        .map(|r| trace_one(scene, *r, max_depth, &mut detectors))
+        .collect()
+}
+
+fn blank_readouts(scene: &GpuScene3) -> Vec<DetReadout3> {
+    scene
+        .detectors
+        .iter()
+        .map(|d| DetReadout3 {
+            object: d.object,
+            bins: d.bins,
+            geometry: d.geometry.clone(),
+            incident: vec![0.0; d.bins[0].max(1) * d.bins[1].max(1)],
+            hits: 0,
+            total: 0.0,
+            direction: vec![0.0; d.solid_angle_sr.len()],
+            solid_angle_sr: d.solid_angle_sr.clone(),
+            outside: 0.0,
+        })
+        .collect()
 }
 
 fn trace_one(
@@ -656,15 +674,22 @@ struct Event {
 
 fn nearest_event(scene: &GpuScene3, o: Vec3, d: Vec3) -> Option<Event> {
     let mut best: Option<Event> = None;
-    let mut consider = |t: f32, kind: EvKind| {
+    fn consider(best: &mut Option<Event>, t: f32, kind: EvKind) {
         if best.as_ref().map(|e| t < e.t).unwrap_or(true) {
-            best = Some(Event { t, kind });
+            *best = Some(Event { t, kind });
         }
-    };
+    }
 
     for (bi, b) in scene.bodies.iter().enumerate() {
+        // A body the ray does not reach before the nearest hit so far cannot
+        // be the nearest: pass over it without solving its faces.
+        let limit = best.as_ref().map_or(f32::INFINITY, |e| e.t);
+        if !reaches(b.bounds, o, d, limit) {
+            continue;
+        }
         if let Some((t, nl, face)) = body_hit(b, o, d) {
             consider(
+                &mut best,
                 t,
                 EvKind::Body {
                     body: bi,
@@ -676,20 +701,45 @@ fn nearest_event(scene: &GpuScene3, o: Vec3, d: Vec3) -> Option<Event> {
     }
     for (si, s) in scene.surfaces.iter().enumerate() {
         if let Some((t, normal)) = surface_hit(s, o, d) {
-            consider(t, EvKind::Surface { surf: si, normal });
+            consider(&mut best, t, EvKind::Surface { surf: si, normal });
         }
     }
     for a in &scene.apertures {
         if let Some(t) = aperture_hit(a, o, d) {
-            consider(t, EvKind::Aperture);
+            consider(&mut best, t, EvKind::Aperture);
         }
     }
     for (di, det) in scene.detectors.iter().enumerate() {
         if let Some((t, uv)) = detector_hit(det, o, d) {
-            consider(t, EvKind::Detector { det: di, uv });
+            consider(&mut best, t, EvKind::Detector { det: di, uv });
         }
     }
     best
+}
+
+/// Does the ray enter the box `(lo, hi)` before `limit`? Permissive, like the
+/// reference's slab test: an axis it runs along, or a `NaN` from starting on a
+/// face, never rules the box out.
+fn reaches((lo, hi): (Vec3, Vec3), o: Vec3, d: Vec3, limit: f32) -> bool {
+    let (mut enter, mut exit) = (0.0f32, limit);
+    for axis in 0..3 {
+        let inv = 1.0 / d[axis];
+        let mut near = (lo[axis] - o[axis]) * inv;
+        let mut far = (hi[axis] - o[axis]) * inv;
+        if near > far {
+            std::mem::swap(&mut near, &mut far);
+        }
+        if near > enter {
+            enter = near;
+        }
+        if far < exit {
+            exit = far;
+        }
+        if enter > exit {
+            return false;
+        }
+    }
+    true
 }
 
 /// A body's `(t, world normal, face index)`. Only a revolved body distinguishes
@@ -833,6 +883,12 @@ fn box_hit(o: Vec3, d: Vec3, half: Vec3, tmin: f32) -> Option<(f32, Vec3)> {
 fn region_optics(scene: &GpuScene3, p: Vec3, lambda: f32) -> (f32, f32) {
     let mut best: Option<&GpuBody3> = None;
     for b in &scene.bodies {
+        // A body lies inside its padded box, so a point outside the box is
+        // outside the body: its shape need not be asked.
+        let (lo, hi) = b.bounds;
+        if !(p.cmpge(lo).all() && p.cmple(hi).all()) {
+            continue;
+        }
         if contains(b, p) {
             match best {
                 Some(cur) if cur.priority >= b.priority => {}

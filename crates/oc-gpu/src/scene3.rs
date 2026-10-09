@@ -25,6 +25,7 @@
 //! and any body surface other than a symmetric dielectric or absorber.
 
 use glam::{DQuat, DVec3, Mat3, Vec2, Vec3};
+use oc_core::geom3::Intersect3;
 use oc_core::material::{Cauchy, Material};
 use oc_core::profile2::{ClosedProfile2, ProfileConstruction3};
 use oc_core::scene3::{
@@ -127,6 +128,11 @@ pub struct GpuBody3 {
     pub alpha_per_mm: f32,
     /// The source object id, for diagnostics and capability parity.
     pub object: u64,
+    /// The body's world box in the normalized frame, padded past f32
+    /// rounding: a ray that does not enter it before a nearer hit cannot hit
+    /// the body. The CPU mirror passes over such a body without solving its
+    /// faces; the shader does not read it.
+    pub bounds: (Vec3, Vec3),
 }
 
 impl GpuBody3 {
@@ -376,7 +382,7 @@ fn body_index_at(
 ) -> Option<f64> {
     match m {
         Material::AbbePoint { nd, vd } => Some(Cauchy::from_abbe(*nd, *vd).index(lambda_um)),
-        Material::Catalog(id) => catalog.get(*id).map(|g| g.sell.index(lambda_um)),
+        Material::Catalog(id) => catalog.get(*id).map(|g| g.index(lambda_um)),
         Material::Grin(f) => Some(f.base_index),
         Material::Mirror { .. } | Material::Absorber => Some(1.0),
     }
@@ -526,9 +532,21 @@ fn compile_body(
         dp: [0.0; 6],
         alpha_per_mm,
         object: b.common.id.0,
+        bounds: normalized_bounds(&b.geometry.aabb_world(&b.common.transform), norm),
     };
     set_dispersion(&mut gb, &b.material, catalog)?;
     Ok(gb)
+}
+
+/// A world box in the normalized frame, padded by 1e-4 of the scene's scale
+/// (f32 rounding is 1e-7): large enough that no hit inside the true box falls
+/// outside it, which is all a conservative bound owes.
+fn normalized_bounds(bb: &oc_core::vec3::Aabb3, norm: &Norm) -> (Vec3, Vec3) {
+    const PAD: f32 = 1e-4;
+    (
+        norm.point(bb.min) - Vec3::splat(PAD),
+        norm.point(bb.max) + Vec3::splat(PAD),
+    )
 }
 
 /// The closed polygon of a line-only profile, normalized and in loop order, or

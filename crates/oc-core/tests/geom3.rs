@@ -940,6 +940,40 @@ fn promotion_accepts_a_symmetric_lens_and_refuses_an_asymmetric_one() {
 }
 
 #[test]
+fn a_deep_meniscus_is_revolvable_and_a_bow_tie_is_not() {
+    // Both faces bend toward -X, and the back rim sits inside the front face's
+    // depth: the cemented meniscus of Optiland's telephoto sample. The check
+    // once sampled every face from -half_ap to +half_ap whichever way the
+    // loop ran, joined the back face by a chord straight across the body,
+    // and read that chord as the profile crossing itself.
+    let meniscus = singlet_profile(-14.5161, -18.8544, 2.286, 10.87);
+    assert!(validate_revolvable(&meniscus).is_ok());
+
+    // A loop that does cross itself is still refused. (Its sides cross the
+    // axis between the check's sample points; a crossing exactly on one is a
+    // touch to it.)
+    let corners = [
+        Vec2::new(-1.0, -1.0),
+        Vec2::new(2.0, 1.7),
+        Vec2::new(2.0, -1.7),
+        Vec2::new(-1.0, 1.0),
+    ];
+    let bow_tie = ClosedProfile2 {
+        edges: (0..4)
+            .map(|i| ProfileEdge2 {
+                patch: PatchId(i as u64),
+                curve: Curve2::Line {
+                    a: corners[i],
+                    b: corners[(i + 1) % 4],
+                },
+            })
+            .collect(),
+    };
+    let e = validate_revolvable(&bow_tie).unwrap_err();
+    assert!(e.contains("crosses itself"), "{e}");
+}
+
+#[test]
 fn promotion_refuses_an_off_axis_arc_for_revolve() {
     // A closed loop whose curved side is an arc centred off the axis revolves to a
     // torus, which is refused rather than traced with a missing surface.

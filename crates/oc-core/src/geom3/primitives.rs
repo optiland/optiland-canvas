@@ -414,6 +414,133 @@ pub fn cylinder_contains(
 }
 
 // ---------------------------------------------------------------------------
+// Hollow tube about local +X, centred at the local origin
+// ---------------------------------------------------------------------------
+
+/// Face indices of a tube, which are also its patch ids: a tube is the one
+/// analytic solid whose faces can carry their own responses, because the
+/// inside of a light pipe and the outside of it are different parts.
+pub mod tube_face {
+    /// The outer wall, `ρ = outer_radius`.
+    pub const OUTER: u32 = 0;
+    /// The end ring at `x = +half_length`.
+    pub const END_PLUS: u32 = 1;
+    /// The end ring at `x = −half_length`.
+    pub const END_MINUS: u32 = 2;
+    /// The bore, `ρ = inner_radius`.
+    pub const INNER: u32 = 3;
+}
+
+/// Where a ray crosses the infinite cylinder `y² + z² = r²` about `+X`, both
+/// roots, stable against cancellation. `None` for a ray parallel to the axis
+/// or one that misses.
+fn x_cylinder_roots(r: f64, ray: &Ray3) -> Option<[f64; 2]> {
+    let (oy, oz, dy, dz) = (ray.origin.y, ray.origin.z, ray.dir.y, ray.dir.z);
+    let aa = dy * dy + dz * dz;
+    if aa <= PARALLEL_EPS * PARALLEL_EPS {
+        return None;
+    }
+    let bb = 2.0 * (oy * dy + oz * dz);
+    let cc = oy * oy + oz * oz - r * r;
+    let disc = bb * bb - 4.0 * aa * cc;
+    if disc < 0.0 {
+        return None;
+    }
+    let q = -0.5 * (bb + bb.signum() * disc.sqrt());
+    Some([q / aa, cc / q])
+}
+
+/// A hollow circular tube: the region `inner ≤ ρ ≤ outer`, `|x| ≤ half_length`,
+/// with `ρ = √(y² + z²)`. Faces as [`tube_face`].
+///
+/// The bore's outward normal points **toward the axis**: outward from the
+/// material, which is what makes a ray travelling down the bore "outside" the
+/// solid and its reflection off the wall a reflection from outside.
+pub fn tube_intersect(
+    inner_radius_mm: f64,
+    outer_radius_mm: f64,
+    half_length_mm: f64,
+    ray: &Ray3,
+    tmin: f64,
+    tmax: f64,
+    out: &mut dyn FnMut(RawHit3),
+) {
+    let l = half_length_mm;
+    for (r, face, sign) in [
+        (outer_radius_mm, tube_face::OUTER, 1.0),
+        (inner_radius_mm, tube_face::INNER, -1.0),
+    ] {
+        let Some(roots) = x_cylinder_roots(r, ray) else {
+            continue;
+        };
+        for t in roots {
+            if t.is_finite() && in_range(t, tmin, tmax) {
+                let p = ray.at(t);
+                if p.x.abs() <= l {
+                    out(RawHit3 {
+                        t_mm: t,
+                        point: p,
+                        normal: Vec3::new(0.0, p.y, p.z) * (sign / r),
+                        uv: None,
+                        face,
+                    });
+                }
+            }
+        }
+    }
+
+    // End rings at x = ±l.
+    if ray.dir.x.abs() >= PARALLEL_EPS {
+        let (ri2, ro2) = (
+            inner_radius_mm * inner_radius_mm,
+            outer_radius_mm * outer_radius_mm,
+        );
+        for (s, face) in [(l, tube_face::END_PLUS), (-l, tube_face::END_MINUS)] {
+            let t = (s - ray.origin.x) / ray.dir.x;
+            if in_range(t, tmin, tmax) {
+                let p = ray.at(t);
+                let rho2 = p.y * p.y + p.z * p.z;
+                if rho2 >= ri2 && rho2 <= ro2 {
+                    out(RawHit3 {
+                        t_mm: t,
+                        point: p,
+                        normal: Vec3::new(s.signum(), 0.0, 0.0),
+                        uv: None,
+                        face,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Containment for [`tube_intersect`]'s solid, by the exact signed distance.
+///
+/// In the meridian half-plane `(|x|, ρ)` the tube's section is the rectangle
+/// `[0, l] × [inner, outer]`, and the distance from a point to a solid of
+/// revolution is the distance from its meridian point to the section. So this
+/// is the ordinary box distance, centred on the wall.
+pub fn tube_contains(
+    inner_radius_mm: f64,
+    outer_radius_mm: f64,
+    half_length_mm: f64,
+    p: Vec3,
+    tol: &ToleranceContext,
+) -> super::Containment {
+    let rho = (p.y * p.y + p.z * p.z).sqrt();
+    let mid = 0.5 * (inner_radius_mm + outer_radius_mm);
+    let half_wall = 0.5 * (outer_radius_mm - inner_radius_mm);
+    let qa = p.x.abs() - half_length_mm;
+    let qr = (rho - mid).abs() - half_wall;
+    let d = if qa <= 0.0 && qr <= 0.0 {
+        qa.max(qr)
+    } else {
+        qa.max(0.0).hypot(qr.max(0.0))
+    };
+    classify(d, tol)
+}
+
+// ---------------------------------------------------------------------------
 // Conic and even-asphere of revolution about an arbitrary local axis
 // ---------------------------------------------------------------------------
 
@@ -604,9 +731,18 @@ fn conic_intersect(
     }
 }
 
-/// Even-asphere-of-revolution roots: seed from the base conic, then Newton-refine
-/// the residual `axial(t) − sag(r(t))` with an **analytic** derivative, falling
-/// back to bisection when a step leaves the bracket (§7.4).
+/// Even-asphere-of-revolution roots, found where they can be: on the stretch
+/// of the ray whose radius lies in the aperture and whose axial coordinate lies
+/// in the surface's axial slab, the residual `axial(t) − sag(r(t))` is sampled
+/// and every sign change refined (Newton with an **analytic** derivative,
+/// bisecting when a step leaves the bracket, §7.4). On a whole surface the
+/// base conic's roots seed a local refinement too, for a root the samples
+/// straddle twice (a tangent crossing).
+///
+/// Every root in `(tmin, tmax]` is found whatever the range asked: a ray
+/// grazing a narrow zone (a Fresnel groove) meets it far from where it
+/// crosses the base conic, and a search seeded only from the conic found that
+/// hit or not depending on how far the caller looked.
 fn asphere_intersect(
     surf: &Revolution,
     ray: &Ray3,
@@ -631,51 +767,182 @@ fn asphere_intersect(
         dz - surf.dsag_dr(r) * dr
     };
 
-    // Seeds: base-conic roots bracket the near cap. Fall back to a coarse march
-    // over the aperture span so a highly aspheric surface with no nearby conic
-    // root is still bracketed rather than missed.
-    let base = Revolution {
-        coeffs: [0.0; 8],
-        ..*surf
+    let mut roots: Vec<f64> = Vec::new();
+    let keep = |t: f64, roots: &mut Vec<f64>| {
+        if !roots.iter().any(|q| (q - t).abs() <= 1e-9 * (1.0 + t.abs())) {
+            roots.push(t);
+        }
     };
-    let mut seeds: Vec<f64> = Vec::new();
-    conic_intersect(&base, ray, tmin - surf.outer_r.max(1.0), tmax, &mut |h| {
-        seeds.push(h.t_mm)
-    });
-    if seeds.is_empty() {
-        let start = tmin.max(0.0);
-        let step = surf.outer_r.max(1.0) * 0.1;
-        let mut pt = start;
-        let mut pv = residual(pt);
-        for i in 1..=200 {
-            let t = start + step * i as f64;
-            if t > tmax {
-                break;
-            }
+
+    // The axial slab the surface fills: the sag at its two radii, widened by
+    // their difference, so a surface that is not monotone across its zone
+    // (by less than its own rise) still lies inside.
+    let (s_in, s_out) = (surf.sag(surf.inner_r.max(0.0)), surf.sag(surf.outer_r));
+    for (a, b) in aperture_spans(surf, o_rad, d_rad, z0, dz, s_in, s_out, tmin, tmax) {
+        const SAMPLES: usize = 8;
+        let mut pt = a;
+        let mut pv = residual(a);
+        if pv == 0.0 {
+            keep(a, &mut roots);
+        }
+        for i in 1..=SAMPLES {
+            let t = a + (b - a) * (i as f64 / SAMPLES as f64);
             let v = residual(t);
-            if pv * v < 0.0 {
-                seeds.push(0.5 * (pt + t));
+            if v == 0.0 {
+                keep(t, &mut roots);
+            } else if pv * v < 0.0 {
+                if let Some(r) = solve_bracket(pt, t, pv, &residual, &dresidual) {
+                    keep(r, &mut roots);
+                }
             }
             pt = t;
             pv = v;
         }
     }
 
-    for seed in seeds {
-        if let Some(t) = refine_root(seed, tmin, tmax, &residual, &dresidual) {
-            let p = ray.at(t);
-            let (r, _) = surf.cyl_coords(p);
-            if surf.in_aperture(r) {
-                out(RawHit3 {
-                    t_mm: t,
-                    point: p,
-                    normal: surf.normal_at(p),
-                    uv: None,
-                    face: 0,
-                });
+    // The base conic's roots, refined close by: a tangent crossing that the
+    // samples straddle. Only for a whole surface: a zone (a Fresnel groove)
+    // is narrow enough that its samples straddle nothing, and a lens of
+    // thousands of grooves would refine a seed for every one a ray passes.
+    if surf.inner_r <= 0.0 {
+        let base = Revolution {
+            coeffs: [0.0; 8],
+            ..*surf
+        };
+        let reach = 0.1 * (1.0 + surf.outer_r.abs());
+        let mut seeds: Vec<f64> = Vec::new();
+        conic_intersect(&base, ray, tmin - surf.outer_r.max(1.0), tmax + reach, &mut |h| {
+            seeds.push(h.t_mm)
+        });
+        for seed in seeds {
+            if let Some(t) = refine_root(seed, tmin, tmax, reach, &residual, &dresidual) {
+                keep(t, &mut roots);
             }
         }
     }
+
+    roots.sort_by(f64::total_cmp);
+    for t in roots {
+        if !in_range(t, tmin, tmax) {
+            continue;
+        }
+        let p = ray.at(t);
+        let (r, _) = surf.cyl_coords(p);
+        if surf.in_aperture(r) {
+            out(RawHit3 {
+                t_mm: t,
+                point: p,
+                normal: surf.normal_at(p),
+                uv: None,
+                face: 0,
+            });
+        }
+    }
+}
+
+/// The stretches of `(tmin, tmax]` over which the ray's radius lies in the
+/// surface's aperture and its axial coordinate in the slab between `s_in` and
+/// `s_out` (widened by their difference and a hair): the only places it can
+/// meet the surface. `r(t)² = |o_rad + t d_rad|²` is a quadratic in `t`.
+#[allow(clippy::too_many_arguments)] // the ray's radial and axial parts, the slab, the range
+fn aperture_spans(
+    surf: &Revolution,
+    o_rad: Vec3,
+    d_rad: Vec3,
+    z0: f64,
+    dz: f64,
+    s_in: f64,
+    s_out: f64,
+    tmin: f64,
+    tmax: f64,
+) -> Vec<(f64, f64)> {
+    let pad = 1e-6 * (1.0 + surf.outer_r.abs());
+    let rise = (s_out - s_in).abs();
+    let (z_lo, z_hi) = (s_in.min(s_out) - rise - pad, s_in.max(s_out) + rise + pad);
+    // The slab along the ray.
+    let (mut lo, mut hi) = (tmin, tmax);
+    if dz.abs() >= PARALLEL_EPS {
+        let (u, v) = ((z_lo - z0) / dz, (z_hi - z0) / dz);
+        lo = lo.max(u.min(v));
+        hi = hi.min(u.max(v));
+    } else if z0 < z_lo || z0 > z_hi {
+        return Vec::new();
+    }
+    // An empty span, or a NaN bound.
+    if lo.partial_cmp(&hi) != Some(std::cmp::Ordering::Less) {
+        return Vec::new();
+    }
+    // Where r(t)² crosses `radius²`, if it does.
+    let (qa, qb, qc) = (d_rad.length_squared(), 2.0 * o_rad.dot(d_rad), o_rad.length_squared());
+    let crossings = |radius: f64| -> Option<(f64, f64)> {
+        if qa < PARALLEL_EPS * PARALLEL_EPS {
+            return None;
+        }
+        let disc = qb * qb - 4.0 * qa * (qc - radius * radius);
+        if disc < 0.0 {
+            return None;
+        }
+        let sq = disc.sqrt();
+        Some(((-qb - sq) / (2.0 * qa), (-qb + sq) / (2.0 * qa)))
+    };
+    let (r_in, r_out) = (surf.inner_r.max(0.0), surf.outer_r + pad);
+    let mut spans = Vec::new();
+    let mut push = |a: f64, b: f64| {
+        let (a, b) = (a.max(lo), b.min(hi));
+        if a < b {
+            spans.push((a, b));
+        }
+    };
+    if qa < PARALLEL_EPS * PARALLEL_EPS {
+        // Along the axis: the radius stays put.
+        let r = qc.sqrt();
+        if r >= r_in - pad && r <= r_out {
+            push(lo, hi);
+        }
+        return spans;
+    }
+    let Some((u1, u2)) = crossings(r_out) else {
+        return spans;
+    };
+    match (r_in > pad).then(|| crossings(r_in - pad)).flatten() {
+        Some((v1, v2)) => {
+            push(u1, v1);
+            push(v2, u2);
+        }
+        None => push(u1, u2),
+    }
+    spans
+}
+
+/// The root of `f` in the sign-change bracket `[a, b]` (`fa = f(a)`):
+/// Newton, bisecting whenever a step would leave the bracket.
+fn solve_bracket(a: f64, b: f64, fa: f64, f: &dyn Fn(f64) -> f64, df: &dyn Fn(f64) -> f64) -> Option<f64> {
+    let (mut lo, mut hi, mut flo) = (a, b, fa);
+    let mut t = 0.5 * (lo + hi);
+    for _ in 0..100 {
+        let ft = f(t);
+        if !ft.is_finite() {
+            return None;
+        }
+        if ft.abs() < 1e-13 {
+            return Some(t);
+        }
+        if flo * ft <= 0.0 {
+            hi = t;
+        } else {
+            lo = t;
+            flo = ft;
+        }
+        let dft = df(t);
+        let nt = if dft.abs() > 1e-300 { t - ft / dft } else { f64::NAN };
+        let nt = if nt.is_finite() && nt > lo && nt < hi { nt } else { 0.5 * (lo + hi) };
+        if (nt - t).abs() < 1e-14 * (1.0 + t.abs()) || hi - lo < 1e-14 * (1.0 + t.abs()) {
+            t = nt;
+            break;
+        }
+        t = nt;
+    }
+    (f(t).abs() < 1e-9).then_some(t)
 }
 
 /// Safeguarded Newton for `f(t) = 0` near `seed`, converging in both `|f|` and
@@ -685,15 +952,22 @@ fn refine_root(
     seed: f64,
     tmin: f64,
     tmax: f64,
+    reach: f64,
     f: &dyn Fn(f64) -> f64,
     df: &dyn Fn(f64) -> f64,
 ) -> Option<f64> {
     let mut t = seed;
-    // Establish a bracket around the seed by probing outward; the residual is
-    // smooth here, so a modest span suffices.
-    let span = (tmax - tmin).abs().clamp(1.0, 1e6) * 1e-3;
+    // Establish a bracket around the seed by probing outward from close in,
+    // four times wider each step, out to `reach`: the first sign change holds
+    // the root nearest the seed.
+    let mut span = (1e-6 * (1.0 + seed.abs())).min(reach);
     let (mut lo, mut hi) = (seed - span, seed + span);
     let (mut flo, mut fhi) = (f(lo), f(hi));
+    while flo * fhi > 0.0 && span < reach {
+        span = (span * 4.0).min(reach);
+        (lo, hi) = (seed - span, seed + span);
+        (flo, fhi) = (f(lo), f(hi));
+    }
     let bracketed = flo * fhi <= 0.0;
 
     for _ in 0..64 {

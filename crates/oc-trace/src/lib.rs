@@ -29,8 +29,9 @@ pub use tracer::{trace, DetectorResult, Segment, TraceConfig, TraceResult};
 #[cfg(feature = "trace3")]
 pub use result3::{
     Approximation, CapabilityIssue, CapabilityReport, ChildRole, DetectorHit3, DetectorResult3,
-    EnergyLedger, LaunchRay3, PhysicsFeature, Segment3, SegmentFlags, TerminationReason,
-    TerminationSummary, TraceEvent3, TraceEventKind, TraceResult3,
+    Deposit3, EnergyLedger, LaunchRay3, ObjectEntry3, ObjectLedger3, ObjectRef3, PhysicsFeature, Segment3,
+    SegmentFlags, SpectralSums3,
+    TerminationReason, TerminationSummary, TraceEvent3, TraceEventKind, TraceResult3,
 };
 #[cfg(feature = "trace3")]
 pub use sequence3::{axial_launch, extract_for_intent, extract_sequence3, SequenceError};
@@ -38,6 +39,7 @@ pub use sequence3::{axial_launch, extract_for_intent, extract_sequence3, Sequenc
 pub use seq_export::{default_path, export_seq, ExportError};
 #[cfg(feature = "trace3")]
 pub use tracer3::{
-    depth_for_scene3, launch_from_scene, launch_from_source, trace3, trace_scene3, EncodedPart3,
+    bounds_for_scene3, depth_for_scene3, launch_from_scene, launch_from_scene_pass, launch_from_source,
+    launch_from_source_pass, trace3, trace_scene3, EncodedPart3,
     TraceBlocks3, TraceConfig3, TraceJob3, TraceMerge3, TracePart3, TRACE_BLOCKS,
 };

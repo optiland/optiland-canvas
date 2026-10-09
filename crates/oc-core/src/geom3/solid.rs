@@ -9,11 +9,12 @@
 
 use super::primitives::{
     box_contains, box_intersect, cylinder_contains, cylinder_intersect, sphere_contains,
-    sphere_intersect, RawHit3,
+    sphere_intersect, tube_contains, tube_intersect, RawHit3,
 };
 use super::profile::{
     extrude_aabb, extrude_contains, extrude_intersect, revolve_aabb, revolve_contains,
-    revolve_intersect, revolve_intersect_with, revolve_tolerance,
+    revolve_contains_prepared, revolve_intersect, revolve_intersect_prepared, revolve_prepare,
+    RevolvePrep,
 };
 use super::{ray_to_local, Containment, Intersect3, LocalHit3, ToleranceContext};
 use crate::id::PatchId;
@@ -79,6 +80,14 @@ fn local_aabb(geom: &SolidGeometry3) -> Aabb3 {
                 max: ext,
             }
         }
+        SolidGeometry3::Tube {
+            outer_radius_mm,
+            half_length_mm,
+            ..
+        } => Aabb3 {
+            min: Vec3::new(-half_length_mm, -outer_radius_mm, -outer_radius_mm),
+            max: Vec3::new(*half_length_mm, *outer_radius_mm, *outer_radius_mm),
+        },
         SolidGeometry3::Profile(p) => profile_aabb(p),
     }
 }
@@ -99,9 +108,10 @@ fn profile_aabb(p: &ProfileSolid3) -> Aabb3 {
 }
 
 /// Wrap an analytic primitive's [`RawHit3`] as a [`LocalHit3`], turning the face
-/// index into a stable synthetic patch: an analytic solid carries no authored
-/// patches, and validation refuses a per-patch override on one, so the face index
-/// is only ever resolved against the body's default response.
+/// index into a stable synthetic patch. An analytic solid carries no authored
+/// patches, and validation refuses a per-patch override on every one but the
+/// tube, whose faces are fixed by construction and so are stable ids already
+/// ([`tube_face`](super::primitives::tube_face)).
 fn raw_to_local(raw: RawHit3) -> LocalHit3 {
     LocalHit3 {
         t_mm: raw.t_mm,
@@ -114,10 +124,11 @@ fn raw_to_local(raw: RawHit3) -> LocalHit3 {
 
 /// What intersecting a solid needs that depends on its shape alone: found once
 /// for a trace ([`SolidGeometry3::prepare`]) instead of at every step.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct SolidPrep {
-    /// A revolved profile's own tolerances ([`revolve_tolerance`]).
-    revolve_tol: Option<ToleranceContext>,
+    /// A revolved profile's own tolerances and axial extent
+    /// ([`revolve_prepare`]).
+    revolve: Option<RevolvePrep>,
 }
 
 impl SolidGeometry3 {
@@ -127,7 +138,7 @@ impl SolidGeometry3 {
         match self {
             SolidGeometry3::Profile(p) if p.construction == ProfileConstruction3::RevolveLocalX => {
                 SolidPrep {
-                    revolve_tol: Some(revolve_tolerance(&p.profile)),
+                    revolve: Some(revolve_prepare(&p.profile)),
                 }
             }
             _ => SolidPrep::default(),
@@ -146,14 +157,34 @@ impl SolidGeometry3 {
         t_max_mm: f64,
         out: &mut dyn FnMut(LocalHit3),
     ) {
-        match (self, &prep.revolve_tol) {
-            (SolidGeometry3::Profile(p), Some(tol))
+        match (self, &prep.revolve) {
+            (SolidGeometry3::Profile(p), Some(rp))
                 if p.construction == ProfileConstruction3::RevolveLocalX =>
             {
                 let ray = ray_to_local(transform, ray_world);
-                revolve_intersect_with(&p.profile, tol, &ray, t_min_mm, t_max_mm, out)
+                revolve_intersect_prepared(&p.profile, rp, &ray, t_min_mm, t_max_mm, out)
             }
             _ => self.intersect(ray_world, transform, t_min_mm, t_max_mm, out),
+        }
+    }
+
+    /// [`Intersect3::contains`], with the work that depends on the shape alone
+    /// taken from `prep`. The same answer, for a `prep` this geometry prepared.
+    pub fn contains_prepared(
+        &self,
+        prep: &SolidPrep,
+        point_world: Vec3,
+        transform: &Isometry3,
+        tol: &ToleranceContext,
+    ) -> Containment {
+        match (self, &prep.revolve) {
+            (SolidGeometry3::Profile(p), Some(rp))
+                if p.construction == ProfileConstruction3::RevolveLocalX =>
+            {
+                let local = transform.inverse_transform_point(point_world);
+                revolve_contains_prepared(&p.profile, rp, local, tol)
+            }
+            _ => self.contains(point_world, transform, tol),
         }
     }
 }
@@ -196,6 +227,19 @@ impl Intersect3 for SolidGeometry3 {
                 t_max_mm,
                 &mut |h| out(raw_to_local(h)),
             ),
+            SolidGeometry3::Tube {
+                inner_radius_mm,
+                outer_radius_mm,
+                half_length_mm,
+            } => tube_intersect(
+                *inner_radius_mm,
+                *outer_radius_mm,
+                *half_length_mm,
+                &ray,
+                t_min_mm,
+                t_max_mm,
+                &mut |h| out(raw_to_local(h)),
+            ),
             SolidGeometry3::Profile(p) => match p.construction {
                 ProfileConstruction3::RevolveLocalX => {
                     revolve_intersect(&p.profile, &ray, t_min_mm, t_max_mm, out)
@@ -230,6 +274,11 @@ impl Intersect3 for SolidGeometry3 {
                 p,
                 tol,
             ),
+            SolidGeometry3::Tube {
+                inner_radius_mm,
+                outer_radius_mm,
+                half_length_mm,
+            } => tube_contains(*inner_radius_mm, *outer_radius_mm, *half_length_mm, p, tol),
             SolidGeometry3::Profile(prof) => match prof.construction {
                 ProfileConstruction3::RevolveLocalX => revolve_contains(&prof.profile, p, tol),
                 ProfileConstruction3::ExtrudeLocalZ { z_min_mm, z_max_mm } => {

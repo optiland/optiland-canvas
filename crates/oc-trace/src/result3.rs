@@ -87,6 +87,89 @@ pub struct DetectorHit3 {
     /// `s1`/`s2` above name nothing: they are components on an axis, and a
     /// reader that does not know which axis cannot use them.
     pub frame_x: Vec3,
+    /// How many hits this branch made, since launch, on the objects
+    /// [`crate::TraceConfig3::count_bodies`] names: the reflections in a
+    /// light pipe, say. 0 when it names none.
+    pub counted: u32,
+}
+
+/// A scene object, by kind and by its index in the scene's list of that kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ObjectRef3 {
+    /// The launch itself: what a branch carries before its first interaction.
+    Source,
+    Surface(usize),
+    /// A closed body, and the patch of it that was hit (a tube's bore, its
+    /// outer wall, an end ring).
+    Body(usize, u64),
+    Aperture(usize),
+    Detector(usize),
+}
+
+/// What one object did to the light of one band
+/// ([`crate::TraceConfig3::object_ledger`]).
+///
+/// Every watt the ledger removes is booked here once, against the object
+/// where it left the light: a mirror's absorption at the mirror, a stop's
+/// block at the stop, the bulk absorption on the way out of an object against
+/// that object, an escape or a culled branch against the object that sent the
+/// branch on its way. Summed over every object and band, the removals are the
+/// [`EnergyLedger`]'s, so an object table that closes is the ledger's closure
+/// told object by object. `hits` and `incident` count what arrived, which
+/// includes light that passed a probe detector and went on.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ObjectLedger3 {
+    pub hits: u64,
+    pub incident: f64,
+    pub absorbed_surface: f64,
+    pub absorbed_volume: f64,
+    pub blocked: f64,
+    pub detected: f64,
+    pub escaped: f64,
+    pub truncated: f64,
+    pub numerical: f64,
+}
+
+impl ObjectLedger3 {
+    /// What this object took out of the light, every way.
+    pub fn removed(&self) -> f64 {
+        self.absorbed_surface + self.absorbed_volume + self.blocked + self.detected + self.escaped + self.truncated + self.numerical
+    }
+
+    pub fn add(&mut self, o: &ObjectLedger3) {
+        self.hits += o.hits;
+        self.incident += o.incident;
+        self.absorbed_surface += o.absorbed_surface;
+        self.absorbed_volume += o.absorbed_volume;
+        self.blocked += o.blocked;
+        self.detected += o.detected;
+        self.escaped += o.escaped;
+        self.truncated += o.truncated;
+        self.numerical += o.numerical;
+    }
+}
+
+/// Where light was absorbed or blocked: one entry of [`TraceResult3::deposits`]
+/// ([`crate::TraceConfig3::deposit_bodies`], [`crate::TraceConfig3::deposit_apertures`]).
+/// A segment's bulk absorption is split over four equal steps of its length,
+/// each placed at its step's middle with the power the step took.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Deposit3 {
+    pub object: ObjectRef3,
+    /// World mm.
+    pub point: Vec3,
+    pub lambda_um: f64,
+    /// W.
+    pub flux: f64,
+}
+
+/// One row of [`TraceResult3::objects`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ObjectEntry3 {
+    pub object: ObjectRef3,
+    /// Inside [`crate::TraceConfig3::ledger_band_um`] or not.
+    pub in_band: bool,
+    pub ledger: ObjectLedger3,
 }
 
 /// The role a spawned child branch plays at an interaction.
@@ -102,6 +185,9 @@ pub enum ChildRole {
     Tir,
     /// The ideal thin-lens bend of a standalone surface.
     ThinLens,
+    /// A diffraction grating's working order (its zero order is `Reflect` or
+    /// `Transmit`).
+    Diffract,
 }
 
 /// What an event-log entry records (see [`TraceEvent3`]).
@@ -222,6 +308,213 @@ pub struct DetectorResult3 {
     /// `total_incident` is then a fact to read instead of a discrepancy to
     /// hunt.
     pub outside_cone_flux: f64,
+
+    /// Each cell's colour, `Σ Φ · (x̄, ȳ, z̄)(λ)` under the CIE 1931
+    /// observer, row-major over `bins`. Filled only under
+    /// [`DetectorMeasure::Illuminance`], for the same reason as
+    /// `direction_flux`.
+    pub colour_xyz: Vec<[f64; 3]>,
+
+    /// The hits split by wavelength, one entry per wavelength bin
+    /// ([`spectral_bin`]) in order of wavelength: what the chromatic
+    /// diagnostics are read from. Sums rather than records, so every hit
+    /// counts however many there are, and a pool adds them up like the rest
+    /// ([`SpectralSums3`]).
+    pub spectral: Vec<SpectralSums3>,
+    /// Flux in bins past the first [`MAX_SPECTRAL_LINES`]: counted in every
+    /// total, and broken out by wavelength nowhere.
+    pub spectral_untracked_flux: f64,
+}
+
+/// How many wavelength bins a detector breaks its hits out by: enough for the
+/// whole of [`spectral_bin`]'s grid from 0.2 to 4 µm.
+pub const MAX_SPECTRAL_LINES: usize = 256;
+
+/// The bin a wavelength's hits are summed in, named by its centre, µm: 5 nm
+/// wide below 1 µm, 20 nm to 2.5 µm, 100 nm beyond. A continuous source gives
+/// every ray its own wavelength, and a sum per wavelength would be a sum per
+/// ray; bins this narrow still resolve a glass's dispersion, which changes by
+/// a few parts in 10⁵ across 5 nm in the visible. Each bin also keeps its
+/// flux-weighted wavelength, so a source of a few lines reads each line's own
+/// wavelength back exactly.
+pub fn spectral_bin(lambda_um: f64) -> f64 {
+    let nm = lambda_um * 1000.0;
+    let width = if nm < 1000.0 {
+        5.0
+    } else if nm < 2500.0 {
+        20.0
+    } else {
+        100.0
+    };
+    ((nm / width).floor() + 0.5) * width / 1000.0
+}
+
+/// One wavelength's hits on a detector, as flux-weighted sums.
+///
+/// Positions are the face's local `(u, v)` in mm. Slopes are the arriving
+/// direction's `(x, y) / |z|` in the detector's frame: the tangent of the
+/// angle to the normal in each plane, and the rate at which a ray's `(u, v)`
+/// moves per mm travelled along the normal. From these come a line's
+/// centroid, its spot size, its mean direction and spread, and the plane
+/// along the normal where its spot is smallest, all exactly, from one pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SpectralSums3 {
+    /// The bin's centre, µm ([`spectral_bin`]).
+    pub lambda_um: f64,
+    /// `Σ w·λ`: over `flux`, the bin's mean wavelength.
+    pub lw: f64,
+    pub hits: u64,
+    /// `Σw`, and the weighted sums of `u`, `v`, `u²`, `v²`.
+    pub flux: f64,
+    pub u: f64,
+    pub v: f64,
+    pub uu: f64,
+    pub vv: f64,
+    /// Weighted sums of the slopes `a = x/|z|`, `b = y/|z|`, their squares,
+    /// and the cross terms `u·a` and `v·b` the focus needs.
+    pub a: f64,
+    pub b: f64,
+    pub aa: f64,
+    pub bb: f64,
+    pub ua: f64,
+    pub vb: f64,
+}
+
+/// The fields of a [`SpectralSums3`] as f64s, in [`SpectralSums3::to_array`]'s order.
+pub const SPECTRAL_FIELDS: usize = 14;
+
+impl SpectralSums3 {
+    /// The flux-weighted wavelength of the hits in the bin, µm.
+    pub fn mean_lambda_um(&self) -> f64 {
+        if self.flux > 0.0 {
+            self.lw / self.flux
+        } else {
+            self.lambda_um
+        }
+    }
+
+    fn add(&mut self, flux: f64, lambda_um: f64, uv: Vec2, a: f64, b: f64) {
+        self.lw += flux * lambda_um;
+        self.hits += 1;
+        self.flux += flux;
+        self.u += flux * uv.x;
+        self.v += flux * uv.y;
+        self.uu += flux * uv.x * uv.x;
+        self.vv += flux * uv.y * uv.y;
+        self.a += flux * a;
+        self.b += flux * b;
+        self.aa += flux * a * a;
+        self.bb += flux * b * b;
+        self.ua += flux * uv.x * a;
+        self.vb += flux * uv.y * b;
+    }
+
+    fn plus(&mut self, o: &SpectralSums3) {
+        self.lw += o.lw;
+        self.hits += o.hits;
+        self.flux += o.flux;
+        self.u += o.u;
+        self.v += o.v;
+        self.uu += o.uu;
+        self.vv += o.vv;
+        self.a += o.a;
+        self.b += o.b;
+        self.aa += o.aa;
+        self.bb += o.bb;
+        self.ua += o.ua;
+        self.vb += o.vb;
+    }
+
+    pub fn to_array(&self) -> [f64; SPECTRAL_FIELDS] {
+        [
+            self.lambda_um,
+            self.lw,
+            self.hits as f64,
+            self.flux,
+            self.u,
+            self.v,
+            self.uu,
+            self.vv,
+            self.a,
+            self.b,
+            self.aa,
+            self.bb,
+            self.ua,
+            self.vb,
+        ]
+    }
+
+    pub fn from_array(x: &[f64; SPECTRAL_FIELDS]) -> Self {
+        Self {
+            lambda_um: x[0],
+            lw: x[1],
+            hits: x[2] as u64,
+            flux: x[3],
+            u: x[4],
+            v: x[5],
+            uu: x[6],
+            vv: x[7],
+            a: x[8],
+            b: x[9],
+            aa: x[10],
+            bb: x[11],
+            ua: x[12],
+            vb: x[13],
+        }
+    }
+
+    /// The flux-weighted centroid on the face, mm.
+    pub fn centroid(&self) -> Option<Vec2> {
+        (self.flux > 0.0).then(|| Vec2::new(self.u / self.flux, self.v / self.flux))
+    }
+
+    /// The flux-weighted mean slope `(x/|z|, y/|z|)`.
+    pub fn mean_slope(&self) -> Option<Vec2> {
+        (self.flux > 0.0).then(|| Vec2::new(self.a / self.flux, self.b / self.flux))
+    }
+
+    /// The variances of `u`, `v`, `a`, `b` and the covariances of `u` with `a`
+    /// and `v` with `b`, each floored at zero where rounding makes a variance
+    /// of a tight spot come out a hair negative.
+    fn moments(&self) -> Option<[f64; 6]> {
+        if self.flux <= 0.0 {
+            return None;
+        }
+        let w = self.flux;
+        let (mu, mv, ma, mb) = (self.u / w, self.v / w, self.a / w, self.b / w);
+        Some([
+            (self.uu / w - mu * mu).max(0.0),
+            (self.vv / w - mv * mv).max(0.0),
+            (self.aa / w - ma * ma).max(0.0),
+            (self.bb / w - mb * mb).max(0.0),
+            self.ua / w - mu * ma,
+            self.vb / w - mv * mb,
+        ])
+    }
+
+    /// The RMS radius of the spot about its centroid, mm.
+    pub fn rms_radius(&self) -> Option<f64> {
+        self.moments().map(|m| (m[0] + m[1]).sqrt())
+    }
+
+    /// The RMS spread of the slopes about their mean: for small angles, the
+    /// RMS angular spread in radians. What is left of a collimated beam's
+    /// divergence at this line.
+    pub fn rms_slope(&self) -> Option<f64> {
+        self.moments().map(|m| (m[2] + m[3]).sqrt())
+    }
+
+    /// How far along the normal, mm, the spot of this line is smallest:
+    /// positive in the direction the light travels, so a beam still
+    /// converging on the face focuses past it. Each ray's position there is
+    /// `u + s·a`, and the spot's variance in `s` is a parabola whose least
+    /// point is `-(cov(u,a) + cov(v,b)) / (var a + var b)`. `None` for a
+    /// beam whose rays are all parallel, which focuses nowhere.
+    pub fn best_focus_mm(&self) -> Option<f64> {
+        let m = self.moments()?;
+        let spread = m[2] + m[3];
+        (spread > 1e-18).then(|| -(m[4] + m[5]) / spread)
+    }
 }
 
 impl DetectorResult3 {
@@ -245,6 +538,13 @@ impl DetectorResult3 {
             direction_flux,
             direction_solid_angle_sr,
             outside_cone_flux: 0.0,
+            colour_xyz: if matches!(d.measure, DetectorMeasure::Illuminance) {
+                vec![[0.0; 3]; cells]
+            } else {
+                Vec::new()
+            },
+            spectral: Vec::new(),
+            spectral_untracked_flux: 0.0,
             incident_flux: vec![0.0; cells],
             detected_signal: vec![0.0; cells],
             stokes_local: oc_core::polarization::Stokes::ZERO,
@@ -305,6 +605,22 @@ impl DetectorResult3 {
         (a > 0.0).then(|| self.total_incident / a)
     }
 
+    /// Each cell's colour as a light meter scales it: `683 lm/W · (X, Y, Z)`
+    /// per `m²` of the cell on the face, so `Y` is the illuminance (lux when
+    /// the flux is watts). `None` unless the detector measures illuminance.
+    pub fn colour_per_m2(&self) -> Option<Vec<[f64; 3]>> {
+        (!self.colour_xyz.is_empty()).then(|| {
+            self.colour_xyz
+                .iter()
+                .zip(&self.covered_area_mm2)
+                .map(|(c, a)| {
+                    let k = if *a > 0.0 { oc_core::colorimetry::LM_PER_W / (a * 1e-6) } else { 0.0 };
+                    [c[0] * k, c[1] * k, c[2] * k]
+                })
+                .collect()
+        })
+    }
+
     /// Radiant intensity per direction cell, flux per steradian, or `None`
     /// unless the detector was asked to measure it.
     pub fn radiant_intensity(&self) -> Option<Vec<f64>> {
@@ -324,6 +640,7 @@ impl DetectorResult3 {
             DetectorMeasure::Power => Some(self.incident_flux.clone()),
             DetectorMeasure::Irradiance => self.irradiance(),
             DetectorMeasure::Intensity { .. } => self.radiant_intensity(),
+            DetectorMeasure::Illuminance => self.colour_per_m2().map(|c| c.iter().map(|x| x[1]).collect()),
         };
         (cells.unwrap_or_default(), self.measure.unit())
     }
@@ -339,7 +656,7 @@ impl DetectorResult3 {
     /// pixel would. The readings themselves are left as they are.
     pub fn peak_reading(&self) -> Option<f64> {
         let floor = match self.measure {
-            DetectorMeasure::Irradiance => {
+            DetectorMeasure::Irradiance | DetectorMeasure::Illuminance => {
                 Some(0.5 * self.covered_area_mm2.iter().copied().fold(0.0, f64::max))
             }
             DetectorMeasure::Power | DetectorMeasure::Intensity { .. } => None,
@@ -353,6 +670,40 @@ impl DetectorResult3 {
                 Some(f) => self.covered_area_mm2.get(*i).is_some_and(|a| *a >= f),
             })
             .fold(None, |m: Option<f64>, (_, v)| Some(m.map_or(v, |m| m.max(v))))
+    }
+
+    /// Add one hit to its wavelength's sums. `dir_local` is the direction it
+    /// arrived in, in the detector's frame.
+    pub(crate) fn add_spectral(&mut self, lambda_um: f64, flux: f64, uv: Vec2, dir_local: Vec3) {
+        let z = dir_local.z.abs().max(1e-12);
+        let (a, b) = (dir_local.x / z, dir_local.y / z);
+        match self.spectral_line(spectral_bin(lambda_um)) {
+            Some(i) => self.spectral[i].add(flux, lambda_um, uv, a, b),
+            None => self.spectral_untracked_flux += flux,
+        }
+    }
+
+    /// The index of `lambda_um`'s sums, made if there is room for it. The list
+    /// stays in order of wavelength, so two traces that met the same lines in
+    /// a different order still lay them out, and add them up, the same way.
+    fn spectral_line(&mut self, lambda_um: f64) -> Option<usize> {
+        match self
+            .spectral
+            .binary_search_by(|s| s.lambda_um.total_cmp(&lambda_um))
+        {
+            Ok(i) => Some(i),
+            Err(i) if self.spectral.len() < MAX_SPECTRAL_LINES => {
+                self.spectral.insert(
+                    i,
+                    SpectralSums3 {
+                        lambda_um,
+                        ..Default::default()
+                    },
+                );
+                Some(i)
+            }
+            Err(_) => None,
+        }
     }
 
     pub(crate) fn merge(&mut self, other: &DetectorResult3) {
@@ -376,6 +727,18 @@ impl DetectorResult3 {
             *a += *b;
         }
         self.outside_cone_flux += other.outside_cone_flux;
+        for (a, b) in self.colour_xyz.iter_mut().zip(&other.colour_xyz) {
+            for k in 0..3 {
+                a[k] += b[k];
+            }
+        }
+        for line in &other.spectral {
+            match self.spectral_line(line.lambda_um) {
+                Some(i) => self.spectral[i].plus(line),
+                None => self.spectral_untracked_flux += line.flux,
+            }
+        }
+        self.spectral_untracked_flux += other.spectral_untracked_flux;
         // Both sides already rotated into the same detector frame, so this is a
         // sum of comparable numbers rather than of different bases.
         self.stokes_local = self.stokes_local.plus(&other.stokes_local);
@@ -519,6 +882,7 @@ pub enum PhysicsFeature {
     ExplicitRt,
     ThinFilmCoating,
     ThinLens,
+    Grating,
     Polarizer,
     Retarder,
     VolumeAbsorption,
@@ -672,4 +1036,12 @@ pub struct TraceResult3 {
     pub capability_report: CapabilityReport,
     /// The event log, empty unless `TraceConfig3::record_events` was set.
     pub events: Vec<TraceEvent3>,
+    /// The ledger object by object and band, empty unless
+    /// `TraceConfig3::object_ledger` was set. A pooled trace's encoded parts do
+    /// not carry it.
+    pub objects: Vec<ObjectEntry3>,
+    /// Where the light was absorbed in the bodies, and blocked on the stops,
+    /// the config asks for; empty by default. A pooled trace's encoded parts
+    /// do not carry it.
+    pub deposits: Vec<Deposit3>,
 }

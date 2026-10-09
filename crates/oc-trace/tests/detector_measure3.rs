@@ -1,4 +1,5 @@
-//! What a detector measures: power, irradiance, radiant intensity.
+//! What a detector measures: power, irradiance, radiant intensity,
+//! illuminance.
 //!
 //! The bins hold flux whichever it is. The measure is the divisor, and the
 //! divisor is the whole content of the thing: area makes irradiance, solid
@@ -68,6 +69,7 @@ fn a_ring_reports_the_intensity_it_was_given() {
         DetectorMeasure::Intensity {
             half_angle_deg: cone_deg,
         bins: [RINGS, 1],
+        layout: Default::default(),
         },
     );
     scene.validate().unwrap();
@@ -120,6 +122,7 @@ fn the_rings_partition_the_cone_exactly() {
             DetectorMeasure::Intensity {
                 half_angle_deg: cone_deg,
             bins: [rings, sectors],
+            layout: Default::default(),
         },
     );
         scene.validate().unwrap();
@@ -169,6 +172,7 @@ fn a_lambertian_source_falls_off_as_the_cosine() {
         DetectorMeasure::Intensity {
             half_angle_deg: cone_deg,
         bins: [RINGS, 1],
+        layout: Default::default(),
         },
     );
     scene.validate().unwrap();
@@ -233,6 +237,7 @@ fn a_cone_uniform_in_solid_angle_reads_flat_and_then_stops() {
         DetectorMeasure::Intensity {
             half_angle_deg: det_deg,
         bins: [RINGS, 1],
+        layout: Default::default(),
         },
     );
     scene.validate().unwrap();
@@ -283,6 +288,7 @@ fn flux_past_the_cone_is_counted_where_it_went() {
         DetectorMeasure::Intensity {
             half_angle_deg: 20.0,
         bins: [8, 4],
+        layout: Default::default(),
         },
     );
     scene.validate().unwrap();
@@ -361,6 +367,49 @@ fn irradiance_is_power_divided_by_the_cell() {
     );
 }
 
+/// Illuminance is the light meter's reading: 683 lm/W times flux times
+/// `V(λ)`, over the cell in square metres, and the colour beside it is the
+/// same flux times the three colour-matching functions.
+///
+/// Two rays in one 2 mm cell: 2 W at 555 nm, where `V` is 1, and 1 W at
+/// 700 nm, where it is 0.004102. The cell's lux follow from the table by hand;
+/// a pool of workers must add them up the same way.
+#[test]
+fn illuminance_weighs_each_wavelength_by_the_eye() {
+    use oc_core::colorimetry::{cie_1931, LM_PER_W};
+    let mut scene = Scene3::new();
+    let det = add_rect_detector(&mut scene, Vec3::new(10.0, 0.0, 0.0), -Vec3::X, 8.0, 8.0, [8, 8]);
+    set_detector_measure(&mut scene, det, DetectorMeasure::Illuminance);
+    scene.validate().unwrap();
+    let ray = |l: f64, flux: f64| launch(Ray3::new(Vec3::new(-5.0, 0.5, 0.5), Vec3::X).unwrap(), l, flux);
+    let rays = [ray(0.555, 2.0), ray(0.700, 1.0)];
+    let res = trace3(&scene, &rays, &no_ghosts());
+    let d = detector_named(&res, det);
+    let (lux, unit) = d.readings();
+    assert_eq!(unit, "lx");
+
+    let m2 = 4.0e-6;
+    let want = LM_PER_W * (2.0 * 1.0 + 1.0 * 0.004102) / m2;
+    let lit = lux.iter().position(|v| *v > 0.0).expect("one lit cell");
+    assert!((lux[lit] / want - 1.0).abs() < 1e-12, "{} lx against {want}", lux[lit]);
+    assert_eq!(lux.iter().filter(|v| **v > 0.0).count(), 1);
+
+    let colour = d.colour_per_m2().unwrap();
+    let (a, b) = (cie_1931(0.555), cie_1931(0.700));
+    for k in 0..3 {
+        let want = LM_PER_W * (2.0 * a[k] + b[k]) / m2;
+        assert!((colour[lit][k] - want).abs() <= 1e-9 * want.abs().max(1.0), "channel {k}");
+    }
+    assert_eq!(colour[lit][1], lux[lit], "Y is the illuminance");
+
+    // Power still counts watts, whatever the eye makes of them.
+    assert!((d.total_incident - 3.0).abs() < 1e-12);
+    // Another measure keeps no colour.
+    set_detector_measure(&mut scene, det, DetectorMeasure::Irradiance);
+    let res = trace3(&scene, &rays, &no_ghosts());
+    assert!(detector_named(&res, det).colour_per_m2().is_none());
+}
+
 /// A line has no area, so it cannot be asked for one.
 ///
 /// The v1 line probe is kept so old documents still trace, and it is kept
@@ -409,6 +458,7 @@ fn an_intensity_cone_outside_its_range_is_refused() {
             DetectorMeasure::Intensity {
                 half_angle_deg: bad,
             bins: [4, 4],
+            layout: Default::default(),
         },
     );
         assert!(
@@ -426,8 +476,102 @@ fn an_intensity_cone_outside_its_range_is_refused() {
             DetectorMeasure::Intensity {
                 half_angle_deg: good,
             bins: [4, 4],
+            layout: Default::default(),
         },
     );
         scene.validate().expect("a real cone");
     }
+}
+
+/// A grid measure over `cone_deg` with `bins` cells, on a detector at the
+/// origin facing back down `-X`.
+fn grid_detector(cone_deg: f64, bins: [usize; 2]) -> (Scene3, oc_core::id::ObjectId) {
+    let mut scene = Scene3::new();
+    let det = add_rect_detector(&mut scene, Vec3::ZERO, -Vec3::X, 5.0, 5.0, [8, 8]);
+    set_detector_measure(
+        &mut scene,
+        det,
+        DetectorMeasure::Intensity {
+            half_angle_deg: cone_deg,
+            bins,
+            layout: oc_core::scene3::DirectionLayout::Grid,
+        },
+    );
+    scene.validate().unwrap();
+    (scene, det)
+}
+
+/// The grid's cells add up to the square of directions it covers: four times
+/// the solid angle a `tan c` by `tan c` rectangle subtends from above its
+/// corner at unit height, and the whole hemisphere at a 90° cone.
+#[test]
+fn the_grid_partitions_its_square_of_directions_exactly() {
+    for (cone_deg, bins) in [
+        (15.0, [3, 3]),
+        (45.0, [7, 5]),
+        (89.0, [31, 31]),
+        (90.0, [64, 64]),
+    ] {
+        let (scene, _) = grid_detector(cone_deg, bins);
+        let cells = scene.detectors[0].direction_cell_solid_angles().unwrap();
+        assert_eq!(cells.len(), bins[0] * bins[1]);
+        let t = f64::tan(cone_deg.to_radians());
+        let square = if cone_deg == 90.0 {
+            TAU
+        } else {
+            4.0 * (t * t / (1.0 + 2.0 * t * t).sqrt()).atan()
+        };
+        let sum: f64 = cells.iter().sum();
+        assert!(
+            (sum - square).abs() < 1e-12,
+            "{bins:?} over {cone_deg}: {sum} vs {square}"
+        );
+        assert!(cells.iter().all(|w| *w > 0.0), "no empty cell");
+        // Symmetric about both axes.
+        let [nu, nv] = bins;
+        for j in 0..nv {
+            for i in 0..nu {
+                let w = cells[j * nu + i];
+                assert!((w - cells[j * nu + (nu - 1 - i)]).abs() < 1e-15);
+                assert!((w - cells[(nv - 1 - j) * nu + i]).abs() < 1e-15);
+            }
+        }
+    }
+}
+
+/// Every grid cell reads back the intensity it was handed: one ray down the
+/// middle of each cell, carrying that cell's solid angle times a chosen
+/// intensity, lands in that cell and reads that intensity.
+#[test]
+fn a_grid_cell_reports_the_intensity_it_was_given() {
+    let (cone_deg, bins) = (30.0_f64, [5usize, 3usize]);
+    let (scene, det) = grid_detector(cone_deg, bins);
+    let d = &scene.detectors[0];
+    let omega = d.direction_cell_solid_angles().unwrap();
+    let cone = cone_deg.to_radians();
+    let i0 = 2.5;
+    let mut rays = Vec::new();
+    for j in 0..bins[1] {
+        for i in 0..bins[0] {
+            let au = -cone + 2.0 * cone * (i as f64 + 0.5) / bins[0] as f64;
+            let av = -cone + 2.0 * cone * (j as f64 + 0.5) / bins[1] as f64;
+            let local = Vec3::new(au.tan(), av.tan(), 1.0).normalize();
+            assert_eq!(d.direction_cell(local), Some(j * bins[0] + i));
+            let dir = d.common.transform.rotate(local);
+            rays.push(launch(
+                Ray3::new(dir * -30.0, dir).unwrap(),
+                LAMBDA_D,
+                i0 * omega[j * bins[0] + i],
+            ));
+        }
+    }
+    let res = trace3(&scene, &rays, &no_ghosts());
+    let r = detector_named(&res, det);
+    assert_eq!(r.hits, rays.len() as u64);
+    for (k, got) in r.radiant_intensity().unwrap().iter().enumerate() {
+        assert!((got - i0).abs() < 1e-12, "cell {k} reads {got}");
+    }
+    // Past the cone in either angle: counted, binned nowhere.
+    let local = Vec3::new(f64::tan(cone + 0.01), 0.0, 1.0).normalize();
+    assert_eq!(d.direction_cell(local), None);
 }

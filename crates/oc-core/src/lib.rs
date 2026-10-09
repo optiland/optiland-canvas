@@ -25,15 +25,24 @@
 
 #[cfg(feature = "scene3")]
 pub mod build3;
+pub mod colorimetry;
 pub mod coordinates;
 #[cfg(feature = "scene3")]
 pub mod display_mesh;
 #[cfg(feature = "scene3")]
 pub mod document;
 pub mod fragment;
+#[cfg(feature = "scene3")]
+pub mod fresnel_lens;
 pub mod geom;
 #[cfg(feature = "scene3")]
 pub mod geom3;
+#[cfg(feature = "scene3")]
+pub mod grating;
+#[cfg(feature = "scene3")]
+pub mod heliostat;
+#[cfg(feature = "scene3")]
+pub mod link;
 pub mod id;
 pub mod material;
 #[cfg(feature = "scene3")]
@@ -52,10 +61,13 @@ pub mod seq;
 pub mod seq3;
 #[cfg(feature = "scene3")]
 pub mod seq_import;
+pub mod solar;
 #[cfg(feature = "scene3")]
 pub mod source3;
 #[cfg(feature = "scene3")]
 pub mod thinfilm;
+#[cfg(feature = "scene3")]
+pub mod tube;
 pub mod vec;
 pub mod vec3;
 

@@ -108,6 +108,7 @@ function doLoad(l: Load) {
     c.loadScene3JSON(l.scene);
     c.setGhosts(l.key.ghosts);
     c.setMaxGhostBounces(l.key.maxGhost);
+    c.setAnalysisRays(l.key.rays);
     loaded = l.key;
     batch = 1;
     if (l.standIn) doStandIn(l.key, l.standIn.share, l.standIn.shares);

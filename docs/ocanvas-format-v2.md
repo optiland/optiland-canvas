@@ -131,6 +131,45 @@ default is the old behaviour, never a new one:
 | field | on | absent means | added |
 |---|---|---|---|
 | `measure` | detector | `Power`, flux per cell, which is what a detector read before there was a choice | [what a detector measures](detectors.md) |
+| `measure.Intensity.layout` | detector | `Polar`, rings and sectors, which is what every file written before the grid meant; a file with the grid says `Grid` | [radiant intensity](detectors.md#radiant-intensity) |
+| `solar` | scene | no sun, and the key is left out on save | [the sun and heliostats](solar.md) |
+| `solar.continuous`, `solar.disc`, `solar.csr` | scene | lines, a uniform disc, no aureole: the sun every file before them meant | [the shape of the sun](solar.md#the-shape-of-the-sun) |
+| `solar.spectrum` | scene | ASTM G173-03, and the key is left out on save | [a spectrum for your site](solar.md#a-spectrum-for-your-site) |
+| `links` | scene | no element is locked to another, and the key is left out on save | [locking one element to another](solar.md#locking-one-element-to-another) |
+| `figure_errors` | scene | every face is the shape it is drawn as, and the key is left out on save | [slope error](solar.md#slope-error): `[{object, slope_rms_mrad}]`, a Gaussian lean of each hit's normal, RMS per axis, on a body's or surface's faces |
+| `response.Grating.tm` | surface | the grating treats both polarizations alike, and the key is left out on save | [gratings](gratings.md#polarization): `{efficiency, zero_order}` for light polarized across the grooves; `efficiency` and `zero_order` are then along them |
+| `coating.backing.Plate.thickness_mm` | coating | a lossless plate, and the key is left out when it is 0 | [coatings](coatings.md): the plate's thickness, which only its absorption reads, by the substrate's own `k` along each pass |
+| `geometry.SurfaceOfRevolution.outline` | surface | the whole annulus the radial aperture bounds, and the key is left out on save | [the spectrograph](spectrograph.md): a planar shape in the surface's local `XY`, seen down its axis, that keeps only the piece of the revolution inside it (a strip cut from a large mirror; a polygon for an off-axis segment) |
+
+A variant added to an enum cannot default, so it only reads in a kernel that
+knows it. `Tube` (a hollow tube about local `+X`: `inner_radius_mm`,
+`outer_radius_mm`, `half_length_mm`) is one: a document containing a tube
+does not open in a kernel older than the tube. A tube's faces carry per-patch
+overrides by fixed patch ids: 0 outer wall, 1 the `+X` end ring, 2 the `-X`
+end ring, 3 the bore.
+
+`SurfaceResponse::Grating { lines_per_mm, order, efficiency, zero_order,
+transmissive }` is another: a plane diffraction grating on a standalone
+surface, grooves along its local `Y` ([gratings](gratings.md)). A document
+containing one does not open in a kernel older than the grating.
+
+`AngularDistribution3::RadialProfile { half_angle_rad, radiance }` is
+another: a source whose directions follow a measured profile, the same all
+round its axis, radiance at 24 polar angles evenly spaced out to
+`half_angle_rad` ([slope error](solar.md#feeding-an-instrument-from-a-measured-beam)).
+
+`DetectorMeasure::Illuminance` (lux and each pixel's colour,
+[detectors](detectors.md#illuminance-what-the-eye-sees)) is another: a
+document with a detector measuring it does not open in a kernel older than
+the measure.
+
+A new variant is the other way the schema grows, and an old document never
+contains one. `Curve2::SagSegment { base, coeffs, y0, y1 }` is an annular piece of
+an on-axis conic or even asphere, between signed profile heights `y0` and `y1`;
+`base.half_ap` is not read. It is what a Fresnel lens's facets are
+(`oc_core::fresnel_lens`), and a Fresnel lens stores no recipe beside its
+profile: the recipe is read back out of the edges. A reader that predates the
+variant refuses such a document rather than dropping the facets.
 
 ## What a document may not contain
 
@@ -141,7 +180,8 @@ Validation runs on load and refuses, rather than repairs:
   a document could have intended, and leaving it would scale the body by `|q|²`;
 - a duplicate id, anywhere in the one id space;
 - a dangling reference: a layer, patch, source, detector, aperture, or path
-  intent that is not in the document;
+  intent that is not in the document, or a sun rig naming a source, mirror or
+  target that is not in it;
 - a non-finite geometric value;
 - an ambient index that is not strictly positive;
 - a wavelength table that is not a function: fewer than two samples, mismatched

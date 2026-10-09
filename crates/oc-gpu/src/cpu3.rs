@@ -22,7 +22,7 @@ use glam::{DVec3, Vec2, Vec3};
 use crate::scene3::{
     even_asphere_dsag, even_asphere_sag, GpuAperture3, GpuBody3, GpuDetector3, GpuExtrude,
     GpuResponse, GpuRevolve, GpuScene3, GpuSurface3, RevFace, Spectral32, OBJ_BOX, OBJ_CYLINDER,
-    OBJ_EXTRUDE, OBJ_REVOLVE, OBJ_SPHERE, SURF_ABSORBER,
+    OBJ_EXTRUDE, OBJ_REVOLVE, OBJ_SPHERE, OBJ_TUBE, SURF_ABSORBER,
 };
 
 /// Segment flag bits (shared meaning with the 2D path).
@@ -272,14 +272,42 @@ fn interact_body(
     max_depth: u32,
     min_flux: f32,
 ) {
-    if scene.bodies[body].surface == SURF_ABSORBER {
-        return; // swallowed at the surface
+    // An absorbing body swallows the ray at its surface, unless the face it hit
+    // carries a response of its own: the silvered bore of a black tube.
+    let own_face = matches!(scene.bodies[body].face_resp.get(face), Some(Some(_)));
+    if scene.bodies[body].surface == SURF_ABSORBER && !own_face {
+        return;
     }
     let n = if hit_normal.dot(w.d) > 0.0 {
         -hit_normal
     } else {
         hit_normal
     };
+    // A mirror face reflects what its reflectivity says and absorbs the rest.
+    // A table with no value at this wavelength ends the branch, as it does on a
+    // standalone mirror.
+    if let Some(Some(GpuResponse::Mirror { r })) = scene.bodies[body].face_resp.get(face) {
+        let Some(r) = r.sample(lambda) else {
+            return;
+        };
+        let dir = reflect(w.d, n);
+        push(
+            stack,
+            Work {
+                o: point + dir * EPS,
+                d: dir,
+                flux: flux_end * r.clamp(0.0, 1.0),
+                depth: w.depth + 1,
+                gdepth: w.gdepth,
+                medium_n: w.medium_n,
+                medium_alpha: w.medium_alpha,
+                flags: w.flags & !SEG_TIR,
+            },
+            max_depth,
+            min_flux,
+        );
+        return;
+    }
     let (n1, _a1) = region_optics(scene, point + n * EPS, lambda);
     let (n2, a2) = region_optics(scene, point - n * EPS, lambda);
 
@@ -288,9 +316,8 @@ fn interact_body(
     // and T come from the baked grid at this ray's own angle, and the
     // transmitted branch still refracts, because unlike a zero-thickness plate
     // this interface really does change the medium.
-    if let Some(Some(GpuResponse::CoatingGrid { lambdas, rt, stray })) = scene.bodies[body]
-        .face_resp
-        .get(face)
+    if let Some(Some(GpuResponse::CoatingGrid { lambdas, rt, stray })) =
+        scene.bodies[body].face_resp.get(face)
     {
         let cos_i = (-n.dot(w.d)).clamp(0.0, 1.0);
         let (r, t) = crate::scene3::sample_coating_grid(
@@ -370,6 +397,9 @@ fn interact_body(
                 min_flux,
             );
         }
+        return;
+    }
+    if scene.bodies[body].surface == SURF_ABSORBER {
         return;
     }
 
@@ -556,6 +586,52 @@ fn interact_surface(
                 transmit(stack, flux_end * t);
             }
         }
+        GpuResponse::Grating {
+            k,
+            eta,
+            zero,
+            transmit,
+        } => {
+            // The grating equation in the surface's frame (mirrors tracer3):
+            // the working order shifts the direction cosine across the
+            // grooves by k·λ; the zero order is the mirror or the straight
+            // beam; the rest is absorbed.
+            let em = eta.sample(lambda).unwrap_or(0.0).clamp(0.0, 1.0);
+            let e0 = zero.sample(lambda).unwrap_or(0.0).clamp(0.0, 1.0);
+            let over = (em + e0).max(1.0);
+            let rt = s.rot.transpose();
+            let dl = rt * w.d;
+            let tx = dl.x + k * lambda;
+            let t2 = tx * tx + dl.y * dl.y;
+            let go = |stack: &mut Vec<Work>, dir: Vec3, flux: f32| {
+                push(
+                    stack,
+                    Work {
+                        o: point + dir * EPS,
+                        d: dir,
+                        flux,
+                        depth: w.depth + 1,
+                        gdepth: w.gdepth,
+                        medium_n: w.medium_n,
+                        medium_alpha: w.medium_alpha,
+                        flags: w.flags & !SEG_TIR,
+                    },
+                    max_depth,
+                    min_flux,
+                );
+            };
+            if em > 0.0 && t2 < 1.0 {
+                let ahead = if dl.z >= 0.0 { 1.0 } else { -1.0 };
+                let nz = (1.0 - t2).sqrt();
+                let z = if *transmit { ahead * nz } else { -ahead * nz };
+                let dir = (s.rot * Vec3::new(tx, dl.y, z)).normalize();
+                go(stack, dir, flux_end * em / over);
+            }
+            if e0 > 0.0 {
+                let dir = if *transmit { w.d } else { reflect(w.d, n_oppose) };
+                go(stack, dir, flux_end * e0 / over);
+            }
+        }
         GpuResponse::ThinLens { f } => {
             // Ideal-lens slope law u' = u − h/f in the surface's local frame
             // (direction-aware; mirrors tracer3's f64 branch). Full
@@ -624,6 +700,16 @@ fn record_detector(out: &mut DetReadout3, d: &GpuDetector3, uv: Vec2, dir: Vec3,
 fn direction_cell(d: &GpuDetector3, dir_local: Vec3) -> Option<usize> {
     let (cone, rings, sectors) = d.measure.direction_grid()?;
     let cone = cone as f32;
+    if d.measure.direction_layout() == Some(oc_core::scene3::DirectionLayout::Grid) {
+        let (nu, nv) = (rings, sectors);
+        let z = dir_local.z.abs();
+        let (au, av) = (dir_local.x.atan2(z), dir_local.y.atan2(z));
+        if au.abs() > cone || av.abs() > cone {
+            return None;
+        }
+        let cell = |a: f32, n: usize| (((a + cone) / (2.0 * cone) * n as f32) as usize).min(n - 1);
+        return Some(cell(av, nv) * nu + cell(au, nu));
+    }
     let theta = dir_local.z.abs().clamp(0.0, 1.0).acos();
     if theta > cone {
         return None;
@@ -754,6 +840,7 @@ fn body_hit(b: &GpuBody3, o: Vec3, d: Vec3) -> Option<(f32, Vec3, usize)> {
         OBJ_CYLINDER => plain(cylinder_hit(ol, dl, b.params.x, b.params.y, EPS)),
         OBJ_EXTRUDE => plain(extrude_hit(b.extrude.as_ref()?, ol, dl, EPS)),
         OBJ_REVOLVE => revolve_hit(b.revolve.as_ref()?, ol, dl, EPS),
+        OBJ_TUBE => tube_hit(ol, dl, b.params, EPS),
         _ => None,
     }
 }
@@ -920,6 +1007,12 @@ fn contains(b: &GpuBody3, p: Vec3) -> bool {
             .as_ref()
             .map(|r| revolve_contains(r, pl))
             .unwrap_or(false),
+        OBJ_TUBE => {
+            let rho2 = pl.y * pl.y + pl.z * pl.z;
+            pl.x.abs() <= b.params.z
+                && rho2 >= b.params.x * b.params.x
+                && rho2 <= b.params.y * b.params.y
+        }
         _ => false,
     }
 }
@@ -928,7 +1021,73 @@ fn contains(b: &GpuBody3, p: Vec3) -> bool {
 /// sampled meridian contour.
 fn revolve_contains(rev: &GpuRevolve, p: Vec3) -> bool {
     let r = (p.y * p.y + p.z * p.z).sqrt();
-    point_in_polygon(&rev.contour, Vec2::new(p.x, r))
+    let q = Vec2::new(p.x, r);
+    match &rev.index {
+        Some(ix) => indexed_point_in_polygon(&rev.contour, ix, q),
+        None => point_in_polygon(&rev.contour, q),
+    }
+}
+
+/// [`point_in_polygon`] over the one bucket holding `p.y`: the segments a
+/// horizontal probe at that height can cross, which are all that change the
+/// parity. The same test on each, so the same answer.
+fn indexed_point_in_polygon(verts: &[Vec2], ix: &crate::scene3::ContourIndex, p: Vec2) -> bool {
+    let n = verts.len();
+    let (start, count) = ix.buckets[ix.bucket(p.y)];
+    let mut inside = false;
+    for &i in &ix.items[start as usize..(start + count) as usize] {
+        let i = i as usize;
+        let (a, b) = (verts[i], verts[if i == 0 { n - 1 } else { i - 1 }]);
+        if (a.y > p.y) != (b.y > p.y) {
+            let t = (p.y - a.y) / (b.y - a.y);
+            if p.x < a.x + t * (b.x - a.x) {
+                inside = !inside;
+            }
+        }
+    }
+    inside
+}
+
+/// The radii a ray passes through inside an indexed body's `x` slab at
+/// `t > tmin`, or `None` if it never enters the slab. Mirrors `ray_radii` in
+/// the shader.
+fn ray_radii(ix: &crate::scene3::ContourIndex, o: Vec3, d: Vec3, tmin: f32) -> Option<(f32, f32)> {
+    const PAD: f32 = 1e-3;
+    let (mut ta, mut tb) = (tmin, 1e30_f32);
+    if d.x.abs() > 1e-12 {
+        let u = (ix.x_lo - PAD - o.x) / d.x;
+        let v = (ix.x_hi + PAD - o.x) / d.x;
+        ta = ta.max(u.min(v));
+        tb = tb.min(u.max(v));
+    } else if o.x < ix.x_lo - PAD || o.x > ix.x_hi + PAD {
+        return None;
+    }
+    if ta > tb {
+        return None;
+    }
+    let oo = o.y * o.y + o.z * o.z;
+    let od = o.y * d.y + o.z * d.z;
+    let dd = d.y * d.y + d.z * d.z;
+    let r2 = |t: f32| (oo + t * (2.0 * od + t * dd)).max(0.0);
+    let ts = if dd > 0.0 {
+        (-od / dd).clamp(ta, tb)
+    } else {
+        ta
+    };
+    let lo = r2(ts).min(r2(ta)).min(r2(tb)).sqrt();
+    let hi = r2(ta).max(r2(tb)).sqrt();
+    Some((lo, hi))
+}
+
+/// The radii a revolved face spans, where that is read straight off it.
+fn face_radii(face: &RevFace) -> Option<(f32, f32)> {
+    match face {
+        RevFace::Sag {
+            inner_r, outer_r, ..
+        } => Some((*inner_r, *outer_r)),
+        RevFace::Frustum { y0, y1, .. } => Some((y0.min(*y1), y0.max(*y1))),
+        RevFace::Arc { .. } => None,
+    }
 }
 
 /// Nearest revolved-profile intersection at `t > tmin`, with the outward local
@@ -941,7 +1100,19 @@ fn revolve_hit(rev: &GpuRevolve, o: Vec3, d: Vec3, tmin: f32) -> Option<(f32, Ve
             *best = Some((t, orient_rev(rev, n, o + d * t), i));
         }
     };
+    // An indexed (many-faced) body passes over the faces whose radii the ray
+    // never reaches inside its slab.
+    let reach = match &rev.index {
+        Some(ix) => Some(ray_radii(ix, o, d, tmin)?),
+        None => None,
+    };
     for (fi, face) in rev.faces.iter().enumerate() {
+        if let (Some((lo, hi)), Some((f_lo, f_hi))) = (reach, face_radii(face)) {
+            let pad = 1e-3 * (1.0 + hi.min(1e3));
+            if f_hi < lo - pad || f_lo > hi + pad {
+                continue;
+            }
+        }
         match face {
             RevFace::Sag {
                 vertex_x,
@@ -949,6 +1120,7 @@ fn revolve_hit(rev: &GpuRevolve, o: Vec3, d: Vec3, tmin: f32) -> Option<(f32, Ve
                 c,
                 k,
                 coeffs,
+                inner_r,
                 outer_r,
                 is_conic,
             } => sag_hit(
@@ -957,7 +1129,7 @@ fn revolve_hit(rev: &GpuRevolve, o: Vec3, d: Vec3, tmin: f32) -> Option<(f32, Ve
                 *c,
                 *k,
                 coeffs,
-                *outer_r,
+                (*inner_r, *outer_r),
                 *is_conic,
                 o,
                 d,
@@ -1014,7 +1186,7 @@ fn sag_hit(
     c: f32,
     k: f32,
     coeffs: &[f32; 8],
-    outer_r: f32,
+    (inner_r, outer_r): (f32, f32),
     is_conic: bool,
     o: Vec3,
     d: Vec3,
@@ -1042,7 +1214,7 @@ fn sag_hit(
         let p = o + d * t;
         let r = (p.y * p.y + p.z * p.z).sqrt();
         let z = (p - Vec3::new(vertex_x, 0.0, 0.0)).x * axis_sign;
-        if r <= outer_r + r_tol && z >= z_lo - z_tol && z <= z_hi + z_tol {
+        if r >= inner_r - r_tol && r <= outer_r + r_tol && z >= z_lo - z_tol && z <= z_hi + z_tol {
             out(t, sag_normal(vertex_x, axis_sign, c, k, coeffs, p));
         }
     };
@@ -1321,6 +1493,47 @@ fn cylinder_hit(o: Vec3, d: Vec3, r: f32, hl: f32, tmin: f32) -> Option<(f32, Ve
             let p = o + d * t;
             if p.x * p.x + p.y * p.y <= r * r {
                 keep(&mut best, t, Vec3::new(0.0, 0.0, nz));
+            }
+        }
+    }
+    best
+}
+
+/// Nearest tube intersection at `t > tmin`: `(t, outward local normal, face)`,
+/// faces in the kernel's `tube_face` order. `p = (inner, outer, half_length)`,
+/// axis local `+X`; the bore's outward normal faces the axis.
+fn tube_hit(o: Vec3, d: Vec3, p: Vec3, tmin: f32) -> Option<(f32, Vec3, usize)> {
+    let (ri, ro, hl) = (p.x, p.y, p.z);
+    let mut best: Option<(f32, Vec3, usize)> = None;
+    let mut keep = |t: f32, n: Vec3, face: usize| {
+        if t > tmin && best.map(|(bt, _, _)| t < bt).unwrap_or(true) {
+            best = Some((t, n, face));
+        }
+    };
+    let a = d.y * d.y + d.z * d.z;
+    if a > 1e-20 {
+        for (r, face, sign) in [(ro, 0usize, 1.0f32), (ri, 3usize, -1.0f32)] {
+            let b = 2.0 * (o.y * d.y + o.z * d.z);
+            let c = o.y * o.y + o.z * o.z - r * r;
+            let disc = b * b - 4.0 * a * c;
+            if disc >= 0.0 {
+                let sq = disc.sqrt();
+                for t in [(-b - sq) / (2.0 * a), (-b + sq) / (2.0 * a)] {
+                    let q = o + d * t;
+                    if q.x.abs() <= hl {
+                        keep(t, Vec3::new(0.0, q.y, q.z) * (sign / r), face);
+                    }
+                }
+            }
+        }
+    }
+    if d.x.abs() > 1e-20 {
+        for (xc, nx, face) in [(hl, 1.0f32, 1usize), (-hl, -1.0f32, 2usize)] {
+            let t = (xc - o.x) / d.x;
+            let q = o + d * t;
+            let rho2 = q.y * q.y + q.z * q.z;
+            if rho2 >= ri * ri && rho2 <= ro * ro {
+                keep(t, Vec3::new(nx, 0.0, 0.0), face);
             }
         }
     }

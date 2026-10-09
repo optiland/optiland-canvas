@@ -143,6 +143,7 @@ pub fn export_seq(
     let tol = ToleranceContext::for_scene_scale(axial(chain.terminal.point).abs());
     let step = 8.0 * tol.medium_abs_mm;
     let mut noted_absorption: Vec<ObjectId> = Vec::new();
+    let mut noted_figure: Vec<ObjectId> = Vec::new();
     let ambient = ambient_material(scene);
 
     for hit in &chain.hits {
@@ -169,6 +170,12 @@ pub fn export_seq(
                 ));
                 continue;
             }
+            SeqAction::Diffract => {
+                reasons.push(format!(
+                    "the path diffracts at {who}; this export writes no gratings"
+                ));
+                continue;
+            }
         }
         if hit.split {
             reasons.push(format!("the path divides at {who}"));
@@ -177,6 +184,12 @@ pub fn export_seq(
             reasons.push(format!("{who} is not a body in the scene"));
             continue;
         };
+        if has_sag_segments(body) {
+            reasons.push(format!(
+                "{who} is a Fresnel lens: its facets are annular pieces of a surface, and a sequential system has one surface per face"
+            ));
+            continue;
+        }
         let Some(face) = revolved_face(body, hit.patch.0) else {
             reasons.push(format!(
                 "the path meets {who} on a patch that is not a revolved optical face"
@@ -223,6 +236,13 @@ pub fn export_seq(
         let entering =
             body.geometry.contains(past, &body.common.transform, &tol) == Containment::Inside;
         let behind = medium_body(scene, past, &tol);
+        if scene.slope_error_rad(body.common.id) > 0.0 && !noted_figure.contains(&body.common.id) {
+            noted_figure.push(body.common.id);
+            notes.push(format!(
+                "{}: its slope error is not carried; the sequential surface is drawn true",
+                describe(scene, body.common.id)
+            ));
+        }
         if let Some(b) = behind {
             if !matches!(b.absorption, AbsorptionModel::None)
                 && !noted_absorption.contains(&b.common.id)
@@ -515,6 +535,18 @@ struct Face {
     coeffs: Vec<f64>,
 }
 
+/// Is `body` built from annular sag pieces (a Fresnel lens)?
+fn has_sag_segments(body: &Body3) -> bool {
+    match &body.geometry {
+        SolidGeometry3::Profile(p) => p
+            .profile
+            .edges
+            .iter()
+            .any(|e| matches!(e.curve, Curve2::SagSegment { .. })),
+        _ => false,
+    }
+}
+
 fn revolved_face(body: &Body3, patch: u64) -> Option<Face> {
     let SolidGeometry3::Profile(p) = &body.geometry else {
         return None;
@@ -653,6 +685,15 @@ fn illumination(
         AngularDistribution3::PlanarFanLegacy { .. } => {
             Err("the source is a v1 fan, which has no aperture in 3D".into())
         }
+        AngularDistribution3::RadialProfile { .. } => Err(
+            "the source is a measured beam, a spread of directions from an area; a sequential              system needs a point or a beam"
+                .into(),
+        ),
+        AngularDistribution3::Sun { .. } => Err(
+            "the source is the sun, a disc of directions from a disc of origins; a sequential \
+             system needs a point or a beam"
+                .into(),
+        ),
     }
 }
 
@@ -705,6 +746,7 @@ fn surface_kind(scene: &Scene3, id: ObjectId) -> &'static str {
         SurfaceResponse::Retarder { .. } => "a waveplate",
         SurfaceResponse::Absorber => "an absorber",
         SurfaceResponse::ThinLens { .. } => "an ideal thin lens",
+        SurfaceResponse::Grating { .. } => "a diffraction grating",
         SurfaceResponse::DielectricFresnel { .. } => "a bare zero-thickness interface",
     }
 }

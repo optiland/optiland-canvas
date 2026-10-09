@@ -1,4 +1,7 @@
 /target
+# Side build directories, so two builds can run at once without the linker
+# fighting over one exe (CARGO_TARGET_DIR=target-budget, target-dev, ...).
+/target-*
 # Scenes are scratch output, except where they are content: the committed
 # examples, the module fragments the openUC2 catalogue serves to the browser
 # (without these the catalogue loads but every module reports missing optics),
@@ -36,3 +39,5 @@ Thumbs.db
 .vscode/
 *.swp
 
+# Downloaded source data the examples rebuild from (see each script).
+examples/**/.cache/

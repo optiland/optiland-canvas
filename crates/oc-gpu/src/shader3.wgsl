@@ -177,10 +177,15 @@ const RESP_MIRROR: u32 = 1u;
 const RESP_DIELECTRIC: u32 = 2u;
 const RESP_EXPLICIT_RT: u32 = 3u;
 const RESP_THIN_LENS: u32 = 4u;
+// A diffraction grating: `r` the working order's efficiency, `t` the zero
+// order's, `ar.value` the order times the groove density per um.
+const RESP_GRATING: u32 = 6u;
 const RESP_COATING: u32 = 5u;
 // Response.flags: the reflection is stray light (an AR coat's residual), so a
 // ghost like bare glass's. Must match buffers3::RESP_FLAG_STRAY.
 const RESP_FLAG_STRAY: u32 = 1u;
+// A transmission grating. Must match buffers3::RESP_FLAG_TRANSMIT.
+const RESP_FLAG_TRANSMIT: u32 = 2u;
 
 // A baked thin-film coating. `resp.t` holds the wavelength axis (tab_count
 // entries at tab_start, x = lambda) and `resp.r` the grid itself: COAT_ANGLES
@@ -203,6 +208,7 @@ const OBJ_BOX: u32 = 1u;
 const OBJ_CYLINDER: u32 = 2u;
 const OBJ_EXTRUDE: u32 = 3u;
 const OBJ_REVOLVE: u32 = 4u;
+const OBJ_TUBE: u32 = 5u;
 
 // Body surface behaviour kinds.
 const SURF_DIELECTRIC: u32 = 0u;
@@ -264,9 +270,76 @@ fn extrude_contains(start: u32, count: u32, z_min: f32, z_max: f32, p: vec3<f32>
 }
 
 // A revolved point is inside if `(x, r)` is inside the sampled meridian contour.
-fn revolve_contains(cstart: u32, ccount: u32, p: vec3<f32>) -> bool {
+// `istart`/`nb` locate a many-edged body's contour index (`nb == 0`: none).
+fn revolve_contains(cstart: u32, ccount: u32, istart: u32, nb: u32, p: vec3<f32>) -> bool {
     let r = sqrt(p.y * p.y + p.z * p.z);
-    return poly_contains(cstart, ccount, vec2<f32>(p.x, r));
+    if (nb == 0u) {
+        return poly_contains(cstart, ccount, vec2<f32>(p.x, r));
+    }
+    return indexed_poly_contains(cstart, ccount, istart, nb, vec2<f32>(p.x, r));
+}
+
+// A many-edged revolved body (a Fresnel lens) carries its contour bucketed by
+// height at `verts[istart..]`: `(y0, inv_h)`, then `nb` `(start, count)` pairs,
+// then the segment list, integers held exactly in f32. Only the segments of the
+// bucket holding `p.y` can be crossed by the probe, so the parity is the whole
+// scan's. Mirrors `ContourIndex` (scene3.rs) and `indexed_point_in_polygon`
+// (cpu3.rs).
+fn indexed_poly_contains(cstart: u32, ccount: u32, istart: u32, nb: u32, p: vec2<f32>) -> bool {
+    let hdr = verts[istart];
+    let k = u32(clamp(floor((p.y - hdr.x) * hdr.y), 0.0, f32(nb - 1u)));
+    let bk = verts[istart + 1u + k];
+    let s = u32(bk.x);
+    let c = u32(bk.y);
+    let items = istart + 1u + nb + s;
+    var inside = false;
+    for (var m = 0u; m < c; m = m + 1u) {
+        let i = u32(verts[items + m].x);
+        var j = i - 1u;
+        if (i == 0u) {
+            j = ccount - 1u;
+        }
+        let a = verts[cstart + i];
+        let b = verts[cstart + j];
+        if ((a.y > p.y) != (b.y > p.y)) {
+            let t = (p.y - a.y) / (b.y - a.y);
+            if (p.x < a.x + t * (b.x - a.x)) {
+                inside = !inside;
+            }
+        }
+    }
+    return inside;
+}
+
+// The radii a ray passes through inside an indexed body's `x` slab
+// `[x_lo, x_hi]` at `t > tmin`: `(lo, hi, entered)`. Mirrors `ray_radii`
+// (cpu3.rs).
+fn ray_radii(x_lo: f32, x_hi: f32, o: vec3<f32>, d: vec3<f32>, tmin: f32) -> vec3<f32> {
+    let pad = 1e-3;
+    var ta = tmin;
+    var tb = 1e30;
+    if (abs(d.x) > 1e-12) {
+        let u = (x_lo - pad - o.x) / d.x;
+        let v = (x_hi + pad - o.x) / d.x;
+        ta = max(ta, min(u, v));
+        tb = min(tb, max(u, v));
+    } else if (o.x < x_lo - pad || o.x > x_hi + pad) {
+        return vec3<f32>(0.0, 0.0, 0.0);
+    }
+    if (ta > tb) {
+        return vec3<f32>(0.0, 0.0, 0.0);
+    }
+    let oo = o.y * o.y + o.z * o.z;
+    let od = o.y * d.y + o.z * d.z;
+    let dd = d.y * d.y + d.z * d.z;
+    var ts = ta;
+    if (dd > 0.0) {
+        ts = clamp(-od / dd, ta, tb);
+    }
+    let r2s = max(oo + ts * (2.0 * od + ts * dd), 0.0);
+    let r2a = max(oo + ta * (2.0 * od + ta * dd), 0.0);
+    let r2b = max(oo + tb * (2.0 * od + tb * dd), 0.0);
+    return vec3<f32>(sqrt(min(r2s, min(r2a, r2b))), sqrt(max(r2a, r2b)), 1.0);
 }
 
 // ---------------------------------------------------------------------------
@@ -285,7 +358,10 @@ fn body_contains(bi: u32, p: vec3<f32>) -> bool {
     } else if (b.kind == OBJ_EXTRUDE) {
         return extrude_contains(b.poly_start, b.poly_count, b.z_min, b.z_max, pl);
     } else if (b.kind == OBJ_REVOLVE) {
-        return revolve_contains(b.contour_start, b.contour_count, pl);
+        return revolve_contains(b.contour_start, b.contour_count, b.poly_start, b.poly_count, pl);
+    } else if (b.kind == OBJ_TUBE) {
+        let rho2 = pl.y * pl.y + pl.z * pl.z;
+        return abs(pl.x) <= b.params.z && rho2 >= b.params.x * b.params.x && rho2 <= b.params.y * b.params.y;
     }
     return false;
 }
@@ -410,6 +486,55 @@ fn cylinder_hit(o: vec3<f32>, d: vec3<f32>, r: f32, hl: f32) -> Hit {
                 let p = o + d * t;
                 if (p.x * p.x + p.y * p.y <= r * r) {
                     best = Hit(true, t, vec3<f32>(0.0, 0.0, nz[i]), 0u);
+                }
+            }
+        }
+    }
+    return best;
+}
+
+// A hollow tube about local +X: params (inner, outer, half_length). Faces in
+// the kernel's tube_face order (outer 0, +x end 1, -x end 2, bore 3); the bore's
+// outward normal faces the axis. Mirrors cpu3::tube_hit.
+fn tube_hit(o: vec3<f32>, d: vec3<f32>, p: vec3<f32>) -> Hit {
+    var best = no_hit();
+    let ri = p.x;
+    let ro = p.y;
+    let hl = p.z;
+    let a = d.y * d.y + d.z * d.z;
+    if (a > 1e-20) {
+        var rs = array<f32, 2>(ro, ri);
+        var sg = array<f32, 2>(1.0, -1.0);
+        var fc = array<u32, 2>(0u, 3u);
+        for (var k = 0; k < 2; k = k + 1) {
+            let r = rs[k];
+            let b = 2.0 * (o.y * d.y + o.z * d.z);
+            let c = o.y * o.y + o.z * o.z - r * r;
+            let disc = b * b - 4.0 * a * c;
+            if (disc >= 0.0) {
+                let sq = sqrt(disc);
+                var ts = array<f32, 2>((-b - sq) / (2.0 * a), (-b + sq) / (2.0 * a));
+                for (var i = 0; i < 2; i = i + 1) {
+                    let t = ts[i];
+                    let q = o + d * t;
+                    if (t > EPS && abs(q.x) <= hl && (!best.hit || t < best.t)) {
+                        best = Hit(true, t, vec3<f32>(0.0, q.y, q.z) * (sg[k] / r), fc[k]);
+                    }
+                }
+            }
+        }
+    }
+    if (abs(d.x) > 1e-20) {
+        var xc = array<f32, 2>(hl, -hl);
+        var nx = array<f32, 2>(1.0, -1.0);
+        var fe = array<u32, 2>(1u, 2u);
+        for (var i = 0; i < 2; i = i + 1) {
+            let t = (xc[i] - o.x) / d.x;
+            if (t > EPS && (!best.hit || t < best.t)) {
+                let q = o + d * t;
+                let rho2 = q.y * q.y + q.z * q.z;
+                if (rho2 >= ri * ri && rho2 <= ro * ro) {
+                    best = Hit(true, t, vec3<f32>(nx[i], 0.0, 0.0), fe[i]);
                 }
             }
         }
@@ -580,15 +705,17 @@ fn a_refine(seed: f32, tmin: f32, c: f32, k: f32, coeffs: array<f32, 8>, z0: f32
 
 // Accept a sag-surface root: check the aperture/sag envelope, and keep it if it is
 // the nearest so far. Returns the updated best.
+// `radii` is `(inner_r, outer_r)`: an annular face (a Fresnel facet) has an
+// inner radius, a face across the axis has `inner_r = 0`.
 fn sag_accept(best: Hit, t: f32, tmin: f32, o: vec3<f32>, d: vec3<f32>, vertex_x: f32,
-              axis_sign: f32, c: f32, k: f32, coeffs: array<f32, 8>, outer_r: f32,
+              axis_sign: f32, c: f32, k: f32, coeffs: array<f32, 8>, radii: vec2<f32>,
               z_lo: f32, z_hi: f32, z_tol: f32, r_tol: f32) -> Hit {
     if (t <= tmin) { return best; }
     if (best.hit && t >= best.t) { return best; }
     let p = o + d * t;
     let r = sqrt(p.y * p.y + p.z * p.z);
     let z = (p.x - vertex_x) * axis_sign;
-    if (r <= outer_r + r_tol && z >= z_lo - z_tol && z <= z_hi + z_tol) {
+    if (r >= radii.x - r_tol && r <= radii.y + r_tol && z >= z_lo - z_tol && z <= z_hi + z_tol) {
         return Hit(true, t, sag_normal(axis_sign, c, k, coeffs, p), 0u);
     }
     return best;
@@ -600,6 +727,7 @@ fn sag_face_hit(f: RFace, o: vec3<f32>, d: vec3<f32>, tmin: f32) -> Hit {
     let c = f.a.z;
     let k = f.a.w;
     let outer_r = f.b.x;
+    let radii = vec2<f32>(f.b.y, outer_r);
     let coeffs = f.coeffs;
 
     let ov = o - vec3<f32>(vertex_x, 0.0, 0.0);
@@ -622,8 +750,8 @@ fn sag_face_hit(f: RFace, o: vec3<f32>, d: vec3<f32>, tmin: f32) -> Hit {
 
     var best = no_hit();
     if (f.is_conic == 1u) {
-        if (qr.n >= 1u) { best = sag_accept(best, qr.t0, tmin, o, d, vertex_x, axis_sign, c, k, coeffs, outer_r, z_lo, z_hi, z_tol, r_tol); }
-        if (qr.n >= 2u) { best = sag_accept(best, qr.t1, tmin, o, d, vertex_x, axis_sign, c, k, coeffs, outer_r, z_lo, z_hi, z_tol, r_tol); }
+        if (qr.n >= 1u) { best = sag_accept(best, qr.t0, tmin, o, d, vertex_x, axis_sign, c, k, coeffs, radii, z_lo, z_hi, z_tol, r_tol); }
+        if (qr.n >= 2u) { best = sag_accept(best, qr.t1, tmin, o, d, vertex_x, axis_sign, c, k, coeffs, radii, z_lo, z_hi, z_tol, r_tol); }
         return best;
     }
 
@@ -631,11 +759,11 @@ fn sag_face_hit(f: RFace, o: vec3<f32>, d: vec3<f32>, tmin: f32) -> Hit {
     // aperture span to bracket a sign change, then Newton-refine (§7.4).
     if (qr.n >= 1u) {
         let ref0 = a_refine(qr.t0, tmin, c, k, coeffs, z0, dz, o_rad, d_rad);
-        if (ref0.y > 0.5) { best = sag_accept(best, ref0.x, tmin, o, d, vertex_x, axis_sign, c, k, coeffs, outer_r, z_lo, z_hi, z_tol, r_tol); }
+        if (ref0.y > 0.5) { best = sag_accept(best, ref0.x, tmin, o, d, vertex_x, axis_sign, c, k, coeffs, radii, z_lo, z_hi, z_tol, r_tol); }
     }
     if (qr.n >= 2u) {
         let ref1 = a_refine(qr.t1, tmin, c, k, coeffs, z0, dz, o_rad, d_rad);
-        if (ref1.y > 0.5) { best = sag_accept(best, ref1.x, tmin, o, d, vertex_x, axis_sign, c, k, coeffs, outer_r, z_lo, z_hi, z_tol, r_tol); }
+        if (ref1.y > 0.5) { best = sag_accept(best, ref1.x, tmin, o, d, vertex_x, axis_sign, c, k, coeffs, radii, z_lo, z_hi, z_tol, r_tol); }
     }
     if (qr.n == 0u) {
         let start = max(tmin, 0.0);
@@ -647,7 +775,7 @@ fn sag_face_hit(f: RFace, o: vec3<f32>, d: vec3<f32>, tmin: f32) -> Hit {
             let v = a_residual(t, c, k, coeffs, z0, dz, o_rad, d_rad);
             if (pv * v < 0.0) {
                 let rf = a_refine(0.5 * (pt + t), tmin, c, k, coeffs, z0, dz, o_rad, d_rad);
-                if (rf.y > 0.5) { best = sag_accept(best, rf.x, tmin, o, d, vertex_x, axis_sign, c, k, coeffs, outer_r, z_lo, z_hi, z_tol, r_tol); }
+                if (rf.y > 0.5) { best = sag_accept(best, rf.x, tmin, o, d, vertex_x, axis_sign, c, k, coeffs, radii, z_lo, z_hi, z_tol, r_tol); }
             }
             pt = t;
             pv = v;
@@ -743,11 +871,33 @@ fn arc_face_hit(f: RFace, o: vec3<f32>, d: vec3<f32>, tmin: f32) -> Hit {
 
 // Nearest revolved-profile hit, with the outward local normal oriented by a
 // containment probe (a single surface cannot say which side is glass).
+// `istart`/`nb` locate a many-edged body's contour index and `x_lo`/`x_hi` its
+// slab; with one, a face whose radii the ray never reaches is passed over.
 fn revolve_hit(face_start: u32, face_count: u32, cstart: u32, ccount: u32,
+               istart: u32, nb: u32, x_lo: f32, x_hi: f32,
                o: vec3<f32>, d: vec3<f32>, tmin: f32) -> Hit {
     var best = no_hit();
+    var reach = vec3<f32>(0.0, 1e30, 1.0);
+    if (nb > 0u) {
+        reach = ray_radii(x_lo, x_hi, o, d, tmin);
+        if (reach.z < 0.5) {
+            return best;
+        }
+    }
+    let rpad = 1e-3 * (1.0 + min(reach.y, 1e3));
     for (var fi = 0u; fi < face_count; fi = fi + 1u) {
         let f = faces[face_start + fi];
+        if (nb > 0u && f.kind != FACE_ARC) {
+            var f_lo = f.b.y;
+            var f_hi = f.b.x;
+            if (f.kind == FACE_FRUSTUM) {
+                f_lo = min(f.a.y, f.a.w);
+                f_hi = max(f.a.y, f.a.w);
+            }
+            if (f_hi < reach.x - rpad || f_lo > reach.y + rpad) {
+                continue;
+            }
+        }
         var h = no_hit();
         if (f.kind == FACE_SAG) {
             h = sag_face_hit(f, o, d, tmin);
@@ -763,7 +913,7 @@ fn revolve_hit(face_start: u32, face_count: u32, cstart: u32, ccount: u32,
     }
     if (best.hit) {
         let p = o + d * best.t;
-        if (revolve_contains(cstart, ccount, p + best.n * EPS)) {
+        if (revolve_contains(cstart, ccount, istart, nb, p + best.n * EPS)) {
             best.n = -best.n;
         }
     }
@@ -786,7 +936,10 @@ fn body_hit(bi: u32, o: vec3<f32>, d: vec3<f32>) -> Hit {
     } else if (b.kind == OBJ_EXTRUDE) {
         h = extrude_hit(b.poly_start, b.poly_count, b.z_min, b.z_max, ol, dl);
     } else if (b.kind == OBJ_REVOLVE) {
-        h = revolve_hit(b.face_start, b.face_count, b.contour_start, b.contour_count, ol, dl, EPS);
+        h = revolve_hit(b.face_start, b.face_count, b.contour_start, b.contour_count,
+                        b.poly_start, b.poly_count, b.z_min, b.z_max, ol, dl, EPS);
+    } else if (b.kind == OBJ_TUBE) {
+        h = tube_hit(ol, dl, b.params.xyz);
     }
     if (h.hit) {
         h.n = normalize(rot * h.n);
@@ -1089,7 +1242,14 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 fn interact_body(w: Work, ev: Event, point: vec3<f32>, flux_end: f32, lambda: f32, min_flux: f32) {
-    if (bodies[ev.idx].surface == SURF_ABSORBER) { return; }
+    // An absorbing body swallows the ray at its surface, unless the face it hit
+    // carries a response of its own: the silvered bore of a black tube.
+    let bb = bodies[ev.idx];
+    var own_face = false;
+    if (ev.face < bb.face_count) {
+        own_face = faces[bb.face_start + ev.face].has_resp == 1u;
+    }
+    if (bb.surface == SURF_ABSORBER && !own_face) { return; }
     var n = ev.n;
     if (dot(n, w.d) > 0.0) { n = -n; }
     let m1 = region_optics(point + n * EPS, lambda);
@@ -1103,8 +1263,17 @@ fn interact_body(w: Work, ev: Event, point: vec3<f32>, flux_end: f32, lambda: f3
     // still refracts, because unlike a zero-thickness plate this interface
     // really does change the medium. Mirrors cpu3::interact_body.
     let b = bodies[ev.idx];
-    if (b.kind == OBJ_REVOLVE && ev.face < b.face_count) {
+    if (ev.face < b.face_count) {
         let f = faces[b.face_start + ev.face];
+        // A mirror face reflects what its reflectivity says and absorbs the
+        // rest. Mirrors cpu3::interact_body.
+        if (f.has_resp == 1u && f.resp.kind == RESP_MIRROR) {
+            let rs = sample_spectral(f.resp.r, lambda);
+            if (rs.y < 0.5) { return; }
+            let dir = reflect3(w.d, n);
+            push(Work(point + dir * EPS, dir, flux_end * clamp(rs.x, 0.0, 1.0), w.depth + 1u, w.gdepth, w.medium_n, w.medium_alpha, w.flags & ~SEG_TIR), min_flux);
+            return;
+        }
         if (f.has_resp == 1u && f.resp.kind == RESP_COATING) {
             // Past the critical angle nothing gets through whatever the stack,
             // and the grid saturates at grazing rather than saying so: total
@@ -1138,6 +1307,7 @@ fn interact_body(w: Work, ev: Event, point: vec3<f32>, flux_end: f32, lambda: f3
             return;
         }
     }
+    if (b.surface == SURF_ABSORBER) { return; }
 
     let res = refract3(w.d, n, n1, n2);
     if (res.w < 0.5) {
@@ -1179,6 +1349,32 @@ fn interact_surface(w: Work, ev: Event, point: vec3<f32>, flux_end: f32, lambda:
             dir = srot * normalize(vec3<f32>(dl.x - abs(dl.z) * pl.x / fl, dl.y - abs(dl.z) * pl.y / fl, dl.z));
         }
         push(Work(point + dir * EPS, dir, flux_end, w.depth + 1u, w.gdepth, w.medium_n, w.medium_alpha, w.flags & ~SEG_TIR), min_flux);
+    } else if (kind == RESP_GRATING) {
+        // The grating equation in the surface's frame (mirrors tracer3): the
+        // working order shifts the direction cosine across the grooves by
+        // k * lambda; the zero order is the mirror or the straight beam.
+        let es = sample_spectral(resp.r, lambda);
+        let zs = sample_spectral(resp.t, lambda);
+        let em = select(0.0, clamp(es.x, 0.0, 1.0), es.y > 0.5);
+        let e0 = select(0.0, clamp(zs.x, 0.0, 1.0), zs.y > 0.5);
+        let over = max(em + e0, 1.0);
+        let transmit = (resp.flags & RESP_FLAG_TRANSMIT) != 0u;
+        let srot = surface_rot(s);
+        let dl = transpose(srot) * w.d;
+        let tx = dl.x + resp.ar.value * lambda;
+        let t2 = tx * tx + dl.y * dl.y;
+        if (em > 0.0 && t2 < 1.0) {
+            let ahead = select(-1.0, 1.0, dl.z >= 0.0);
+            let nz = sqrt(1.0 - t2);
+            let z = select(-ahead * nz, ahead * nz, transmit);
+            let dir = normalize(srot * vec3<f32>(tx, dl.y, z));
+            push(Work(point + dir * EPS, dir, flux_end * em / over, w.depth + 1u, w.gdepth, w.medium_n, w.medium_alpha, w.flags & ~SEG_TIR), min_flux);
+        }
+        if (e0 > 0.0) {
+            var dir = w.d;
+            if (!transmit) { dir = reflect3(w.d, n_oppose); }
+            push(Work(point + dir * EPS, dir, flux_end * e0 / over, w.depth + 1u, w.gdepth, w.medium_n, w.medium_alpha, w.flags & ~SEG_TIR), min_flux);
+        }
     } else if (kind == RESP_MIRROR) {
         // A table with no value at `lambda` ends the branch.
         let rs = sample_spectral(resp.r, lambda);

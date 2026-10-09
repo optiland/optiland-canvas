@@ -294,7 +294,18 @@ pub enum CoatingBacking {
     Plate {
         substrate: FilmMaterial,
         exit: ExitFace,
+        /// The plate's thickness, mm, which only its absorption reads: each
+        /// pass through the glass is attenuated by the substrate's own `k`
+        /// along the slant path, `exp(-4π k d / (λ cos θ))`. A silvered sheet
+        /// of float glass loses a few percent this way, most of it near 1 µm
+        /// where the iron absorbs. `0`, the default, is a lossless plate.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        thickness_mm: f64,
     },
+}
+
+fn is_zero(v: &f64) -> bool {
+    *v == 0.0
 }
 
 /// The second face of a plate.
@@ -637,7 +648,7 @@ pub fn coating_rt_at(
         // The stack sits straight on whatever the scene has on the far side: an
         // AR coating on a lens face is backed by that lens's own glass.
         CoatingBacking::Medium => Some(rt_both(&layers, n0, n_far, lambda_um, q)),
-        CoatingBacking::Plate { substrate, exit } => {
+        CoatingBacking::Plate { substrate, exit, thickness_mm } => {
             let n_sub = substrate.index_at(lambda_um)?;
             if !n_sub.is_finite() || n_sub.re <= 0.0 {
                 return None;
@@ -655,6 +666,7 @@ pub fn coating_rt_at(
                 q,
                 residual,
                 c.incidence,
+                thickness_mm.max(0.0) * 1e3,
             ))
         }
     }
@@ -852,8 +864,16 @@ fn plate_rt(
     q: Cx,
     exit_residual: f64,
     incidence: Incidence,
+    thickness_um: f64,
 ) -> FilmRt {
     let reversed: Vec<(Cx, f64)> = layers.iter().rev().copied().collect();
+    // One pass through the glass, by its extinction along the slant path.
+    let tau = if thickness_um > 0.0 && n_sub.im > 0.0 {
+        let cos_t = snell_cos(q, Cx::real(n_sub.re)).re.max(1e-6);
+        (-4.0 * std::f64::consts::PI * n_sub.im * thickness_um / (lambda_um * cos_t)).exp()
+    } else {
+        1.0
+    };
     let mut out = [(0.0, 0.0); 2];
     for (idx, p_pol) in [false, true].into_iter().enumerate() {
         // The coated face, lit from the air side and from inside the glass.
@@ -873,10 +893,11 @@ fn plate_rt(
             Incidence::Substrate => (r1p, t1p),
         };
 
-        let den = 1.0 - back_r * second_r;
+        let tau2 = tau * tau;
+        let den = 1.0 - back_r * second_r * tau2;
         let den = if den.abs() < 1e-12 { 1e-12 } else { den };
-        let r = (front_r + front_t * back_t * second_r / den).clamp(0.0, 1.0);
-        let t = (front_t * second_t / den).clamp(0.0, 1.0);
+        let r = (front_r + front_t * back_t * second_r * tau2 / den).clamp(0.0, 1.0);
+        let t = (front_t * second_t * tau / den).clamp(0.0, 1.0);
         // Absorption in the stack can only take energy away, never add it.
         let scale = if r + t > 1.0 { 1.0 / (r + t) } else { 1.0 };
         out[idx] = (r * scale, t * scale);
@@ -928,7 +949,115 @@ pub mod materials {
     pub fn bk7() -> FilmMaterial {
         FilmMaterial::constant("N-BK7", 1.5168)
     }
+
+    /// Silver, measured: Babar and Weaver, Appl. Opt. 54, 477 (2015), 0.21 to
+    /// 3.54 µm, from the refractiveindex.info database (CC0).
+    ///
+    /// The constant [`aluminium`] above is good for one wavelength. A metal
+    /// that has to reflect sunlight has to be right from the UV to the near
+    /// infrared, and silver is not flat across that: it goes transparent near
+    /// 320 nm, which a constant index cannot know.
+    ///
+    /// Clamped outside the table. Past 3.5 µm a metal only gets more
+    /// reflective, so holding the last value slightly understates it, and the
+    /// sun has less than half a percent of its direct power out there.
+    pub fn silver() -> FilmMaterial {
+        tabulated("Ag", &super::SILVER_BABAR_WEAVER)
+    }
+
+    /// Aluminium, measured: Rakić, Appl. Opt. 34, 4755 (1995), 0.21 to 3.9 µm,
+    /// from the refractiveindex.info database (CC0). It carries the interband
+    /// dip near 800 nm, where aluminium falls to about 87%. Clamped outside the
+    /// table, as [`silver`] is.
+    pub fn aluminium_measured() -> FilmMaterial {
+        tabulated("Al", &super::ALUMINIUM_RAKIC)
+    }
+
+    fn tabulated(name: &str, rows: &[[f64; 3]]) -> FilmMaterial {
+        use crate::scene3::{Interpolation, OutOfRangePolicy, SpectralScalar};
+        let lambda_um: Vec<f64> = rows.iter().map(|r| r[0]).collect();
+        let column = |i: usize| SpectralScalar::Tabulated {
+            lambda_um: lambda_um.clone(),
+            values: rows.iter().map(|r| r[i]).collect(),
+            interpolation: Interpolation::Linear,
+            out_of_range: OutOfRangePolicy::Clamp,
+        };
+        FilmMaterial {
+            name: name.to_string(),
+            n: column(1),
+            k: column(2),
+        }
+    }
 }
+
+/// A metal mirror: an opaque metal film under an optional protective
+/// overcoat, `(material, thickness_nm)`, the way a protected silver or
+/// aluminium mirror is sold.
+///
+/// The film is 150 nm, which is what a coater lays down: opaque across the
+/// visible and infrared, but not in silver's window near 320 nm, where a few
+/// percent does get through a real one. What gets through is carried on into
+/// whatever the film is backed by, as it would be.
+///
+/// No design recipe is attached, so what the stack reflects is the path.
+pub fn metal_mirror(metal: FilmMaterial, overcoat: Option<(FilmMaterial, f64)>) -> Coating {
+    let mut layers = Vec::new();
+    if let Some((m, nm)) = overcoat {
+        layers.push(FilmLayer::new(m, nm));
+    }
+    layers.push(FilmLayer::new(metal, 150.0));
+    Coating {
+        layers,
+        backing: CoatingBacking::Medium,
+        incidence: Incidence::Film,
+        design: None,
+    }
+}
+
+/// `[λ µm, n, k]`, Babar and Weaver (2015). See [`materials::silver`].
+#[rustfmt::skip]
+const SILVER_BABAR_WEAVER: [[f64; 3]; 64] = [
+    [0.2066, 1.079, 1.247], [0.2101, 1.101, 1.258], [0.2138, 1.121, 1.267],
+    [0.2175, 1.14, 1.272], [0.2214, 1.157, 1.28], [0.2254, 1.169, 1.283],
+    [0.2296, 1.181, 1.287], [0.2339, 1.19, 1.294], [0.2384, 1.198, 1.306],
+    [0.2431, 1.215, 1.317], [0.248, 1.233, 1.326], [0.253, 1.254, 1.328],
+    [0.2583, 1.27, 1.327], [0.2638, 1.294, 1.329], [0.2695, 1.321, 1.31],
+    [0.2755, 1.348, 1.291], [0.2818, 1.38, 1.247], [0.2883, 1.402, 1.181],
+    [0.2952, 1.427, 1.079], [0.3024, 1.41, 0.894], [0.31, 1.265, 0.656],
+    [0.3179, 0.859, 0.466], [0.3263, 0.307, 0.651], [0.3351, 0.187, 1.042],
+    [0.3444, 0.142, 1.269], [0.3542, 0.106, 1.467], [0.3647, 0.076, 1.645],
+    [0.3757, 0.061, 1.815], [0.3875, 0.05, 1.981], [0.3999, 0.054, 2.138],
+    [0.4133, 0.05, 2.292], [0.4275, 0.051, 2.448], [0.4428, 0.052, 2.604],
+    [0.4592, 0.052, 2.765], [0.4769, 0.053, 2.93], [0.4959, 0.052, 3.105],
+    [0.5166, 0.052, 3.288], [0.5391, 0.05168, 3.483], [0.5636, 0.05009, 3.694],
+    [0.5904, 0.04977, 3.918], [0.6199, 0.04803, 4.164], [0.6525, 0.04964, 4.432],
+    [0.6888, 0.0508, 4.725], [0.7293, 0.05151, 5.048], [0.7749, 0.05269, 5.409],
+    [0.8266, 0.05504, 5.814], [0.8856, 0.05896, 6.276], [0.9537, 0.06542, 6.802],
+    [1.033, 0.07286, 7.412], [1.127, 0.08427, 8.128], [1.24, 0.09799, 8.981],
+    [1.305, 0.1056, 9.472], [1.378, 0.1143, 10.018], [1.459, 0.1256, 10.63],
+    [1.55, 0.1388, 11.31], [1.653, 0.1543, 12.08], [1.771, 0.1735, 12.97],
+    [1.907, 0.1988, 13.98], [2.066, 0.2315, 15.16], [2.254, 0.2724, 16.56],
+    [2.48, 0.3256, 18.23], [2.755, 0.397, 20.26], [3.1, 0.496, 22.8],
+    [3.542, 0.6387, 26.05],
+];
+
+/// `[λ µm, n, k]`, Rakić (1995). See [`materials::aluminium_measured`].
+#[rustfmt::skip]
+const ALUMINIUM_RAKIC: [[f64; 3]; 37] = [
+    [0.20664, 0.12677, 2.3563], [0.24797, 0.18137, 2.9029], [0.30996, 0.28003, 3.7081],
+    [0.32628, 0.31474, 3.9165], [0.36466, 0.39877, 4.3957], [0.41328, 0.52135, 5.0008],
+    [0.4428, 0.6079, 5.3676], [0.47687, 0.7278, 5.7781], [0.5166, 0.8734, 6.2418],
+    [0.56357, 1.0728, 6.7839], [0.61993, 1.366, 7.4052], [0.65225, 1.5724, 7.7354],
+    [0.68881, 1.8301, 8.0601], [0.72932, 2.1606, 8.3565], [0.77491, 2.6154, 8.4914],
+    [0.79478, 2.7675, 8.3866], [0.81569, 2.7668, 8.2573], [0.83774, 2.6945, 8.1878],
+    [0.88561, 2.2802, 8.1134], [0.91166, 1.9739, 8.3058], [0.93928, 1.6784, 8.597],
+    [0.96863, 1.4867, 9.0655], [0.99988, 1.4359, 9.4939], [1.0332, 1.3998, 9.8914],
+    [1.1271, 1.3281, 10.969], [1.2399, 1.3157, 12.245], [1.3776, 1.3899, 13.784],
+    [1.5498, 1.5782, 15.656], [1.7712, 1.9205, 17.991], [2.0664, 2.4738, 20.982],
+    [2.4797, 3.3372, 25.004], [2.7552, 3.938, 27.58], [3.0996, 4.7097, 30.737],
+    [3.2628, 5.0735, 32.183], [3.444, 5.4903, 33.814], [3.6466, 5.9564, 35.608],
+    [3.8745, 6.4808, 37.595],
+];
 
 impl CoatingDesign {
     /// A long-pass dichroic: short wavelengths reflect, long ones pass, with the
@@ -1173,7 +1302,7 @@ pub fn plate_coating(
     exit: ExitFace,
     n_incident: f64,
 ) -> Coating {
-    let backing = CoatingBacking::Plate { substrate, exit };
+    let backing = CoatingBacking::Plate { substrate, exit, thickness_mm: 0.0 };
     Coating {
         layers: design_layers_for(&design, n_incident, &backing, n_incident),
         backing,
@@ -1789,6 +1918,47 @@ mod tests {
         );
     }
 
+    /// A thick plate absorbs by its own `k` on every pass: an uncoated one at
+    /// normal incidence is the textbook incoherent slab, and a silvered one
+    /// lit through its glass returns its front face's 4% plus the silver's
+    /// share of what survives two passes.
+    #[test]
+    fn a_thick_plate_absorbs_on_every_pass() {
+        let (n, k, d_mm, lam) = (1.52, 2e-6, 4.0, 1.0);
+        let glass = FilmMaterial::absorbing("glass", n, k);
+        let tau = (-4.0 * std::f64::consts::PI * k * d_mm * 1e3 / lam).exp();
+        let r = ((n - 1.0) / (n + 1.0)).powi(2);
+        let bare = Coating {
+            layers: Vec::new(),
+            backing: CoatingBacking::Plate { substrate: glass.clone(), exit: ExitFace::Bare, thickness_mm: d_mm },
+            incidence: Incidence::Film,
+            design: None,
+        };
+        let got = coating_rt(&bare, 1.0, lam, 1.0).unwrap();
+        let t_slab = (1.0 - r) * (1.0 - r) * tau / (1.0 - r * r * tau * tau);
+        assert!((got.t() - t_slab).abs() < 1e-5, "{} vs {t_slab}", got.t());
+        assert!(tau < 0.92 && tau > 0.9);
+
+        let silvered = Coating {
+            layers: vec![FilmLayer::new(materials::silver(), 150.0)],
+            backing: CoatingBacking::Plate { substrate: glass, exit: ExitFace::Bare, thickness_mm: d_mm },
+            incidence: Incidence::Substrate,
+            design: None,
+        };
+        let r_ag = coating_rt_at(
+            &Coating { layers: vec![FilmLayer::new(materials::silver(), 150.0)], backing: CoatingBacking::Medium, incidence: Incidence::Film, design: None },
+            n,
+            1.0,
+            lam,
+            1.0,
+        )
+        .unwrap()
+        .r();
+        let want = r + (1.0 - r) * (1.0 - r) * r_ag * tau * tau / (1.0 - r * r_ag * tau * tau);
+        let got = coating_rt(&silvered, 1.0, lam, 1.0).unwrap().r();
+        assert!((got - want).abs() < 2e-4, "{got} vs {want}");
+    }
+
     /// A plate transmits less than its coating alone, because the light still
     /// has to leave the glass, and an AR on the back face recovers most of it.
     #[test]
@@ -1800,6 +1970,7 @@ mod tests {
             backing: CoatingBacking::Plate {
                 substrate: bk7.clone(),
                 exit: ExitFace::Bare,
+                thickness_mm: 0.0,
             },
             incidence: Incidence::Film,
             design: None,
@@ -1808,6 +1979,7 @@ mod tests {
             backing: CoatingBacking::Plate {
                 substrate: bk7,
                 exit: ExitFace::AntiReflective { residual: 0.05 },
+                thickness_mm: 0.0,
             },
             ..bare.clone()
         };

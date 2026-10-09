@@ -21,7 +21,10 @@ async function openApp(page: Page) {
 /** A clean browser profile: no remembered window or editor mode. */
 async function freshApp(page: Page) {
   await openApp(page);
-  await page.evaluate(() => localStorage.clear());
+  await page.evaluate(() => {
+    localStorage.clear();
+    localStorage.setItem("optiland-canvas:tools", "open");
+  });
   await page.reload();
   await expect(page.locator("#stat")).toContainText("segs");
 }
@@ -638,7 +641,7 @@ test.describe("component view — what a detector measures", () => {
     const id = await addDetector(page);
 
     const bar = page.locator("#componentInset .cv-bar");
-    for (const name of ["power", "irradiance", "intensity"]) {
+    for (const name of ["power", "irradiance", "intensity", "illuminance"]) {
       await expect(bar.getByText(name, { exact: true })).toBeVisible();
     }
     await expect(bar.getByText("power", { exact: true })).toHaveClass(/active/);
@@ -668,6 +671,31 @@ test.describe("component view — what a detector measures", () => {
     await expect(page.locator("#dockNums")).toContainText("flux/mm²");
   });
 
+  test("illuminance reads lux and gives each pixel its colour", async ({ page }) => {
+    await freshApp(page);
+    await openInset(page);
+    const id = await addDetector(page);
+    const exposure = page.locator('#componentInset input[data-name="detExposure"]');
+    await expect(exposure).toBeHidden();
+
+    await page.locator("#componentInset .cv-bar").getByText("illuminance", { exact: true }).click();
+    await expect(page.locator("#stat")).toContainText("segs");
+
+    const info = await result(page, id);
+    expect(info.measure).toBe("illuminance");
+    // No sun, so the flux is relative and so are the lux.
+    expect(info.unit).toBe("lx (relative)");
+    expect(info.colour.length).toBe(3 * info.cells.length);
+    // Y is the illuminance, pixel for pixel.
+    for (let i = 0; i < info.cells.length; i += 97) {
+      expect(info.colour[3 * i + 1]).toBeCloseTo(info.cells[i], 9);
+    }
+    expect(info.peak).toBeGreaterThan(0);
+    await expect(exposure).toBeVisible();
+    await expect(page.locator("#componentInset .cv-read")).toContainText("lx (relative)");
+    await expect(page.locator("#dockNums")).toContainText("lx (relative)");
+  });
+
   test("intensity bins the arrival directions and reports per steradian", async ({ page }) => {
     await freshApp(page);
     await openInset(page);
@@ -679,16 +707,19 @@ test.describe("component view — what a detector measures", () => {
     const info = await result(page, id);
     expect(info.measure).toBe("intensity");
     expect(info.unit).toBe("flux/sr");
-    // Its own grid, not the face's 64 by 64.
-    expect(info.coneBins).toEqual([24, 1]);
+    // Its own grid, not the face's 64 by 64: two angles on straight axes,
+    // with a cell on the normal.
+    expect(info.directionLayout).toBe("grid");
+    expect(info.coneBins).toEqual([31, 31]);
     expect(info.bins).toEqual([64, 64]);
-    expect(info.cells.length).toBe(24);
-    // The solid angles partition the cone exactly, which is the property the
-    // whole measure rests on.
-    const cap = 2 * Math.PI * (1 - Math.cos((info.coneDeg * Math.PI) / 180));
+    expect(info.cells.length).toBe(31 * 31);
+    // The solid angles partition the square of directions exactly, which is
+    // the property the whole measure rests on.
+    const t = Math.tan((info.coneDeg * Math.PI) / 180);
+    const square = 4 * Math.atan((t * t) / Math.sqrt(1 + 2 * t * t));
     const sum = (info.solidAngle as number[]).reduce((a: number, b: number) => a + b, 0);
-    expect(sum).toBeCloseTo(cap, 12);
-    // Every ray is either in the cone or counted as being outside it.
+    expect(sum).toBeCloseTo(square, 12);
+    // Every ray is either in the grid or counted as being outside it.
     const binned = (info.cells as number[]).reduce(
       (a: number, v: number, i: number) => a + v * info.solidAngle[i],
       0,
@@ -702,11 +733,20 @@ test.describe("component view — what a detector measures", () => {
     await expect(page.locator("#stat")).toContainText("segs");
     expect((await result(page, id)).coneDeg).toBeCloseTo(15, 9);
 
-    // And the dock stops calling the picture a heatmap, because it is not one.
+    // And the dock stops calling the picture a heatmap of the face.
+    await expect(page.locator("#detHead")).toContainText("far field");
+    await expect(page.locator("#componentInset .cv-read")).toContainText("cells over");
+
+    // The polar map is still there for whoever reads a goniometer, with its
+    // own resolution: rings out to the cone, sectors round.
+    await page.locator("#componentInset .cv-bar").getByText("polar", { exact: true }).click();
+    await expect.poll(async () => (await result(page, id)).directionLayout).toBe("polar");
+    expect((await result(page, id)).coneBins).toEqual([24, 1]);
     await expect(page.locator("#detHead")).toContainText("polar");
     await expect(page.locator("#componentInset .cv-read")).toContainText("ring");
-
-    // Its resolution is its own to set: rings out to the cone, sectors round.
+    const polar = await result(page, id);
+    const cap = 2 * Math.PI * (1 - Math.cos((polar.coneDeg * Math.PI) / 180));
+    expect((polar.solidAngle as number[]).reduce((a: number, b: number) => a + b, 0)).toBeCloseTo(cap, 12);
     await page.locator('#componentInset input[data-name="detRings"]').fill("12");
     await expect.poll(async () => (await result(page, id)).coneBins).toEqual([12, 1]);
     await page.locator('#componentInset input[data-name="detSectors"]').fill("4");

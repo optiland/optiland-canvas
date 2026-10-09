@@ -53,6 +53,10 @@ impl std::fmt::Display for DocumentError {
 impl std::error::Error for DocumentError {}
 
 /// A document as read, in the version it was written in.
+///
+/// One is held at a time, never in bulk, so the v2 scene is not boxed to
+/// even out the variants' sizes.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum Document {
     V1(Scene),

@@ -20,7 +20,10 @@ const fixture = (name: string) =>
 async function freshApp(page: Page) {
   await page.goto("/");
   await expect(page.locator("#stat")).toContainText("segs");
-  await page.evaluate(() => localStorage.clear());
+  await page.evaluate(() => {
+    localStorage.clear();
+    localStorage.setItem("optiland-canvas:tools", "open");
+  });
   await page.reload();
   await expect(page.locator("#stat")).toContainText("segs");
 }

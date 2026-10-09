@@ -6,6 +6,7 @@
 
 import type { Canvas } from "../../pkg/oc_wasm.js";
 import { createCardManager, type CardManager, type V2 } from "../cards";
+import { commitAperture, commitLink, fieldChanged, renderAperture, renderLink } from "../card-extras";
 
 export type SceneObject = {
   id: number;
@@ -37,8 +38,12 @@ export function createScene3Cards(opts: {
   function commit(id: number, root: HTMLElement) {
     const num = (n: string) => Number((root.querySelector(`input[data-name="${n}"]`) as HTMLInputElement).value);
     const o = find(id);
-    scene.setObjectPosition(id, num("x"), num("y"), o ? o.pos[2] : 0);
-    if (o) {
+    // Only what was changed: an untouched x, y or tilt written back would
+    // flatten a 3D pose, or undo where a link placed the element.
+    if (o && (fieldChanged(root, "x", o.pos[0]) || fieldChanged(root, "y", o.pos[1]))) {
+      scene.setObjectPosition(id, num("x"), num("y"), o.pos[2]);
+    }
+    if (o && fieldChanged(root, "rot", o.rotZ)) {
       // A source turns like a body (its aim is its local +X).
       if (o.body || o.kind === "source") scene.setObjectRotationZDeg(id, num("rot"));
       else scene.setSurfaceTiltZDeg(id, num("rot"));
@@ -47,7 +52,8 @@ export function createScene3Cards(opts: {
       scene.setSingletGeom(id, num("r1"), num("r2"), num("thickness"), num("semiAperture"), num("conic1"), num("conic2"));
     }
     if (JSON.parse(scene.bodyGlassJSON(id))) scene.setBodyGlassAbbe(id, num("nd"), num("vd"));
-    if (JSON.parse(scene.apertureOpeningJSON(id))) scene.setApertureOpening(id, num("apMin"), num("apMax"));
+    commitAperture(scene, id, root);
+    commitLink(scene, id, root);
     if (o && !o.body && o.kind !== "source") {
       const sel = (n: string) => (root.querySelector(`select[data-name="${n}"]`) as HTMLSelectElement | null)?.value;
       const f = sel("front"), b = sel("back");
@@ -87,9 +93,8 @@ export function createScene3Cards(opts: {
       const glass = JSON.parse(scene.bodyGlassJSON(id));
       q(".c3-glass").style.display = glass ? "block" : "none";
       if (glass) { setV("nd", glass.nd); setV("vd", glass.vd); }
-      const ap = JSON.parse(scene.apertureOpeningJSON(id));
-      q(".c3-aperture").style.display = ap ? "block" : "none";
-      if (ap) { setV("apMin", ap.inner); setV("apMax", ap.outer); }
+      renderAperture(scene, id, root);
+      renderLink(scene, id, root, opts.objects());
       const block = q(".c3-surface");
       const r = o.body || o.kind === "source" ? null : JSON.parse(scene.surfaceResponseJSON(id));
       block.style.display = r ? "block" : "none";

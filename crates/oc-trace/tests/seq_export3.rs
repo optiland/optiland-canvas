@@ -412,3 +412,34 @@ fn the_bridge_s_interior_stop_file_is_this_bench() {
         "interior-stop.ocanvas no longer matches the bench; regenerate it"
     );
 }
+
+#[test]
+fn a_fresnel_lens_is_refused_by_name() {
+    let mut s = Scene3::new();
+    let (nd, vd) = oc_core::fresnel_lens::PMMA_ND_VD;
+    let lens = s
+        .add_fresnel_lens(
+            Vec3::ZERO,
+            0.0,
+            &oc_core::fresnel_lens::FresnelLens1::default(),
+            oc_core::material::Material::AbbePoint { nd, vd },
+        )
+        .unwrap();
+    let src = s.add_collimated_beam(
+        Vec3::new(-70.0, 0.0, 0.0),
+        5.0,
+        5.0,
+        9,
+        Spectrum::Monochromatic(0.58756),
+    );
+    let det = s.add_area_detector(Vec3::new(100.0, 0.0, 0.0), -Vec3::X, 12.0, 12.0, [8, 8]);
+    match export_seq(&s, src, det) {
+        Err(ExportError::Unsupported(reasons)) => assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("Fresnel lens") && r.contains(&format!("#{lens}"))),
+            "{reasons:?}"
+        ),
+        other => panic!("{other:?}"),
+    }
+}

@@ -82,6 +82,22 @@ pub struct TraceConfig3 {
     /// onward. It is what the f32 preview does, so the parity suite runs the
     /// reference this way to compare like with like.
     pub polarization: bool,
+    /// Book every removal against the object where it happened
+    /// ([`TraceResult3::objects`]). Off by default: it costs a map update per
+    /// event, and it changes no number the trace reports otherwise.
+    pub object_ledger: bool,
+    /// The band, µm, `[lo, hi)`, the object ledger keeps apart from the rest.
+    pub ledger_band_um: [f64; 2],
+    /// The bodies, by scene index `[lo, hi)`, whose hits every branch counts
+    /// ([`DetectorHit3::counted`]): the sections of a light pipe, say. Empty by
+    /// default.
+    pub count_bodies: [usize; 2],
+    /// The bodies, by scene index `[lo, hi)`, whose absorbed power is recorded
+    /// where it happened ([`TraceResult3::deposits`]): the thermal load of a
+    /// lens. Empty by default.
+    pub deposit_bodies: [usize; 2],
+    /// Record where each stop or mask blocks light, too.
+    pub deposit_apertures: bool,
 }
 
 impl Default for TraceConfig3 {
@@ -100,6 +116,11 @@ impl Default for TraceConfig3 {
             brute_force_search: false,
             revision: 0,
             polarization: true,
+            object_ledger: false,
+            ledger_band_um: [0.39, 0.70],
+            count_bodies: [0, 0],
+            deposit_bodies: [0, 0],
+            deposit_apertures: false,
         }
     }
 }
@@ -118,6 +139,14 @@ pub fn depth_for_scene3(scene: &Scene3, ghosts: bool, max_ghost_bounces: u32) ->
         .iter()
         .map(|b| match &b.geometry {
             SolidGeometry3::Profile(p) => p.profile.edges.len(),
+            // A light pipe is walked by reflection, not crossed: a ray at
+            // 80 degrees to its axis meets the bore about six times per bore
+            // diameter of length, so that is what it is budgeted.
+            SolidGeometry3::Tube {
+                inner_radius_mm,
+                half_length_mm,
+                ..
+            } => 4 + (6.0 * half_length_mm / inner_radius_mm).ceil().min(1024.0) as usize,
             _ => 6,
         })
         .sum::<usize>()
@@ -132,13 +161,55 @@ pub fn depth_for_scene3(scene: &Scene3, ghosts: bool, max_ghost_bounces: u32) ->
         .clamp(32, 1024)
 }
 
+/// How far a ray may fly between events, sized to the scene rather than fixed.
+///
+/// A ray that meets nothing within this is an escape, so it has to reach
+/// across the whole scene: the 10 m default is a bench, and a heliostat field
+/// is tens of metres with its target at the far end. Four scene diagonals, and
+/// never less than the default, so a ray leaving the scene at its far corner
+/// still draws as leaving it.
+pub fn bounds_for_scene3(scene: &Scene3) -> f64 {
+    use oc_core::geom3::Intersect3;
+    let mut bb = oc_core::vec3::Aabb3::EMPTY;
+    for b in &scene.bodies {
+        let w = b.geometry.aabb_world(&b.common.transform);
+        if w.min.is_finite() && w.max.is_finite() {
+            bb.expand(w.min);
+            bb.expand(w.max);
+        }
+    }
+    let placed = scene
+        .surfaces
+        .iter()
+        .map(|s| s.common.transform.pos)
+        .chain(scene.apertures.iter().map(|a| a.common.transform.pos))
+        .chain(scene.detectors.iter().map(|d| d.common.transform.pos))
+        .chain(scene.sources.iter().map(|s| s.transform.pos));
+    for p in placed {
+        if p.is_finite() {
+            bb.expand(p);
+        }
+    }
+    let diagonal = if bb.min.is_finite() && bb.max.is_finite() {
+        (bb.max - bb.min).length()
+    } else {
+        0.0
+    };
+    (4.0 * diagonal).max(TraceConfig3::default().bounds_mm)
+}
+
 /// The launch rays a single source emits, as the tracer's [`LaunchRay3`].
 ///
 /// The sampler lives in `oc-core` ([`Source3::emit`](oc_core::source3)); this is
 /// the thin wrapper that tags each ray with its source and hands it to transport.
 pub fn launch_from_source(source: &oc_core::scene3::Source3) -> Vec<LaunchRay3> {
+    launch_from_source_pass(source, 0)
+}
+
+/// Pass `pass` of a source's launch rays ([`Source3::emit_pass`](oc_core::scene3::Source3::emit_pass)).
+pub fn launch_from_source_pass(source: &oc_core::scene3::Source3, pass: u32) -> Vec<LaunchRay3> {
     source
-        .emit()
+        .emit_pass(pass)
         .into_iter()
         .map(|e| LaunchRay3 {
             ray: e.ray,
@@ -169,7 +240,28 @@ fn launch_state(lr: &LaunchRay3) -> PolRay {
 
 /// Every launch ray a scene's sources emit, deterministically (§6.10).
 pub fn launch_from_scene(scene: &Scene3) -> Vec<LaunchRay3> {
-    scene.sources.iter().flat_map(launch_from_source).collect()
+    launch_from_scene_pass(scene, 0)
+}
+
+/// Pass `pass` of every launch ray a scene's sources emit.
+pub fn launch_from_scene_pass(scene: &Scene3, pass: u32) -> Vec<LaunchRay3> {
+    scene
+        .sources
+        .iter()
+        .flat_map(|s| launch_from_source_pass(s, pass))
+        .collect()
+}
+
+/// Pass `pass` of `passes`: every ray carrying its share of the passes' flux.
+fn launch_pass(scene: &Scene3, pass: u32, passes: u32) -> Vec<LaunchRay3> {
+    let mut rays = launch_from_scene_pass(scene, pass);
+    if passes > 1 {
+        let k = 1.0 / passes as f64;
+        for r in &mut rays {
+            r.flux *= k;
+        }
+    }
+    rays
 }
 
 /// Trace a scene end to end, emitting launch rays from its sources.
@@ -192,13 +284,21 @@ pub fn trace3(scene: &Scene3, launch: &[LaunchRay3], cfg: &TraceConfig3) -> Trac
     let (objs, bvh, tol) = (&prep.objs, &prep.bvh, &prep.tol);
     let identity = || prep.empty();
 
+    // A few chunks per thread, each traced into its own readout. Left to
+    // itself, rayon splits a long launch list into hundreds of pieces, and
+    // every piece holds a copy of every detector: with a 2600 x 330 pixel
+    // detector that is tens of gigabytes.
     #[cfg(feature = "parallel")]
     let merged = {
         use rayon::prelude::*;
+        let chunk = launch.len().div_ceil(4 * rayon::current_num_threads()).max(1);
         launch
-            .par_iter()
-            .fold(identity, |mut acc, lr| {
-                trace_one(scene, objs, bvh, tol, cfg, *lr, &mut acc);
+            .par_chunks(chunk)
+            .map(|rays| {
+                let mut acc = identity();
+                for lr in rays {
+                    trace_one(scene, objs, bvh, tol, cfg, *lr, &mut acc);
+                }
                 acc
             })
             .reduce(identity, |mut a, b| {
@@ -282,6 +382,12 @@ impl Local {
             terminations: r.terminations,
             capability_report: r.report,
             events: r.events,
+            objects: r
+                .objects
+                .into_iter()
+                .map(|((object, in_band), ledger)| ObjectEntry3 { object, in_band, ledger })
+                .collect(),
+            deposits: r.deposits,
         }
     }
 }
@@ -299,10 +405,13 @@ fn blocks_for(rays: usize) -> usize {
     rays.clamp(1, TRACE_BLOCKS)
 }
 
-/// The launch rays of block `i` of a trace of `rays` rays.
+/// The launch rays of block `i` of a trace of `rays` rays. In u64, since a
+/// trace of many passes can hold more rays than a 32-bit `usize` can
+/// multiply by the block count.
 fn block_rays(rays: usize, i: usize) -> Range<usize> {
-    let b = blocks_for(rays);
-    i * rays / b..(i + 1) * rays / b
+    let b = blocks_for(rays) as u64;
+    let (rays, i) = (rays as u64, i as u64);
+    (i * rays / b) as usize..((i + 1) * rays / b) as usize
 }
 
 /// A reference trace prepared once and traced a block at a time, for a pool
@@ -312,30 +421,80 @@ fn block_rays(rays: usize, i: usize) -> Range<usize> {
 pub struct TraceBlocks3 {
     scene: Scene3,
     cfg: TraceConfig3,
-    launch: Vec<LaunchRay3>,
+    /// How many times the scene's rays are traced, each time shifted
+    /// ([`Source3::emit_pass`](oc_core::scene3::Source3::emit_pass)).
+    passes: u32,
+    /// The launch rays in one pass.
+    per_pass: usize,
+    /// One pass's launch rays, and which: a trace of many passes holds one
+    /// at a time. Its blocks run through the passes in order, so a worker
+    /// makes each pass it reaches about once.
+    launch: std::cell::RefCell<(u32, Vec<LaunchRay3>)>,
+    /// Launch rays traced for the picture alone, when the numbers are traced
+    /// with more rays than the picture should show; empty when the launch
+    /// rays draw themselves. See [`TraceBlocks3::with_picture`].
+    picture: Vec<LaunchRay3>,
     prep: Prepared,
 }
 
 impl TraceBlocks3 {
     pub fn new(scene: Scene3, cfg: TraceConfig3) -> Self {
-        let launch = launch_from_scene(&scene);
-        let prep = Prepared::new(&scene, &launch, &cfg);
+        Self::with_picture(scene, None, cfg)
+    }
+
+    /// A trace whose numbers come from `scene` and whose picture comes from
+    /// `picture`, the same scene sampled with fewer rays.
+    ///
+    /// Tracing more rays sharpens every number and would thicken the picture
+    /// by as much, which past a point shows nothing more and costs memory in
+    /// every worker. So the numbers' rays draw nothing, and each block also
+    /// traces its share of `picture`'s rays for their segments alone: their
+    /// hits, flux and ledger are thrown away. The picture is then the one
+    /// `picture` traced by itself would draw, and the numbers are `scene`'s,
+    /// to the bit.
+    pub fn with_picture(scene: Scene3, picture: Option<&Scene3>, cfg: TraceConfig3) -> Self {
+        Self::with_passes(scene, 1, picture, cfg)
+    }
+
+    /// A trace of `passes` passes of `scene`'s rays, each carrying its share
+    /// of the flux, so every total is what one pass gives and the noise falls
+    /// as one over the root of the passes. The numbers take as many rays as
+    /// anyone has time for, while a worker holds one pass of them.
+    ///
+    /// The [`TRACE_BLOCKS`] blocks run across the passes in order: pass 0's
+    /// rays, then pass 1's, cut into blocks as one long list. A block's sum
+    /// does not depend on which worker traces it, so a pool gives what one
+    /// job gives, to the bit, whatever the passes.
+    pub fn with_passes(scene: Scene3, passes: u32, picture: Option<&Scene3>, cfg: TraceConfig3) -> Self {
+        let passes = passes.max(1);
+        let first = launch_pass(&scene, 0, passes);
+        let picture = picture.map(launch_from_scene).unwrap_or_default();
+        let drawn = if picture.is_empty() { &first } else { &picture };
+        let prep = Prepared::new(&scene, drawn, &cfg);
         Self {
             scene,
             cfg,
-            launch,
+            passes,
+            per_pass: first.len(),
+            launch: std::cell::RefCell::new((0, first)),
+            picture,
             prep,
         }
     }
 
     /// The number of blocks.
     pub fn blocks(&self) -> usize {
-        blocks_for(self.launch.len())
+        blocks_for(self.rays())
     }
 
-    /// The number of launch rays, in all blocks.
+    /// The number of launch rays, in all blocks and every pass.
     pub fn rays(&self) -> usize {
-        self.launch.len()
+        self.per_pass.saturating_mul(self.passes as usize)
+    }
+
+    /// The number of passes.
+    pub fn passes(&self) -> u32 {
+        self.passes
     }
 
     /// Begin block `block`. A part begun without `record_hits` keeps no
@@ -344,27 +503,75 @@ impl TraceBlocks3 {
     /// one block has filled every detector's by itself, no later block's
     /// records can reach the result, and a pool skips them.
     pub fn part(&self, block: usize, record_hits: bool) -> TracePart3 {
-        let rays = block_rays(self.launch.len(), block);
+        let rays = block_rays(self.rays(), block);
         let mut acc = self.prep.empty();
         acc.result.record_hits = record_hits;
+        // The picture's rays split into as many blocks as the numbers', so a
+        // block holds its share of both.
+        let blocks = self.blocks();
+        let p = self.picture.len();
+        let pic_rays = block * p / blocks..(block + 1) * p / blocks;
+        let pic = (!self.picture.is_empty()).then(|| {
+            acc.result.draw = false;
+            let mut pic = self.prep.empty();
+            pic.result.record_hits = false;
+            pic
+        });
         TracePart3 {
             block,
             start: rays.start,
             next: rays.start,
             end: rays.end,
             acc,
+            pic,
+            pic_start: pic_rays.start,
+            pic_next: pic_rays.start,
+            pic_end: pic_rays.end,
         }
     }
 
-    /// Trace up to `rays` more launch rays of `part` (at least one). True once
-    /// its block is traced.
+    /// Trace up to `rays` more launch rays of `part` (at least one): its
+    /// picture's first, then its numbers'. True once its block is traced.
     pub fn step(&self, part: &mut TracePart3, rays: usize) -> bool {
-        let end = (part.next + rays.max(1)).min(part.end);
+        let mut left = rays.max(1);
         let Prepared { objs, bvh, tol, .. } = &self.prep;
-        for lr in &self.launch[part.next..end] {
-            trace_one(&self.scene, objs, bvh, tol, &self.cfg, *lr, &mut part.acc);
+        if let Some(pic) = part.pic.as_mut() {
+            let end = (part.pic_next + left).min(part.pic_end);
+            for lr in &self.picture[part.pic_next..end] {
+                trace_one(&self.scene, objs, bvh, tol, &self.cfg, *lr, pic);
+            }
+            left -= end - part.pic_next;
+            part.pic_next = end;
+            if part.pic_next >= part.pic_end {
+                // The picture's share is in: its segments are the block's,
+                // and nothing else it traced is kept.
+                let pic = part.pic.take().expect("the picture is in hand");
+                part.acc.result.segments = pic.result.segments;
+                part.acc.result.segments_omitted += pic.result.segments_omitted;
+            }
+            if left == 0 {
+                return part.done();
+            }
         }
-        part.next = end;
+        let end = (part.next + left).min(part.end);
+        while part.next < end {
+            // The pass `part.next` is in, and its rays up to `end`.
+            let pass = part.next / self.per_pass;
+            let base = pass * self.per_pass;
+            let stop = end.min(base + self.per_pass);
+            let pass = pass as u32;
+            if self.launch.borrow().0 != pass {
+                *self.launch.borrow_mut() = (pass, launch_pass(&self.scene, pass, self.passes));
+            }
+            let launch = self.launch.borrow();
+            let rays = &launch.1;
+            // A pass whose sampler dropped a degenerate ray is that much shorter.
+            let (lo, hi) = ((part.next - base).min(rays.len()), (stop - base).min(rays.len()));
+            for lr in &rays[lo..hi] {
+                trace_one(&self.scene, objs, bvh, tol, &self.cfg, *lr, &mut part.acc);
+            }
+            part.next = stop;
+        }
         part.done()
     }
 }
@@ -376,6 +583,12 @@ pub struct TracePart3 {
     next: usize,
     end: usize,
     acc: Local,
+    /// The picture's rays of this block while they are traced, when the
+    /// picture has rays of its own ([`TraceBlocks3::with_picture`]).
+    pic: Option<Local>,
+    pic_start: usize,
+    pic_next: usize,
+    pic_end: usize,
 }
 
 /// A [`TracePart3`]'s numbers, to post from one worker to another: every sum
@@ -389,7 +602,7 @@ pub struct EncodedPart3 {
 }
 
 /// Bumped whenever [`EncodedPart3::numbers`] changes layout.
-const PART_LAYOUT: f64 = 1.0;
+const PART_LAYOUT: f64 = 4.0;
 /// One detector hit record, as f64s.
 const HIT_FIELDS: usize = 24;
 
@@ -399,12 +612,15 @@ impl TracePart3 {
     }
 
     pub fn done(&self) -> bool {
-        self.next >= self.end
+        self.next >= self.end && self.pic.is_none()
     }
 
-    /// Launch rays traced so far, and in the block.
+    /// Launch rays traced so far, and in the block, the picture's included.
     pub fn progress(&self) -> (usize, usize) {
-        (self.next - self.start, self.end - self.start)
+        (
+            self.next - self.start + self.pic_next - self.pic_start,
+            self.end - self.start + self.pic_end - self.pic_start,
+        )
     }
 
     /// The block's segments, in launch order: its share of the picture.
@@ -478,6 +694,13 @@ impl TracePart3 {
             for v in [&d.incident_flux, &d.detected_signal, &d.direction_flux] {
                 n.push(v.len() as f64);
                 n.extend_from_slice(v);
+            }
+            n.push(d.colour_xyz.len() as f64);
+            n.extend(d.colour_xyz.iter().flatten());
+            n.push(d.spectral_untracked_flux);
+            n.push(d.spectral.len() as f64);
+            for line in &d.spectral {
+                n.extend(line.to_array());
             }
             n.push(d.records.len() as f64);
             for h in &d.records {
@@ -659,6 +882,24 @@ impl TraceMerge3 {
                     *x = next()?;
                 }
             }
+            if next()? as usize != d.colour_xyz.len() {
+                return Err(bad("another detector shape"));
+            }
+            for c in d.colour_xyz.iter_mut() {
+                *c = [next()?, next()?, next()?];
+            }
+            d.spectral_untracked_flux = next()?;
+            let lines = next()? as usize;
+            if lines > crate::result3::MAX_SPECTRAL_LINES {
+                return Err(bad("too many spectral lines"));
+            }
+            let mut x = [0.0; crate::result3::SPECTRAL_FIELDS];
+            for _ in 0..lines {
+                for v in x.iter_mut() {
+                    *v = next()?;
+                }
+                d.spectral.push(crate::result3::SpectralSums3::from_array(&x));
+            }
             let records = next()? as usize;
             let mut h = [0.0; HIT_FIELDS];
             for _ in 0..records {
@@ -684,6 +925,7 @@ impl TraceMerge3 {
                         s3: h[19],
                     },
                     frame_x: Vec3::new(h[20], h[21], h[22]),
+                    counted: 0,
                 });
             }
         }
@@ -716,7 +958,18 @@ pub struct TraceJob3 {
 impl TraceJob3 {
     /// A job tracing every ray `scene`'s sources emit.
     pub fn new(scene: Scene3, cfg: TraceConfig3) -> Self {
-        let blocks = TraceBlocks3::new(scene, cfg);
+        Self::with_picture(scene, None, cfg)
+    }
+
+    /// A job whose numbers come from `scene` and whose picture comes from
+    /// `picture` ([`TraceBlocks3::with_picture`]).
+    pub fn with_picture(scene: Scene3, picture: Option<&Scene3>, cfg: TraceConfig3) -> Self {
+        Self::with_passes(scene, 1, picture, cfg)
+    }
+
+    /// A job of `passes` passes of `scene`'s rays ([`TraceBlocks3::with_passes`]).
+    pub fn with_passes(scene: Scene3, passes: u32, picture: Option<&Scene3>, cfg: TraceConfig3) -> Self {
+        let blocks = TraceBlocks3::with_passes(scene, passes, picture, cfg);
         let part = blocks.part(0, true);
         let merge = TraceMerge3::new(&blocks);
         let mut job = Self {
@@ -734,9 +987,9 @@ impl TraceJob3 {
     pub fn step(&mut self, rays: usize) -> bool {
         let mut left = rays.max(1);
         while left > 0 && !self.done() {
-            let before = self.part.next;
+            let before = self.part.progress().0;
             self.blocks.step(&mut self.part, left);
-            left = left.saturating_sub(self.part.next - before);
+            left = left.saturating_sub(self.part.progress().0 - before);
             self.advance();
         }
         self.done()
@@ -764,7 +1017,7 @@ impl TraceJob3 {
         let current = if self.done() {
             0
         } else {
-            self.part.progress().0
+            self.part.next - self.part.start
         };
         (self.merged_rays + current, self.blocks.rays())
     }
@@ -808,11 +1061,16 @@ struct LocalResult {
     /// Keep per-hit records, when the trace asks for them. Off for a block
     /// whose records no merge would keep ([`TraceBlocks3::part`]).
     record_hits: bool,
+    /// Record segments. Off for rays traced for their numbers alone, when
+    /// the picture has rays of its own ([`TraceBlocks3::with_picture`]).
+    draw: bool,
     detectors: Vec<DetectorResult3>,
     ledger: EnergyLedger,
     terminations: TerminationSummary,
     report: CapabilityReport,
     events: Vec<TraceEvent3>,
+    objects: std::collections::BTreeMap<(ObjectRef3, bool), ObjectLedger3>,
+    deposits: Vec<Deposit3>,
     next_path: u64,
 }
 
@@ -823,11 +1081,14 @@ impl LocalResult {
             segment_floor: 0.0,
             segments_omitted: 0,
             record_hits: true,
+            draw: true,
             detectors,
             ledger: EnergyLedger::default(),
             terminations: TerminationSummary::default(),
             report,
             events: Vec::new(),
+            objects: std::collections::BTreeMap::new(),
+            deposits: Vec::new(),
             next_path: 0,
         }
     }
@@ -842,6 +1103,10 @@ impl LocalResult {
         self.terminations.merge(&o.terminations);
         self.report.merge(&o.report);
         self.events.extend(o.events);
+        for (k, v) in o.objects {
+            self.objects.entry(k).or_default().add(&v);
+        }
+        self.deposits.extend(o.deposits);
     }
 
     fn new_path(&mut self) -> PathId {
@@ -864,6 +1129,10 @@ struct RayWork {
     parent: Option<PathId>,
     from_tir: bool,
     ghost: bool,
+    /// The object that sent this branch on its way, for the object ledger.
+    from: ObjectRef3,
+    /// Hits on `TraceConfig3::count_hits_on` since launch.
+    counted: u32,
 }
 
 impl RayWork {
@@ -1024,6 +1293,8 @@ fn trace_one(
         parent: None,
         from_tir: false,
         ghost: false,
+        from: ObjectRef3::Source,
+        counted: 0,
     });
 
     let mut branches = 0u64;
@@ -1034,30 +1305,35 @@ fn trace_one(
             // subtracts a named quantity rather than a silent one.
             r.ledger.truncated_flux += w.flux() + stack.iter().map(|x| x.flux()).sum::<f64>();
             r.terminations.record(TerminationReason::MaxBranches);
+            if cfg.object_ledger {
+                book(r, cfg, w.from, w.lambda).truncated += w.flux();
+                for x in &stack {
+                    book(r, cfg, x.from, x.lambda).truncated += x.flux();
+                }
+            }
             break;
         }
-        if w.depth > cfg.max_depth {
-            deposit_truncated(r, &w, TerminationReason::MaxDepth);
-            continue;
-        }
-        if w.ghost && w.ghost_depth > cfg.max_ghost_bounces {
-            deposit_truncated(r, &w, TerminationReason::MaxGhostDepth);
-            continue;
-        }
-        if w.flux() < min_flux {
-            deposit_truncated(r, &w, TerminationReason::FluxThreshold);
+        let culled = if w.depth > cfg.max_depth {
+            Some(TerminationReason::MaxDepth)
+        } else if w.ghost && w.ghost_depth > cfg.max_ghost_bounces {
+            Some(TerminationReason::MaxGhostDepth)
+        } else if w.flux() < min_flux {
+            Some(TerminationReason::FluxThreshold)
+        } else {
+            None
+        };
+        if let Some(reason) = culled {
+            deposit_truncated(r, &w, reason);
+            if cfg.object_ledger {
+                book(r, cfg, w.from, w.lambda).truncated += w.flux();
+            }
             continue;
         }
 
         // The medium this branch travels through: containment + priority, sampled
         // just ahead of the origin so a ray leaving a surface reads the medium it
         // is entering.
-        let here = region_at(
-            scene,
-            &objs.body_boxes,
-            w.ray.origin + medium_eps * w.ray.dir,
-            tol,
-        );
+        let here = region_at(scene, objs, w.ray.origin + medium_eps * w.ray.dir, tol);
         let n_here = region_index(scene, here, w.lambda);
         let alpha = match region_absorption(scene, here, w.lambda) {
             Ok(a) => a,
@@ -1084,12 +1360,23 @@ fn trace_one(
             );
             r.ledger.escaped += flux_end;
             r.terminations.record(TerminationReason::EscapedBounds);
+            if cfg.object_ledger {
+                let b = book(r, cfg, w.from, w.lambda);
+                b.absorbed_volume += (w.flux() - flux_end).max(0.0);
+                b.escaped += flux_end;
+            }
             continue;
         };
 
         let l = ev.t;
         let flux_at = w.flux() * beer_lambert(alpha, l);
         record_absorption(r, w.flux() - flux_at);
+        if cfg.object_ledger && w.flux() > flux_at {
+            book(r, cfg, w.from, w.lambda).absorbed_volume += w.flux() - flux_at;
+        }
+        if w.flux() > flux_at {
+            deposit_segment(r, cfg, &w, alpha, l);
+        }
         let opl_at = w.opl + n_here * l;
         push_segment(r, &w, ev.point, flux_at, opl_at);
 
@@ -1114,6 +1401,14 @@ fn trace_one(
                 record_detector(
                     r, scene, det, &w, ev.point, uv, dir_local, flux_at, opl_at, cfg,
                 );
+                if cfg.object_ledger {
+                    let b = book(r, cfg, ObjectRef3::Detector(det), w.lambda);
+                    b.hits += 1;
+                    b.incident += flux_at;
+                    if terminates {
+                        b.detected += flux_at;
+                    }
+                }
                 if terminates {
                     r.ledger.detected_incident += flux_at;
                     r.ledger.detected_signal += flux_at * detector_qe(scene, det, w.lambda);
@@ -1125,6 +1420,15 @@ fn trace_one(
             }
             EventKind::ApertureBlocked { ap } => {
                 r.ledger.blocked_aperture += flux_at;
+                if cfg.object_ledger {
+                    let b = book(r, cfg, ObjectRef3::Aperture(ap), w.lambda);
+                    b.hits += 1;
+                    b.incident += flux_at;
+                    b.blocked += flux_at;
+                }
+                if cfg.deposit_apertures {
+                    r.deposits.push(Deposit3 { object: ObjectRef3::Aperture(ap), point: ev.point, lambda_um: w.lambda, flux: flux_at });
+                }
                 r.report.note_exact(PhysicsFeature::Aperture);
                 push_event(
                     r,
@@ -1139,36 +1443,91 @@ fn trace_one(
                 r.terminations.record(TerminationReason::ApertureBlocked);
             }
             EventKind::Surface { surf, normal } => {
+                let (before, n0) = (r.ledger, stack.len());
                 interact_surface(
                     scene, &mut stack, r, cfg, &w, surf, ev.point, normal, n_here, flux_at, opl_at,
                     min_flux,
                 );
+                after_interaction(r, cfg, &mut stack[n0..], ObjectRef3::Surface(surf), &w, flux_at, &before, ev.point);
             }
             EventKind::Body {
                 body,
                 outward,
                 patch,
             } => {
+                let (before, n0) = (r.ledger, stack.len());
                 interact_body(
-                    scene,
-                    &objs.body_boxes,
-                    &mut stack,
-                    r,
-                    cfg,
-                    tol,
-                    &w,
-                    body,
-                    ev.point,
-                    outward,
-                    patch,
-                    here,
-                    n_here,
-                    flux_at,
-                    opl_at,
-                    medium_eps,
-                    min_flux,
+                    scene, objs, &mut stack, r, cfg, tol, &w, body, ev.point, outward, patch, here,
+                    n_here, flux_at, opl_at, medium_eps, min_flux,
                 );
+                after_interaction(r, cfg, &mut stack[n0..], ObjectRef3::Body(body, patch.0), &w, flux_at, &before, ev.point);
             }
+        }
+    }
+}
+
+/// The object ledger's row for `obj` in `lambda`'s band.
+fn book<'a>(r: &'a mut LocalResult, cfg: &TraceConfig3, obj: ObjectRef3, lambda: f64) -> &'a mut ObjectLedger3 {
+    let [lo, hi] = cfg.ledger_band_um;
+    r.objects.entry((obj, lambda >= lo && lambda < hi)).or_default()
+}
+
+/// After an interaction at `obj`: its children leave from `obj` and count it
+/// when it is counted, and whatever the interaction took out of the ledger
+/// (absorption, culled children, numerical losses) is booked against it.
+#[allow(clippy::too_many_arguments)] // the result, the config, the ray before and after, and where it hit
+fn after_interaction(
+    r: &mut LocalResult,
+    cfg: &TraceConfig3,
+    children: &mut [RayWork],
+    obj: ObjectRef3,
+    w: &RayWork,
+    flux_at: f64,
+    before: &EnergyLedger,
+    point: Vec3,
+) {
+    let counts = matches!(obj, ObjectRef3::Body(i, _) if (cfg.count_bodies[0]..cfg.count_bodies[1]).contains(&i));
+    // Absorbed at the face of a recorded body (a coating, a black face).
+    if let ObjectRef3::Body(i, _) = obj {
+        let took = r.ledger.absorbed_surface - before.absorbed_surface;
+        if took > 0.0 && (cfg.deposit_bodies[0]..cfg.deposit_bodies[1]).contains(&i) {
+            r.deposits.push(Deposit3 { object: obj, point, lambda_um: w.lambda, flux: took });
+        }
+    }
+    for c in children.iter_mut() {
+        c.from = obj;
+        c.counted = w.counted + u32::from(counts);
+    }
+    if !cfg.object_ledger {
+        return;
+    }
+    let l = r.ledger;
+    let b = book(r, cfg, obj, w.lambda);
+    b.hits += 1;
+    b.incident += flux_at;
+    b.absorbed_surface += l.absorbed_surface - before.absorbed_surface;
+    b.absorbed_volume += l.absorbed_volume - before.absorbed_volume;
+    b.blocked += l.blocked_aperture - before.blocked_aperture;
+    b.detected += l.detected_incident - before.detected_incident;
+    b.escaped += l.escaped - before.escaped;
+    b.truncated += l.truncated_flux - before.truncated_flux;
+    b.numerical += l.numerical_loss - before.numerical_loss;
+}
+
+/// The bulk absorption of the segment `w` travelled before its event, `l` mm
+/// at `alpha` per mm, recorded in four steps when it ran inside a recorded
+/// body (the body it entered through).
+fn deposit_segment(r: &mut LocalResult, cfg: &TraceConfig3, w: &RayWork, alpha: f64, l: f64) {
+    let ObjectRef3::Body(i, _) = w.from else { return };
+    if !(cfg.deposit_bodies[0]..cfg.deposit_bodies[1]).contains(&i) {
+        return;
+    }
+    const STEPS: usize = 4;
+    for k in 0..STEPS {
+        let (t0, t1) = (l * k as f64 / STEPS as f64, l * (k + 1) as f64 / STEPS as f64);
+        let took = w.flux() * (beer_lambert(alpha, t0) - beer_lambert(alpha, t1));
+        if took > 0.0 {
+            r.deposits.push(Deposit3 { object: w.from, point: w.ray.at(0.5 * (t0 + t1)), lambda_um: w.lambda, flux: took });
         }
     }
 }
@@ -1209,6 +1568,9 @@ fn push_event(
 }
 
 fn push_segment(r: &mut LocalResult, w: &RayWork, b: Vec3, flux_end: f64, opl1: f64) {
+    if !r.draw {
+        return;
+    }
     if flux_end < r.segment_floor {
         r.segments_omitted += 1;
         return;
@@ -1375,16 +1737,19 @@ fn event_object(scene: &Scene3, kind: &EventKind) -> u64 {
 /// the one asking every body gives, found without solving every body's curves.
 fn region_at(
     scene: &Scene3,
-    body_boxes: &[Aabb3],
+    objs: &EventObjects,
     point: Vec3,
     tol: &ToleranceContext,
 ) -> Option<usize> {
     let mut best: Option<(usize, i32, u64)> = None;
     for (i, b) in scene.bodies.iter().enumerate() {
-        if !b.is_3d() || !body_boxes[i].contains_point(point) {
+        if !b.is_3d() || !objs.body_boxes[i].contains_point(point) {
             continue;
         }
-        if b.geometry.contains(point, &b.common.transform, tol) == Containment::Inside {
+        let inside =
+            b.geometry
+                .contains_prepared(&objs.body_preps[i], point, &b.common.transform, tol);
+        if inside == Containment::Inside {
             let key = (b.priority, b.common.id.0);
             if best.map_or(true, |(_, p, id)| key > (p, id)) {
                 best = Some((i, b.priority, b.common.id.0));
@@ -1428,7 +1793,7 @@ fn region_absorption(
 #[allow(clippy::too_many_arguments)]
 fn interact_body(
     scene: &Scene3,
-    body_boxes: &[Aabb3],
+    objs: &EventObjects,
     stack: &mut Vec<RayWork>,
     r: &mut LocalResult,
     cfg: &TraceConfig3,
@@ -1463,9 +1828,11 @@ fn interact_body(
 
     // The medium on the far side of the boundary (§9.4).
     let n_oppose = if entering { outward } else { -outward };
-    let far = region_at(scene, body_boxes, point - medium_eps * n_oppose, tol);
+    let far = region_at(scene, objs, point - medium_eps * n_oppose, tol);
     let n_far = region_index(scene, far, w.lambda);
     let _ = here;
+    // The medium is found off the drawn face; the light sees the wavy one.
+    let n_oppose = lean_normal(n_oppose, w.ray.dir, point, scene.slope_error_rad(b.common.id));
 
     apply_response(
         stack,
@@ -1483,6 +1850,49 @@ fn interact_body(
         opl_at,
         min_flux,
     );
+}
+
+/// The normal a hit sees on a face with slope error `sigma` (radians RMS per
+/// axis, [`oc_core::scene3::FigureError`]): the drawn normal `n`, which
+/// opposes `dir`, leaned by a Gaussian draw in the two directions across it.
+///
+/// The draw is hashed from the hit's own point and direction, so a trace
+/// repeats exactly and two rays never share one. A lean that would turn the
+/// face away from the ray, or send the mirror image into the face, is drawn
+/// again: at grazing incidence a real wavy face hides those slopes behind its
+/// own crests. After eight tries the drawn normal is kept.
+fn lean_normal(n: Vec3, dir: Vec3, point: Vec3, sigma: f64) -> Vec3 {
+    if sigma <= 0.0 {
+        return n;
+    }
+    fn mix(z: u64) -> u64 {
+        // splitmix64's finaliser.
+        let z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        let z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    let mut h = [point.x, point.y, point.z, dir.x, dir.y, dir.z]
+        .iter()
+        .fold(0u64, |acc, v| mix(acc ^ v.to_bits()));
+    let mut uniform = || {
+        h = mix(h);
+        // (0, 1]: never 0, which the logarithm below cannot take.
+        ((h >> 11) as f64 + 1.0) * (1.0 / (1u64 << 53) as f64)
+    };
+    let t1 = n.any_orthonormal_vector();
+    let t2 = n.cross(t1);
+    for _ in 0..8 {
+        // Box-Muller: two independent unit Gaussians.
+        let (u1, u2) = (uniform(), uniform());
+        let radius = sigma * (-2.0 * u1.ln()).sqrt();
+        let (s, c) = (std::f64::consts::TAU * u2).sin_cos();
+        let m = (n + t1 * (radius * c) + t2 * (radius * s)).normalize();
+        if dir.dot(m) < 0.0 && reflect3(dir, m).dot(n) > 0.0 {
+            return m;
+        }
+    }
+    n
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1510,7 +1920,12 @@ fn interact_surface(
     } else {
         &s.response_back
     };
-    let n_oppose = if from_front { normal } else { -normal };
+    let n_oppose = lean_normal(
+        if from_front { normal } else { -normal },
+        w.ray.dir,
+        point,
+        scene.slope_error_rad(s.common.id),
+    );
     let surface_ref = SurfaceRef::new(s.common.id, oc_core::id::PatchId(0));
     let lens_interact = |children: Vec<(ChildRole, PathId)>| TraceEventKind::Interact {
         surface: surface_ref,
@@ -1571,6 +1986,114 @@ fn interact_surface(
             .map(|id| (ChildRole::ThinLens, id))
             .into_iter()
             .collect();
+        push_event(r, cfg, w, point, opl_at, lens_interact(children));
+        return;
+    }
+    // A grating sends light along its grating vector, which is a direction in
+    // the element like a lens's axes: handled here, in the surface's frame.
+    if let SurfaceResponse::Grating {
+        lines_per_mm,
+        order,
+        efficiency,
+        zero_order,
+        transmissive,
+        tm,
+    } = response
+    {
+        // A table that promises more than all of the light gives all of it,
+        // in proportion.
+        let pair = |e: &oc_core::scene3::SpectralScalar, z: &oc_core::scene3::SpectralScalar| {
+            let (a, b) = (e.sample(w.lambda)?.clamp(0.0, 1.0), z.sample(w.lambda)?.clamp(0.0, 1.0));
+            let over = (a + b).max(1.0);
+            Some((a / over, b / over))
+        };
+        let te = pair(efficiency, zero_order);
+        let tm_pair = match tm {
+            Some(t) => pair(&t.efficiency, &t.zero_order),
+            None => te,
+        };
+        let (Some((te_m, te_0)), Some((tm_m, tm_0))) = (te, tm_pair) else {
+            r.report
+                .reject(CapabilityIssue::UnsupportedSurfaceResponse { surface: surface_ref });
+            r.ledger.numerical_loss += flux_at;
+            r.terminations.record(TerminationReason::UnsupportedPhysics);
+            push_event(r, cfg, w, point, opl_at, lens_interact(Vec::new()));
+            return;
+        };
+        r.report.note_exact(PhysicsFeature::Grating);
+        r.report.note_approx(
+            PhysicsFeature::Grating,
+            if tm.is_some() {
+                "declared order efficiencies per polarization, with no retardance, and the other orders absorbed"
+            } else {
+                "declared order efficiencies: polarization-blind, and the other orders absorbed"
+            },
+        );
+        let t = &s.common.transform;
+        let d_local = t.quat().inverse() * w.ray.dir;
+        let k = oc_core::grating::k_per_um(*lines_per_mm, *order);
+        let stokes = w.state_at(flux_at);
+        // TE's axis on a ray: the grooves, seen across it.
+        let grooves = t.rotate(Vec3::Y);
+        let te_axis = |d: Vec3| {
+            let p = grooves - d * d.dot(grooves);
+            (p.length() > 1e-9).then(|| p.normalize())
+        };
+        let branch = |eta_te: f64, eta_tm: f64, dir: Vec3| -> PolRay {
+            match (tm.is_some(), te_axis(w.ray.dir), te_axis(dir)) {
+                // The grating splits the state on its grooves, as a
+                // diattenuator would: amplitude √η along them and across.
+                (true, Some(a_in), Some(a_out)) => {
+                    let m = Mueller::from_diagonal_jones(
+                        oc_core::thinfilm::Cx::real(eta_te.sqrt()),
+                        oc_core::thinfilm::Cx::real(eta_tm.sqrt()),
+                    );
+                    let s_in = stokes.rotated(polarization::frame_angle(w.ray.dir, w.pol.x, a_in));
+                    let out = if cfg.polarization {
+                        m.apply(&s_in)
+                    } else {
+                        Stokes::unpolarized(m.unpolarized_gain() * flux_at)
+                    };
+                    PolRay { stokes: out, x: a_out }
+                }
+                // Scaled as it is: an ideal grating that treats both
+                // polarizations alike, which the declared numbers assume.
+                _ => PolRay {
+                    stokes: stokes.scaled(0.5 * (eta_te + eta_tm)),
+                    x: polarization::transport_frame(w.pol.x, w.ray.dir, dir),
+                },
+            }
+        };
+        let (eta_m, eta_0) = (te_m.max(tm_m), te_0.max(tm_0));
+        let mut children = Vec::new();
+        let mut kept = 0.0;
+        if eta_m > 0.0 {
+            if let Some(dl) = oc_core::grating::diffract_local(d_local, k, w.lambda, *transmissive) {
+                let dir = (t.quat() * dl).normalize();
+                let pol = branch(te_m, tm_m, dir);
+                kept += pol.stokes.s0;
+                if let Some(id) = spawn(stack, r, cfg, w, point, dir, pol, opl_at, false, false, min_flux) {
+                    children.push((ChildRole::Diffract, id));
+                }
+            }
+        }
+        if eta_0 > 0.0 {
+            let (dir, role) = if *transmissive {
+                (w.ray.dir, ChildRole::Transmit)
+            } else {
+                (reflect3(w.ray.dir, n_oppose), ChildRole::Reflect)
+            };
+            let pol = branch(te_0, tm_0, dir);
+            kept += pol.stokes.s0;
+            if let Some(id) = spawn(stack, r, cfg, w, point, dir, pol, opl_at, false, false, min_flux) {
+                children.push((role, id));
+            }
+        }
+        // The other orders, and an evanescent working order, are absorbed.
+        r.ledger.absorbed_surface += (flux_at - kept).max(0.0);
+        if children.is_empty() {
+            r.terminations.record(TerminationReason::AbsorbedSurface);
+        }
         push_event(r, cfg, w, point, opl_at, lens_interact(children));
         return;
     }
@@ -1684,9 +2207,10 @@ fn interact_surface(
         if projected.length() < 1e-9 {
             // The ray runs along the element's own axis: there is no projection
             // and no meaningful transmission axis to apply.
-            r.report.reject(CapabilityIssue::UnsupportedSurfaceResponse {
-                surface: surface_ref,
-            });
+            r.report
+                .reject(CapabilityIssue::UnsupportedSurfaceResponse {
+                    surface: surface_ref,
+                });
             r.ledger.numerical_loss += flux_at;
             r.terminations.record(TerminationReason::UnsupportedPhysics);
             push_event(r, cfg, w, point, opl_at, interact_ev(Vec::new()));
@@ -1702,9 +2226,10 @@ fn interact_surface(
                 let Some(leak) = extinction.sample(cos_i.acos().to_degrees()) else {
                     // The curve does not reach this angle and its policy says
                     // to refuse, so there is no contrast to apply.
-                    r.report.reject(CapabilityIssue::UnsupportedSurfaceResponse {
-                        surface: surface_ref,
-                    });
+                    r.report
+                        .reject(CapabilityIssue::UnsupportedSurfaceResponse {
+                            surface: surface_ref,
+                        });
                     r.ledger.numerical_loss += flux_at;
                     r.terminations.record(TerminationReason::UnsupportedPhysics);
                     push_event(r, cfg, w, point, opl_at, interact_ev(Vec::new()));
@@ -1771,8 +2296,10 @@ fn interact_surface(
         };
         r.report.note_exact(feature);
         if n_sub > 1.0 {
-            r.report
-                .note_approx(feature, "element faces added singly: no bounce between them");
+            r.report.note_approx(
+                feature,
+                "element faces added singly: no bounce between them",
+            );
         }
         if matches!(
             response,
@@ -2172,8 +2699,7 @@ fn apply_response(
             let stray = !tir && coating.reflection_is_stray();
             if tir {
                 let dir_r = reflect3(w.ray.dir, n_oppose);
-                if let Some(id) =
-                    spawn_tir(stack, r, cfg, w, point, dir_r, pol_r, opl_at, min_flux)
+                if let Some(id) = spawn_tir(stack, r, cfg, w, point, dir_r, pol_r, opl_at, min_flux)
                 {
                     children.push((ChildRole::Tir, id));
                 }
@@ -2221,6 +2747,7 @@ fn apply_response(
         // surfaces intercept all three in `interact_surface`; anything else
         // refuses rather than picking an axis.
         SurfaceResponse::ThinLens { .. }
+        | SurfaceResponse::Grating { .. }
         | SurfaceResponse::Polarizer { .. }
         | SurfaceResponse::Retarder { .. } => {
             r.report
@@ -2284,6 +2811,9 @@ fn spawn(
         parent: Some(parent.path_id),
         from_tir,
         ghost: is_ghost,
+        // The caller names the object once the interaction is over.
+        from: parent.from,
+        counted: parent.counted,
     });
     Some(path_id)
 }
@@ -2340,6 +2870,8 @@ fn continue_probe(
             parent: w.parent,
             from_tir: w.from_tir,
             ghost: w.ghost,
+            from: w.from,
+            counted: w.counted,
         });
     }
 }
@@ -2399,6 +2931,12 @@ fn record_detector(
     if let Some(cell) = detector_cell(d, uv) {
         out.incident_flux[cell] += flux;
         out.detected_signal[cell] += flux * qe;
+        if let Some(c) = out.colour_xyz.get_mut(cell) {
+            let cmf = oc_core::colorimetry::cie_1931(w.lambda);
+            for k in 0..3 {
+                c[k] += flux * cmf[k];
+            }
+        }
     }
     // The angular histogram, when the detector was asked for one. A ray past
     // the cone is counted somewhere rather than nowhere.
@@ -2408,6 +2946,7 @@ fn record_detector(
             None => out.outside_cone_flux += flux,
         }
     }
+    out.add_spectral(w.lambda, flux, uv, dir_local);
     if record && out.records.len() < cfg.max_records {
         out.records.push(DetectorHit3 {
             point_world: point,
@@ -2423,6 +2962,7 @@ fn record_detector(
             ghost_depth: w.ghost_depth,
             stokes,
             frame_x: w.pol.x,
+            counted: w.counted,
         });
     }
 }
@@ -2579,7 +3119,6 @@ fn detector_aabb(d: &Detector3) -> Option<Aabb3> {
     }
     Some(bb.padded(1e-6 * ext.max_element().max(1.0)))
 }
-
 
 /// The cell index a local `(u, v)` hit falls in, row-major over `bins`. A
 /// rectangle maps to an even grid (equal-area cells, the normalization test);

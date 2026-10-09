@@ -31,3 +31,12 @@ serde_json.workspace = true
 [[example]]
 name = "scene3_trace"
 required-features = ["trace3"]
+
+# The heliostat light-pipe demonstrator: builds, traces and writes the scene.
+[[example]]
+name = "heliostat_lightpipe"
+required-features = ["trace3"]
+
+[[example]]
+name = "heliostat_melt"
+required-features = ["trace3"]

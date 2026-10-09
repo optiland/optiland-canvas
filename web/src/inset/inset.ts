@@ -25,6 +25,10 @@ export type Inset = {
   /** Open with the top-left corner at (x, y), or where it was last. */
   open: (at?: { x: number; y: number }) => void;
   close: () => void;
+  /** The window's width, and a new one: kept on screen, moved left if it
+   *  would run off the right edge, and remembered like a drag would be. */
+  width: () => number;
+  setWidth: (w: number) => void;
 };
 
 type Placement = { open: boolean; x: number; y: number; w: number; h: number };
@@ -258,5 +262,12 @@ export function initInset(opts: {
     isOpen: () => place.open,
     open,
     close,
+    width: () => place.w,
+    setWidth: (w) => {
+      place.w = w;
+      apply();
+      save();
+      if (place.open) content?.resized();
+    },
   };
 }

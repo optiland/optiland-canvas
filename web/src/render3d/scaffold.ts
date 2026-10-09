@@ -85,13 +85,16 @@ export class Scaffold {
 
   /** Place the ground, grid, and axes for an assembly that occupies `bounds`.
    *  `spacing` is the grid pitch in mm. */
-  layout(bounds: Bounds3 | null, spacing: number, gridOn: boolean, groundOn: boolean, theme: ScaffoldTheme) {
+  layout(bounds: Bounds3 | null, spacing: number, gridOn: boolean, groundOn: boolean, theme: ScaffoldTheme, upSign: 1 | -1 = 1) {
     const lo = bounds?.min ?? { x: -40, y: -20, z: -20 };
     const hi = bounds?.max ?? { x: 40, y: 20, z: 20 };
     const size = Math.max(hi.x - lo.x, hi.y - lo.y, hi.z - lo.z, 20);
     const cx = (lo.x + hi.x) / 2, cz = (lo.z + hi.z) / 2;
-    // Below the lowest point, with a margin that grows with the assembly.
-    this.groundY = lo.y - Math.max(2, 0.15 * size);
+    // Below the lowest point, with a margin that grows with the assembly;
+    // upside down, "below" is past the highest world Y, the floor facing -Y.
+    const margin = Math.max(2, 0.15 * size);
+    this.groundY = upSign > 0 ? lo.y - margin : hi.y + margin;
+    this.ground.rotation.x = (-upSign * Math.PI) / 2;
     this.axisLength = Math.min(200, Math.max(18, 0.2 * size));
     this.axes.scale.setScalar(this.axisLength);
 
@@ -112,7 +115,7 @@ export class Scaffold {
     this.gridPitch.value = sp;
     // Snapped to the pitch, so the lines stay on world multiples of it. A small
     // lift keeps the lines off the ground plane without z-fighting.
-    this.grid.position.set(Math.round(cx / sp) * sp, this.groundY + Math.max(0.01, 1e-4 * size), Math.round(cz / sp) * sp);
+    this.grid.position.set(Math.round(cx / sp) * sp, this.groundY + upSign * Math.max(0.01, 1e-4 * size), Math.round(cz / sp) * sp);
     this.grid.visible = gridOn;
 
     this.gridColor.value.copy(theme.grid);

@@ -31,6 +31,7 @@ import {
   type RenderBackend,
   type RenderStats,
 } from "./types";
+import { panKeyHeld } from "../pan-key";
 
 // The projected trace layout (traceProjected3D): 11 floats per segment,
 // [au,av,bu,bv, r,g,b, flux, flags, dist_a, dist_b]. With the default XY view
@@ -62,6 +63,8 @@ export type View3dThree = {
   setPreset: (name: string) => void;
   setPerspective: (on: boolean) => void;
   isPerspective: () => boolean;
+  /** Draw world -Y up: the model is the room turned over (the sun says so). */
+  setUpsideDown: (on: boolean) => void;
   /** "render WebGPU" etc., for the status line. */
   backendLabel: () => string;
   /** Fetch the renderer code in idle time, so the first switch to 3D does not
@@ -701,14 +704,16 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
   view.addEventListener("pointerdown", (e) => {
     if (!owns() || e.button === 2) return;
     last = { x: e.clientX, y: e.clientY };
-    const hit = e.button === 0 ? pick(e.clientX, e.clientY) : null;
+    // Middle-drag, Shift or Space pans, even with a part under the pointer.
+    const panning = e.button === 1 || e.shiftKey || panKeyHeld();
+    const hit = e.button === 0 && !panning ? pick(e.clientX, e.clientY) : null;
     if (hit) {
       mode = "drag";
       dragId = hit.id;
       select(hit.id);
       dragStart = { x: hit.pos[0], y: hit.pos[1], z: hit.pos[2] };
       grab = { x: e.clientX, y: e.clientY };
-    } else if (e.button === 1 || e.shiftKey) {
+    } else if (panning) {
       mode = "pan";
     } else {
       mode = "orbit";
@@ -787,7 +792,8 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
   view.addEventListener("wheel", (e) => {
     if (!owns()) return;
     e.preventDefault();
-    rig.zoom(e.deltaY < 0 ? 1.12 : 1 / 1.12);
+    const r = view.getBoundingClientRect();
+    rig.zoomAt(e.deltaY < 0 ? 1.12 : 1 / 1.12, e.clientX - r.left, e.clientY - r.top);
     quality.pulse();
     invalidate();
   }, { passive: false });
@@ -1003,6 +1009,12 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
     setPreset: (name) => { rig.setPreset(name as CameraPreset); frameScene(); invalidate(); },
     setPerspective: (on) => { rig.setPerspective(on); remember(); invalidate(); },
     isPerspective: () => rig.perspective,
+    setUpsideDown: (on) => {
+      if (on === (rig.upSign < 0)) return;
+      rig.setUpsideDown(on);
+      frameScene();
+      invalidate();
+    },
     backendLabel,
     prefetch: () => {
       if (opts.disable) return;

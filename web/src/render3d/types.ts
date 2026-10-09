@@ -23,6 +23,7 @@ export type MaterialRole =
   | "beamsplitter"
   | "dichroic"
   | "polarizing"
+  | "grating"
   | "error";
 
 /** A coated face's display colours (linear RGB): its reflectance and its

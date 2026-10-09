@@ -49,6 +49,11 @@ pub const OBJ_EXTRUDE: u32 = 3;
 /// A profile revolved about local `+X`. Its surfaces and containment contour are
 /// in [`GpuBody3::revolve`].
 pub const OBJ_REVOLVE: u32 = 4;
+/// A hollow tube about local `+X`. `params = (inner_radius, outer_radius,
+/// half_length)`, and its four faces carry their own responses through
+/// [`GpuBody3::face_resp`] in the kernel's
+/// [`tube_face`](oc_core::geom3::primitives::tube_face) order.
+pub const OBJ_TUBE: u32 = 5;
 
 /// Surface behaviour kinds.
 pub const SURF_DIELECTRIC: u32 = 0;
@@ -336,6 +341,11 @@ fn body_world_bound(b: &Body3) -> Option<(DVec3, f64)> {
             half_length_mm,
             ..
         } => Some((t.pos, radius_mm.hypot(*half_length_mm))),
+        SolidGeometry3::Tube {
+            outer_radius_mm,
+            half_length_mm,
+            ..
+        } => Some((t.pos, outer_radius_mm.hypot(*half_length_mm))),
         SolidGeometry3::Profile(p) => {
             // The profile's XY reach plus its Z span, roughly.
             let r = p
@@ -369,6 +379,15 @@ fn profile_edge_points(e: &oc_core::profile2::ProfileEdge2) -> Vec<oc_core::vec:
         } => {
             vec![*center + oc_core::vec::Vec2::splat(*radius_mm)]
         }
+        Curve2::SagSegment {
+            base,
+            coeffs,
+            y0,
+            y1,
+        } => vec![
+            oc_core::geom3::profile::sag_segment_point(base, coeffs, *y0),
+            oc_core::geom3::profile::sag_segment_point(base, coeffs, *y1),
+        ],
     }
 }
 
@@ -429,6 +448,15 @@ fn compile_body(
                 body_rot * align,
             )
         }
+        SolidGeometry3::Tube {
+            inner_radius_mm,
+            outer_radius_mm,
+            half_length_mm,
+        } => (
+            OBJ_TUBE,
+            Vec3::new(s(*inner_radius_mm), s(*outer_radius_mm), s(*half_length_mm)),
+            body_rot,
+        ),
         SolidGeometry3::Profile(p) => match p.construction {
             ProfileConstruction3::ExtrudeLocalZ { z_min_mm, z_max_mm } => {
                 extrude = Some(GpuExtrude {
@@ -461,53 +489,86 @@ fn compile_body(
             .map(|&l| body_index_at(&b.material, catalog, l as f64).unwrap_or(1.0))
             .collect()
     };
-    if let SolidGeometry3::Profile(prof) = &b.geometry {
-        for edge in &prof.profile.edges {
-            let two = b.surface.for_patch(edge.patch);
-            if std::ptr::eq(two, &b.surface.default) {
-                face_resp.push(None);
-                continue;
+    // The patches a per-face response can name, in the face order the preview
+    // reports hits in: a revolved profile's edges, or a tube's four faces.
+    let patches: Vec<oc_core::id::PatchId> = match &b.geometry {
+        SolidGeometry3::Profile(_) if !b.surface.overrides.is_empty() => match &revolve {
+            Some(rev) => rev.face_patch.clone(),
+            // An extruded body reports every hit as face 0, so no response
+            // could reach the face it was authored on.
+            None => {
+                return Err(
+                    "per-face response on an extruded body (not yet in the f32 preview)".into(),
+                )
             }
-            // A coated face's inside copy is the same stack met from behind.
-            // The grid is baked from outside and serves a ray from inside as
-            // well, because a lossless stack reflects and transmits the same
-            // from either side at conjugate angles; the inside copy exists to
-            // tell the reference which way round to walk the layers.
-            let mirrored = match (&two.from_outside, &two.from_inside) {
-                (SurfaceResponse::Coating { coating: a }, SurfaceResponse::Coating { coating: b }) => {
-                    a.seen_from_behind() == *b
-                }
-                _ => false,
-            };
-            if two.from_outside != two.from_inside && !mirrored {
-                return Err("asymmetric per-face response (not yet in the f32 preview)".into());
+        },
+        SolidGeometry3::Tube { .. } if !b.surface.overrides.is_empty() => (0
+            ..=oc_core::geom3::primitives::tube_face::INNER)
+            .map(|f| oc_core::id::PatchId(f as u64))
+            .collect(),
+        _ => Vec::new(),
+    };
+    for &patch in &patches {
+        let two = b.surface.for_patch(patch);
+        if std::ptr::eq(two, &b.surface.default) {
+            face_resp.push(None);
+            continue;
+        }
+        // A coated face's inside copy is the same stack met from behind.
+        // The grid is baked from outside and serves a ray from inside as
+        // well, because a lossless stack reflects and transmits the same
+        // from either side at conjugate angles; the inside copy exists to
+        // tell the reference which way round to walk the layers.
+        let mirrored = match (&two.from_outside, &two.from_inside) {
+            (SurfaceResponse::Coating { coating: a }, SurfaceResponse::Coating { coating: b }) => {
+                a.seen_from_behind() == *b
             }
-            match &two.from_outside {
-                SurfaceResponse::Coating { coating } => {
-                    face_resp.push(Some(bake_coating(
-                        coating,
-                        ambient,
-                        coat_lambdas,
-                        &body_indices,
-                    )?));
-                }
-                SurfaceResponse::DielectricFresnel { .. } => face_resp.push(None),
-                other => {
-                    return Err(format!(
-                        "per-face {} response (not yet in the f32 preview)",
-                        oc_core::build3::response_kind(other)
-                    ));
-                }
+            _ => false,
+        };
+        if two.from_outside != two.from_inside && !mirrored {
+            return Err("asymmetric per-face response (not yet in the f32 preview)".into());
+        }
+        match &two.from_outside {
+            SurfaceResponse::Coating { coating } => {
+                face_resp.push(Some(bake_coating(
+                    coating,
+                    ambient,
+                    coat_lambdas,
+                    &body_indices,
+                )?));
+            }
+            SurfaceResponse::DielectricFresnel { .. } => face_resp.push(None),
+            // A mirror face on a solid: the bore of a light pipe.
+            SurfaceResponse::Mirror { .. } => face_resp.push(Some(compile_response(
+                &two.from_outside,
+                norm.scale,
+                ambient,
+                coat_lambdas,
+            )?)),
+            other => {
+                return Err(format!(
+                    "per-face {} response (not yet in the f32 preview)",
+                    oc_core::build3::response_kind(other)
+                ));
             }
         }
     }
-    // Per-face responses are honoured below for revolved bodies, which is what
-    // a coated plate and a coated lens are. Anything else carrying an override
+    // Per-face responses are honoured for revolved bodies, which is what a
+    // coated plate and a coated lens are, and for a tube, whose bore is the
+    // reason it exists. Anything else carrying an override
     // is rejected by name rather than traced as if the override were not there:
     // a dichroic silently reduced to plain glass is worse than a dichroic that
     // says it cannot be previewed.
-    if !b.surface.overrides.is_empty() && !matches!(b.geometry, SolidGeometry3::Profile(_)) {
-        return Err("per-face response on a non-profile body (not yet in the f32 preview)".into());
+    if !b.surface.overrides.is_empty()
+        && !matches!(
+            b.geometry,
+            SolidGeometry3::Profile(_) | SolidGeometry3::Tube { .. }
+        )
+    {
+        return Err(
+            "per-face response on a body other than a profile or tube (not yet in the f32 preview)"
+                .into(),
+        );
     }
     let alpha_per_mm = match &b.absorption {
         AbsorptionModel::None => 0.0,
@@ -567,7 +628,10 @@ fn line_polygon(
                     verts.push(Vec2::new((p.x / scale) as f32, (p.y / scale) as f32));
                 }
             }
-            Curve2::Conic(_) | Curve2::EvenAsphere { .. } | Curve2::Arc { .. } => {
+            Curve2::Conic(_)
+            | Curve2::EvenAsphere { .. }
+            | Curve2::Arc { .. }
+            | Curve2::SagSegment { .. } => {
                 return Err(
                     "extruded profile has a curved edge (not yet in the f32 preview)".into(),
                 )
@@ -590,13 +654,16 @@ fn line_polygon(
 pub enum RevFace {
     /// A conic or even-asphere surface of revolution. `axis_sign` is the sign of
     /// the profile conic's axis (`±X`). `is_conic` selects the exact quadratic
-    /// over the safeguarded Newton solver.
+    /// over the safeguarded Newton solver. `inner_r` is `0` for a face that
+    /// spans the axis and the facet's inner radius for an annular one (a
+    /// Fresnel facet, [`Curve2::SagSegment`](oc_core::profile2::Curve2)).
     Sag {
         vertex_x: f32,
         axis_sign: f32,
         c: f32,
         k: f32,
         coeffs: [f32; 8],
+        inner_r: f32,
         outer_r: f32,
         is_conic: bool,
     },
@@ -617,9 +684,92 @@ pub enum RevFace {
 #[derive(Debug, Clone)]
 pub struct GpuRevolve {
     pub faces: Vec<RevFace>,
+    /// The profile edge each face came from, face for face. Not one to one
+    /// with the edges: an edge below the axis makes no face (its mirror edge
+    /// already did), and a polyline makes one per segment, so a per-face
+    /// response is found through this and never by edge index.
+    pub face_patch: Vec<oc_core::id::PatchId>,
     /// The meridian, sampled and closed, in `(x, r)` normalized coordinates. Used
     /// by point-in-polygon to classify a point's medium.
     pub contour: Vec<Vec2>,
+    /// A many-edged profile's contour bucketed by height, with its local `x`
+    /// range; `None` for an ordinary lens, which is scanned whole.
+    pub index: Option<ContourIndex>,
+}
+
+/// The contour's segments bucketed by the heights they span, for a profile with
+/// hundreds of edges (a Fresnel lens), plus the body's local `x` range.
+///
+/// Point-in-polygon counts the segments a horizontal probe at the point's
+/// height crosses, and only a segment whose `y` range holds that height can be
+/// crossed, so the one bucket holding it has every segment that counts: the
+/// same parity as the whole scan, from a handful of segments. The `x` range
+/// lets the face loop pass over a face whose radii the ray never reaches
+/// inside the body's slab. The shader reads the same tables from the `verts`
+/// arena (`buffers3`), so the two stay in lockstep.
+#[derive(Debug, Clone, Default)]
+pub struct ContourIndex {
+    pub y0: f32,
+    pub inv_h: f32,
+    /// `(start, count)` into `items`, one per bucket.
+    pub buckets: Vec<(u32, u32)>,
+    /// Segment `i` joins contour points `i - 1` (wrapping) and `i`, the pair
+    /// point-in-polygon visits at `i`.
+    pub items: Vec<u32>,
+    pub x_lo: f32,
+    pub x_hi: f32,
+}
+
+/// Contours at least this long are indexed; a lens's hundred points are
+/// scanned, exactly as before.
+pub const CONTOUR_INDEX_MIN: usize = 256;
+
+impl ContourIndex {
+    /// Index a closed contour, or `None` for one short enough to scan.
+    pub fn build(contour: &[Vec2]) -> Option<Self> {
+        let n = contour.len();
+        if n < CONTOUR_INDEX_MIN {
+            return None;
+        }
+        let (mut y_lo, mut y_hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        let (mut x_lo, mut x_hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        for p in contour {
+            y_lo = y_lo.min(p.y);
+            y_hi = y_hi.max(p.y);
+            x_lo = x_lo.min(p.x);
+            x_hi = x_hi.max(p.x);
+        }
+        let nb = (n / 4).clamp(1, 1024);
+        let span = if y_hi > y_lo { y_hi - y_lo } else { 1.0 };
+        let mut ix = Self {
+            y0: y_lo,
+            inv_h: nb as f32 / span,
+            buckets: vec![(0, 0); nb],
+            items: Vec::new(),
+            x_lo,
+            x_hi,
+        };
+        let mut lists: Vec<Vec<u32>> = vec![Vec::new(); nb];
+        for i in 0..n {
+            let (a, b) = (contour[i], contour[if i == 0 { n - 1 } else { i - 1 }]);
+            let (k0, k1) = (ix.bucket(a.y.min(b.y)), ix.bucket(a.y.max(b.y)));
+            for list in &mut lists[k0..=k1] {
+                list.push(i as u32);
+            }
+        }
+        for (k, list) in lists.into_iter().enumerate() {
+            ix.buckets[k] = (ix.items.len() as u32, list.len() as u32);
+            ix.items.extend(list);
+        }
+        Some(ix)
+    }
+
+    /// The bucket holding height `y`. Monotone in `y`, which is what makes a
+    /// segment's bucket range hold every height it spans.
+    pub fn bucket(&self, y: f32) -> usize {
+        let last = (self.buckets.len() - 1) as f32;
+        ((y - self.y0) * self.inv_h).floor().clamp(0.0, last) as usize
+    }
 }
 
 /// Even-asphere sag at radial coordinate `r`, in f32 (§7.4). Shared by the
@@ -652,6 +802,7 @@ pub fn even_asphere_dsag(c: f32, k: f32, coeffs: &[f32; 8], r: f32) -> f32 {
 fn compile_revolve(profile: &ClosedProfile2, scale: f64) -> Result<GpuRevolve, String> {
     use oc_core::profile2::Curve2;
     let mut faces = Vec::new();
+    let mut face_patch = Vec::new();
     for e in &profile.edges {
         match &e.curve {
             Curve2::Line { a, b } => {
@@ -670,6 +821,28 @@ fn compile_revolve(profile: &ClosedProfile2, scale: f64) -> Result<GpuRevolve, S
             Curve2::EvenAsphere { base, coeffs } => {
                 faces.push(sag_face(base, coeffs, scale, false)?)
             }
+            Curve2::SagSegment {
+                base,
+                coeffs,
+                y0,
+                y1,
+            } => {
+                // Only the part at r >= 0 is a surface; one entirely below the
+                // axis is its mirror edge's surface already.
+                let (lo, hi) = (y0.min(*y1), y0.max(*y1));
+                if !(hi <= 0.0 && lo < 0.0) {
+                    let is_conic = coeffs.iter().all(|a| *a == 0.0);
+                    let mut face = sag_face(base, coeffs, scale, is_conic)?;
+                    if let RevFace::Sag {
+                        inner_r, outer_r, ..
+                    } = &mut face
+                    {
+                        *inner_r = (lo.max(0.0) / scale) as f32;
+                        *outer_r = (hi / scale) as f32;
+                    }
+                    faces.push(face);
+                }
+            }
             Curve2::Arc {
                 center,
                 radius_mm,
@@ -687,10 +860,14 @@ fn compile_revolve(profile: &ClosedProfile2, scale: f64) -> Result<GpuRevolve, S
                 });
             }
         }
+        face_patch.resize(faces.len(), e.patch);
     }
+    let contour = revolve_contour(profile, scale);
     Ok(GpuRevolve {
         faces,
-        contour: revolve_contour(profile, scale),
+        face_patch,
+        index: ContourIndex::build(&contour),
+        contour,
     })
 }
 
@@ -716,6 +893,7 @@ fn sag_face(
         c: (cp.c * scale) as f32,
         k: cp.k as f32,
         coeffs: cn,
+        inner_r: 0.0,
         outer_r: (cp.half_ap / scale) as f32,
         is_conic,
     })
@@ -769,6 +947,21 @@ fn revolve_contour(profile: &ClosedProfile2, scale: f64) -> Vec<Vec2> {
             }
             Curve2::Conic(cp) => sample_sag(cp, &[0.0; 8], scale, N, &mut pts),
             Curve2::EvenAsphere { base, coeffs } => sample_sag(base, coeffs, scale, N, &mut pts),
+            Curve2::SagSegment {
+                base,
+                coeffs,
+                y0,
+                y1,
+            } => {
+                // A facet is one annular piece, so fewer samples hold the same
+                // chord error a whole face gets from `N`.
+                const N_SEG: usize = 12;
+                for i in 0..=N_SEG {
+                    let t = y0 + (y1 - y0) * i as f64 / N_SEG as f64;
+                    let q = oc_core::geom3::profile::sag_segment_point(base, coeffs, t);
+                    pts.push(Vec2::new(s(q.x), s(q.y)));
+                }
+            }
             Curve2::Arc {
                 center,
                 radius_mm,
@@ -873,6 +1066,9 @@ fn classify_surface(r: &TwoSidedSurfaceResponse) -> Result<u32, String> {
         }
         SurfaceResponse::ThinLens { .. } => {
             Err("thin lens on a body patch (only standalone surfaces carry it)".into())
+        }
+        SurfaceResponse::Grating { .. } => {
+            Err("grating on a body patch (only standalone surfaces carry one)".into())
         }
         SurfaceResponse::Polarizer { .. } | SurfaceResponse::Retarder { .. } => {
             Err("polarizing element on a body patch (only standalone surfaces carry one)".into())
@@ -1053,6 +1249,15 @@ pub enum GpuResponse {
     ThinLens {
         f: f32,
     },
+    /// A diffraction grating, grooves along the surface's local Y: `k` is
+    /// the order times the groove density per micrometre, `eta` and `zero`
+    /// the fractions sent into that order and the zero order.
+    Grating {
+        k: f32,
+        eta: Spectral32,
+        zero: Spectral32,
+        transmit: bool,
+    },
     /// A thin-film stack evaluated onto a grid: `COAT_ANGLES` rows, uniform in
     /// `sin2 theta`, of one `(R, T)` pair per entry in `lambdas`.
     CoatingGrid {
@@ -1169,6 +1374,29 @@ fn compile_response(
         SurfaceResponse::Absorber => GpuResponse::Absorber,
         SurfaceResponse::ThinLens { focal_length_mm } => GpuResponse::ThinLens {
             f: (focal_length_mm / scale) as f32,
+        },
+        // Directions do not depend on the scene's scale: the shift in a ray's
+        // direction cosine is per micrometre of wavelength.
+        // The preview traces no polarization, so a grating that splits it
+        // gives each ray the mean of its two curves.
+        SurfaceResponse::Grating {
+            lines_per_mm,
+            order,
+            efficiency,
+            zero_order,
+            transmissive,
+            tm,
+        } => GpuResponse::Grating {
+            k: oc_core::grating::k_per_um(*lines_per_mm, *order) as f32,
+            eta: match tm {
+                Some(t) => spectral(&oc_core::grating::unpolarized(efficiency, &t.efficiency))?,
+                None => spectral(efficiency)?,
+            },
+            zero: match tm {
+                Some(t) => spectral(&oc_core::grating::unpolarized(zero_order, &t.zero_order))?,
+                None => spectral(zero_order)?,
+            },
+            transmit: *transmissive,
         },
         SurfaceResponse::Mirror { reflectivity } => GpuResponse::Mirror {
             r: spectral(reflectivity)?,

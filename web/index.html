@@ -10,16 +10,22 @@
         font: 12px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
       canvas#view { position: fixed; inset: 0; width: 100vw; height: 100vh; cursor: grab; }
       canvas#view.dragging { cursor: grabbing; }
+      /* Space held: every drag pans, so say so over parts too. */
+      body.pan-key canvas#view { cursor: grab !important; }
       /* The GPU 3D view sits under #view, which stays on top as a transparent
          overlay (labels, cards' leader lines) and receives the pointer. */
       canvas#view3d { position: fixed; inset: 0; width: 100vw; height: 100vh; display: none; }
       .panel { position: fixed; background: rgba(10,14,22,0.86); border: 1px solid #1e2a3d;
         border-radius: 8px; padding: 10px 12px; backdrop-filter: blur(6px); }
-      /* Stops short of the centred view toolbar; the status line wraps. */
-      #hud { top: 12px; left: 14px; pointer-events: none; max-width: calc(50vw - 226px); }
-      #hud b { color: #7fd6ff; }
-      #hud #stat { opacity: 0.7; }
-      #controls { top: 12px; right: 14px; width: 250px; }
+      /* Scrolls when its content is taller than the window, so the controls
+         below a long list stay reachable. Border-box, so the width is the
+         250 px of content plus padding and border it always was. */
+      #controls { top: 12px; right: 14px; width: 276px; max-height: calc(100vh - 24px); overflow-y: auto; box-sizing: border-box;
+        overscroll-behavior: contain; }
+      #wlFold { padding-left: 38px; margin: 2px 0 4px; font-size: 11px; }
+      #wlFold > summary { cursor: pointer; opacity: 0.75; user-select: none; }
+      #wlFold > summary:hover { opacity: 1; }
+      #wlFold[open] #wlSwatches { max-height: 120px; overflow-y: auto; margin-top: 4px; padding: 0; }
       #controls h3 { margin: 0 0 6px; font-size: 12px; color: #7fd6ff; }
       #abbe { display: block; margin-top: 6px; border-radius: 4px; cursor: crosshair; }
       #abbeLabel { opacity: 0.75; margin-top: 4px; min-height: 15px; }
@@ -140,6 +146,15 @@
       .field .u { width: 18px; opacity: 0.45; text-align: right; }
       .field select.c3-resp { flex: 1; min-width: 0; background: #0a1220; color: #e8f6ff;
         border: 1px solid #24344d; border-radius: 4px; padding: 1px 3px; font: inherit; }
+      /* The sun panel: fields wider than a card's, the same look. */
+      #sunSec .field > span:first-child { width: 58px; }
+      #sunSec .field input[type="date"] { flex: 1; min-width: 0; background: #0a1220; color: #e8f6ff;
+        border: 1px solid #24344d; border-radius: 4px; padding: 1px 4px; font: inherit; color-scheme: dark; }
+      #sunSec .field input[type="range"] { flex: 1; min-width: 0; }
+      #sunSec .field select { flex: 1; min-width: 0; background: #0a1220; color: #e8f6ff; border: 1px solid #1f3350; border-radius: 3px; }
+      #sunSec #sunBands { width: 44px; flex: none; }
+      #sunSec .sun-table { flex: 1; min-width: 0; font-weight: normal; color: #7fd6ff; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      #sunReadout { white-space: pre-wrap; opacity: 0.75; font: 10px/1.4 ui-monospace, monospace; margin: 4px 0 0; }
       button.pin { background: none; border: none; cursor: pointer; padding: 0; opacity: 0.45; font-size: 11px; }
       button.pin.pinned { opacity: 1; }
       .sub { opacity: 0.7; margin-top: 2px; min-height: 14px; font-size: 11px; }
@@ -177,6 +192,12 @@
       .cv-field .u { opacity: 0.45; min-width: 14px; }
       /* Fixed heights: a longer message must not resize the drawing above. */
       .cv-read { font-size: 11px; opacity: 0.85; line-height: 1.45; height: 46px; overflow-y: auto; flex: none; }
+      .cv-read.tall { height: 78px; }
+      .cv-bar .cv-group { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+      .cv-bar .cv-group[hidden] { display: none; }
+      .cv-bar .cv-rays { width: 64px; background: #0a1220; color: #e8f6ff; border: 1px solid #24344d;
+        border-radius: 4px; padding: 1px 4px; font: inherit; font-size: 11px; text-align: right; }
+      .cv-bar .cv-rays.bad { border-color: #ff8a65; }
       .cv-read b { color: #7fd6ff; font-weight: normal; }
       .cv-note { font-size: 11px; opacity: 0.6; height: 30px; overflow: hidden; line-height: 1.35; flex: none; }
       .cv-note.warn { color: #ffb38a; opacity: 1; }
@@ -223,7 +244,19 @@
       #gallery .g-err { color: #ff8a6b; font-size: 11px; min-height: 14px; }
 
       /* --- M4 "it's a workflow" --- */
-      #m4dock { left: 14px; top: 96px; width: 236px; max-height: calc(100vh - 210px); overflow-y: auto; }
+      #m4dock { left: 14px; top: 12px; width: 236px; max-height: calc(100vh - 126px); overflow-y: auto; }
+      /* The scene tools fold down to one button, and start folded. */
+      #toolsToggle { display: flex; align-items: center; gap: 6px; width: 100%; background: none; border: none;
+        color: #7fd6ff; font: inherit; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em;
+        padding: 0; margin: 0 0 7px; cursor: pointer; }
+      #toolsToggle svg { width: 16px; height: 16px; flex: none; }
+      #toolsToggle .chev { margin-left: auto; opacity: 0.6; transition: transform 0.15s; }
+      #toolsToggle:hover .chev { opacity: 1; }
+      #m4dock.collapsed { width: auto; padding: 7px; overflow: hidden; }
+      #m4dock.collapsed > :not(#toolsToggle) { display: none; }
+      #m4dock.collapsed #toolsToggle { margin: 0; width: auto; }
+      #m4dock.collapsed #toolsToggle .label, #m4dock.collapsed #toolsToggle .chev { display: none; }
+      #m4dock:not(.collapsed) #toolsToggle .chev { transform: rotate(180deg); }
       #m4dock h4 { margin: 0 0 5px; font-size: 11px; color: #7fd6ff; text-transform: uppercase; letter-spacing: 0.04em; }
       #m4dock h4 .h4-sub { text-transform: none; letter-spacing: 0; opacity: 0.5; font-weight: normal; }
       .m4hint { opacity: 0.5; font-size: 10px; line-height: 1.35; margin-top: 5px; }
@@ -288,11 +321,9 @@
     <canvas id="view3d"></canvas>
     <canvas id="view"></canvas>
 
-    <div class="panel" id="hud">
-      <div><b>Optiland Canvas</b> — always 3D</div>
-      <div>drag &amp; double-click to edit · hover the Abbe map for glass · views and the component tab above</div>
-      <div id="stat"></div>
-    </div>
+    <!-- The trace's status line: segments, timings, the preview path. Kept
+         for the debug hooks and the tests, not shown. -->
+    <div id="stat" hidden></div>
 
     <div class="panel" id="controls">
       <h3 id="abbeHead">material — Abbe map</h3>
@@ -321,7 +352,10 @@
         </select></label>
       <label class="row" id="wlRow"><span style="width:38px">nm</span>
         <input type="text" id="wlList" placeholder="e.g. 486, 588, 656" title="comma-separated wavelengths in nm (outside 380–780 nm shows yellow)" style="flex:1; background:#0a1220; color:#e8f6ff; border:1px solid #24344d; border-radius:4px; padding:2px 4px; font:inherit" /></label>
-      <div class="row" id="wlSwatches" style="gap:3px; flex-wrap:wrap; min-height:14px; padding-left:38px"></div>
+      <details id="wlFold" title="the source's wavelengths, one swatch each">
+        <summary id="wlSummary">wavelengths</summary>
+        <div class="row" id="wlSwatches" style="gap:3px; flex-wrap:wrap; min-height:14px"></div>
+      </details>
       <label class="row">ray density <input type="range" id="density" min="8" max="240" value="16" /></label>
       <label class="row"><input type="checkbox" id="ghosts" /> ghost layer</label>
       <label class="row">ghost bounces
@@ -348,7 +382,12 @@
     </div>
 
     <!-- Scene dock: the 3D scene inspector + the .ocanvas handoff. -->
-    <div class="panel" id="m4dock">
+    <div class="panel collapsed" id="m4dock">
+      <button id="toolsToggle" type="button" aria-expanded="false" aria-controls="m4dock" title="tools: add elements, the sun, open and save">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>
+        <span class="label">tools</span>
+        <span class="chev" aria-hidden="true">▾</span>
+      </button>
       <!-- The canonical 3D scene: its objects, the preview-mode badge, the
            meridional-slab slider, and open-a-scene. -->
       <div class="m4-sec">
@@ -369,6 +408,7 @@
         <div class="m4row">
           <button class="m4btn" id="addAperture" title="add a circular aperture stop">＋ aperture</button>
           <button class="m4btn" id="addPrism" title="add a dispersing glass prism">＋ prism</button>
+          <button class="m4btn" id="addFresnel" title="add a grooved Fresnel lens (PMMA, R 50 base, 50 mm across, 1 mm pitch, about 100 mm focal length); its recipe is edited in the component view">＋ Fresnel</button>
         </div>
         <div class="m4row">
           <button class="m4btn" id="addSplitter" title="add a 50:50 beam splitter plate at 45°">＋ splitter</button>
@@ -376,11 +416,43 @@
           <button class="m4btn" id="addPbs" title="add a polarizing beam splitter: a glass cube with a coated diagonal, which transmits p and reflects s. Its contrast and its acceptance angle come out of the stack rather than being declared">＋ PBS</button>
         </div>
         <div class="m4row">
+          <button class="m4btn" id="addGrating" title="add a plane diffraction grating facing the beam, 600 lines/mm, grooves out of the section plane so it disperses in it (the f32 preview and the f64 reference both trace it)">＋ grating</button>
           <button class="m4btn" id="addPolarizer" title="add an ideal linear polarizer facing the beam (unpolarized light loses half its flux here; the f32 preview cannot show this, the f64 reference can)">＋ polarizer</button>
           <button class="m4btn" id="addRetarder" title="add an ideal quarter-wave plate, fast axis at 45° (turns linear light circular; f64 reference only)">＋ waveplate</button>
         </div>
         <div class="m4row">
           <button class="m4btn" id="addDetector" title="add an area detector (movable/tiltable; add as many as you like)">＋ detector</button>
+          <button class="m4btn" id="addTube" title="add a tube (a light pipe, a barrel, a baffle): inner and outer diameter and length, black outside, its bore black, mirrored or lined with real silver or aluminium">＋ tube</button>
+        </div>
+        <div class="m4row">
+          <button class="m4btn" id="addSun" title="put the sun in the scene: its position from the site, date and time (NREL SPA), its disc, the ASTM G173 direct spectrum, and DNI in W/m², so detectors read watts">＋ sun</button>
+          <button class="m4btn" id="addHeliostat" title="add a heliostat: a flat mirror that follows the sun to send it onto its target (the selected object, else the first detector)">＋ heliostat</button>
+        </div>
+        <div id="sunSec" class="m4-sec" hidden>
+          <div class="field"><span>latitude</span><input type="number" id="sunLat" step="0.01" /><span class="u">°</span></div>
+          <div class="field"><span>longitude</span><input type="number" id="sunLon" step="0.01" /><span class="u">°E</span></div>
+          <div class="field"><span>elevation</span><input type="number" id="sunElev" step="10" /><span class="u">m</span></div>
+          <div class="field"><span>date</span><input type="date" id="sunDate" /></div>
+          <div class="field"><span>UTC +</span><input type="number" id="sunUtc" step="0.5" /><span class="u">h</span></div>
+          <div class="field"><span>time <b id="sunTimeLabel">12:00</b></span><input type="range" id="sunTime" min="0" max="1439" step="5" /></div>
+          <div class="field" title="compass bearing of the canvas's +X; +Y is up. 180 puts south to the right"><span>+X bearing</span><input type="number" id="sunBearing" step="5" /><span class="u">°</span></div>
+          <div class="field" title="the model is the room turned over about +X: up is world −Y (a heliostat on the roof drawn below the tube it feeds). The sun then comes from the −Y side, and the 3D view puts −Y at the top"><span>upside down</span><input type="checkbox" id="sunUpsideDown" /></div>
+          <div class="field" title="direct normal irradiance; the ASTM G173 direct spectrum carries 900"><span>DNI</span><input type="number" id="sunDni" step="10" min="0" /><span class="u">W/m²</span></div>
+          <div class="field" title="diameter of the sun beam: enough to fill what it lights"><span>beam ⌀</span><input type="number" id="sunBeam" step="10" min="1" /><span class="u">mm</span></div>
+          <div class="field" title="how far up-sun of the heliostat the beam starts. The light is the same at any distance; a larger one draws the sun where it stands, above the tower and the tube. Anything in between shades the mirror, as it would outdoors. With heliostats this is a floor: the beam starts at least one beam radius out"><span>sun distance</span><input type="number" id="sunStandoff" step="500" min="0" /><span class="u">mm</span></div>
+          <div class="field" title="how bright the disc is across its face: limb-darkened as measured by Neckel &amp; Labs (1994), wavelength by wavelength; Buie et al. (2003), one broadband profile; or evenly bright"><span>disc</span><select id="sunDisc">
+            <option value="limb">limb-darkened</option>
+            <option value="buie">Buie</option>
+            <option value="uniform">uniform</option>
+          </select></div>
+          <div class="field" title="circumsolar ratio: the share of the direct light, within 2.5° of the sun's centre, that comes from the aureole around the disc (Buie's shape). Clear days 1 to 10%; 0 for no aureole"><span>aureole</span><input type="number" id="sunCsr" step="1" min="0" max="84.9" /><span class="u">% CSR</span></div>
+          <div class="field" title="continuous: every ray draws its own wavelength from the spectrum table at the table's resolution. lines: every ray goes out once per line, each line standing for an equal-width band"><span>spectrum</span><select id="sunSpectral">
+            <option value="continuous">continuous</option>
+            <option value="lines">lines</option>
+          </select><input type="number" id="sunBands" step="1" min="1" max="64" title="how many lines" /></div>
+          <div class="field" title="the spectral irradiance the sun emits: ASTM G173-03 direct + circumsolar, or a table for your site and day (SMARTS output, a spectroradiometer export): wavelength and W/m²/nm columns"><span>table</span><b id="sunTable" class="sun-table">ASTM G173-03</b></div>
+          <div class="field"><span></span><button class="m4btn" id="sunImport" type="button" title="read a spectrum table from a file">import…</button><button class="m4btn" id="sunG173" type="button" title="back to ASTM G173-03 and 900 W/m²">G173</button><input type="file" id="sunFile" accept=".txt,.csv,.dat,.ext,.out,text/*" hidden /></div>
+          <pre id="sunReadout"></pre>
         </div>
         <div id="objects3d" class="obj3d"></div>
         <div id="preview3dMsg" class="m4hint">The scientifically-correct f64 3D trace. In the 2D view its rays are projected onto the meridional Y–Z plane; the slice slider thins them to a slab about it.</div>
@@ -496,8 +568,43 @@
           <div class="field"><span>Vd</span><input type="number" data-name="vd" step="0.1" /><span class="u"></span></div>
         </div>
         <div class="c3-aperture" style="display:none">
-          <div class="field"><span>min r</span><input type="number" data-name="apMin" step="0.5" min="0" /><span class="u">mm</span></div>
-          <div class="field"><span>max r</span><input type="number" data-name="apMax" step="0.5" min="0" /><span class="u">mm</span></div>
+          <div class="field"><span>hole</span><select data-name="apOpenKind" class="c3-resp">
+            <option value="circle">circle</option><option value="ring">ring (central stop)</option>
+            <option value="rect">rectangle</option></select></div>
+          <div class="field c3-ap-od"><span>⌀</span><input type="number" data-name="apOpenD" step="1" min="0" /><span class="u">mm</span></div>
+          <div class="field c3-ap-oin"><span>⌀ stop</span><input type="number" data-name="apOpenDIn" step="1" min="0" /><span class="u">mm</span></div>
+          <div class="field c3-ap-ow"><span>w</span><input type="number" data-name="apOpenW" step="1" min="0" /><span class="u">mm</span></div>
+          <div class="field c3-ap-oh"><span>h</span><input type="number" data-name="apOpenH" step="1" min="0" /><span class="u">mm</span></div>
+          <div class="field"><span>mask</span><select data-name="apMaskKind" class="c3-resp">
+            <option value="circle">circle</option><option value="rect">rectangle</option>
+            <option value="none">unbounded</option></select></div>
+          <div class="field c3-ap-md"><span>⌀</span><input type="number" data-name="apMaskD" step="5" min="0" /><span class="u">mm</span></div>
+          <div class="field c3-ap-mw"><span>w</span><input type="number" data-name="apMaskW" step="5" min="0" /><span class="u">mm</span></div>
+          <div class="field c3-ap-mh"><span>h</span><input type="number" data-name="apMaskH" step="5" min="0" /><span class="u">mm</span></div>
+          <div class="c3-apNote m4hint"></div>
+        </div>
+        <div class="c3-tube" style="display:none">
+          <div class="field"><span>⌀ in</span><input type="number" data-name="tubeInner" step="1" min="0" /><span class="u">mm</span></div>
+          <div class="field"><span>⌀ out</span><input type="number" data-name="tubeOuter" step="1" min="0" /><span class="u">mm</span></div>
+          <div class="field"><span>L</span><input type="number" data-name="tubeLength" step="5" min="0" /><span class="u">mm</span></div>
+          <div class="field"><span>bore</span><select data-name="tubeBore" class="c3-resp">
+            <option value="silver-protected">silver, protected</option><option value="silver">silver, bare</option>
+            <option value="aluminium-protected">aluminium, protected</option><option value="aluminium">aluminium, bare</option>
+            <option value="mirror">ideal mirror</option><option value="black">black</option>
+            <option value="custom" disabled>custom</option></select></div>
+          <div class="field c3-tubeR"><span>R</span><input type="number" data-name="tubeR" step="0.01" min="0" max="1" /><span class="u"></span></div>
+        </div>
+        <div class="c3-helio" style="display:none">
+          <div class="field"><span>aim</span><select data-name="helioTarget" class="c3-resp"></select></div>
+          <div class="c3-helioNote m4hint"></div>
+        </div>
+        <div class="c3-link" style="display:none">
+          <div class="field"><span>lock to</span><select data-name="linkParent" class="c3-resp"></select></div>
+          <div class="field c3-linkMode"><span>as</span><select data-name="linkMode" class="c3-resp">
+            <option value="front">in front of it</option><option value="follow">attached where it is</option>
+            <option value="face">turned to face it</option></select></div>
+          <div class="field c3-linkGap"><span>gap</span><input type="number" data-name="linkGap" step="5" /><span class="u">mm</span></div>
+          <div class="c3-linkNote m4hint"></div>
         </div>
         <div class="c3-surface" style="display:none">
           <div class="field"><span>front</span><select data-name="front" class="c3-resp">

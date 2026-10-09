@@ -9,7 +9,9 @@
 //
 // Axes: world coordinates are the Rust scene's, 1:1 and in millimetres. +X is
 // the optical axis, +Y is up, +Z is out of the meridional plane. The camera's up
-// vector is +Y. The UI labels these the Zemax way (optical axis "Z", out of
+// vector is +Y, or -Y for a model drawn upside down (`upSign`, the room turned
+// over about +X, as the heliostat light pipe is): the picture is then the
+// upright one turned, never mirrored. The UI labels these the Zemax way (optical axis "Z", out of
 // plane "X"); that relabelling happens only in the overlay text (`overlays.ts`).
 //
 // One deliberate change from the wireframe view: pan moves the orbit target in
@@ -47,6 +49,8 @@ export const DEFAULT_PITCH = 0.42;
 
 // Pitch stays shy of the poles so the right vector never degenerates.
 const PITCH_LIMIT = 1.45;
+/** Zoom-out floor, px per mm: 0.005 fits 100 m into a 500 px wide view. */
+const MIN_SCALE = 0.005;
 
 const PRESETS: Record<CameraPreset, [number, number]> = {
   iso: [DEFAULT_YAW, DEFAULT_PITCH],
@@ -63,6 +67,7 @@ export type CameraState = {
   target: V3;
   perspective: boolean;
   distance: number;
+  upSign: 1 | -1;
 };
 
 export class CameraRig {
@@ -80,6 +85,8 @@ export class CameraRig {
   /** CSS pixel size of the view. */
   width = 1;
   height = 1;
+  /** +1 when world +Y is up on screen, -1 when the model is upside down. */
+  upSign: 1 | -1 = 1;
   /** Bumped on every change, so the renderer knows to redraw. */
   revision = 0;
 
@@ -97,9 +104,11 @@ export class CameraRig {
   basis(): Basis {
     const cp = Math.cos(this.pitch), sp = Math.sin(this.pitch);
     const cy = Math.cos(this.yaw), sy = Math.sin(this.yaw);
-    const dir = v3(cp * sy, sp, cp * cy); // target -> eye
+    // Upside down, the whole rig turns half a turn about +X.
+    const s = this.upSign;
+    const dir = v3(cp * sy, s * sp, s * cp * cy); // target -> eye
     const f = scl(dir, -1); // eye -> target
-    const right = norm(cross(f, v3(0, 1, 0)));
+    const right = norm(cross(f, v3(0, s, 0)));
     const up = cross(right, f); // unit, since f and right are unit and orthogonal
     return { right, up, dir };
   }
@@ -158,14 +167,29 @@ export class CameraRig {
   }
 
   zoom(factor: number) {
-    // Same limits as the wireframe view. In perspective the zoom is a field of
-    // view change, capped so the frustum stays sane.
-    let s = Math.max(0.3, Math.min(200, this.scale * factor));
+    // In perspective the zoom is a field of view change, capped so the
+    // frustum stays sane. The floor lets a heliostat field or a 40 m light
+    // pipe fit the window.
+    let s = Math.max(MIN_SCALE, Math.min(200, this.scale * factor));
     if (this.perspective) {
       const minScale = this.height / 2 / (this.distance * Math.tan((150 * Math.PI) / 360));
       s = Math.max(s, minScale);
     }
     this.scale = s;
+    this.touch();
+  }
+
+  /** Zoom by `factor` keeping the point under the pointer where it is:
+   *  `(px, py)` in CSS pixels from the view's top-left corner. In a 40 m scene
+   *  a zoom about the centre never reaches a 1 m lens without a long pan. */
+  zoomAt(factor: number, px: number, py: number) {
+    const B = this.basis();
+    const before = this.pxPerMm(this.target, B);
+    this.zoom(factor);
+    const after = this.pxPerMm(this.target, B);
+    const dx = px - this.width / 2, dy = py - this.height / 2;
+    const k = 1 / before - 1 / after;
+    this.target = add(this.target, add(scl(B.right, dx * k), scl(B.up, -dy * k)));
     this.touch();
   }
 
@@ -181,6 +205,14 @@ export class CameraRig {
   imagePlaneAxes(): { right: V3; up: V3 } {
     const B = this.basis();
     return { right: B.right, up: B.up };
+  }
+
+  /** Which way up the model is drawn: `true` puts world -Y up on screen. */
+  setUpsideDown(on: boolean) {
+    const s = on ? -1 : 1;
+    if (s === this.upSign) return;
+    this.upSign = s;
+    this.touch();
   }
 
   setPerspective(on: boolean) {
@@ -229,7 +261,7 @@ export class CameraRig {
       }
     }
     const freeWidth = Math.max(this.width * 0.4, this.width - 2 * this.sideInset);
-    this.scale = Math.max(0.5, Math.min((freeWidth * 0.42) / mx, (this.height * 0.42) / my));
+    this.scale = Math.max(MIN_SCALE, Math.min((freeWidth * 0.42) / mx, (this.height * 0.42) / my));
     this.sceneRadius = Math.max(10, 0.5 * Math.hypot(hi.x - lo.x, hi.y - lo.y, hi.z - lo.z));
     // Far enough that the whole assembly sits in front of the perspective eye.
     this.distance = Math.max(500, 4 * this.sceneRadius);
@@ -244,6 +276,7 @@ export class CameraRig {
       target: { ...this.target },
       perspective: this.perspective,
       distance: this.distance,
+      upSign: this.upSign,
     };
   }
 }

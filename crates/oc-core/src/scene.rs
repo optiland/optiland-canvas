@@ -196,16 +196,37 @@ pub enum SourceKind {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Spectrum {
     Monochromatic(f64),
-    /// Discrete lines: `(λ_µm, weight)`.
+    /// Discrete lines: `(λ_µm, weight)`. Every line gets every ray a source
+    /// samples, so a source of `n` lines launches `n` times the rays.
     Lines(Vec<(f64, f64)>),
+    /// A continuous spectrum, tabulated as narrow bands `(λ_µm, power)`: each
+    /// band's power-weighted wavelength and the power in it. A source draws
+    /// **one** wavelength per ray, each band as often as its power says, so
+    /// the ray count does not grow with the table and a spectrum of two
+    /// thousand bands costs no more to trace than one line.
+    Continuum(Vec<(f64, f64)>),
 }
 
 impl Spectrum {
+    /// Is each ray given its own wavelength ([`Spectrum::Continuum`])?
+    pub fn is_continuum(&self) -> bool {
+        matches!(self, Spectrum::Continuum(_))
+    }
+
+    /// How many times over a source's rays are launched: once per line, or
+    /// once for a continuum, whose rays share the wavelengths out.
+    pub fn ray_multiplicity(&self) -> usize {
+        match self {
+            Spectrum::Monochromatic(_) | Spectrum::Continuum(_) => 1,
+            Spectrum::Lines(v) => v.len(),
+        }
+    }
+
     /// Normalized `(λ, weight)` samples; weights sum to 1.
     pub fn samples(&self) -> Vec<(f64, f64)> {
         match self {
             Spectrum::Monochromatic(l) => vec![(*l, 1.0)],
-            Spectrum::Lines(v) => {
+            Spectrum::Lines(v) | Spectrum::Continuum(v) => {
                 let total: f64 = v.iter().map(|(_, w)| *w).sum();
                 let total = if total > 0.0 { total } else { 1.0 };
                 v.iter().map(|(l, w)| (*l, w / total)).collect()

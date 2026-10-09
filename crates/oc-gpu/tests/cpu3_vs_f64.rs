@@ -818,6 +818,7 @@ fn the_preview_bins_arrival_directions_like_the_reference() {
             d.measure = oc_core::scene3::DetectorMeasure::Intensity {
                 half_angle_deg: 30.0,
                 bins: [6, 4],
+                layout: Default::default(),
             }
         });
     scene.validate().unwrap();
@@ -1580,4 +1581,358 @@ fn a_coated_plate_body_matches_f64() {
         worst < 2e-3,
         "the coating grid drifts further than documented: {worst}"
     );
+}
+
+/// A tube about +X, bore radius 5 in a 1 mm wall, 100 mm long, with `bore`,
+/// and a detector past its far end. Returns the detector.
+fn light_pipe(scene: &mut Scene3, bore: oc_core::tube::BoreFinish) -> ObjectId {
+    scene
+        .add_tube(
+            Vec3::ZERO,
+            0.0,
+            oc_core::tube::TubeDims {
+                inner_diameter_mm: 10.0,
+                outer_diameter_mm: 12.0,
+                length_mm: 100.0,
+            },
+            bore,
+        )
+        .expect("a tube");
+    add_rect_detector(scene, Vec3::new(70.0, 0.0, 0.0), -Vec3::X, 40.0, 40.0, [3, 3])
+}
+
+/// Rays into a light pipe: down the axis, a meridional zig-zag, two skew
+/// spirals, and one into the black end ring.
+fn pipe_rays(lambda_um: f64) -> Vec<(Vec3, Vec3, f64)> {
+    let slope = |deg: f64, z: f64| {
+        let t = deg.to_radians();
+        (Vec3::new(-60.0, 0.0, z), Vec3::new(t.cos(), t.sin(), 0.0), lambda_um)
+    };
+    vec![
+        (Vec3::new(-60.0, 0.0, 0.0), Vec3::X, lambda_um),
+        slope(15.0, 0.0),
+        slope(15.0, 3.0),
+        slope(22.0, -2.0),
+        (Vec3::new(-60.0, 5.5, 0.0), Vec3::X, lambda_um),
+    ]
+}
+
+/// A mirror-lined tube: every bounce in the preview lands where the reference
+/// puts it, and the flux out is the same `R^N`.
+#[test]
+fn a_mirror_lined_tube_matches_f64() {
+    let mut scene = Scene3::new();
+    let det = light_pipe(
+        &mut scene,
+        oc_core::tube::BoreFinish::Mirror { reflectivity: 0.9 },
+    );
+    scene.validate().unwrap();
+    for ray in pipe_rays(LAMBDA_D) {
+        assert_tree_matches(&scene, ray, false);
+    }
+    assert_detectors_match(&scene, &[det], &pipe_rays(LAMBDA_D), false);
+}
+
+/// A silver-lined tube: the paths are exact, and the flux carries only the
+/// coating grid's interpolation error, compounded over the bounces.
+#[test]
+fn a_silver_lined_tube_matches_f64_within_the_grid_tolerance() {
+    let mut scene = Scene3::new();
+    let det = light_pipe(
+        &mut scene,
+        oc_core::tube::BoreFinish::Metal {
+            metal: oc_core::tube::BoreMetal::Silver,
+            protected: true,
+        },
+    );
+    scene.validate().unwrap();
+    let mut worst: f64 = 0.0;
+    for lambda_um in [0.35, 0.45, 0.55, 0.80] {
+        let rays = pipe_rays(lambda_um);
+        for &ray in &rays {
+            assert_tree_geometry_matches(&scene, ray, false);
+        }
+        let (emitted, launch) = rays_at(&rays);
+        let f64_res = trace3(&scene, &launch, &cfg());
+        let gpu = GpuScene3::build_with_rays(&scene, &emitted, opts(false));
+        assert!(gpu.rejected.is_empty(), "rejects: {:?}", gpu.rejected);
+        let f32_res = cpu3::trace(&gpu, 32);
+        let a = f64_res
+            .detectors
+            .iter()
+            .find(|d| d.detector.0 == det.0)
+            .expect("f64 detector");
+        let b = f32_res.detector(det.0).expect("f32 detector");
+        assert_eq!(a.hits, b.hits, "hit count at {lambda_um}");
+        worst = worst.max((a.total_incident - b.total as f64).abs() / rays.len() as f64);
+    }
+    assert!(worst < 2e-3, "the silver grid drifts: {worst}");
+    eprintln!("worst per-ray flux drift through a silver pipe: {worst:.2e}");
+}
+
+// ---------------------------------------------------------------------------
+// Fresnel lens: a hundred annular facets and risers, each an exact face
+// ---------------------------------------------------------------------------
+
+fn fresnel_scene(lens: &oc_core::fresnel_lens::FresnelLens1) -> Scene3 {
+    let mut scene = Scene3::new();
+    let (nd, vd) = oc_core::fresnel_lens::PMMA_ND_VD;
+    scene
+        .add_fresnel_lens(Vec3::ZERO, 0.0, lens, Material::AbbePoint { nd, vd })
+        .expect("the lens builds");
+    scene
+}
+
+#[test]
+fn a_fresnel_lens_matches_f64_away_from_its_risers() {
+    // Rays through the middle of a zone, skew ones included: the f32 facet must
+    // be the f64 facet, shifted and clipped to its annulus.
+    let lens = oc_core::fresnel_lens::FresnelLens1::default();
+    let scene = fresnel_scene(&lens);
+    let gpu = GpuScene3::build(&scene, BuildOpts::default());
+    assert!(gpu.rejected.is_empty(), "rejected: {:?}", gpu.rejected);
+    let mut rays = Vec::new();
+    for j in 0..24 {
+        let h = j as f64 + 0.5;
+        let phi = 0.9 * j as f64;
+        rays.push((
+            Vec3::new(-30.0, h * phi.cos(), h * phi.sin()),
+            Vec3::new(1.0, 0.004, -0.003).normalize(),
+        ));
+    }
+    assert_landing_matches(&scene, &rays);
+}
+
+/// The fraction of a uniformly filled beam whose f32 path matches the f64 one
+/// (same hit count, every hit within the landing tolerance, same exit
+/// direction). A ray that lands within the medium probe of a riser can read the
+/// wrong side in f32; that is the whole of the disagreement.
+fn fresnel_agreement(lens: &oc_core::fresnel_lens::FresnelLens1, n: usize) -> f64 {
+    let scene = fresnel_scene(lens);
+    let tol = pos_tol(GpuScene3::build(&scene, BuildOpts::default()).norm.scale);
+    let rc = lens.clear_radius_mm;
+    let mut agree = 0usize;
+    for i in 0..n {
+        let r = 0.99 * rc * ((i as f64 + 0.5) / n as f64).sqrt();
+        let phi = i as f64 * 2.399_963_229_728_653;
+        let od = (
+            Vec3::new(-30.0, r * phi.cos(), r * phi.sin()),
+            Vec3::new(1.0, 0.002, 0.001).normalize(),
+        );
+        let (emitted, launch) = rays(std::slice::from_ref(&od));
+        let (a_hits, a_dir) = f64_landing(&trace3(&scene, &launch, &cfg()), 0, 1);
+        let gpu = GpuScene3::build_with_rays(
+            &scene,
+            &emitted,
+            BuildOpts {
+                ghosts: false,
+                flux_eps: 1e-9,
+                max_ghost: 0,
+            },
+        );
+        let (b_hits, b_dir) = f32_landing(&cpu3::trace_segments(&gpu, 32)[0]);
+        let same = a_hits.len() == b_hits.len()
+            && a_hits
+                .iter()
+                .zip(&b_hits)
+                .all(|(a, b)| (*a - *b).length() <= tol)
+            && (a_dir - b_dir).length() < 1e-3;
+        agree += same as usize;
+    }
+    agree as f64 / n as f64
+}
+
+#[test]
+fn a_fresnel_lens_matches_f64_across_a_filled_beam() {
+    for lens in [
+        oc_core::fresnel_lens::FresnelLens1::default(),
+        oc_core::fresnel_lens::FresnelLens1 {
+            draft_deg: 5.0,
+            facing: oc_core::fresnel_lens::FresnelFacing::MinusX,
+            ..oc_core::fresnel_lens::FresnelLens1::default()
+        },
+    ] {
+        let agree = fresnel_agreement(&lens, 600);
+        eprintln!("f32 vs f64 path agreement, {lens:?}: {agree:.4}");
+        assert!(agree >= 0.97, "only {agree} of the beam agrees");
+    }
+}
+
+/// Per-ray cost of the f32 CPU mirror through a Fresnel lens against a plain
+/// singlet of the same size. A measurement, not a check: run with
+/// `cargo test --release -p oc-gpu --features gpu3 --test cpu3_vs_f64 fresnel_preview_cost -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn fresnel_preview_cost() {
+    let big = oc_core::fresnel_lens::FresnelLens1 {
+        radius_mm: 100.0,
+        clear_radius_mm: 50.0,
+        grooves: oc_core::fresnel_lens::FresnelGrooves::ConstantPitch { pitch_mm: 0.5 },
+        ..oc_core::fresnel_lens::FresnelLens1::default()
+    };
+    for lens in [oc_core::fresnel_lens::FresnelLens1::default(), big] {
+        let rc = lens.clear_radius_mm;
+        let n = 20_000;
+        let od: Vec<(Vec3, Vec3)> = (0..n)
+            .map(|i| {
+                let r = 0.98 * rc * ((i as f64 + 0.5) / n as f64).sqrt();
+                let phi = i as f64 * 2.399_963_229_728_653;
+                (Vec3::new(-50.0, r * phi.cos(), r * phi.sin()), Vec3::X)
+            })
+            .collect();
+        let (emitted, _) = rays(&od);
+        let mut singlet = Scene3::new();
+        singlet.add_singlet(
+            Vec3::ZERO,
+            oc_core::build3::SingletGeom {
+                r1_mm: f64::INFINITY,
+                r2_mm: -lens.radius_mm,
+                thickness_mm: 2.0 + lens.radius_mm - (lens.radius_mm.powi(2) - rc * rc).sqrt(),
+                semi_aperture_mm: rc,
+                conic1: 0.0,
+                conic2: 0.0,
+            },
+            1.4917,
+            57.4,
+        );
+        for (name, scene) in [("fresnel", fresnel_scene(&lens)), ("singlet", singlet)] {
+            let gpu = GpuScene3::build_with_rays(&scene, &emitted, BuildOpts::default());
+            assert!(gpu.rejected.is_empty());
+            let t0 = std::time::Instant::now();
+            let segs = cpu3::trace_segments(&gpu, 32);
+            let dt = t0.elapsed().as_secs_f64();
+            let faces = gpu.bodies[0].revolve.as_ref().map_or(0, |r| r.faces.len());
+            let contour = gpu.bodies[0]
+                .revolve
+                .as_ref()
+                .map_or(0, |r| r.contour.len());
+            eprintln!(
+                "{name:8} R {} clear {rc}: {faces} faces, {contour} contour points, {:.2} us/ray ({} rays)",
+                lens.radius_mm,
+                1e6 * dt / n as f64,
+                segs.len()
+            );
+        }
+    }
+}
+
+/// A silvered facet on a Fresnel lens turns the ray back at that facet, in
+/// both tiers.
+#[test]
+fn a_mirrored_facet_on_a_fresnel_lens_is_the_facet_it_names() {
+    let lens = oc_core::fresnel_lens::FresnelLens1::default();
+    let mut scene = fresnel_scene(&lens);
+    let body = &mut scene.bodies[0];
+    let SolidGeometry3::Profile(p) = &body.geometry else {
+        panic!("a Fresnel lens is a revolved profile");
+    };
+    let (patch, lo, hi) = p
+        .profile
+        .edges
+        .iter()
+        .filter_map(|e| match e.curve {
+            Curve2::SagSegment { y0, y1, .. } if y0.min(y1) > 0.0 => {
+                Some((e.patch, y0.min(y1), y0.max(y1)))
+            }
+            _ => None,
+        })
+        .next_back()
+        .expect("facets above the axis");
+    let mirror = SurfaceResponse::Mirror {
+        reflectivity: SpectralScalar::Constant(0.9),
+    };
+    body.surface.overrides.push(oc_core::scene3::PatchResponseOverride {
+        patch,
+        response: oc_core::scene3::TwoSidedSurfaceResponse {
+            from_outside: mirror.clone(),
+            from_inside: mirror,
+        },
+    });
+    scene.validate().unwrap();
+    let h = 0.5 * (lo + hi);
+    let segs = assert_tree_matches(&scene, (Vec3::new(-30.0, h, 0.0), Vec3::X, LAMBDA_D), false);
+    let out = segs.last().unwrap();
+    assert!(
+        (out.b - out.a).x < 0.0,
+        "the silvered facet sends the ray back: {segs:?}"
+    );
+}
+
+/// A per-face response lands on the face it names, however many faces the
+/// preview cuts the profile into.
+///
+/// The preview's faces are not the profile's edges one for one: a polyline
+/// becomes a face per segment, and an edge below the axis becomes none. A
+/// response found by edge index then lands on a neighbour. Here the rim is a
+/// two-segment polyline ahead of the back face, so edge 2 (the back face) and
+/// face 2 (the rim's second segment) differ, and a silvered back face must
+/// still send the ray back.
+#[test]
+fn a_face_response_follows_its_patch_past_a_polyline() {
+    let mut scene = Scene3::new();
+    revolved_singlet(&mut scene, 30.0, -30.0, 6.0, 8.0, 1.5);
+    let SolidGeometry3::Profile(p) = &mut scene.bodies[0].geometry else {
+        unreachable!()
+    };
+    let Curve2::Line { a, b } = p.profile.edges[1].curve else {
+        unreachable!()
+    };
+    p.profile.edges[1].curve = Curve2::Polyline {
+        points: vec![a, (a + b) * 0.5, b],
+    };
+    let back = p.profile.edges[2].patch;
+    let mirror = SurfaceResponse::Mirror {
+        reflectivity: SpectralScalar::Constant(0.9),
+    };
+    scene.bodies[0]
+        .surface
+        .overrides
+        .push(oc_core::scene3::PatchResponseOverride {
+            patch: back,
+            response: oc_core::scene3::TwoSidedSurfaceResponse {
+                from_outside: mirror.clone(),
+                from_inside: mirror,
+            },
+        });
+    scene.validate().unwrap();
+    let segs = assert_tree_matches(&scene, (Vec3::new(-30.0, 2.0, 0.0), Vec3::X, LAMBDA_D), false);
+    let out = segs.last().unwrap();
+    assert!(
+        (out.b - out.a).x < 0.0,
+        "the silvered back face returns the ray: {segs:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Diffraction gratings
+// ---------------------------------------------------------------------------
+
+/// Both engines send each order where the grating equation says and split
+/// the flux the same way: reflection and transmission, both orders' signs,
+/// skew rays, and a wavelength whose working order is evanescent (only the
+/// zero order leaves).
+#[test]
+fn a_grating_matches_f64_order_for_order() {
+    for transmissive in [false, true] {
+        for order in [1, -1] {
+            let mut scene = Scene3::new();
+            let id = scene.add_grating(Vec3::ZERO, 50.0, 40.0, 160.0, 1200.0, transmissive);
+            if let Some(s) = scene.surfaces.iter_mut().find(|s| s.common.id.0 == id) {
+                for r in [&mut s.response_front, &mut s.response_back] {
+                    if let SurfaceResponse::Grating { order: o, .. } = r {
+                        *o = order;
+                    }
+                }
+            }
+            scene.validate().unwrap();
+            let toward = Vec3::new(-0.94, -0.34, 0.0).normalize();
+            for ray in [
+                (Vec3::new(30.0, 11.0, 0.0), toward, 0.45),
+                (Vec3::new(30.0, 11.0, 3.0), (toward + Vec3::new(0.0, 0.0, -0.1)).normalize(), 0.6),
+                (Vec3::new(30.0, 11.0, -2.0), toward, 1.6),
+            ] {
+                assert_tree_matches(&scene, ray, false);
+            }
+        }
+    }
 }

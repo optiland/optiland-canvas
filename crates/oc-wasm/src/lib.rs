@@ -40,6 +40,15 @@ pub mod gpu_preview;
 /// Cross-section of the 3D scene with the view plane (§10.4), for drawing the
 /// optical elements in the 2D layout.
 mod xsection;
+// Tubes, the sun and heliostats: the editor's side of `oc_core::tube` and
+// `oc_core::heliostat`.
+mod solar_ui;
+mod edit_ui;
+mod detector_ui;
+mod grating_ui;
+
+/// The Fresnel lens: add one, read its recipe, rebuild it from an edited one.
+mod fresnel;
 
 /// Render descriptors and display meshes for the GPU 3D view.
 pub mod render_view;
@@ -127,6 +136,10 @@ pub struct Canvas {
     /// [`auto_max_depth`]), so adding elements never truncates the rays.
     max_ghost: u32,
     ghosts: bool,
+    /// How many launch rays the f64 reference traces for its numbers
+    /// ([`Canvas::set_analysis_rays`]). 0, or any count below the scene's
+    /// own, traces the scene as the ray-density control sets it.
+    analysis_rays: u64,
     /// Freehand-fitted elements, keyed by element id (§5.3).
     fitted: HashMap<u32, FittedSurface>,
     /// Pinned `(element_id, param_code)` pairs — locked against edits (§5.2).
@@ -186,14 +199,37 @@ struct Pool3 {
     merge: Option<oc_trace::TraceMerge3>,
 }
 
+/// The launch rays `scene`'s sources emit: every origin with every direction,
+/// once per line of a line spectrum.
+fn launch_count(scene: &Scene3) -> f64 {
+    scene
+        .sources
+        .iter()
+        .map(|src| {
+            src.spectrum.ray_multiplicity() as f64
+                * src.samples.spatial_samples.max(1) as f64
+                * src.samples.angular_samples.max(1) as f64
+        })
+        .sum()
+}
+
 /// What a reference trace depends on besides the scene's revision: the ghost
-/// settings, which move no revision when toggled.
+/// settings and the analysis ray count, which move no revision when changed.
 #[derive(Clone, Copy, PartialEq)]
 struct ReferenceKey {
     revision: u64,
     ghosts: bool,
     max_ghost: u32,
+    analysis_rays: u64,
 }
+
+/// The most launch rays the reference traces for its numbers.
+const MAX_ANALYSIS_RAYS: u64 = 1_000_000_000;
+
+/// The most launch rays one pass of an analysis trace holds. A worker keeps
+/// one pass in memory, 144 bytes a ray (75 MB); more rays are traced as more
+/// passes ([`oc_trace::TraceBlocks3::with_passes`]).
+const PASS_RAYS: f64 = 524_288.0;
 
 #[wasm_bindgen]
 impl Canvas {
@@ -208,6 +244,7 @@ impl Canvas {
             // detector), still cheap. Raise it to hunt deeper stray light (§4.2).
             max_ghost: 2,
             ghosts: false,
+            analysis_rays: 0,
             fitted: HashMap::new(),
             param_pins: HashSet::new(),
             active_layer: 0,
@@ -252,6 +289,60 @@ impl Canvas {
         self.ghosts
     }
 
+    /// Trace the f64 reference's numbers with `rays` launch rays, up to a
+    /// billion; returns the count kept. 0, or any count at or below the rays
+    /// the scene's sources emit, traces the scene's own.
+    ///
+    /// Each source gets its share in proportion to the rays it emits now,
+    /// rounded to whole samples, so the count traced is close to `rays`
+    /// rather than equal to it ([`Canvas::launch_ray_counts`] says what it
+    /// is). Past half a million rays the trace runs in passes, each the
+    /// scene's point sets shifted afresh, and a worker holds one pass at a
+    /// time: the limit is time, not memory.
+    ///
+    /// The ray-density control sets how many rays the picture draws and the
+    /// preview traces, which has to stay cheap enough to follow a drag. The
+    /// numbers every panel quotes can afford more: they are traced in the
+    /// background, and a detector's pixels, cross-sections and colour
+    /// diagnostics are only as good as the rays behind them. The picture stays
+    /// the scene's own ([`oc_trace::TraceBlocks3::with_picture`]). Like the
+    /// ghost layer it is a trace setting, not part of the scene: it moves no
+    /// revision and is not saved.
+    #[wasm_bindgen(js_name = setAnalysisRays)]
+    pub fn set_analysis_rays(&mut self, rays: f64) -> f64 {
+        self.analysis_rays = if rays.is_finite() && rays > 0.0 {
+            (rays.round() as u64).min(MAX_ANALYSIS_RAYS)
+        } else {
+            0
+        };
+        self.analysis_rays as f64
+    }
+
+    /// The analysis ray count [`Canvas::set_analysis_rays`] set; 0 for the
+    /// scene's own.
+    #[wasm_bindgen(js_name = analysisRays)]
+    pub fn analysis_rays(&self) -> f64 {
+        self.analysis_rays as f64
+    }
+
+    /// The launch rays the scene's sources emit, the ones the reference
+    /// traces for its numbers at the analysis ray count, and the passes it
+    /// takes them in: `[scene, analysis, passes]`.
+    #[wasm_bindgen(js_name = launchRayCounts)]
+    pub fn launch_ray_counts(&self) -> Vec<f64> {
+        let Some(scene) = &self.scene3 else {
+            return vec![0.0, 0.0, 1.0];
+        };
+        match self.analysis_scene(scene) {
+            Some((more, passes)) => vec![
+                launch_count(scene),
+                launch_count(&more) * passes as f64,
+                passes as f64,
+            ],
+            None => vec![launch_count(scene), launch_count(scene), 1.0],
+        }
+    }
+
     /// Begin the f64 reference of the 3D scene as it is, to be traced a batch
     /// of launch rays at a time by [`Canvas::reference_step`], so a worker can
     /// return to its event loop between batches and drop the trace when a
@@ -271,7 +362,7 @@ impl Canvas {
         {
             return 0;
         }
-        let job = oc_trace::TraceJob3::new(scene.clone(), self.reference_cfg());
+        let job = self.reference_job(scene);
         let rays = job.progress().1 as u32;
         *self.reference_job.borrow_mut() = Some((key, job));
         rays
@@ -334,7 +425,15 @@ impl Canvas {
         if !matches!(pool.as_ref(), Some(p) if p.key == key) {
             *pool = Some(Pool3 {
                 key,
-                blocks: oc_trace::TraceBlocks3::new(scene.clone(), self.reference_cfg()),
+                blocks: match self.analysis_scene(scene) {
+                    Some((more, passes)) => oc_trace::TraceBlocks3::with_passes(
+                        more,
+                        passes,
+                        Some(scene),
+                        self.reference_cfg(),
+                    ),
+                    None => oc_trace::TraceBlocks3::new(scene.clone(), self.reference_cfg()),
+                },
                 part: None,
                 report: String::new(),
                 merge: None,
@@ -346,11 +445,11 @@ impl Canvas {
     /// The launch rays of the reference [`Canvas::pool_prepare`] prepared,
     /// in all blocks.
     #[wasm_bindgen(js_name = poolRays)]
-    pub fn pool_rays(&self) -> u32 {
+    pub fn pool_rays(&self) -> f64 {
         self.pool
             .borrow()
             .as_ref()
-            .map_or(0, |p| p.blocks.rays() as u32)
+            .map_or(0.0, |p| p.blocks.rays() as f64)
     }
 
     /// Begin block `block` of the pool's reference. `recordHits` is false for
@@ -1722,7 +1821,7 @@ impl Canvas {
     pub fn load_scene3_json(&mut self, json: &str) -> Result<String, JsError> {
         let (scene, report) = load_any(json).map_err(|e| JsError::new(&format!("{e:?}")))?;
         self.scene3 = Some(scene);
-        self.revision += 1;
+        self.bump();
         Ok(self.load_report_json(&report))
     }
 
@@ -2023,7 +2122,7 @@ impl Canvas {
         if scene.transform_objects(&raw, iso).is_err() {
             return false;
         }
-        self.revision += 1;
+        self.bump();
         true
     }
 
@@ -2080,7 +2179,7 @@ impl Canvas {
             _ => false,
         };
         if ok {
-            self.revision += 1;
+            self.bump();
         }
         ok
     }
@@ -2120,7 +2219,7 @@ impl Canvas {
             .map(|(i, w)| (w / 1000.0, if use_weights { weights[i] } else { 1.0 }))
             .collect();
         if scene.set_first_source_spectrum(&lines) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -2175,7 +2274,7 @@ impl Canvas {
             reflectivity,
         ) {
             Some(id) => {
-                self.revision += 1;
+                self.bump();
                 id as f64
             }
             None => -1.0,
@@ -2200,7 +2299,7 @@ impl Canvas {
             transmittance: SpectralScalar::Constant(1.0),
         };
         let id = scene.add_planar_element(Vec3::new(x, y, 0.0), radius.max(0.5), tilt_deg, front, back);
-        self.revision += 1;
+        self.bump();
         id as f64
     }
 
@@ -2237,7 +2336,7 @@ impl Canvas {
             extinction,
         ) {
             Some(id) => {
-                self.revision += 1;
+                self.bump();
                 id as f64
             }
             None => -1.0,
@@ -2274,7 +2373,7 @@ impl Canvas {
             retardance_deg,
         ) {
             Some(id) => {
-                self.revision += 1;
+                self.bump();
                 id as f64
             }
             None => -1.0,
@@ -2307,7 +2406,7 @@ impl Canvas {
             transmittance,
         ) {
             Some(id) => {
-                self.revision += 1;
+                self.bump();
                 id as f64
             }
             None => -1.0,
@@ -2343,7 +2442,7 @@ impl Canvas {
         };
         match scene.add_dichroic(Vec3::new(x, y, 0.0), radius.max(0.5), tilt_deg, spec) {
             Some(id) => {
-                self.revision += 1;
+                self.bump();
                 id as f64
             }
             None => -1.0,
@@ -2358,7 +2457,7 @@ impl Canvas {
             return false;
         };
         if scene.set_surface_split(id as u64, reflectance, transmittance) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -2390,7 +2489,7 @@ impl Canvas {
             t_max,
         };
         if scene.set_surface_dichroic(id as u64, spec) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -2486,7 +2585,7 @@ impl Canvas {
             return false;
         };
         if scene.set_polarizer_extinction_table(id as u64, aoi_deg, extinction) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -2521,7 +2620,7 @@ impl Canvas {
             design_lambda_um,
         };
         if scene.set_retarder_crystal(id as u64, Some(c)) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -2536,7 +2635,7 @@ impl Canvas {
             return false;
         };
         if scene.set_retarder_crystal(id as u64, None) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -2556,7 +2655,7 @@ impl Canvas {
             return false;
         };
         if scene.set_polarizing_substrate(id as u64, index) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -2571,7 +2670,7 @@ impl Canvas {
             return false;
         };
         if scene.set_polarization_axis(id as u64, axis_deg) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -2586,7 +2685,7 @@ impl Canvas {
             return false;
         };
         if scene.set_polarizer_extinction(id as u64, extinction) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -2601,7 +2700,7 @@ impl Canvas {
             return false;
         };
         if scene.set_retarder_retardance(id as u64, retardance_deg) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -2648,6 +2747,9 @@ impl Canvas {
                 SurfaceResponse::Polarizer { .. } | SurfaceResponse::Retarder { .. } => {
                     ("null".into(), "null".into())
                 }
+                // A grating's light leaves in new directions, not as R and T:
+                // `gratingJSON` carries its orders.
+                SurfaceResponse::Grating { .. } => ("null".into(), "null".into()),
             };
             let dichroic = DichroicSpec::from_response(r).map_or("null".into(), |d| {
                 format!(
@@ -2735,6 +2837,7 @@ impl Canvas {
                 SurfaceResponse::Polarizer { .. } | SurfaceResponse::Retarder { .. } => {
                     (None, None)
                 }
+                SurfaceResponse::Grating { .. } => (None, None),
             };
             out.push(rr.unwrap_or(f64::NAN));
             out.push(tt.unwrap_or(f64::NAN));
@@ -2901,7 +3004,7 @@ impl Canvas {
             return false;
         };
         if scene.set_object_coating_design(id as u64, design) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -2962,7 +3065,7 @@ impl Canvas {
             return false;
         };
         if scene.set_body_face_coating(id as u64, face, design) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -3012,7 +3115,7 @@ impl Canvas {
             return false;
         };
         if scene.set_object_layer_thickness(id as u64, index, nm) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -3064,7 +3167,7 @@ impl Canvas {
             n_low,
         ) {
             Some((_cube, diagonal)) => {
-                self.revision += 1;
+                self.bump();
                 diagonal as f64
             }
             None => -1.0,
@@ -3096,7 +3199,7 @@ impl Canvas {
             long_pass,
         ) {
             Some(id) => {
-                self.revision += 1;
+                self.bump();
                 id.0 as f64
             }
             None => -1.0,
@@ -3131,7 +3234,7 @@ impl Canvas {
             long_pass,
         ) {
             Some(id) => {
-                self.revision += 1;
+                self.bump();
                 id as f64
             }
             None => -1.0,
@@ -3148,7 +3251,7 @@ impl Canvas {
             return false;
         };
         if scene.set_surface_response(id as u64, front, back) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -3178,7 +3281,7 @@ impl Canvas {
             return -1.0;
         };
         let id = scene.add_aperture(Vec3::new(x, y, 0.0), opening.max(0.2), tilt_deg);
-        self.revision += 1;
+        self.bump();
         id as f64
     }
 
@@ -3194,12 +3297,12 @@ impl Canvas {
         let normal = Vec3::new(phi.cos(), phi.sin(), 0.0);
         let h = half.max(0.5);
         let id = scene.add_area_detector(Vec3::new(x, y, 0.0), normal, h, h, [64, 64]);
-        self.revision += 1;
+        self.bump();
         id.0 as f64
     }
 
-    /// Set what a detector measures: `"power"`, `"irradiance"` or
-    /// `"intensity"`. Returns false if `id` is not a detector or the request
+    /// Set what a detector measures: `"power"`, `"irradiance"`,
+    /// `"intensity"` or `"illuminance"` (lux, with each pixel's colour). Returns false if `id` is not a detector or the request
     /// does not hold up.
     ///
     /// `half_angle_deg` is read only for intensity, where it is the cone the
@@ -3220,16 +3323,25 @@ impl Canvas {
         let want = match measure {
             "power" => M::Power,
             "irradiance" => M::Irradiance,
-            "intensity" => M::Intensity {
-                half_angle_deg: half_angle_deg.clamp(0.1, 90.0),
-                // Whatever the detector already had, so flipping away and
-                // back does not quietly rescale the histogram; `[24, 1]` is
-                // the I(theta) curve a detector starts with.
-                bins: match d_measure {
-                    Some(M::Intensity { bins, .. }) => bins,
-                    _ => [24, 1],
-                },
-            },
+            "illuminance" => M::Illuminance,
+            "intensity" => {
+                // Whatever the detector already had, so changing the cone
+                // does not quietly rescale the histogram. A detector new to
+                // intensity starts on the grid: the far field with straight
+                // axes, which cross-sections cut through.
+                let (bins, layout) = match d_measure {
+                    Some(M::Intensity { bins, layout, .. }) => (bins, layout),
+                    _ => (
+                        detector_ui::GRID_BINS,
+                        oc_core::scene3::DirectionLayout::Grid,
+                    ),
+                };
+                M::Intensity {
+                    half_angle_deg: half_angle_deg.clamp(0.1, 90.0),
+                    bins,
+                    layout,
+                }
+            }
             _ => return false,
         };
         let Some(d) = scene.detectors.iter_mut().find(|d| d.common.id.0 == id as u64) else {
@@ -3249,7 +3361,7 @@ impl Canvas {
                 .measure = was;
             return false;
         }
-        self.revision += 1;
+        self.bump();
         true
     }
 
@@ -3317,7 +3429,7 @@ impl Canvas {
         if !scene.set_detector_pixels(id as u64, [nu, nv]) {
             return false;
         }
-        self.revision += 1;
+        self.bump();
         true
     }
 
@@ -3337,7 +3449,7 @@ impl Canvas {
         if !scene.set_detector_direction_bins(id as u64, r, s) {
             return false;
         }
-        self.revision += 1;
+        self.bump();
         true
     }
 
@@ -3367,7 +3479,7 @@ impl Canvas {
             return false;
         };
         if scene.set_aperture_opening(id as u64, inner, outer) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -3383,7 +3495,7 @@ impl Canvas {
             return -1.0;
         };
         let id = scene.add_prism(Vec3::new(x, y, 0.0), side, tilt_deg, nd, vd);
-        self.revision += 1;
+        self.bump();
         id as f64
     }
 
@@ -3395,7 +3507,7 @@ impl Canvas {
             return false;
         };
         if scene.set_surface_tilt_z_deg(id as u64, deg) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -3412,7 +3524,7 @@ impl Canvas {
         match scene.sources.first_mut() {
             Some(src) => {
                 src.samples.spatial_samples = samples.max(1);
-                self.revision += 1;
+                self.bump();
                 true
             }
             None => false,
@@ -3435,7 +3547,7 @@ impl Canvas {
             return false;
         };
         body.common.transform.pos = Vec3::new(x, y, z);
-        self.revision += 1;
+        self.bump();
         true
     }
 
@@ -3443,8 +3555,9 @@ impl Canvas {
     /// JSON `{hits, totalIncident, totalSignal, pixelArea, faceArea,
     /// meanIrradiance, face, centroid, meanOpl, bins, incident, measure, unit,
     /// coneDeg, coneBins, cells, solidAngle, outsideCone, peak, dop, dolp,
-    /// azimuthDeg, stokes, maxTiltDeg}`, or `null` if there is no such
-    /// detector. `face` is [`Canvas::detector_face_json`]'s reply, so the
+    /// azimuthDeg, stokes, maxTiltDeg, colour}`, or `null` if there is no such
+    /// detector. `colour` is each pixel's `(X, Y, Z)` scaled like the lux in
+    /// `cells`, flattened, under illuminance, and `null` otherwise. `face` is [`Canvas::detector_face_json`]'s reply, so the
     /// cells can be drawn to scale; `totalIncident` is the flux on the whole
     /// face, which every view of the detector quotes.
     ///
@@ -3497,10 +3610,28 @@ impl Canvas {
         // reader that wants the histogram itself is not made to undo a
         // division.
         let (readings, unit) = d.readings();
+        // Under the sun and nothing else, flux is watts: the sun is the one
+        // calibrated source. Any other source makes the sum relative again.
+        let calibrated = scene.solar.is_some() && scene.sources.len() == 1;
+        let unit = if calibrated {
+            unit.replacen("flux", "W", 1)
+        } else if unit == "lx" {
+            // Lux need watts; with relative flux the scale is relative too.
+            "lx (relative)".to_string()
+        } else {
+            unit.to_string()
+        };
+        // Under illuminance, each pixel's (X, Y, Z) on the same scale as the
+        // lux in `cells`, flattened, for drawing the face in true colour.
+        let colour = d.colour_per_m2().map_or("null".to_string(), |c| {
+            let v: Vec<String> = c.iter().flatten().map(|x| format!("{x}")).collect();
+            format!("[{}]", v.join(","))
+        });
         let cells: Vec<String> = readings.iter().map(|v| format!("{v}")).collect();
         let (measure, cone) = match d.measure {
             oc_core::scene3::DetectorMeasure::Power => ("power", "null".to_string()),
             oc_core::scene3::DetectorMeasure::Irradiance => ("irradiance", "null".to_string()),
+            oc_core::scene3::DetectorMeasure::Illuminance => ("illuminance", "null".to_string()),
             oc_core::scene3::DetectorMeasure::Intensity { half_angle_deg, .. } => {
                 ("intensity", format!("{half_angle_deg}"))
             }
@@ -3516,7 +3647,11 @@ impl Canvas {
             .direction_grid()
             .map_or((0, 0), |(_, r, sct)| (r, sct));
         format!(
-            "{{\"hits\":{},\"totalIncident\":{},\"totalSignal\":{},\"pixelArea\":{},\"faceArea\":{},\"meanIrradiance\":{},\"face\":{},\"centroid\":{},\"meanOpl\":{},\"bins\":[{},{}],\"incident\":[{}],\"measure\":\"{}\",\"unit\":\"{}\",\"coneDeg\":{},\"coneBins\":[{},{}],\"cells\":[{}],\"solidAngle\":[{}],\"outsideCone\":{},\"peak\":{},\"dop\":{},\"dolp\":{},\"azimuthDeg\":{},\"stokes\":[{},{},{},{}],\"maxTiltDeg\":{}}}",
+            "{{\"colour\":{},\"directionLayout\":{},\"spectral\":{},\"spectralUntracked\":{},\"hits\":{},\"totalIncident\":{},\"totalSignal\":{},\"pixelArea\":{},\"faceArea\":{},\"meanIrradiance\":{},\"face\":{},\"centroid\":{},\"meanOpl\":{},\"bins\":[{},{}],\"incident\":[{}],\"measure\":\"{}\",\"unit\":\"{}\",\"coneDeg\":{},\"coneBins\":[{},{}],\"cells\":[{}],\"solidAngle\":[{}],\"outsideCone\":{},\"peak\":{},\"dop\":{},\"dolp\":{},\"azimuthDeg\":{},\"stokes\":[{},{},{},{}],\"maxTiltDeg\":{}}}",
+            colour,
+            detector_ui::layout_json(&d.measure),
+            detector_ui::spectral_json(d),
+            json_num(d.spectral_untracked_flux),
             d.hits,
             d.total_incident,
             d.total_signal,
@@ -3820,7 +3955,7 @@ impl Canvas {
         let scene = Scene3::default_scene();
         let body_id = scene.bodies.first().map_or(0, |b| b.common.id.0);
         self.scene3 = Some(scene);
-        self.revision += 1;
+        self.bump();
         body_id as f64
     }
 
@@ -3832,7 +3967,7 @@ impl Canvas {
             return false;
         };
         if scene.set_object_position(id as u64, Vec3::new(x, y, z)) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -3847,7 +3982,7 @@ impl Canvas {
             return false;
         };
         if scene.set_object_rotation_z_deg(id as u64, deg) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -3924,7 +4059,7 @@ impl Canvas {
             conic2,
         };
         if scene.set_singlet_geom(id as u64, g) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -4073,7 +4208,7 @@ impl Canvas {
             conic2,
         };
         if scene.set_singlet_shape(id as u64, g, SingletAspheres { front, back }) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -4091,7 +4226,7 @@ impl Canvas {
             return false;
         };
         if scene.bend_singlet_face(id as u64, back, rim_sag) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -4115,7 +4250,7 @@ impl Canvas {
         }
         let pts: Vec<(f64, f64)> = heights.iter().copied().zip(sags.iter().copied()).collect();
         if scene.fit_singlet_face(id as u64, back, &pts) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -4130,7 +4265,7 @@ impl Canvas {
             return false;
         };
         if scene.set_body_glass_abbe(id as u64, nd, vd) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -4145,7 +4280,7 @@ impl Canvas {
             return false;
         };
         if scene.delete_object(id as u64) {
-            self.revision += 1;
+            self.bump();
             true
         } else {
             false
@@ -4161,7 +4296,7 @@ impl Canvas {
         };
         match scene.clone_body(id as u64, Vec3::new(dx, dy, dz)) {
             Some(new_id) => {
-                self.revision += 1;
+                self.bump();
                 new_id.0 as f64
             }
             None => -1.0,
@@ -4299,7 +4434,7 @@ fn detector_face_json(d: &oc_core::scene3::Detector3) -> Option<String> {
     let [pu, pv] = d.pixel_pitch_mm()?;
     let direction = match d.measure {
         M::Intensity { bins, .. } => format!("[{},{}]", bins[0], bins[1]),
-        M::Power | M::Irradiance => "null".into(),
+        M::Power | M::Irradiance | M::Illuminance => "null".into(),
     };
     Some(format!(
         "{{\"shape\":\"{shape}\",\"width\":{},\"height\":{},\"inner\":{},\"pixels\":[{},{}],\"pitch\":[{},{}],\"pixelArea\":{},\"faceArea\":{},\"directionBins\":{direction},\"maxCells\":{MAX_DETECTOR_CELLS}}}",
@@ -4316,6 +4451,19 @@ fn detector_face_json(d: &oc_core::scene3::Detector3) -> Option<String> {
 }
 
 impl Canvas {
+    /// Every edit to the 3D scene ends here: the revision moves, so a result
+    /// traced before the edit is recognised as stale, and a sun rig is
+    /// re-resolved, so a heliostat follows a target that was just dragged and
+    /// the sun beam follows the heliostat, and so is every link, so an element
+    /// locked to another follows it. Resolving is a few dozen flops per
+    /// heliostat or link, cheaper than deciding which edits could have mattered.
+    fn bump(&mut self) {
+        self.revision += 1;
+        if let Some(scene) = self.scene3.as_mut() {
+            scene.resolve_constraints();
+        }
+    }
+
     /// The compiled f32 scene the interactive preview traces, on the CPU mirror
     /// or the GPU. `None` until a 3D scene is loaded.
     pub(crate) fn fast_scene(&self) -> Option<oc_gpu::scene3::GpuScene3> {
@@ -4345,7 +4493,7 @@ impl Canvas {
         if !scene.set_detector_geometry(id as u64, g) {
             return false;
         }
-        self.revision += 1;
+        self.bump();
         true
     }
 
@@ -4354,6 +4502,10 @@ impl Canvas {
             ghosts: self.ghosts,
             max_ghost_bounces: self.max_ghost,
             max_depth: self.depth3(),
+            bounds_mm: self
+                .scene3
+                .as_ref()
+                .map_or(TraceConfig3::default().bounds_mm, oc_trace::bounds_for_scene3),
             revision: self.revision,
             ..TraceConfig3::default()
         }
@@ -4391,7 +4543,7 @@ impl Canvas {
                 return std::rc::Rc::clone(&r.result);
             }
         }
-        let mut job = oc_trace::TraceJob3::new(scene.clone(), self.reference_cfg());
+        let mut job = self.reference_job(scene);
         while !job.step(usize::MAX) {}
         let result = std::rc::Rc::new(job.finish());
         *self.reference.borrow_mut() = Some(Reference3 {
@@ -4402,8 +4554,47 @@ impl Canvas {
         result
     }
 
+    /// The reference trace of `scene`: its numbers at the analysis ray
+    /// count, its picture at the scene's own.
+    fn reference_job(&self, scene: &Scene3) -> oc_trace::TraceJob3 {
+        match self.analysis_scene(scene) {
+            Some((more, passes)) => {
+                oc_trace::TraceJob3::with_passes(more, passes, Some(scene), self.reference_cfg())
+            }
+            None => oc_trace::TraceJob3::new(scene.clone(), self.reference_cfg()),
+        }
+    }
+
+    /// One pass of `scene` sampled for [`Canvas::analysis_rays`] launch rays,
+    /// and the passes that make them up; `None` when the scene's own rays are
+    /// as many. Each pass holds at most [`PASS_RAYS`]. A source with an
+    /// extent gets more origins; a point source, which has one, gets more
+    /// directions. Flux per ray falls to match, so every total stays what it
+    /// was and only the noise drops.
+    fn analysis_scene(&self, scene: &Scene3) -> Option<(Scene3, u32)> {
+        let own = launch_count(scene);
+        let target = self.analysis_rays as f64;
+        if own <= 0.0 || target <= own {
+            return None;
+        }
+        let passes = (target / PASS_RAYS).ceil().max(1.0);
+        let k = target / passes / own;
+        let mut more = scene.clone();
+        for src in &mut more.sources {
+            let s = &mut src.samples;
+            let grow = |n: u32| ((n.max(1) as f64 * k).round().max(1.0)).min(u32::MAX as f64) as u32;
+            if matches!(src.spatial, oc_core::scene3::SpatialDistribution3::Point) {
+                s.angular_samples = grow(s.angular_samples);
+            } else {
+                s.spatial_samples = grow(s.spatial_samples);
+            }
+        }
+        Some((more, passes as u32))
+    }
+
     fn reference_key(&self) -> ReferenceKey {
         ReferenceKey {
+            analysis_rays: self.analysis_rays,
             revision: self.revision,
             ghosts: self.ghosts,
             max_ghost: self.max_ghost,
@@ -4668,6 +4859,11 @@ fn body_radius(b: &oc_core::scene3::Body3) -> f64 {
             half_length_mm,
             ..
         } => radius_mm.hypot(*half_length_mm),
+        SolidGeometry3::Tube {
+            outer_radius_mm,
+            half_length_mm,
+            ..
+        } => outer_radius_mm.hypot(*half_length_mm),
         SolidGeometry3::Profile(p) => {
             let r = p
                 .profile
@@ -4682,6 +4878,17 @@ fn body_radius(b: &oc_core::scene3::Body3) -> f64 {
                     Curve2::Arc {
                         center, radius_mm, ..
                     } => vec![center.length() + radius_mm],
+                    Curve2::SagSegment {
+                        base,
+                        coeffs,
+                        y0,
+                        y1,
+                    } => [*y0, *y1]
+                        .iter()
+                        .map(|t| {
+                            oc_core::geom3::profile::sag_segment_point(base, coeffs, *t).length()
+                        })
+                        .collect(),
                 })
                 .fold(0.0_f64, f64::max);
             r.max(1.0)
@@ -4776,6 +4983,8 @@ pub(crate) fn surface_object_kind(s: &oc_core::scene3::SurfaceObject3) -> &'stat
         "dichroic"
     } else if f == "split" || b == "split" {
         "beamsplitter"
+    } else if f == "grating" || b == "grating" {
+        "grating"
     } else if f == "polarizer" || f == "retarder" {
         // Named, because "surface" tells a reader nothing and these two are
         // not interchangeable: one absorbs half the light and one absorbs none.
@@ -4837,6 +5046,7 @@ fn body_kind_construction(b: &oc_core::scene3::Body3) -> (&'static str, &'static
         SolidGeometry3::Sphere { .. } => ("sphere", "analytic"),
         SolidGeometry3::Box { .. } => ("box", "analytic"),
         SolidGeometry3::Cylinder { .. } => ("cylinder", "analytic"),
+        SolidGeometry3::Tube { .. } => ("tube", "analytic"),
         // A coated plate is a revolved solid like any lens, and calling it one
         // tells you nothing about what it is for. Its film is the component.
         //

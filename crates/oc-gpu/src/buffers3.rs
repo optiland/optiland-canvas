@@ -45,10 +45,16 @@ pub const RESP_THIN_LENS: u32 = 4;
 /// A baked thin-film coating: `r.tab_start` points at
 /// `COAT_ANGLES × COAT_LAMBDAS` `(R, T)` pairs in `verts`, row-major by angle.
 pub const RESP_COATING: u32 = 5;
+/// A diffraction grating: `r` its working order's efficiency, `t` the zero
+/// order's, and `ar.value` the order times the groove density per µm.
+pub const RESP_GRATING: u32 = 6;
 /// `Response3Buf::flags`: the reflection is stray light, an AR coat's
 /// residual, and so a ghost rather than a designed path. Must match the
 /// shader's `RESP_FLAG_STRAY`.
 pub const RESP_FLAG_STRAY: u32 = 1;
+/// `Response3Buf::flags`: a transmission grating. Must match the shader's
+/// `RESP_FLAG_TRANSMIT`.
+pub const RESP_FLAG_TRANSMIT: u32 = 2;
 
 // Out-of-range policies of a tabulated response scalar.
 pub const POLICY_ERROR: u32 = 0;
@@ -157,7 +163,7 @@ pub struct Face3Buf {
     /// Sag: `(vertex_x, axis_sign, c, k)`; frustum: `(x0,y0,x1,y1)`; arc:
     /// `(center_x, r, a0, a1)`.
     pub a: [f32; 4],
-    /// Sag: `(outer_r, 0, 0, 0)`.
+    /// Sag: `(outer_r, inner_r, 0, 0)`.
     pub b: [f32; 4],
     /// Sag aspheric coefficients A4.. (unused by frustum/arc).
     pub coeffs: [f32; 8],
@@ -366,6 +372,7 @@ fn encode_response(resp: &GpuResponse, verts: &mut Vec<Vert3Buf>) -> Response3Bu
     let zero = constant(0.0);
     let flags = match resp {
         GpuResponse::CoatingGrid { stray: true, .. } => RESP_FLAG_STRAY,
+        GpuResponse::Grating { transmit: true, .. } => RESP_FLAG_TRANSMIT,
         _ => 0,
     };
     let (kind, r, t, ar) = match resp {
@@ -377,6 +384,10 @@ fn encode_response(resp: &GpuResponse, verts: &mut Vec<Vert3Buf>) -> Response3Bu
             (RESP_EXPLICIT_RT, r, encode_spectral(t, verts), zero)
         }
         GpuResponse::ThinLens { f } => (RESP_THIN_LENS, constant(*f), zero, zero),
+        GpuResponse::Grating { k, eta, zero: z0, .. } => {
+            let r = encode_spectral(eta, verts);
+            (RESP_GRATING, r, encode_spectral(z0, verts), constant(*k))
+        }
         GpuResponse::CoatingGrid { lambdas, rt, .. } => {
             // Both halves live in `verts`, which is already a list of pairs:
             // the wavelength axis in the `t` slot, the grid itself in `r`. The
@@ -439,6 +450,33 @@ fn pack_body(b: &GpuBody3, verts: &mut Vec<Vert3Buf>, faces: &mut Vec<Face3Buf>)
         contour_start = verts.len() as u32;
         verts.extend(rev.contour.iter().map(|p| [p.x, p.y]));
         contour_count = rev.contour.len() as u32;
+        // A many-edged body's contour index rides in the fields a revolved body
+        // does not otherwise use: its tables at `verts[poly_start..]`, bucket
+        // count in `poly_count`, and its `x` slab in `z_min`/`z_max`. Integers
+        // go in as exact f32 values. See `indexed_poly_contains` in the shader.
+        if let Some(ix) = &rev.index {
+            poly_start = verts.len() as u32;
+            poly_count = ix.buckets.len() as u32;
+            verts.push([ix.y0, ix.inv_h]);
+            verts.extend(ix.buckets.iter().map(|&(s, c)| [s as f32, c as f32]));
+            verts.extend(ix.items.iter().map(|&i| [i as f32, 0.0]));
+            z_min = ix.x_lo;
+            z_max = ix.x_hi;
+        }
+    } else if !b.face_resp.is_empty() {
+        // An analytic body with per-face responses (a tube): its faces need no
+        // geometry here, only a slot for the response, indexed by the face
+        // number its own hit routine reports.
+        face_start = faces.len() as u32;
+        for resp in &b.face_resp {
+            let mut packed = Face3Buf::zeroed();
+            if let Some(resp) = resp {
+                packed.has_resp = 1;
+                packed.resp = encode_response(resp, verts);
+            }
+            faces.push(packed);
+        }
+        face_count = b.face_resp.len() as u32;
     }
     Body3Buf {
         rot0,
@@ -487,6 +525,7 @@ fn pack_face(f: &RevFace) -> Face3Buf {
             c,
             k,
             coeffs,
+            inner_r,
             outer_r,
             is_conic,
         } => Face3Buf {
@@ -496,7 +535,7 @@ fn pack_face(f: &RevFace) -> Face3Buf {
             resp: zero_response(),
             _p1: 0,
             a: [*vertex_x, *axis_sign, *c, *k],
-            b: [*outer_r, 0.0, 0.0, 0.0],
+            b: [*outer_r, *inner_r, 0.0, 0.0],
             coeffs: *coeffs,
         },
         RevFace::Frustum { x0, y0, x1, y1 } => Face3Buf {

@@ -1488,6 +1488,103 @@ impl Scene3 {
         self.planar_surface(pos, normal, radius_mm, front, back)
     }
 
+    /// Add a plane diffraction grating at `pos`: a `width_mm` × `height_mm`
+    /// rectangle whose normal is tilted `tilt_deg` in the meridional (XY)
+    /// plane like [`Self::add_planar_element`], with its grooves along world
+    /// `Z`, so it disperses in the meridional plane. `transmissive` makes a
+    /// transmission grating; otherwise its front reflects and its back
+    /// absorbs. First order at 65% and 10% left in the zero order, the
+    /// figures of a good holographic grating in the visible, until they are
+    /// set. Returns the new surface's id.
+    pub fn add_grating(
+        &mut self,
+        pos: Vec3,
+        width_mm: f64,
+        height_mm: f64,
+        tilt_deg: f64,
+        lines_per_mm: f64,
+        transmissive: bool,
+    ) -> u64 {
+        let phi = tilt_deg.to_radians();
+        let z = Vec3::new(phi.cos(), phi.sin(), 0.0);
+        // Grooves (local Y) along world Z; local X across them, in the plane.
+        let y = Vec3::Z;
+        let x = y.cross(z);
+        let q = glam::DQuat::from_mat3(&glam::DMat3::from_cols(x, y, z));
+        let transform =
+            Isometry3::new(pos, [q.x, q.y, q.z, q.w]).unwrap_or_else(|_| Isometry3::from_pos(pos));
+        let id = self.alloc_object_id();
+        let mut common = ObjectCommon::new(id, LayerId(0));
+        common.transform = transform;
+        common.label = "Grating".into();
+        let grating = SurfaceResponse::Grating {
+            lines_per_mm,
+            order: 1,
+            efficiency: SpectralScalar::Constant(0.65),
+            zero_order: SpectralScalar::Constant(0.10),
+            transmissive,
+            tm: None,
+        };
+        self.surfaces.push(SurfaceObject3 {
+            common,
+            geometry: SurfaceGeometry3::Plane {
+                shape: PlanarShape2::Rectangle {
+                    half_width_mm: 0.5 * width_mm.max(0.5),
+                    half_height_mm: 0.5 * height_mm.max(0.5),
+                },
+            },
+            response_front: grating.clone(),
+            response_back: if transmissive { grating } else { SurfaceResponse::Absorber },
+        });
+        id.0
+    }
+
+    /// Change grating `id`: its groove density, its order, whether it
+    /// transmits, and, when given, a constant efficiency for the working
+    /// order and for the zero order (replacing any table). A reflection
+    /// grating's back absorbs; a transmission grating diffracts from either
+    /// side. False, and nothing changed, if `id` is not a grating or the
+    /// result does not validate.
+    pub fn set_grating(
+        &mut self,
+        id: u64,
+        lines_per_mm: f64,
+        order: i32,
+        transmissive: bool,
+        efficiency: Option<f64>,
+        zero_order: Option<f64>,
+    ) -> bool {
+        let Some(s) = self.surfaces.iter_mut().find(|s| s.common.id.0 == id) else {
+            return false;
+        };
+        let SurfaceResponse::Grating {
+            efficiency: e0,
+            zero_order: z0,
+            tm: tm0,
+            ..
+        } = &s.response_front
+        else {
+            return false;
+        };
+        // A constant set by hand is one number for both polarizations, so it
+        // drops a TM table it would contradict.
+        let tm = if efficiency.is_some() || zero_order.is_some() { None } else { tm0.clone() };
+        let grating = SurfaceResponse::Grating {
+            lines_per_mm,
+            order,
+            efficiency: efficiency.map_or_else(|| e0.clone(), SpectralScalar::Constant),
+            zero_order: zero_order.map_or_else(|| z0.clone(), SpectralScalar::Constant),
+            transmissive,
+            tm,
+        };
+        if grating.validate("grating").is_err() {
+            return false;
+        }
+        s.response_back = if transmissive { grating.clone() } else { SurfaceResponse::Absorber };
+        s.response_front = grating;
+        true
+    }
+
     /// Set a surface object's front/back responses from kind strings
     /// (`mirror`/`absorb`/`clear`/`refract`). False for an unknown kind or a
     /// non-surface id.
@@ -1697,6 +1794,31 @@ impl Scene3 {
             })
     }
 
+    /// Lay a detector's intensity histogram out as `layout`, with `bins`
+    /// cells: `[rings, sectors]` polar, `[across, down]` on a grid. False,
+    /// with the scene unchanged, for a detector that measures something else,
+    /// a count of zero, or a grid past [`crate::scene3::MAX_DETECTOR_CELLS`].
+    pub fn set_detector_direction_layout(
+        &mut self,
+        id: u64,
+        layout: crate::scene3::DirectionLayout,
+        bins: [usize; 2],
+    ) -> bool {
+        let is_intensity = self.detectors.iter().any(|d| {
+            d.common.id.0 == id && matches!(d.measure, DetectorMeasure::Intensity { .. })
+        });
+        is_intensity
+            && self.edit_area_detector(id, |d| {
+                if let DetectorMeasure::Intensity {
+                    bins: b, layout: l, ..
+                } = &mut d.measure
+                {
+                    *b = bins;
+                    *l = layout;
+                }
+            })
+    }
+
     /// Apply `edit` to the area detector `id`, then keep it only if the scene
     /// still validates; otherwise put the detector back as it was.
     fn edit_area_detector(&mut self, id: u64, edit: impl FnOnce(&mut Detector3)) -> bool {
@@ -1825,6 +1947,42 @@ impl Scene3 {
             }
         }
         true
+    }
+
+    /// An aperture's clear opening and its mask (`None`: unbounded in its
+    /// plane). `None` if `id` is not an aperture.
+    pub fn aperture_shape(&self, id: u64) -> Option<(PlanarShape2, Option<PlanarShape2>)> {
+        let a = self.apertures.iter().find(|a| a.common.id.0 == id)?;
+        Some((a.shape.clear_opening.clone(), a.shape.outer_extent.clone()))
+    }
+
+    /// Give an aperture a new opening and mask, each sized on its own. The
+    /// opening has to lie inside the mask with a rim to spare, or the mask
+    /// would block nothing on that side. Refused, with the scene unchanged, for
+    /// a size that is not positive and finite, an opening that does not fit,
+    /// or an id that is not an aperture.
+    pub fn set_aperture_shape(
+        &mut self,
+        id: u64,
+        opening: PlanarShape2,
+        mask: Option<PlanarShape2>,
+    ) -> Result<(), String> {
+        if let Some(m) = &mask {
+            if !opening_fits(&opening, m) {
+                return Err("the opening does not fit inside the mask".into());
+            }
+        }
+        let Some(i) = self.apertures.iter().position(|a| a.common.id.0 == id) else {
+            return Err(format!("#{id} is not an aperture"));
+        };
+        let was = self.apertures[i].shape.clone();
+        self.apertures[i].shape.clear_opening = opening;
+        self.apertures[i].shape.outer_extent = mask;
+        if let Err(e) = self.validate() {
+            self.apertures[i].shape = was;
+            return Err(e.to_string());
+        }
+        Ok(())
     }
 
     /// Replace a singlet body's geometry, keeping its aspheric terms. Rejects
@@ -2139,7 +2297,7 @@ impl Scene3 {
     }
 
     /// The transform of whichever object or source carries `id`.
-    fn object_transform_mut(&mut self, id: u64) -> Option<&mut Isometry3> {
+    pub(crate) fn object_transform_mut(&mut self, id: u64) -> Option<&mut Isometry3> {
         if let Some(b) = self.bodies.iter_mut().find(|b| b.common.id.0 == id) {
             return Some(&mut b.common.transform);
         }
@@ -2156,6 +2314,35 @@ impl Scene3 {
             return Some(&mut s.transform);
         }
         None
+    }
+}
+
+/// Does `opening` lie strictly inside `mask`? Both centred on the aperture's
+/// axis. A polygon is judged by its farthest vertex.
+fn opening_fits(opening: &PlanarShape2, mask: &PlanarShape2) -> bool {
+    // (half width, half height, farthest point) of the opening.
+    let (hw, hh, r) = match opening {
+        PlanarShape2::Disc { radius_mm } => (*radius_mm, *radius_mm, *radius_mm),
+        PlanarShape2::Annulus { outer_mm, .. } => (*outer_mm, *outer_mm, *outer_mm),
+        PlanarShape2::Rectangle {
+            half_width_mm,
+            half_height_mm,
+        } => (*half_width_mm, *half_height_mm, half_width_mm.hypot(*half_height_mm)),
+        PlanarShape2::Polygon { vertices } => {
+            let r = vertices.iter().fold(0.0_f64, |m, v| m.max(v.length()));
+            (r, r, r)
+        }
+    };
+    match mask {
+        PlanarShape2::Disc { radius_mm } => r < *radius_mm,
+        PlanarShape2::Annulus { outer_mm, .. } => r < *outer_mm,
+        PlanarShape2::Rectangle {
+            half_width_mm,
+            half_height_mm,
+        } => hw < *half_width_mm && hh < *half_height_mm,
+        PlanarShape2::Polygon { vertices } => {
+            r < vertices.iter().fold(f64::INFINITY, |m, v| m.min(v.length()))
+        }
     }
 }
 
@@ -2284,6 +2471,7 @@ pub fn response_kind(r: &SurfaceResponse) -> &'static str {
         SurfaceResponse::Retarder { .. } => "retarder",
         SurfaceResponse::DielectricFresnel { .. } => "refract",
         SurfaceResponse::ThinLens { .. } => "thin-lens",
+        SurfaceResponse::Grating { .. } => "grating",
     }
 }
 

@@ -165,6 +165,7 @@ fn the_direction_grid_runs_rings_fastest() {
     d.measure = DetectorMeasure::Intensity {
         half_angle_deg: 50.0,
         bins: [5, 4],
+        layout: Default::default(),
     };
 
     let d = &scene.detectors[0];

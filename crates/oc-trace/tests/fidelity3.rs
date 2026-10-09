@@ -16,11 +16,12 @@ use oc_trace::{trace3, trace_scene3, TraceConfig3};
 const GOLDEN: &str = include_str!("data/pre_profile_corpus3.json");
 
 /// Two fingerprint lines agree: to the bit on Windows, where the golden file
-/// was recorded, and elsewhere to 4 ulp per number with every count and word
-/// exact. The pre-profile kernel itself gives a different last bit on Linux
-/// (a source's emitted flux sums to 1.0 there and 0.9999999999999999 on
-/// Windows), because the platforms' `sin` and `cos` differ by an ulp; a
-/// change the profile made would be far larger than that.
+/// was recorded, and elsewhere to 1e-12 of the launched flux (which is 1) plus
+/// 1e-12 relative, with every count and word exact. The platforms' `sin` and
+/// `cos` differ by an ulp, so the pre-profile kernel itself traces a few ulp
+/// apart on Linux, more on quantities that are differences of large ones (an
+/// absorbed residual of 6e-16 moves by 2e-17); a change the profile made would
+/// be orders of magnitude larger.
 fn same_line(got: &str, want: &str) -> bool {
     if cfg!(windows) || got == want {
         return got == want;
@@ -31,7 +32,7 @@ fn same_line(got: &str, want: &str) -> bool {
             a == b
                 || match (a.parse::<f64>(), b.parse::<f64>()) {
                     (Ok(x), Ok(y)) if a.contains(['.', 'e']) && b.contains(['.', 'e']) => {
-                        (x - y).abs() <= 4.0 * f64::EPSILON * x.abs().max(y.abs())
+                        (x - y).abs() <= 1e-12 * (1.0 + x.abs().max(y.abs()))
                     }
                     _ => false,
                 }

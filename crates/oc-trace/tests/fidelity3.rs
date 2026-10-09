@@ -21,12 +21,19 @@ const GOLDEN: &str = include_str!("data/pre_profile_corpus3.json");
 /// `cos` differ by an ulp, so the pre-profile kernel itself traces a few ulp
 /// apart on Linux, more on quantities that are differences of large ones (an
 /// absorbed residual of 6e-16 moves by 2e-17); a change the profile made would
-/// be orders of magnitude larger.
+/// be orders of magnitude larger. The number of deposit records is not
+/// compared off Windows: a deposit is booked for every residual above zero,
+/// and residuals of 1e-16 change sign with the platform (1990 against 1942 on
+/// the two-dichroic scene); their sum is compared.
 fn same_line(got: &str, want: &str) -> bool {
     if cfg!(windows) || got == want {
         return got == want;
     }
-    let (g, w): (Vec<&str>, Vec<&str>) = (got.split(' ').collect(), want.split(' ').collect());
+    let (mut g, mut w): (Vec<&str>, Vec<&str>) = (got.split(' ').collect(), want.split(' ').collect());
+    if g.first() == Some(&"deposits") && w.first() == Some(&"deposits") {
+        g.remove(1);
+        w.remove(1);
+    }
     g.len() == w.len()
         && g.iter().zip(&w).all(|(a, b)| {
             a == b

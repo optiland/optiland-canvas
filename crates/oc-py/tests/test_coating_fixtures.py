@@ -9,6 +9,7 @@ references, not a library release moving under it.
 from __future__ import annotations
 
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -40,11 +41,24 @@ def test_the_fixtures_were_made_by_the_scripts_in_the_tree():
     assert not stale, f"regenerate with `python tests/gen_coating_fixtures.py`: {stale}"
 
 
+def _same(a, b) -> bool:
+    """Equal, floats to a few ulp: a quarter wave at 45 degrees goes through
+    `math.cos`, which differs in the last bit between platforms; the frozen
+    stack is the one the oracles were fed, and the one compared."""
+    if isinstance(a, float) and isinstance(b, float):
+        return math.isclose(a, b, rel_tol=1e-15, abs_tol=0.0)
+    if isinstance(a, dict) and isinstance(b, dict):
+        return a.keys() == b.keys() and all(_same(a[k], b[k]) for k in a)
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(_same(x, y) for x, y in zip(a, b))
+    return a == b
+
+
 @pytest.mark.parametrize("name", list(coating_cases.CASES))
 def test_the_fixture_describes_the_case(name):
     doc = _load(name)
     stack, n0, nf, _ = coating_cases.CASES[name]
-    assert doc["stack"] == stack and doc["n_incident"] == n0 and doc["n_far"] == nf
+    assert _same(doc["stack"], stack) and doc["n_incident"] == n0 and doc["n_far"] == nf
     assert doc["lambda_um"] == coating_cases.lambdas_for(name) and doc["aoi_deg"] == coating_cases.angles_for(name)
 
 

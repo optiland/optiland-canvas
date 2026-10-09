@@ -15,9 +15,33 @@ use oc_trace::{trace3, trace_scene3, TraceConfig3};
 
 const GOLDEN: &str = include_str!("data/pre_profile_corpus3.json");
 
+/// Two fingerprint lines agree: to the bit on Windows, where the golden file
+/// was recorded, and elsewhere to 4 ulp per number with every count and word
+/// exact. The pre-profile kernel itself gives a different last bit on Linux
+/// (a source's emitted flux sums to 1.0 there and 0.9999999999999999 on
+/// Windows), because the platforms' `sin` and `cos` differ by an ulp; a
+/// change the profile made would be far larger than that.
+fn same_line(got: &str, want: &str) -> bool {
+    if cfg!(windows) || got == want {
+        return got == want;
+    }
+    let (g, w): (Vec<&str>, Vec<&str>) = (got.split(' ').collect(), want.split(' ').collect());
+    g.len() == w.len()
+        && g.iter().zip(&w).all(|(a, b)| {
+            a == b
+                || match (a.parse::<f64>(), b.parse::<f64>()) {
+                    (Ok(x), Ok(y)) if a.contains(['.', 'e']) && b.contains(['.', 'e']) => {
+                        (x - y).abs() <= 4.0 * f64::EPSILON * x.abs().max(y.abs())
+                    }
+                    _ => false,
+                }
+        })
+}
+
 /// C33, first half: `Standard` is the pre-profile kernel, to the bit, on every
 /// corpus scene and configuration. The golden file was recorded at 212c747,
-/// before the profile existed (`record_corpus3.rs`).
+/// before the profile existed (`record_corpus3.rs`), on Windows; see
+/// [`same_line`] for the other platforms.
 #[test]
 fn standard_reproduces_the_pre_profile_kernel_bit_for_bit() {
     let golden: serde_json::Value = serde_json::from_str(GOLDEN).unwrap();
@@ -28,7 +52,8 @@ fn standard_reproduces_the_pre_profile_kernel_bit_for_bit() {
             let got = corpus3::fingerprint(&case.trace(&cfg));
             let want: Vec<String> = serde_json::from_value(golden[case.name][name].clone())
                 .unwrap_or_else(|e| panic!("no golden for {} / {name}: {e}", case.name));
-            assert_eq!(got, want, "{} under {name}", case.name);
+            let same = got.len() == want.len() && got.iter().zip(&want).all(|(g, w)| same_line(g, w));
+            assert!(same, "{} under {name}:\n  got  {got:?}\n  want {want:?}", case.name);
             compared += 1;
         }
     }

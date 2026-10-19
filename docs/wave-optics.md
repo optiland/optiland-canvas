@@ -163,8 +163,9 @@ between neighbouring samples at the window edge.
 ## The wave path
 
 `oc_wave::path` (feature `scene`) carries a coherent beam through a scene,
-from a source to a rectangular detector. The f64 tracer's chief ray decides
-where the beam goes; the field decides what arrives. This is the coupling
+from a source to a rectangular detector, along every chain by which the
+source's axial ray reaches it. The f64 tracer's chief ray decides where the
+beam goes; the field decides what arrives. This is the coupling
 ADR 0003 chose: rays for the layout, fields for the diffraction, joined by
 optical path [17].
 
@@ -182,9 +183,11 @@ let result = wave_path(&scene, &spec, revision)?;   // power per detector pixel,
 let spec = WavePathSpec::for_source(&scene, source, detector, 512, 4.0)?;
 ```
 
-**How the path is planned.** `extract_sequence3`
+**How the path is planned.** `extract_sequences3`
 ([ADR 0002](architecture/adr/0002-sequence-extraction-from-the-trace.md)) gives
-the chain of surfaces the chief ray meets. The tracer logs no event when a ray
+each chain of surfaces the chief ray meets on its way to the detector, at
+each of the source's lines; there are several where splitter arms recombine
+on the detector (below). The tracer logs no event when a ray
 passes an aperture's opening, so the path intersects the chief ray with every
 aperture plane itself and inserts the crossings. The field rides in a frame
 across the chief ray, its transverse axes carried round each turn by the
@@ -196,8 +199,8 @@ incoming ray to the plane across the outgoing one:
 
 | Element | What the field does | Exact? |
 |---|---|---|
-| flat mirror | mirror image, amplitude `√R`; what it does not reflect is absorbed | yes, in scalar optics (image theory [1]) |
-| beam-splitter arm (`ExplicitRt`) | `√R` or `√T` on the arm the chain took; the other arm's share is booked as `other_arm`, the rest as absorbed | as the element's R and T |
+| flat mirror | mirror image, amplitude `−√R`; what it does not reflect is absorbed | yes, in scalar optics (image theory [1]) |
+| beam-splitter arm (`ExplicitRt`) | `−√R` reflected from its front, `+√R` from its back, `√T` transmitted, on the arm the chain took; the other arm's share is booked as `other_arm`, the rest as absorbed | as the element's R and T; the signs make it unitary (below) |
 | grating | its order's momentum along the grooves, amplitude `√η`; the other orders are booked as `untracked_orders` | thin element |
 | ideal thin lens | `exp(−ik\|r − c\|²/2f)` about the lens's centre | thin element |
 | a flat element's outline | the element acts inside its own shape, the edge weighted by exact cell coverage; light outside passes it by, on the chain where the chain goes straight on (a transmitted arm, a thin lens), off it as `passed_by` where the chain turns (a mirror, a grating's order) | thin element |
@@ -296,12 +299,58 @@ order: an iris on a Lee hologram's −1 order, off the chief ray, would block
 the chief ray itself. The wave path does not follow an order yet; the ray
 tracer's orders model (`RayModel::Orders`) traces them as rays.
 
+**Interferometers: arms that meet.** Where splitter arms recombine on the
+detector, the axial ray reaches it by several chains. Each carries the same
+launched field along its own arm, and the arms' fields are added on the
+detector's own grid, `s × s` points a pixel (two for `Readout::Projected`),
+before the power is formed. That is the coherent sum of paths the
+scattering-network formulation asks for (`T = C(I − SP)⁻¹SB`, here a network
+without feedback, so a finite sum of paths). It needs three things the single
+chain did not:
+
+- **One phase clock.** The samples carry the whole phase (above), and every
+  arm starts from the same launched field, so the arms' fields on the same
+  points of the face add as they are.
+- **Unitary splitters.** A lossless splitter must send all its power out of
+  its two ports whatever the phase between its inputs. Real amplitudes `√R`,
+  `√T` on both arms do not: a Mach–Zehnder's two outputs would carry
+  `1 + cos Δφ` of the input between them. The splitter is given the signs of a
+  dielectric interface's two-port, the Stokes relations [23], [24]: reflection
+  `−√R` from its front and `+√R` from its back, transmission `√T` both ways; a
+  perfect conductor is that interface's limit, so a mirror reflects `−√R`.
+  These are conventions where a real coating would fix the phases; they move
+  fringes, never the power. The Mach–Zehnder test holds the sum to 1 at every
+  phase.
+- **A ledger for a network.** Each arm's own losses are counted, an event the
+  arms share once (they carry one field until they part). What a splitter
+  sends into another arm is not lost, so a splitter several arms meet books
+  no `other_arm`; the light that leaves by the ports no arm reads (a
+  recombining splitter's other output, what misses the detector once the arms
+  meet) is then the remainder, `other_ports`, named and never a check.
+
+Each arm's field is weighted on the face by the root of its obliquity, so that
+one arm alone reads as it would by itself. Two arms crossing at an angle make
+fringes of period `λ/|t₁ − t₂|`, `t` the directions' components along the face;
+a period under two of the readout's points is flagged `Undersampled`. The
+field is scalar, so the arms' polarizations are taken as the same and the
+fringes' visibility is an upper bound (named in the report). An arm read out
+at a tilt goes through the tilted-plane spectrum, whose reading between
+spectral samples is its approximation (5.9e-4 in its own test).
+
+**Several lines.** A source of spectral lines is a set of mutually incoherent
+modes [22]: each line runs coherently through every chain at its own
+wavelength, its chains traced at that wavelength, with its share of the
+power, and the lines add in power. So two lines' fringes wash out where they
+fall in antiphase, which the two-line test holds. The field shown is the
+strongest line's.
+
 **Refused, by name:** polarizers and retarders (the field is scalar), any
-response with no wave model, an aperture inside a face's slab, and a source of
-more than one wavelength: a coherent field has one, and summing lines
-incoherently is not done yet. A refusal is an error naming what was refused;
-nothing is skipped and nothing is run at a wavelength the source did not ask
-for.
+response with no wave model, an aperture inside a face's slab, an LCoS whose
+two polarization beams both reach the detector (they add in power, and a
+scalar field carries one), a continuous spectrum (give the source lines: a
+sampling of it is the source's to choose), and more than 16 lines. A refusal
+is an error naming what was refused; nothing is skipped and nothing is run at
+a wavelength the source did not ask for.
 
 **In steps.** `WaveJob::new` plans the chain and launches the beam;
 `WaveJob::step(n)` carries the field through `n` more events (the free space
@@ -360,6 +409,12 @@ These are acceptance case C53, in `crates/oc-wave/tests/path.rs`.
 | `a_lens_rim_smaller_than_the_beam_stops_and_diffracts_as_an_iris_against_it` | a 1 mm iris 1.5 µm before a lens too large to clip; the lens rim itself, with exact cover | power 3e-4; spot 2e-3 of peak | 1.1e-4 (the back face's rim stops 9e-4 of what reaches it, which is real); 3.5e-4 |
 | `an_lcos_on_the_path_sends_half_of_unpolarized_light_into_each_beam` | half of what the device meets in the unmodulated beam [26]; `sinc²(1/16)` of the modulated half in the first order [31] | 2e-3; 3e-3 | 5.9e-7; −2.0e-3 |
 | `a_glass_plate_delays_the_beam_by_its_optical_path` | `k₀(n − 1)t` less the Gouy change of the effective length [13] | 1e-4 rad | 2.6e-6 rad |
+| `a_mach_zehnder_sends_all_the_power_out_of_its_two_ports_whatever_the_path_difference` | a lossless network is unitary: the two ports carry the input between them, `(1 ∓ cos Δφ)/2` each, at Δφ = 0, π/2, π, 3π/2 [23], [24] | sum 1e-3; share 2e-3 | sum 1.000; share within 1e-7 |
+| `a_michelson_with_a_tilted_mirror_makes_fringes_of_period_lambda_over_sin_2_alpha` | two arms crossing at 2α make fringes `λ/sin 2α` apart [1]; read from the power's spectrum across the face | 2e-3 | −7.1e-5 (the beams' curvature accounts for −3.5e-5) |
+| `moving_a_michelson_mirror_by_d_shifts_its_fringes_by_two_k_d` | four steps of λ/8 are four of π/2: `P₀ + P₂ = P₁ + P₃`; visibility 1; equal arms dark [1] | 1e-3; 0.995 | 2.8e-7; 1.000 |
+| `two_lines_wash_a_michelson_s_fringes_out_where_their_beats_cancel` | two incoherent lines [22]: visibility `\|cos(2πΔ(1/λ₁ − 1/λ₂))\|`, 1 at equal arms, 0 where the beats cancel | 0.99; 2e-2 | 0.9996; 1.6e-3 |
+| `a_continuous_source_is_refused_and_lines_add_in_power` | the lines' own runs, weighted; a continuum refused by name | 1e-12 | 1.8e-15 |
+| `an_lcos_whose_two_polarization_beams_both_reach_the_detector_is_refused_by_name` | orthogonal polarizations do not interfere [20] | refused | refused |
 
 The propagation tests of W8 (acceptance case C57, `crates/oc-wave/tests/propagate.rs`):
 
@@ -405,7 +460,8 @@ Every call returns a `WaveReport`:
 ```text
 launched = detected + absorbed_aperture + absorbed_element + band_limit_removed
          + beyond_nyquist + evanescent + left_window + other_family
-         + untracked_orders + other_arm + passed_by + resampling + numerical
+         + untracked_orders + other_arm + passed_by + resampling
+         + other_ports + numerical
 ```
 
 That it sums to what was launched is bookkeeping, not a check: `numerical`
@@ -526,7 +582,9 @@ The coating fixtures keep their own pin, `optiland==0.6.1`
 - **Lenses face by face.** A face is traced across its sag in the geometric
   limit; diffraction is taken between faces, not inside a face's slab.
 - **On a wave path, the beam follows the chief ray.** Steering onto a chosen
-  diffraction order is W7.
+  diffraction order is W7. Arms that recombine are added once: a cavity's
+  round trips (an etalon's, a Fabry–Perot's) are not followed, and a plate's
+  two faces do not interfere.
 - **No measured datasets.** Every reference above is a closed-form result or
   another implementation of the same integral. The DMD page compares with
   published device numbers, and says which are simulations.
@@ -577,5 +635,10 @@ entry says so.
 18. Optiland, https://github.com/optiland/optiland, `master` at `1e0513902c68948a727394c6226f3580c7261c65` (2026-10-14), cloned 2026-10-19: the oracle for C45.
 
 19. J. E. Harvey et al., "Linear systems formulation of non-paraxial scalar diffraction theory," *Proc. SPIE* 8122, 812205 (2011), doi:10.1117/12.894562. (The obliquity factor that keeps a beam's power through an element it leaves at another angle.)
+20. Z. Zhang, Z. You, D. Chu, "Fundamentals of phase-only liquid crystal on silicon (LCOS) devices," *Light Sci. Appl.* 3, e213 (2014), doi:10.1038/lsa.2014.94. (An LCoS modulates the field along its director only.)
+21. G. J. Swanson, "Binary optics technology: the theory and design of multi-level diffractive optical elements," MIT Lincoln Laboratory Technical Report 854 (1989), DTIC ADA213404. (An N-level staircase's first order, `sinc²(1/N)`.)
+22. E. Wolf, "New theory of partial coherence in the space–frequency domain. Part I: spectra and cross spectra of steady-state sources," *J. Opt. Soc. Am.* 72(3), 343–351 (1982), doi:10.1364/JOSA.72.000343. (Mutually incoherent modes add in power.)
+23. G. G. Stokes, "On the perfect blackness of the central spot in Newton's rings, and on the verification of Fresnel's formulae for the intensities of reflected and refracted rays," *Cambridge and Dublin Mathematical Journal* 4, 1–14 (1849). (The Stokes relations: `r' = −r`, `tt' = 1 − r²`.)
+24. A. Zeilinger, "General properties of lossless beam splitters in interferometry," *Am. J. Phys.* 49(9), 882–883 (1981), doi:10.1119/1.12387. (A lossless splitter is a unitary two-port. DOI to confirm.)
 
 The FFT is `rustfft` 6.4.1 (MIT OR Apache-2.0).

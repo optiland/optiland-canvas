@@ -58,6 +58,7 @@ use oc_core::modulator::{DmdState, LcosBeam, ModulatorKind};
 use oc_core::scene3::{DetectorGeometry3, PlanarShape2, Scene3, SurfaceGeometry3, SurfaceResponse};
 use oc_core::seq3::{SeqAction, SeqHitKind};
 use oc_core::{Isometry3, Vec3};
+use std::sync::Arc;
 
 /// The coherent beam a wave path launches: the scene's own type, which a
 /// source carries as its `coherence` and the document saves.
@@ -332,6 +333,7 @@ fn merge(total: &mut WaveReport, step: WaveReport) {
     t.other_arm += l.other_arm;
     t.passed_by += l.passed_by;
     t.resampling += l.resampling;
+    t.other_ports += l.other_ports;
     t.numerical += l.numerical;
     total.steps.extend(step.steps);
     for w in step.warnings {
@@ -444,24 +446,29 @@ enum Ev {
     End,
 }
 
-/// A wave path in resumable steps, for a worker that must be able to drop a
-/// stale job between steps: [`WaveJob::new`] plans the chain and launches
-/// the beam, each [`WaveJob::step`] carries the field through a number of
-/// the chain's events (the free space up to an event and the element there),
-/// and [`WaveJob::finish`] reads the detector. However the work is sliced,
-/// the result is the same to the bit: [`wave_path`] is this job run in one
-/// step.
-///
-/// The job keeps its own copy of the scene, so it answers for the revision
-/// it was started at whatever happens to the scene meanwhile.
-pub struct WaveJob {
-    scene: Scene3,
+/// One chain of a wave path: the beam carried along one branch lineage of
+/// the axial ray, at one wavelength.
+struct ChainJob {
+    scene: Arc<Scene3>,
     spec: WavePathSpec,
-    revision: u64,
     lam: f64,
+    /// The beam's power on this chain, and the index it is launched into.
+    power: f64,
+    n0: f64,
+    /// The field is laid out only when the chain first runs, so a job of
+    /// many chains holds one full field at a time.
+    launched: bool,
+    /// Read out onto the detector's own grid, to be added to other arms.
+    face: bool,
     /// Each event: where the field reaches it, where it leaves from (the
     /// same point except after a transfer), and what it is.
     points: Vec<(Vec3, Vec3, Ev)>,
+    /// An identity per event, for finding the events chains share.
+    keys: Vec<String>,
+    /// The splitter met at an event, if a splitter (`ExplicitRt`) it was.
+    arms: Vec<Option<u64>>,
+    /// The ledger at the launch and after each event.
+    ledgers: Vec<WaveLedger>,
     next: usize,
     beam: Beam,
     u: Field2,
@@ -469,86 +476,56 @@ pub struct WaveJob {
     fft: Fft2,
 }
 
-impl std::fmt::Debug for WaveJob {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WaveJob")
-            .field("revision", &self.revision)
-            .field("events", &self.points.len())
-            .field("done", &self.next)
-            .finish_non_exhaustive()
+/// The field a source launches on `grid`, with the ledger of the launch.
+fn launch_field(spec: &WavePathSpec, grid: Grid2, lam: f64, n0: f64, power: f64, beam: &Beam) -> Result<(Field2, WaveLedger), WaveError> {
+    let mut u = match spec.beam {
+        BeamProfile::Gaussian { waist_radius_mm, waist_offset_mm } => {
+            GaussianBeam { w0_mm: waist_radius_mm, lambda_um: lam, n: n0, power, center: [0.0, 0.0] }.sample(grid, -waist_offset_mm)?
+        }
+        BeamProfile::TopHat { radius_mm } => {
+            // The disc's edge weighted by exact cell coverage, as an
+            // aperture's is.
+            let a = (power / (std::f64::consts::PI * radius_mm * radius_mm)).sqrt();
+            let cover = crate::elements::coverage(&grid, &crate::elements::Shape::Disc { c: [0.0, 0.0], r: radius_mm })?;
+            let mut u = Field2::zeros(grid, lam)?.in_medium(n0)?;
+            for (z, c) in u.data.iter_mut().zip(&cover) {
+                *z = Cx::real(a * c);
+            }
+            u
+        }
+    };
+    u.frame = beam.iso();
+    // The source launches its power; what the samples do not hold is the
+    // Gaussian's tail beyond the window, or the top-hat's edge diffracted
+    // beyond the grid's band.
+    let mut ledger = WaveLedger { launched: power, ..Default::default() };
+    let short = power - u.power();
+    match spec.beam {
+        BeamProfile::TopHat { .. } => ledger.beyond_nyquist += short,
+        BeamProfile::Gaussian { .. } if short >= 0.0 => ledger.left_window += short,
+        BeamProfile::Gaussian { .. } => ledger.resampling += short,
     }
+    Ok((u, ledger))
 }
 
-impl WaveJob {
-    /// Plan the chain from `spec.source` to `spec.detector` and launch the
-    /// beam at the source.
-    pub fn new(scene: &Scene3, spec: &WavePathSpec, revision: u64) -> Result<Self, WaveError> {
-        if !(spec.power.is_finite() && spec.power > 0.0 && spec.window_mm > 0.0 && spec.grid_n >= 8) {
-            return Err(WaveError::OutOfRange("a wave path needs power, a window and at least 8 samples".into()));
-        }
-        let seq = oc_trace::extract_sequence3(scene, spec.source, spec.detector, revision)
-            .map_err(|e| WaveError::OutOfRange(format!("no chain from the source to the detector: {e}")))?;
+impl ChainJob {
+    /// Plan the events along `seq` and frame the beam at the source; the
+    /// field is launched when the chain first steps.
+    fn new(scene: &Arc<Scene3>, spec: &WavePathSpec, seq: oc_core::seq3::SequencePrescription3, power: f64, face: bool) -> Result<Self, WaveError> {
         let src = scene
             .sources
             .iter()
             .find(|s| s.id == spec.source)
             .ok_or_else(|| WaveError::OutOfRange("no such source".into()))?;
-        // A coherent field has one wavelength. Lines summed incoherently, or
-        // a continuum sampled into lines, are not done yet: refused by name
-        // rather than run at whichever wavelength the chief ray drew.
-        match &src.spectrum {
-            oc_core::scene::Spectrum::Monochromatic(_) => {}
-            oc_core::scene::Spectrum::Lines(v) if v.len() == 1 => {}
-            oc_core::scene::Spectrum::Lines(v) => {
-                return Err(WaveError::OutOfRange(format!(
-                    "source #{} emits {} lines; the wave path is coherent at one wavelength (summing lines is not done yet): give it a single line",
-                    spec.source.0,
-                    v.len()
-                )))
-            }
-            oc_core::scene::Spectrum::Continuum(_) => {
-                return Err(WaveError::OutOfRange(format!(
-                    "source #{} emits a continuous spectrum; the wave path is coherent at one wavelength: give it a single line",
-                    spec.source.0
-                )))
-            }
-        }
         let lam = seq.launch.lambda_um;
         let d0 = seq.launch.dir.normalize();
         let x0 = src.transform.rotate(Vec3::Y);
         let x0 = (x0 - d0 * d0.dot(x0)).normalize();
         let beam = Beam { origin: seq.launch.point, x: x0, y: d0.cross(x0), d: d0 };
         let n0 = seq.hits.first().map_or(scene.env.ambient_index, |h| h.n_before);
-        let grid = Grid2::square(spec.grid_n, spec.window_mm / spec.grid_n as f64)?;
-        let mut u = match spec.beam {
-            BeamProfile::Gaussian { waist_radius_mm, waist_offset_mm } => {
-                GaussianBeam { w0_mm: waist_radius_mm, lambda_um: lam, n: n0, power: spec.power, center: [0.0, 0.0] }
-                    .sample(grid, -waist_offset_mm)?
-            }
-            BeamProfile::TopHat { radius_mm } => {
-                // The disc's edge weighted by exact cell coverage, as an
-                // aperture's is.
-                let a = (spec.power / (std::f64::consts::PI * radius_mm * radius_mm)).sqrt();
-                let cover = crate::elements::coverage(&grid, &crate::elements::Shape::Disc { c: [0.0, 0.0], r: radius_mm })?;
-                let mut u = Field2::zeros(grid, lam)?.in_medium(n0)?;
-                for (z, c) in u.data.iter_mut().zip(&cover) {
-                    *z = Cx::real(a * c);
-                }
-                u
-            }
-        };
-        u.frame = beam.iso();
-        // The source launches its power; what the samples do not hold is the
-        // Gaussian's tail beyond the window, or the top-hat's edge diffracted
-        // beyond the grid's band.
-        let mut ledger = WaveLedger { launched: spec.power, ..Default::default() };
-        let short = spec.power - u.power();
-        match spec.beam {
-            BeamProfile::TopHat { .. } => ledger.beyond_nyquist += short,
-            BeamProfile::Gaussian { .. } if short >= 0.0 => ledger.left_window += short,
-            BeamProfile::Gaussian { .. } => ledger.resampling += short,
-        }
-        let report = WaveReport { ledger, ..Default::default() };
+        // A placeholder until the chain runs.
+        let u = Field2::zeros(Grid2::square(1, 1.0)?, lam)?.in_medium(n0)?;
+        let report = WaveReport { ledger: WaveLedger { launched: power, ..Default::default() }, ..Default::default() };
 
         // The chain's events. Each face of a body, and each curved surface, is
         // a transfer across the thin slab that holds the surface where the
@@ -638,12 +615,31 @@ impl WaveJob {
             points.push((p, after, ev));
             prev = after;
         }
-        Ok(WaveJob {
-            scene: scene.clone(),
+        let keys = points
+            .iter()
+            .map(|(p, _, ev)| {
+                let at = format!("{:.6},{:.6},{:.6}", p.x, p.y, p.z);
+                match ev {
+                    Ev::Hit(h) => format!("hit {} {:?} {at}", h.object.0, h.action),
+                    Ev::Aperture(ai) => format!("aperture {ai} {at}"),
+                    Ev::Transfer { hit, .. } => format!("transfer {} {:?} {at}", hit.object.0, hit.action),
+                    Ev::End => format!("end {at}"),
+                }
+            })
+            .collect();
+        let arms = vec![None; points.len()];
+        Ok(ChainJob {
+            scene: Arc::clone(scene),
             spec: *spec,
-            revision,
             lam,
+            power,
+            n0,
+            launched: false,
+            face,
             points,
+            keys,
+            arms,
+            ledgers: Vec::new(),
             next: 0,
             beam,
             u,
@@ -652,27 +648,22 @@ impl WaveJob {
         })
     }
 
-    /// The scene revision the job answers for.
-    pub fn revision(&self) -> u64 {
-        self.revision
-    }
-
-    /// The chain's events (surfaces, aperture planes, the detector), and how
-    /// many the field has been carried through.
-    pub fn events(&self) -> usize {
-        self.points.len()
-    }
-    pub fn done(&self) -> usize {
-        self.next
-    }
-
     /// Carry the field through up to `events` more events. `Ok(true)` once
     /// the whole chain is done; an element the field has no model for is an
     /// error naming it, and the job is not resumable after one.
-    pub fn step(&mut self, events: usize) -> Result<bool, WaveError> {
+    fn step(&mut self, events: usize) -> Result<bool, WaveError> {
+        if !self.launched {
+            let grid = Grid2::square(self.spec.grid_n, self.spec.window_mm / self.spec.grid_n as f64)?;
+            let (u, ledger) = launch_field(&self.spec, grid, self.lam, self.n0, self.power, &self.beam)?;
+            self.u = u;
+            self.report.ledger = ledger;
+            self.ledgers = vec![ledger];
+            self.launched = true;
+        }
         let end = self.next.saturating_add(events).min(self.points.len());
         while self.next < end {
             self.event(self.next)?;
+            self.ledgers.push(self.report.ledger);
             self.next += 1;
         }
         Ok(self.next == self.points.len())
@@ -702,6 +693,7 @@ impl WaveJob {
     /// booked by cause: a mirror's absorption, a splitter's other arm
     /// (`other_arm`) and what it absorbs, a grating's other orders
     /// (`untracked_orders`).
+    #[allow(clippy::too_many_arguments)]
     fn flat_element(
         &mut self,
         s: &oc_core::scene3::SurfaceObject3,
@@ -710,6 +702,7 @@ impl WaveJob {
         p: Vec3,
         n_s: Vec3,
         out: &Beam,
+        from_front: bool,
     ) -> Result<(), WaveError> {
         let lam = self.lam;
         let beam = self.beam;
@@ -730,15 +723,23 @@ impl WaveJob {
         let unit = |v: Option<f64>| v.map(|x| x.clamp(0.0, 1.0));
         // The amplitude inside the outline, a thin lens's focal length and
         // centre, and where the rest goes.
+        //
+        // The amplitudes' signs make every lossless element unitary, so that
+        // arms recombined after it conserve power. A splitter is the two-port
+        // of a dielectric interface (bundle M14; the Stokes relations):
+        // reflection −√R from its front, +√R from its back, transmission √T
+        // both ways; a perfect conductor is that interface's limit, so a
+        // mirror reflects −√R. One phase per element is a convention a real
+        // coating fixes otherwise, and it moves fringes, never the power.
         let (amp, lens, loss): (f64, Option<(f64, Vec3)>, Loss) = match (response, h.action) {
             (SurfaceResponse::Mirror { reflectivity }, SeqAction::Reflect) => {
-                (unit(reflectivity.sample(lam)).ok_or_else(|| refuse(kind))?.sqrt(), None, Loss::Absorbed)
+                (-unit(reflectivity.sample(lam)).ok_or_else(|| refuse(kind))?.sqrt(), None, Loss::Absorbed)
             }
             (SurfaceResponse::ExplicitRt { reflectance, transmittance, .. }, SeqAction::Reflect | SeqAction::Transmit) => {
                 let r = unit(reflectance.sample(lam)).ok_or_else(|| refuse(kind))?;
                 let t = unit(transmittance.sample(lam)).ok_or_else(|| refuse(kind))?;
                 if h.action == SeqAction::Reflect {
-                    (r.sqrt(), None, Loss::Arm(t.min(1.0 - r)))
+                    (if from_front { -r.sqrt() } else { r.sqrt() }, None, Loss::Arm(t.min(1.0 - r)))
                 } else {
                     (t.sqrt(), None, Loss::Arm(r.min(1.0 - t)))
                 }
@@ -862,7 +863,7 @@ impl WaveJob {
         }
         let mut note = match lens {
             Some((f, _)) => format!("thin lens #{} ({}), f = {f} mm", h.object.0, h.label),
-            None => format!("{:?} at #{} ({}), amplitude {amp:.6}", h.action, h.object.0, h.label),
+            None => format!("{:?} at #{} ({}), amplitude {amp:+.6}", h.action, h.object.0, h.label),
         };
         if clipped {
             note += &format!(
@@ -888,8 +889,9 @@ impl WaveJob {
 
     fn event(&mut self, idx: usize) -> Result<(), WaveError> {
         let (p, _, ev) = self.points[idx].clone();
-        // A diffracted readout takes the last step itself, onto the detector.
-        if matches!(ev, Ev::End) && matches!(self.spec.readout, Readout::Diffracted { .. }) {
+        // A diffracted readout takes the last step itself, onto the detector,
+        // and so does an arm read out to be added to others.
+        if matches!(ev, Ev::End) && (self.face || matches!(self.spec.readout, Readout::Diffracted { .. })) {
             return Ok(());
         }
         // Free space up to this event.
@@ -1038,7 +1040,10 @@ impl WaveJob {
                     self.u = modulator_step(&self.u, &beam, &out, s, device, &h, &self.spec, &mut self.report)?;
                 } else {
                     let (s, response) = (s.clone(), response.clone());
-                    self.flat_element(&s, &response, &h, p, n_s, &out)?;
+                    if matches!(response, SurfaceResponse::ExplicitRt { .. }) {
+                        self.arms[idx] = Some(h.object.0);
+                    }
+                    self.flat_element(&s, &response, &h, p, n_s, &out, from_front)?;
                 }
                 self.beam = out;
                 self.u.frame = out.iso();
@@ -1050,7 +1055,7 @@ impl WaveJob {
 
     /// Read the detector: each pixel's power, from the field projected onto
     /// its face. Refused before the chain is done.
-    pub fn finish(mut self) -> Result<WavePathResult, WaveError> {
+    fn finish(mut self, revision: u64) -> Result<WavePathResult, WaveError> {
         if self.next < self.points.len() {
             return Err(WaveError::OutOfRange(format!(
                 "the wave job has {} of {} events still to run",
@@ -1076,7 +1081,7 @@ impl WaveJob {
         let cos = beam.d.dot(n_det).abs();
         let (du, dv) = (2.0 * hw / nu as f64, 2.0 * hh / nv as f64);
         if let Readout::Diffracted { samples_per_pixel } = spec.readout {
-            return self.finish_diffracted(samples_per_pixel, (hw, hh), [nu, nv], (du, dv));
+            return self.finish_diffracted(samples_per_pixel, (hw, hh), [nu, nv], (du, dv), revision);
         }
         // A detector integrates power, so the readout bins it: each field
         // cell's power |U|²ΔA goes to the pixel its projection along the beam
@@ -1124,7 +1129,7 @@ impl WaveJob {
         self.report.ledger.detected = on_detector;
         self.report.ledger.close();
         Ok(WavePathResult {
-            revision: self.revision,
+            revision,
             detector: spec.detector,
             bins,
             power,
@@ -1135,7 +1140,7 @@ impl WaveJob {
     }
 }
 
-impl WaveJob {
+impl ChainJob {
     /// The diffracted readout: the field carried from where it is straight
     /// onto a window of the plane across the beam at the detector's centre,
     /// at `s × s` points a pixel, then binned into the pixels.
@@ -1145,6 +1150,7 @@ impl WaveJob {
         (hw, hh): (f64, f64),
         [nu, nv]: [usize; 2],
         (du, dv): (f64, f64),
+        revision: u64,
     ) -> Result<WavePathResult, WaveError> {
         let spec = self.spec;
         let beam = self.beam;
@@ -1189,7 +1195,7 @@ impl WaveJob {
             self.report.ledger.detected = on_detector;
             self.report.ledger.close();
             self.u = zf;
-            return Ok(WavePathResult { revision: self.revision, detector: spec.detector, bins: [nu, nv], power, field: self.u, arriving, report: self.report });
+            return Ok(WavePathResult { revision, detector: spec.detector, bins: [nu, nv], power, field: self.u, arriving, report: self.report });
         }
         // The face's corners, projected along the beam onto the plane across
         // it at the detector's centre, give the window.
@@ -1278,7 +1284,7 @@ impl WaveJob {
         self.u = zf;
         self.u.frame = beam.turned(plane, beam.d).iso();
         Ok(WavePathResult {
-            revision: self.revision,
+            revision,
             detector: spec.detector,
             bins: [nu, nv],
             power,
@@ -1289,8 +1295,611 @@ impl WaveJob {
     }
 }
 
-/// Carry a coherent beam from `spec.source` to `spec.detector` along the
-/// chief ray's chain: a [`WaveJob`] run in one step.
+/// One arm read out onto its detector's own grid, ready to be added to the
+/// other arms.
+struct FaceField {
+    /// The detector's sub-pixel grid, in its own frame, and the arm's whole
+    /// field there (carrier and phase included).
+    grid: Grid2,
+    data: Vec<Cx>,
+    /// The obliquity of the arm's beam on the face, and its direction.
+    cos: f64,
+    dir: Vec3,
+    frame: Isometry3,
+    lambda_um: f64,
+    n_medium: f64,
+    /// The power the arm brought to the detector's plane.
+    arriving: f64,
+    report: WaveReport,
+    keys: Vec<String>,
+    arms: Vec<Option<u64>>,
+    ledgers: Vec<WaveLedger>,
+    events: usize,
+}
+
+impl ChainJob {
+    /// The arm's field on the detector's own sub-pixel grid, `s × s` points a
+    /// pixel at the centres of equal parts of it: the zoomed angular
+    /// spectrum onto the face when it is square to the beam with its axes
+    /// along the beam's, the spectrum rotated onto it otherwise
+    /// ([`crate::asm_tilted`]). Every arm is read on the same points, so the
+    /// fields can be added.
+    fn face(mut self, s: usize) -> Result<FaceField, WaveError> {
+        if self.next < self.points.len() {
+            return Err(WaveError::OutOfRange("an arm read out before its chain is done".into()));
+        }
+        let beam = self.beam;
+        let det = self
+            .scene
+            .detectors
+            .iter()
+            .find(|d| d.common.id.0 == self.spec.detector.0)
+            .ok_or_else(|| WaveError::OutOfRange("no such detector".into()))?;
+        let (hw, hh) = match det.geometry {
+            DetectorGeometry3::Rectangle { half_width_mm, half_height_mm } => (half_width_mm, half_height_mm),
+            _ => return Err(WaveError::OutOfRange("the wave readout needs a rectangular detector".into())),
+        };
+        let [nu, nv] = det.bins;
+        let t = det.common.transform;
+        let n_det = t.rotate(Vec3::Z);
+        let (du, dv) = (2.0 * hw / nu as f64, 2.0 * hh / nv as f64);
+        let z = (t.pos - beam.origin).dot(beam.d);
+        if z <= 0.0 {
+            return Err(WaveError::OutOfRange("the detector is behind the field's last plane".into()));
+        }
+        let s = s.max(1);
+        let (ps, qs) = (du / s as f64, dv / s as f64);
+        let fg = centred(Grid2::new([nu * s, nv * s], [ps, qs], [0.0, 0.0])?);
+        let arriving = self.u.power();
+        let n_max = self.u.grid.n[0].max(self.u.grid.n[1]);
+        let square = n_det.dot(beam.d).abs() > 1.0 - 1e-12;
+        let (eu, ev) = (t.rotate(Vec3::X), t.rotate(Vec3::Y));
+        let along = |a: Vec3, b: Vec3| a.dot(b).abs() > 1.0 - 1e-12;
+        let aligned = if square && along(eu, beam.x) && along(ev, beam.y) {
+            Some(([nu * s, nv * s], [ps, qs]))
+        } else if square && along(eu, beam.y) && along(ev, beam.x) {
+            Some(([nv * s, nu * s], [qs, ps]))
+        } else {
+            None
+        };
+        let mut data = vec![Cx::ZERO; fg.len()];
+        let rep = if let Some((n, pitch)) = aligned {
+            let plane = beam.origin + beam.d * z;
+            let c = beam.coords(t.pos - beam.d * (t.pos - plane).dot(beam.d));
+            let out = centred(Grid2::new(n, pitch, [c.0, c.1])?);
+            let pad = if n_max >= 1024 { 1 } else { 2 };
+            let (zf, rep) = crate::asm_zoom(&self.u, z, out, pad, &mut self.fft)?;
+            let k = zf.k_mm();
+            for j in 0..out.n[1] {
+                for i in 0..out.n[0] {
+                    let (a, b) = out.xy(i, j);
+                    let l = t.inverse_transform_point(plane + beam.x * a + beam.y * b);
+                    let (iu, iv) = (((l.x + hw) / ps).floor(), ((l.y + hh) / qs).floor());
+                    if iu < 0.0 || iv < 0.0 || iu >= (nu * s) as f64 || iv >= (nv * s) as f64 {
+                        continue;
+                    }
+                    data[fg.idx(iu as usize, iv as usize)] = zf.data[out.idx(i, j)] * Cx::expi(k * (zf.carrier[0] * a + zf.carrier[1] * b));
+                }
+            }
+            rep
+        } else {
+            let pad = if n_max <= 512 { 4 } else if n_max <= 1024 { 2 } else { 1 };
+            let (zt, rep) = crate::asm_tilted(&self.u, t, fg, pad, &mut self.fft)?;
+            data = zt.data;
+            rep
+        };
+        let mut report = self.report;
+        report.steps.extend(rep.steps);
+        for w in rep.warnings {
+            report.warn(w);
+        }
+        Ok(FaceField {
+            grid: fg,
+            data,
+            cos: n_det.dot(beam.d).abs(),
+            dir: beam.d,
+            frame: t,
+            lambda_um: self.lam,
+            n_medium: self.u.n_medium,
+            arriving,
+            report,
+            keys: self.keys,
+            arms: self.arms,
+            ledgers: self.ledgers,
+            events: self.points.len(),
+        })
+    }
+}
+
+/// Add `d`'s losses (everything but what was launched and detected) into `l`.
+fn add_losses(l: &mut WaveLedger, d: &WaveLedger) {
+    l.absorbed_aperture += d.absorbed_aperture;
+    l.absorbed_element += d.absorbed_element;
+    l.band_limit_removed += d.band_limit_removed;
+    l.beyond_nyquist += d.beyond_nyquist;
+    l.evanescent += d.evanescent;
+    l.left_window += d.left_window;
+    l.other_family += d.other_family;
+    l.untracked_orders += d.untracked_orders;
+    l.other_arm += d.other_arm;
+    l.passed_by += d.passed_by;
+    l.resampling += d.resampling;
+    l.other_ports += d.other_ports;
+    l.numerical += d.numerical;
+}
+
+/// `after − before`, losses only.
+fn losses_between(after: &WaveLedger, before: &WaveLedger) -> WaveLedger {
+    WaveLedger {
+        launched: 0.0,
+        detected: 0.0,
+        absorbed_aperture: after.absorbed_aperture - before.absorbed_aperture,
+        absorbed_element: after.absorbed_element - before.absorbed_element,
+        band_limit_removed: after.band_limit_removed - before.band_limit_removed,
+        beyond_nyquist: after.beyond_nyquist - before.beyond_nyquist,
+        evanescent: after.evanescent - before.evanescent,
+        left_window: after.left_window - before.left_window,
+        other_family: after.other_family - before.other_family,
+        untracked_orders: after.untracked_orders - before.untracked_orders,
+        other_arm: after.other_arm - before.other_arm,
+        passed_by: after.passed_by - before.passed_by,
+        resampling: after.resampling - before.resampling,
+        other_ports: after.other_ports - before.other_ports,
+        numerical: after.numerical - before.numerical,
+    }
+}
+
+/// Several arms of one coherent mode, added on the detector's grid.
+///
+/// The power a pixel catches is `Σ |Σ_c U_c √cos θ_c|² ΔA` over its points:
+/// each arm's field weighted by the root of its obliquity on the face, so
+/// that one arm alone reads as it would by itself. Two arms crossing at an
+/// angle make fringes of period `λ/|t₁ − t₂|`, `t` the directions' components
+/// along the face; a period under two of the readout's points is flagged.
+///
+/// The ledger counts each arm's losses, an event the arms share once (they
+/// carry the same field up to where they part). What a splitter sends into
+/// another arm is not lost, so a splitter met by several arms books no
+/// `other_arm`; the light that leaves by the ports no arm reads (a
+/// recombining splitter's other output, what misses the detector once the
+/// arms meet) is then the remainder, `other_ports`.
+fn combine_arms(scene: &Scene3, spec: &WavePathSpec, faces: Vec<FaceField>, revision: u64) -> Result<WavePathResult, WaveError> {
+    let det = scene
+        .detectors
+        .iter()
+        .find(|d| d.common.id.0 == spec.detector.0)
+        .ok_or_else(|| WaveError::OutOfRange("no such detector".into()))?;
+    let [nu, nv] = det.bins;
+    let g = faces[0].grid;
+    let s = g.n[0] / nu;
+    let (ps, qs) = (g.pitch_mm[0], g.pitch_mm[1]);
+    let mut data = vec![Cx::ZERO; g.len()];
+    for f in &faces {
+        let w = f.cos.sqrt();
+        for (a, b) in data.iter_mut().zip(&f.data) {
+            *a += *b * w;
+        }
+    }
+    let mut power = vec![0.0; nu * nv];
+    for j in 0..g.n[1] {
+        for i in 0..g.n[0] {
+            power[(j / s) * nu + i / s] += data[g.idx(i, j)].norm_sqr() * ps * qs;
+        }
+    }
+    let mut report = WaveReport::default();
+    for (c, f) in faces.iter().enumerate() {
+        for st in &f.report.steps {
+            let mut st = st.clone();
+            st.note = format!("arm {}: {}", c + 1, st.note);
+            report.steps.push(st);
+        }
+        for w in &f.report.warnings {
+            report.warn(w.clone());
+        }
+        for v in &f.report.validity {
+            report.flag(v.clone());
+        }
+        for a in &f.report.approximated {
+            report.approx(a.clone());
+        }
+    }
+    // The fringes between each pair of arms, against the readout's points.
+    let n_det = det.common.transform.rotate(Vec3::Z);
+    let lam_mm = faces[0].lambda_um / 1000.0 / faces[0].n_medium;
+    for a in 0..faces.len() {
+        for b in a + 1..faces.len() {
+            let (da, db) = (faces[a].dir, faces[b].dir);
+            let ta = da - n_det * da.dot(n_det);
+            let tb = db - n_det * db.dot(n_det);
+            let gap = (ta - tb).length();
+            if gap > 0.0 {
+                let period = lam_mm / gap;
+                let h = ps.min(qs);
+                if period < 2.0 * h {
+                    report.warn(SamplingWarning::Undersampled {
+                        what: format!(
+                            "the fringes of arms {} and {} on detector #{}, {period:.4e} mm apart, against readout points {h:.4e} mm apart",
+                            a + 1,
+                            b + 1,
+                            spec.detector.0
+                        ),
+                        max_phase_step_rad: 2.0 * std::f64::consts::PI * h / period,
+                    });
+                }
+            }
+        }
+    }
+    // The network's ledger.
+    let mut l = WaveLedger { launched: faces[0].ledgers[0].launched, ..Default::default() };
+    add_losses(&mut l, &faces[0].ledgers[0]);
+    let mut met: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    for f in &faces {
+        let mut objs: Vec<u64> = f.arms.iter().flatten().copied().collect();
+        objs.sort_unstable();
+        objs.dedup();
+        for o in objs {
+            *met.entry(o).or_default() += 1;
+        }
+    }
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut parted: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for f in &faces {
+        let mut history = String::new();
+        for i in 0..f.keys.len() {
+            let before = history.clone();
+            history.push_str(&f.keys[i]);
+            history.push('|');
+            if !seen.insert(history.clone()) {
+                continue;
+            }
+            let mut d = losses_between(&f.ledgers[i + 1], &f.ledgers[i]);
+            if let Some(o) = f.arms[i] {
+                if met.get(&o).copied().unwrap_or(0) >= 2 {
+                    d.other_arm = 0.0;
+                }
+                // Where arms part, they meet the splitter with one field: what
+                // it absorbs or passes by is counted once.
+                if !parted.insert(format!("{before}#{o}")) {
+                    d = WaveLedger { resampling: d.resampling, numerical: d.numerical, ..Default::default() };
+                }
+            }
+            add_losses(&mut l, &d);
+        }
+    }
+    l.detected = power.iter().sum();
+    l.other_ports = l.launched - l.accounted();
+    let lam = faces[0].lambda_um;
+    let n = faces[0].n_medium;
+    let arms = faces.len();
+    report.steps.push(element_step(
+        0.0,
+        format!(
+            "{arms} arms added as fields on detector #{}'s own grid, {s}×{s} points a pixel, each weighted by the root of its obliquity on the face",
+            spec.detector.0
+        ),
+    ));
+    report.approx("arms added in a scalar field: their polarizations taken as the same, so the fringes' visibility is an upper bound");
+    report.ledger = l;
+    let mut field = Field2::zeros(g, lam)?.in_medium(n)?;
+    field.data = data;
+    field.frame = faces[0].frame;
+    Ok(WavePathResult {
+        revision,
+        detector: spec.detector,
+        bins: [nu, nv],
+        power,
+        field,
+        arriving: faces.iter().map(|f| f.arriving).sum(),
+        report,
+    })
+}
+
+/// The most spectral lines a wave path runs, each a coherent computation of
+/// its own.
+pub const MAX_WAVE_LINES: usize = 16;
+
+/// A wave path in resumable steps, for a worker that must be able to drop a
+/// stale job between steps: [`WaveJob::new`] plans every chain from the
+/// source to the detector, each [`WaveJob::step`] carries the fields
+/// through a number of the chains' events (the free space up to an event
+/// and the element there), and [`WaveJob::finish`] reads the detector.
+/// However the work is sliced, the result is the same to the bit:
+/// [`wave_path`] is this job run in one step.
+///
+/// **Arms.** Where splitter arms recombine on the detector (an
+/// interferometer) the axial ray reaches it by several chains
+/// (`oc_trace::extract_sequences3`). Each carries the same launched field
+/// along its own arm, and the arms' fields are added on the detector's own
+/// grid before the power is formed ([`combine_arms`]): the coherent sum of
+/// paths the scattering network of bundle M00 asks for, for networks without
+/// feedback.
+///
+/// **Lines.** A source of several spectral lines is a set of mutually
+/// incoherent modes (E. Wolf, *J. Opt. Soc. Am.* 72, 343 (1982); bundle M15):
+/// each line runs coherently through every chain at its own wavelength, with
+/// its share of the power, and the lines add in power. A continuous spectrum
+/// is refused: sampled into lines, it would be a choice the path should not
+/// make for the source.
+///
+/// The job keeps one shared copy of the scene, so it answers for the revision
+/// it was started at whatever happens to the scene meanwhile.
+pub struct WaveJob {
+    scene: Arc<Scene3>,
+    spec: WavePathSpec,
+    revision: u64,
+    /// One per line, strongest first.
+    modes: Vec<Mode>,
+}
+
+struct Mode {
+    lambda_um: f64,
+    chains: Vec<Chain>,
+}
+
+enum Chain {
+    Running(Box<ChainJob>),
+    /// An arm done and read out onto the detector's grid.
+    Face(Box<FaceField>),
+    /// A lone chain of one line among several, finished.
+    Done(Box<WavePathResult>, usize),
+}
+
+impl Chain {
+    fn events(&self) -> usize {
+        match self {
+            Chain::Running(j) => j.points.len(),
+            Chain::Face(f) => f.events,
+            Chain::Done(_, n) => *n,
+        }
+    }
+    fn done(&self) -> usize {
+        match self {
+            Chain::Running(j) => j.next,
+            Chain::Face(f) => f.events,
+            Chain::Done(_, n) => *n,
+        }
+    }
+}
+
+impl std::fmt::Debug for WaveJob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WaveJob")
+            .field("revision", &self.revision)
+            .field("lines", &self.modes.len())
+            .field("chains", &self.modes.iter().map(|m| m.chains.len()).sum::<usize>())
+            .field("events", &self.events())
+            .field("done", &self.done())
+            .finish_non_exhaustive()
+    }
+}
+
+impl WaveJob {
+    /// Plan every chain from `spec.source` to `spec.detector`, at each of the
+    /// source's lines.
+    pub fn new(scene: &Scene3, spec: &WavePathSpec, revision: u64) -> Result<Self, WaveError> {
+        if !(spec.power.is_finite() && spec.power > 0.0 && spec.window_mm > 0.0 && spec.grid_n >= 8) {
+            return Err(WaveError::OutOfRange("a wave path needs power, a window and at least 8 samples".into()));
+        }
+        let src = scene
+            .sources
+            .iter()
+            .find(|s| s.id == spec.source)
+            .ok_or_else(|| WaveError::OutOfRange("no such source".into()))?;
+        let mut lines: Vec<(f64, f64)> = match &src.spectrum {
+            oc_core::scene::Spectrum::Monochromatic(l) => vec![(*l, 1.0)],
+            oc_core::scene::Spectrum::Lines(v) => v.iter().copied().filter(|l| l.1 > 0.0).collect(),
+            oc_core::scene::Spectrum::Continuum(_) => {
+                return Err(WaveError::OutOfRange(format!(
+                    "source #{} emits a continuous spectrum; the wave path runs each spectral line coherently and adds the lines in power: give it a single line or a few lines",
+                    spec.source.0
+                )))
+            }
+        };
+        if lines.is_empty() {
+            return Err(WaveError::OutOfRange(format!("source #{} emits no line of positive weight", spec.source.0)));
+        }
+        if lines.len() > MAX_WAVE_LINES {
+            return Err(WaveError::OutOfRange(format!(
+                "source #{} emits {} lines; the wave path runs at most {MAX_WAVE_LINES}, each a coherent computation: give it fewer",
+                spec.source.0,
+                lines.len()
+            )));
+        }
+        lines.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let total: f64 = lines.iter().map(|l| l.1).sum();
+        let shared = Arc::new(scene.clone());
+        let mut modes = Vec::with_capacity(lines.len());
+        for (lam, w) in lines {
+            let seqs = oc_trace::extract_sequences3(scene, spec.source, spec.detector, Some(lam), revision)
+                .map_err(|e| WaveError::OutOfRange(format!("no chain from the source to the detector: {e}")))?;
+            // Arms that part at an LCoS are its two polarization beams: they do
+            // not interfere, and a scalar field cannot carry both.
+            for a in 0..seqs.len() {
+                for b in a + 1..seqs.len() {
+                    let parted = seqs[a].hits.iter().zip(&seqs[b].hits).find(|(x, y)| x.object != y.object || x.action != y.action);
+                    if let Some((x, _)) = parted {
+                        let lcos = scene.surfaces.iter().any(|s| {
+                            s.common.id == x.object
+                                && [&s.response_front, &s.response_back].iter().any(|r| {
+                                    matches!(r, SurfaceResponse::Modulator { device, .. } if matches!(device.kind, ModulatorKind::Lcos(_)))
+                                })
+                        });
+                        if lcos {
+                            return Err(WaveError::OutOfRange(format!(
+                                "the LCoS #{} ({}) sends both its polarization beams to the detector; they add in power, not as fields, and the wave path's scalar field carries one at a time",
+                                x.object.0, x.label
+                            )));
+                        }
+                    }
+                }
+            }
+            let face = seqs.len() > 1;
+            let chains = seqs
+                .into_iter()
+                .map(|seq| ChainJob::new(&shared, spec, seq, spec.power * w / total, face).map(|j| Chain::Running(Box::new(j))))
+                .collect::<Result<Vec<_>, _>>()?;
+            modes.push(Mode { lambda_um: lam, chains });
+        }
+        Ok(WaveJob { scene: shared, spec: *spec, revision, modes })
+    }
+
+    /// The scene revision the job answers for.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// The chains' events (surfaces, aperture planes, the detector), and how
+    /// many the fields have been carried through.
+    pub fn events(&self) -> usize {
+        self.modes.iter().flat_map(|m| &m.chains).map(Chain::events).sum()
+    }
+    pub fn done(&self) -> usize {
+        self.modes.iter().flat_map(|m| &m.chains).map(Chain::done).sum()
+    }
+
+    /// How many coherent chains (arms) and incoherent lines the job holds.
+    pub fn arms(&self) -> usize {
+        self.modes.iter().map(|m| m.chains.len()).max().unwrap_or(0)
+    }
+    pub fn lines(&self) -> usize {
+        self.modes.len()
+    }
+
+    /// Carry the fields through up to `events` more events, chain after
+    /// chain. `Ok(true)` once every chain is done; an element a field has no
+    /// model for is an error naming it, and the job is not resumable after
+    /// one. A chain that finishes among several is read out at once, so the
+    /// job holds one full field at a time.
+    pub fn step(&mut self, events: usize) -> Result<bool, WaveError> {
+        let lone = self.modes.len() == 1 && self.modes[0].chains.len() == 1;
+        let s = match self.spec.readout {
+            Readout::Diffracted { samples_per_pixel } => samples_per_pixel.max(1),
+            Readout::Projected => 2,
+        };
+        let mut left = events;
+        for m in &mut self.modes {
+            let several = m.chains.len() > 1;
+            for c in &mut m.chains {
+                let Chain::Running(job) = c else { continue };
+                if left == 0 {
+                    return Ok(false);
+                }
+                let k = (job.points.len() - job.next).min(left);
+                let finished = job.step(k)?;
+                left -= k;
+                if finished && !lone {
+                    let Chain::Running(job) = std::mem::replace(c, Chain::Done(Box::new(placeholder_result(self.revision, self.spec.detector)?), 0)) else {
+                        unreachable!()
+                    };
+                    let n = job.points.len();
+                    *c = if several {
+                        Chain::Face(Box::new(job.face(s)?))
+                    } else {
+                        Chain::Done(Box::new(job.finish(self.revision)?), n)
+                    };
+                }
+            }
+        }
+        Ok(self.done() == self.events())
+    }
+
+    /// Read the detector: each pixel's power. Refused before every chain is
+    /// done.
+    pub fn finish(self) -> Result<WavePathResult, WaveError> {
+        if self.done() < self.events() {
+            return Err(WaveError::OutOfRange(format!(
+                "the wave job has {} of {} events still to run",
+                self.events() - self.done(),
+                self.events()
+            )));
+        }
+        let WaveJob { scene, spec, revision, mut modes } = self;
+        if modes.len() == 1 && modes[0].chains.len() == 1 {
+            if let Some(Chain::Running(job)) = modes[0].chains.pop() {
+                return job.finish(revision);
+            }
+            unreachable!("a lone chain stays running until it is finished");
+        }
+        let lines = modes.len();
+        let mut results = Vec::with_capacity(lines);
+        for m in modes {
+            let lam = m.lambda_um;
+            let r = if m.chains.len() > 1 {
+                let faces = m
+                    .chains
+                    .into_iter()
+                    .map(|c| match c {
+                        Chain::Face(f) => Ok(*f),
+                        _ => Err(WaveError::OutOfRange("an arm was not read out".into())),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                combine_arms(&scene, &spec, faces, revision)?
+            } else {
+                match m.chains.into_iter().next() {
+                    Some(Chain::Done(r, _)) => *r,
+                    _ => return Err(WaveError::OutOfRange("a line's chain was not finished".into())),
+                }
+            };
+            results.push((lam, r));
+        }
+        if results.len() == 1 {
+            return Ok(results.pop().expect("one").1);
+        }
+        // Lines add in power: mutually incoherent modes.
+        let mut iter = results.into_iter();
+        let (lam0, mut total) = iter.next().expect("several");
+        for st in &mut total.report.steps {
+            st.note = format!("λ {lam0} µm: {}", st.note);
+        }
+        for (lam, r) in iter {
+            if r.bins != total.bins {
+                return Err(WaveError::Mismatch("the lines were read on different detector grids".into()));
+            }
+            for (a, b) in total.power.iter_mut().zip(&r.power) {
+                *a += *b;
+            }
+            total.arriving += r.arriving;
+            let l = &mut total.report.ledger;
+            l.launched += r.report.ledger.launched;
+            l.detected += r.report.ledger.detected;
+            add_losses(l, &r.report.ledger);
+            for st in r.report.steps {
+                let mut st = st;
+                st.note = format!("λ {lam} µm: {}", st.note);
+                total.report.steps.push(st);
+            }
+            for w in r.report.warnings {
+                total.report.warn(w);
+            }
+            for v in r.report.validity {
+                total.report.flag(v);
+            }
+            for a in r.report.approximated {
+                total.report.approx(a);
+            }
+        }
+        total.report.approx(format!(
+            "{lines} spectral lines added in power, as mutually incoherent modes; the field shown is the strongest line's, at {lam0} µm"
+        ));
+        Ok(total)
+    }
+}
+
+/// A result holding nothing, for the moment a chain is moved out of its slot.
+fn placeholder_result(revision: u64, detector: DetectorId) -> Result<WavePathResult, WaveError> {
+    Ok(WavePathResult {
+        revision,
+        detector,
+        bins: [0, 0],
+        power: Vec::new(),
+        field: Field2::zeros(Grid2::square(1, 1.0)?, 1.0)?,
+        arriving: 0.0,
+        report: WaveReport::default(),
+    })
+}
+
+/// Carry a coherent beam from `spec.source` to `spec.detector` along every
+/// chain the chief ray takes: a [`WaveJob`] run in one step.
 pub fn wave_path(scene: &Scene3, spec: &WavePathSpec, revision: u64) -> Result<WavePathResult, WaveError> {
     let mut job = WaveJob::new(scene, spec, revision)?;
     job.step(usize::MAX)?;

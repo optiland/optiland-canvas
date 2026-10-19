@@ -34,7 +34,7 @@ pub use result3::{
     TerminationReason, TerminationSummary, TraceEvent3, TraceEventKind, TraceResult3,
 };
 #[cfg(feature = "trace3")]
-pub use sequence3::{axial_launch, extract_for_intent, extract_sequence3, SequenceError};
+pub use sequence3::{axial_launch, extract_for_intent, extract_sequence3, extract_sequences3, SequenceError};
 #[cfg(feature = "trace3")]
 pub use seq_export::{default_path, export_seq, ExportError};
 #[cfg(feature = "trace3")]

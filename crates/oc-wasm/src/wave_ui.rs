@@ -94,8 +94,9 @@ impl Canvas {
 
     /// Begin a wave path from `source` (its own coherent beam, its flux the
     /// power) to `detector`, the field `grid_n` samples across `window_mm`.
-    /// `{"ok":true,"events":n}` or `{"error":...}`, which names what the
-    /// path cannot carry.
+    /// `{"ok":true,"events":n,"arms":k,"lines":m}` (an interferometer's arms
+    /// meeting on the detector, the source's spectral lines) or
+    /// `{"error":...}`, which names what the path cannot carry.
     #[wasm_bindgen(js_name = waveBegin)]
     pub fn wave_begin(&self, source: f64, detector: f64, grid_n: u32, window_mm: f64) -> String {
         *self.wave_result.borrow_mut() = None;
@@ -118,9 +119,9 @@ impl Canvas {
         };
         match WaveJob::new(scene, &spec, self.revision) {
             Ok(job) => {
-                let events = job.events();
+                let (events, arms, lines) = (job.events(), job.arms(), job.lines());
                 *self.wave_job.borrow_mut() = Some(job);
-                json!({ "ok": true, "events": events }).to_string()
+                json!({ "ok": true, "events": events, "arms": arms, "lines": lines }).to_string()
             }
             Err(e) => error(e),
         }

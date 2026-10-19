@@ -1,7 +1,7 @@
-// The coherent wave path in the app (acceptance case C54): give the source a
-// coherent beam, switch the detector dock to wave, and the worker carries the
-// beam to the detector, a lens included; a white source is refused by name
-// until it has a single line.
+// The coherent wave path in the app (acceptance cases C54, C58): give the
+// source a coherent beam, switch the detector dock to wave, and the worker
+// carries the beam to the detector, a lens included; a white source runs as
+// its lines, added in power; a Michelson's two arms meet on the detector.
 
 import { test, expect, type Page } from "@playwright/test";
 
@@ -28,15 +28,17 @@ async function giveTheSourceABeam(page: Page) {
   expect(coh.Gaussian.waist_radius_mm).toBe(0.5);
 }
 
-test("a coherent beam: refused for a white source, carried through the singlet, and through empty space", async ({ page }) => {
+test("a coherent beam: a white source as its lines, carried through the singlet, and through empty space", async ({ page }) => {
   await page.goto("/?debug");
   await expect(page.locator("#stat")).toContainText("segs");
   expect(await debug(page)).toBe(true);
   await giveTheSourceABeam(page);
   await page.locator("#detWave").click();
 
-  // The default source is white: refused by name.
-  await expect(page.locator("#refStatus")).toContainText("single line", { timeout: 30_000 });
+  // The default source is white, nine lines: each carried coherently, the
+  // lines added in power.
+  await expect(page.locator("#refStatus")).toContainText("wave current", { timeout: 180_000 });
+  await expect(page.locator("#dockNums")).toHaveAttribute("title", /9 spectral lines added in power/);
   await page.locator("#wlPreset").selectOption("d");
   // The default scene's singlet is traced face by face; the beam reaches the
   // detector near its focus.
@@ -77,4 +79,15 @@ test("a DMD that turns the beam away from the detector: the dock names why", asy
   await page.locator("#addDmd").click();
   await page.locator("#detWave").click();
   await expect(page.locator("#refStatus")).toContainText("no chain from the source to the detector", { timeout: 60_000 });
+});
+
+test("a Michelson interferometer: its two arms meet on the detector", async ({ page }) => {
+  // The fringes' period and phase are held in Rust (oc-wave/tests/path.rs);
+  // here the app must open the scene, run both arms and add them.
+  await page.goto("/?debug");
+  await expect(page.locator("#stat")).toContainText("segs");
+  await page.locator("#open3dFile").setInputFiles("public/demo-michelson.ocanvas");
+  await page.locator("#detWave").click();
+  await expect(page.locator("#refStatus")).toContainText("wave current", { timeout: 60_000 });
+  await expect(page.locator("#dockNums")).toHaveAttribute("title", /2 arms added as fields/);
 });

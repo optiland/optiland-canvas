@@ -176,6 +176,35 @@ pub fn extract_sequence3(
     detector: DetectorId,
     revision: u64,
 ) -> Result<SequencePrescription3, SequenceError> {
+    let mut chains = extract_chains(scene, source, detector, None, revision, false)?;
+    Ok(chains.remove(0))
+}
+
+/// Every chain from `source` to `detector`: one prescription per branch
+/// lineage of the axial ray that reaches it, in the order the trace met the
+/// detector. Where splitter arms recombine on the detector (an
+/// interferometer) there are several, and a coherent computation needs all
+/// of them; [`extract_sequence3`] calls that [`SequenceError::Ambiguous`].
+/// The axial ray is traced at `lambda_um`, or the source's highest-weight
+/// line when `None`: a dispersive element sends each wavelength its own way.
+pub fn extract_sequences3(
+    scene: &Scene3,
+    source: SourceId,
+    detector: DetectorId,
+    lambda_um: Option<f64>,
+    revision: u64,
+) -> Result<Vec<SequencePrescription3>, SequenceError> {
+    extract_chains(scene, source, detector, lambda_um, revision, true)
+}
+
+fn extract_chains(
+    scene: &Scene3,
+    source: SourceId,
+    detector: DetectorId,
+    lambda_um: Option<f64>,
+    revision: u64,
+    all: bool,
+) -> Result<Vec<SequencePrescription3>, SequenceError> {
     let src = scene
         .sources
         .iter()
@@ -185,7 +214,10 @@ pub fn extract_sequence3(
         return Err(SequenceError::DetectorNotFound(detector));
     }
 
-    let launch = axial_launch(src)?;
+    let mut launch = axial_launch(src)?;
+    if let Some(l) = lambda_um {
+        launch.lambda_um = l;
+    }
     let cfg = extraction_config(revision);
     let result = trace3(scene, &[launch], &cfg);
     let events = &result.events;
@@ -290,19 +322,12 @@ pub fn extract_sequence3(
                 fates,
             })
         }
-        1 => {
-            let (path, terminal_idx) = survivors[0];
-            Ok(build_prescription(
-                scene,
-                &launch,
-                source,
-                detector,
-                revision,
-                events,
-                &lineage(path),
-                terminal_idx,
-            ))
-        }
+        n if n == 1 || all => Ok(survivors
+            .iter()
+            .map(|&(path, terminal_idx)| {
+                build_prescription(scene, &launch, source, detector, revision, events, &lineage(path), terminal_idx)
+            })
+            .collect()),
         _ => Err(SequenceError::Ambiguous {
             source,
             detector,
@@ -350,7 +375,7 @@ fn build_prescription(
         .unwrap_or(1);
     if spectral_lines > 1 {
         notes.push(format!(
-            "source has {spectral_lines} spectral lines; extracted at its highest-weight line \
+            "source has {spectral_lines} spectral lines; extracted at \
              λ = {} µm",
             launch.lambda_um
         ));
@@ -614,6 +639,20 @@ mod tests {
             SequenceError::Ambiguous { chains, .. } => assert_eq!(chains.len(), 2),
             other => panic!("expected Ambiguous, got {other:?}"),
         }
+
+        // Asked for every chain, the extractor gives both arms, each a whole
+        // prescription: the splitter's two actions, each arm's own fold.
+        let all = extract_sequences3(&s, src, det, None, 0).unwrap();
+        assert_eq!(all.len(), 2);
+        let actions: Vec<SeqAction> = all.iter().map(|p| p.hits[0].action).collect();
+        assert!(actions.contains(&SeqAction::Reflect) && actions.contains(&SeqAction::Transmit), "{actions:?}");
+        for p in &all {
+            assert_eq!(p.hits.len(), 2, "splitter and fold: {:?}", p.hits);
+            assert_eq!(p.terminal.detector, det);
+        }
+        // At another wavelength the chains are traced there.
+        let at = extract_sequences3(&s, src, det, Some(0.8), 0).unwrap();
+        assert!(at.iter().all(|p| close(p.launch.lambda_um, 0.8)));
     }
 
     #[test]

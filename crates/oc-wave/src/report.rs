@@ -117,6 +117,12 @@ pub struct WaveLedger {
     /// interpolation between samples, a traced map's fit, a window's edge.
     #[serde(default)]
     pub resampling: f64,
+    /// Left by ports a computation of several arms does not read: a
+    /// recombining splitter's other output, and what misses the detector
+    /// once the arms meet. It is the remainder after every arm's own losses
+    /// are booked, so it is named, never a check.
+    #[serde(default)]
+    pub other_ports: f64,
     /// Round-off: whatever is left after every cause above.
     pub numerical: f64,
 }
@@ -136,6 +142,7 @@ impl WaveLedger {
             + self.other_arm
             + self.passed_by
             + self.resampling
+            + self.other_ports
             + self.numerical
     }
 

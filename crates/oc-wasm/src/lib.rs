@@ -6402,6 +6402,33 @@ mod scene3_tests {
         eprintln!("wrote {path}");
     }
 
+    /// The Michelson interferometer of oc-wave's wave-path tests: a 50/50
+    /// splitter, one mirror tilted 0.5 mrad, a 633 nm source with a 1 mm
+    /// Gaussian beam, and a detector at the output, so the wave dock shows
+    /// straight fringes 0.633 mm apart. Written to
+    /// `web/public/demo-michelson.ocanvas` for the wave spec. Ignored (fixture
+    /// generator): `cargo test -p oc-wasm --lib write_demo_michelson_fixture --
+    /// --ignored`.
+    #[test]
+    #[ignore]
+    fn write_demo_michelson_fixture() {
+        use oc_core::scene::Spectrum;
+        use oc_core::scene3::{CoherentBeam, Scene3, SpectralScalar, SurfaceResponse};
+        use oc_core::vec3::Vec3;
+        let mut s = Scene3::new();
+        s.add_collimated_beam(Vec3::ZERO, 1.0, 1.0, 1, Spectrum::Monochromatic(0.6328));
+        s.sources[0].coherence = Some(CoherentBeam::Gaussian { waist_radius_mm: 1.0, waist_offset_mm: 0.0 });
+        let m = SurfaceResponse::Mirror { reflectivity: SpectralScalar::Constant(1.0) };
+        s.add_beam_splitter(Vec3::new(50.0, 0.0, 0.0), 10.0, 135.0, 0.5, 0.5).unwrap();
+        s.add_planar_element(Vec3::new(150.0, 0.0, 0.0), 10.0, 180.0, m.clone(), m.clone());
+        s.add_planar_element(Vec3::new(50.0, 100.0, 0.0), 10.0, -90.0 + 5e-4f64.to_degrees(), m.clone(), m);
+        s.add_area_detector(Vec3::new(50.0, -100.0, 0.0), Vec3::Y, 2.0, 2.0, [128, 128]);
+        s.validate().expect("the Michelson validates");
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../web/public/demo-michelson.ocanvas");
+        std::fs::write(path, s.to_json()).expect("write the Michelson fixture");
+        eprintln!("wrote {path}");
+    }
+
     #[test]
     fn dragging_moves_a_body_and_bumps_the_revision() {
         use oc_core::id::LayerId;

@@ -13,6 +13,15 @@
 //! - [10] J. E. Harvey, C. L. Vernold, *Appl. Opt.* 37(34), 8158 (1998): a
 //!   grating's orders, here a DMD's, are `λ/p` apart in direction cosine, so a
 //!   lens of focal length `f` focuses them `fλ/p` apart.
+//! - [20] Z. Zhang, Z. You, D. Chu, *Light Sci. Appl.* 3, e213 (2014): an LCoS
+//!   modulates the field along its director only.
+//! - [21] G. J. Swanson, MIT Lincoln Laboratory TR-854 (1989): an N-level
+//!   staircase puts `sinc²(1/N)` into the first order.
+//! - [22] E. Wolf, *J. Opt. Soc. Am.* 72, 343–351 (1982): mutually incoherent
+//!   modes add in power.
+//! - [23] G. G. Stokes (1849), and [24] A. Zeilinger, *Am. J. Phys.* 49, 882
+//!   (1981): a lossless splitter is a unitary two-port, its reflections from
+//!   the two sides of opposite sign.
 //!
 //! Numbered as in docs/wave-optics.md; retrieved 2026-10-19.
 
@@ -413,15 +422,198 @@ fn a_source_carries_its_coherent_beam_through_the_file_and_into_its_wave_path() 
 }
 
 #[test]
-fn a_source_of_many_wavelengths_is_refused_by_name() {
-    // A coherent field has one wavelength; a white source is not run at
-    // whichever one the chief ray drew.
+fn a_continuous_source_is_refused_and_lines_add_in_power() {
+    // A coherent field has one wavelength: a source of several lines is a set
+    // of mutually incoherent modes (Wolf 1982 [22]), each run coherently with
+    // its share of the power and added in power. A continuum is refused by
+    // name rather than sampled into lines the source did not declare.
+    let run = |spectrum: Spectrum| {
+        let mut s = Scene3::new();
+        let src = s.add_collimated_beam(Vec3::ZERO, 1.0, 1.0, 1, spectrum);
+        let det = s.add_area_detector(Vec3::new(100.0, 0.0, 0.0), -Vec3::X, 1.0, 1.0, [16, 16]);
+        s.validate().unwrap();
+        wave_path(&s, &spec(src, det, 0.3, 64, 4.0), 1)
+    };
+    let e = run(Spectrum::Continuum(vec![(0.45, 1.0), (0.55, 1.0), (0.65, 1.0)])).unwrap_err().to_string();
+    assert!(e.contains("continuous spectrum") && e.contains("single line"), "{e}");
+    let (a, b) = (0.486, 0.656);
+    let both = run(Spectrum::Lines(vec![(a, 3.0), (b, 1.0)])).unwrap();
+    let (ra, rb) = (run(Spectrum::Monochromatic(a)).unwrap(), run(Spectrum::Monochromatic(b)).unwrap());
+    let worst = both.power.iter().zip(ra.power.iter().zip(&rb.power)).map(|(p, (x, y))| (p - (0.75 * x + 0.25 * y)).abs()).fold(0.0, f64::max);
+    let peak = both.power.iter().cloned().fold(0.0, f64::max);
+    measured("two lines: power per pixel against the lines' own, weighted, worst / peak", worst / peak);
+    assert!(worst / peak < 1e-12, "{}", worst / peak);
+    assert!((both.report.ledger.launched - 1.0).abs() < 1e-12);
+    assert!(both.report.approximated.iter().any(|a| a.contains("2 spectral lines")), "{:?}", both.report.approximated);
+}
+
+/// A Mach–Zehnder interferometer in the XY plane: 50/50 splitters at
+/// (50, 0) and (150, 100), mirrors at (150, 0) and (50, 100), all at 45°, the
+/// second mirror moved `delta` mm along its normal. Its two outputs leave
+/// along +X at y = 100 and along +Y at x = 150.
+fn mach_zehnder(delta: f64) -> (Scene3, SourceId, DetectorId, DetectorId) {
     let mut s = Scene3::new();
-    let src = s.add_collimated_beam(Vec3::ZERO, 1.0, 1.0, 1, Spectrum::Lines(vec![(0.486, 1.0), (0.656, 1.0)]));
-    let det = s.add_area_detector(Vec3::new(100.0, 0.0, 0.0), -Vec3::X, 3.0, 3.0, [16, 16]);
+    let src = source(&mut s);
+    let m = SurfaceResponse::Mirror { reflectivity: oc_core::scene3::SpectralScalar::Constant(1.0) };
+    let n = Vec3::new(-1.0, 1.0, 0.0).normalize();
+    s.add_beam_splitter(Vec3::new(50.0, 0.0, 0.0), 10.0, 135.0, 0.5, 0.5).unwrap();
+    s.add_planar_element(Vec3::new(150.0, 0.0, 0.0), 10.0, 135.0, m.clone(), m.clone());
+    s.add_planar_element(Vec3::new(50.0, 100.0, 0.0) + n * delta, 10.0, 135.0, m.clone(), m);
+    s.add_beam_splitter(Vec3::new(150.0, 100.0, 0.0), 10.0, 135.0, 0.5, 0.5).unwrap();
+    let dx = s.add_area_detector(Vec3::new(250.0, 100.0, 0.0), -Vec3::X, 3.0, 3.0, [64, 64]);
+    let dy = s.add_area_detector(Vec3::new(150.0, 200.0, 0.0), -Vec3::Y, 3.0, 3.0, [64, 64]);
     s.validate().unwrap();
-    let e = wave_path(&s, &spec(src, det, 0.3, 64, 4.0), 1).unwrap_err().to_string();
-    assert!(e.contains("2 lines") && e.contains("single line"), "{e}");
+    (s, src, dx, dy)
+}
+
+#[test]
+fn a_mach_zehnder_sends_all_the_power_out_of_its_two_ports_whatever_the_path_difference() {
+    // Bundle M09: a network of lossless parts is unitary, so the two output
+    // ports of a Mach–Zehnder carry all the power between them at every path
+    // difference, and trade it as (1 ∓ cos Δφ)/2. That holds only if each
+    // splitter is a unitary two-port, which a real √R, √T on both arms is not
+    // (its outputs would sum to 1 + cos Δφ); the splitter takes the Stokes
+    // relations' signs [23], [24]. Moving the second mirror δ along its normal
+    // lengthens its arm by √2·δ.
+    let k0 = 2.0 * std::f64::consts::PI / (LAM / 1000.0);
+    for j in 0..4 {
+        let dphi = j as f64 * std::f64::consts::FRAC_PI_2;
+        let delta = dphi / (k0 * std::f64::consts::SQRT_2);
+        let (s, src, dx, dy) = mach_zehnder(delta);
+        let rx = wave_path(&s, &spec(src, dx, 0.5, 256, 4.0), 1).unwrap();
+        let ry = wave_path(&s, &spec(src, dy, 0.5, 256, 4.0), 1).unwrap();
+        let (px, py) = (rx.report.ledger.detected, ry.report.ledger.detected);
+        let share = px / (px + py);
+        let want = 0.5 * (1.0 - dphi.cos());
+        measured(&format!("Mach–Zehnder at Δφ = {j}·π/2: both ports' power, of the launched"), px + py);
+        measured(&format!("Mach–Zehnder at Δφ = {j}·π/2: the X port's share against (1 − cos Δφ)/2"), share - want);
+        assert!((px + py - 1.0).abs() < 1e-3, "{px} + {py}");
+        assert!((share - want).abs() < 2e-3, "{share} vs {want}");
+        assert!(rx.report.steps.iter().any(|st| st.note.contains("2 arms added")), "{:?}", rx.report.steps);
+        assert!(rx.report.ledger.numerical.abs() < 1e-10, "{:?}", rx.report.ledger);
+    }
+}
+
+/// A Michelson interferometer in the XY plane: a 50/50 splitter at (50, 0)
+/// at 45°, mirror 1 at (150 + d1, 0) facing back along −X, mirror 2 at
+/// (50, 100 + d2) facing back along −Y and tilted `alpha` rad about Z; the
+/// output leaves along −Y onto a detector at (50, −100).
+fn michelson(d1: f64, d2: f64, alpha: f64, spectrum: Spectrum, half: f64, bins: usize) -> (Scene3, SourceId, DetectorId) {
+    let mut s = Scene3::new();
+    let src = s.add_collimated_beam(Vec3::ZERO, 1.0, 1.0, 1, spectrum);
+    let m = SurfaceResponse::Mirror { reflectivity: oc_core::scene3::SpectralScalar::Constant(1.0) };
+    s.add_beam_splitter(Vec3::new(50.0, 0.0, 0.0), 10.0, 135.0, 0.5, 0.5).unwrap();
+    s.add_planar_element(Vec3::new(150.0 + d1, 0.0, 0.0), 10.0, 180.0, m.clone(), m.clone());
+    s.add_planar_element(Vec3::new(50.0, 100.0 + d2, 0.0), 10.0, -90.0 + alpha.to_degrees(), m.clone(), m);
+    let det = s.add_area_detector(Vec3::new(50.0, -100.0, 0.0), Vec3::Y, half, half, [bins, bins]);
+    s.validate().unwrap();
+    (s, src, det)
+}
+
+#[test]
+fn a_michelson_with_a_tilted_mirror_makes_fringes_of_period_lambda_over_sin_2_alpha() {
+    // Two plane waves crossing at an angle 2α make fringes of period
+    // λ/sin 2α across the plane they cross on [1]. A mirror tilted α turns its
+    // arm by 2α. The period is read from the power's spectrum along the face.
+    // The beams are nearly plane. A beam's wavefront is a sphere of radius R,
+    // and the tilted arm's is shifted 2α(R − D) across the face, D = 200 mm
+    // from the mirror, which lowers the fringes' frequency by D/R: for a 1 mm
+    // beam (R ≈ 71 m here) −2.8e-3, where the path reads −3.5e-3; for this
+    // 3 mm beam −3.5e-5, where it reads −7.1e-5. The rest is of the order of
+    // the tilted-plane readout's own error (its spectrum read between
+    // samples).
+    let alpha = 5e-4;
+    let (s, src, det) = michelson(0.0, 0.0, alpha, Spectrum::Monochromatic(LAM), 2.0, 256);
+    let r = wave_path(&s, &spec(src, det, 3.0, 512, 16.0), 1).unwrap();
+    let d = s.detectors.iter().find(|x| x.common.id.0 == det.0).unwrap();
+    let t = d.common.transform;
+    let (nb, du) = (256, 4.0 / 256.0);
+    // |Σ w (P − P̄) e^{−i2πfx}| over the pixels, x their world X, w a Hann
+    // window over the face: its peak is the fringes' frequency. The window and
+    // the mean taken out keep the face's edges and the mean power from
+    // leaking into the peak (a hard-edged face's sidelobes bias it by 3e-3).
+    let px: Vec<(f64, f64)> = (0..nb * nb)
+        .map(|k| {
+            let (i, j) = (k % nb, k / nb);
+            let (u, v) = (-2.0 + (i as f64 + 0.5) * du, -2.0 + (j as f64 + 0.5) * du);
+            let w = (std::f64::consts::PI * u / 4.0).cos().powi(2) * (std::f64::consts::PI * v / 4.0).cos().powi(2);
+            (t.transform_point(Vec3::new(u, v, 0.0)).x - 50.0, w)
+        })
+        .collect();
+    let wsum: f64 = px.iter().map(|p| p.1).sum();
+    let mean = px.iter().zip(&r.power).map(|(p, q)| p.1 * q).sum::<f64>() / wsum;
+    let spectrum_at = |f: f64| {
+        let mut acc = oc_wave::Cx::ZERO;
+        for (k, (x, w)) in px.iter().enumerate() {
+            acc += oc_wave::Cx::expi(-2.0 * std::f64::consts::PI * f * x) * (w * (r.power[k] - mean));
+        }
+        acc.abs()
+    };
+    let want = (2.0 * alpha).sin() / (LAM / 1000.0);
+    let (mut best, mut f_best) = (0.0, 0.0);
+    for k in 0..=200 {
+        let f = want * (0.8 + 0.4 * k as f64 / 200.0);
+        let v = spectrum_at(f);
+        if v > best {
+            best = v;
+            f_best = f;
+        }
+    }
+    // A parabola through the peak and its neighbours.
+    let h = want * 0.4 / 200.0;
+    let (a, b, c) = (spectrum_at(f_best - h), best, spectrum_at(f_best + h));
+    let f_peak = f_best + 0.5 * h * (a - c) / (a - 2.0 * b + c);
+    measured("Michelson, mirror tilted 0.5 mrad: fringe frequency against sin 2α / λ, relative", f_peak / want - 1.0);
+    assert!((f_peak / want - 1.0).abs() < 2e-3, "{f_peak} vs {want} /mm");
+}
+
+#[test]
+fn moving_a_michelson_mirror_by_d_shifts_its_fringes_by_two_k_d() {
+    // The light crosses the arm twice, so moving its mirror by d changes the
+    // phase between the arms by 2k₀d [1]: four steps of λ/8 are four steps of
+    // π/2, and four powers a quarter period apart satisfy P₀ + P₂ = P₁ + P₃.
+    // A single pass, k₀d, would break it by the fringes' amplitude. The
+    // visibility of two equal, overlapping arms is 1.
+    let p: Vec<f64> = (0..4)
+        .map(|j| {
+            let (s, src, det) = michelson(j as f64 * LAM / 1000.0 / 8.0, 0.0, 0.0, Spectrum::Monochromatic(LAM), 3.0, 32);
+            wave_path(&s, &spec(src, det, 1.0, 256, 5.0), 1).unwrap().report.ledger.detected
+        })
+        .collect();
+    let mean = p.iter().sum::<f64>() / 4.0;
+    let vis = ((p[0] - p[2]).powi(2) + (p[1] - p[3]).powi(2)).sqrt() / (2.0 * mean);
+    measured("Michelson, mirror stepped by λ/8: (P₀ + P₂ − P₁ − P₃) / mean", (p[0] + p[2] - p[1] - p[3]) / mean);
+    measured("Michelson, mirror stepped by λ/8: visibility", vis);
+    assert!(((p[0] + p[2] - p[1] - p[3]) / mean).abs() < 1e-3, "{p:?}");
+    assert!(vis > 0.995, "{vis}");
+    // Equal arms through a dielectric splitter: the output is dark.
+    assert!(p[0] < 1e-3, "{p:?}");
+}
+
+#[test]
+fn two_lines_wash_a_michelson_s_fringes_out_where_their_beats_cancel() {
+    // Two equal lines are two incoherent modes. Each makes its own fringes,
+    // P_l ∝ 1 − cos(2k_l Δ); at the arm difference where 2Δ(1/λ₁ − 1/λ₂) = ½
+    // they are in antiphase and the sum stands still as a mirror moves: the
+    // visibility of the beat, |cos(2πΔ(1/λ₁ − 1/λ₂))|, is zero there [1]. At no
+    // difference both are dark together.
+    let (l1, l2) = (LAM, LAM * 1.001);
+    let beat = 1.0 / (l1 / 1000.0) - 1.0 / (l2 / 1000.0);
+    let walk = 0.25 / beat;
+    let run = |dd: f64, j: usize| {
+        let (s, src, det) = michelson(j as f64 * l1 / 1000.0 / 8.0, dd, 0.0, Spectrum::Lines(vec![(l1, 1.0), (l2, 1.0)]), 3.0, 32);
+        wave_path(&s, &spec(src, det, 1.0, 256, 5.0), 1).unwrap().report.ledger.detected
+    };
+    let at = |dd: f64| -> f64 {
+        let p: Vec<f64> = (0..4).map(|j| run(dd, j)).collect();
+        let mean = p.iter().sum::<f64>() / 4.0;
+        ((p[0] - p[2]).powi(2) + (p[1] - p[3]).powi(2)).sqrt() / (2.0 * mean)
+    };
+    let (v0, v_half) = (at(0.0), at(walk));
+    measured("two lines in a Michelson: visibility at equal arms", v0);
+    measured("two lines in a Michelson: visibility where the beats cancel", v_half);
+    assert!(v0 > 0.99, "{v0}");
+    assert!(v_half < 2e-2, "{v_half}");
 }
 
 /// The singlet's paraxial focal length and principal planes, traced by the
@@ -899,12 +1091,12 @@ fn a_lens_rim_smaller_than_the_beam_stops_and_diffracts_as_an_iris_against_it() 
 
 #[test]
 fn an_lcos_on_the_path_sends_half_of_unpolarized_light_into_each_beam() {
-    // [26] Zhang, You & Chu: an LCoS modulates the field along its director.
+    // [20] Zhang, You & Chu: an LCoS modulates the field along its director.
     // The wave path carries unpolarized light, so of what the device reflects
     // half is modulated and half is not; the chain follows the modulated beam,
     // steered by a 16-pixel blazed grating, and books the other half. A
     // 16-level staircase puts sinc²(1/16) of the modulated beam into its first
-    // order [31] (Swanson), which the detector catches.
+    // order [21] (Swanson), which the detector catches.
     use oc_core::modulator::{LcosSpec, ModulatorKind, Pattern, PatternGenerator, PhaseLut, SpatialModulator};
     let dev = SpatialModulator {
         pixels: [128, 128],
@@ -976,4 +1168,35 @@ fn a_glass_plate_delays_the_beam_by_its_optical_path() {
     let wrap = |x: f64| (x + std::f64::consts::PI).rem_euclid(2.0 * std::f64::consts::PI) - std::f64::consts::PI;
     measured("plate: phase at the beam's centre against k0(n−1)t less the Gouy change, rad", wrap(got - want));
     assert!(wrap(got - want).abs() < 1e-4, "{got} vs {want} (mod 2π)");
+}
+
+#[test]
+fn an_lcos_whose_two_polarization_beams_both_reach_the_detector_is_refused_by_name() {
+    // [20]: an LCoS's modulated and unmodulated beams are orthogonally
+    // polarized; meeting on a detector they add in power, never as fields.
+    // A uniform device sends both back the same way, so both chains reach the
+    // detector; the scalar path refuses rather than make them interfere.
+    use oc_core::modulator::{LcosSpec, ModulatorKind, Pattern, PhaseLut, SpatialModulator};
+    let dev = SpatialModulator {
+        pixels: [64, 64],
+        pitch_um: 8.0,
+        kind: ModulatorKind::Lcos(LcosSpec {
+            director_deg: 0.0,
+            lut: PhaseLut::Linear { levels: 256, max_phase_rad: 2.0 * std::f64::consts::PI },
+            design_lambda_um: LAM,
+            pixel_fill: 1.0,
+            gap_amplitude: 0.0,
+            gap_phase_rad: 0.0,
+            fringing_um: 0.0,
+            reflectance: 1.0,
+        }),
+        pattern: Pattern::Uniform { value: 40 },
+    };
+    let mut s = Scene3::new();
+    let src = source(&mut s);
+    s.add_modulator(Vec3::new(100.0, 0.0, 0.0), 180.0, dev).unwrap();
+    let det = s.add_area_detector(Vec3::new(-50.0, 0.0, 0.0), Vec3::X, 1.0, 1.0, [16, 16]);
+    s.validate().unwrap();
+    let e = wave_path(&s, &spec(src, det, 0.3, 128, 2.0), 1).unwrap_err().to_string();
+    assert!(e.contains("both its polarization beams"), "{e}");
 }

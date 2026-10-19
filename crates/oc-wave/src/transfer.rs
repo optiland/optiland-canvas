@@ -396,7 +396,7 @@ fn smooth_phase(k: f64, s: [f64; 3], a: f64, b: f64) -> f64 {
 /// traced rays then finds to a millionth of the ray spacing. `None` when the
 /// region is not star-shaped about the chief ray (a ray passes again beyond
 /// the edge), or the bracket does not hold.
-fn rim_polygon(trace: &dyn Fn(f64, f64) -> Option<RayOut>, grid: &[Option<RayOut>], g: usize, h: f64) -> Option<Vec<[f64; 2]>> {
+pub(crate) fn rim_polygon(pass: &dyn Fn(f64, f64) -> bool, grid: &[bool], g: usize, h: f64) -> Option<Vec<[f64; 2]>> {
     let half = (g - 1) as f64 / 2.0;
     let r_max = half * h * std::f64::consts::SQRT_2;
     let on_grid = |a: f64, b: f64| -> Option<bool> {
@@ -404,7 +404,7 @@ fn rim_polygon(trace: &dyn Fn(f64, f64) -> Option<RayOut>, grid: &[Option<RayOut
         if i < 0.0 || j < 0.0 || i > (g - 1) as f64 || j > (g - 1) as f64 {
             return None;
         }
-        Some(grid[j as usize * g + i as usize].is_some())
+        Some(grid[j as usize * g + i as usize])
     };
     const M: usize = 720;
     let mut poly = Vec::with_capacity(M);
@@ -437,13 +437,15 @@ fn rim_polygon(trace: &dyn Fn(f64, f64) -> Option<RayOut>, grid: &[Option<RayOut
             q += 0.5 * h;
         }
         let mut lo = (rf - 1.5 * h).max(0.0);
-        while lo > 0.0 && trace(lo * c, lo * s).is_none() {
+        while lo > 0.0 && !pass(lo * c, lo * s) {
             lo = (lo - h).max(0.0);
         }
-        trace(lo * c, lo * s)?;
+        if !pass(lo * c, lo * s) {
+            return None;
+        }
         let mut hi = rf + 0.5 * h;
         let mut tries = 0;
-        while trace(hi * c, hi * s).is_some() {
+        while pass(hi * c, hi * s) {
             hi += h;
             tries += 1;
             if tries > 4 {
@@ -452,7 +454,7 @@ fn rim_polygon(trace: &dyn Fn(f64, f64) -> Option<RayOut>, grid: &[Option<RayOut
         }
         while hi - lo > 1e-6 * h {
             let mid = 0.5 * (lo + hi);
-            if trace(mid * c, mid * s).is_some() {
+            if pass(mid * c, mid * s) {
                 lo = mid;
             } else {
                 hi = mid;
@@ -518,7 +520,12 @@ pub(crate) fn transfer(
         return Err(WaveError::OutOfRange("fewer than nine rays pass the element".into()));
     }
     // The rim at the field's own sampling, laid on the arriving field.
-    let rim = if passed < g * g { rim_polygon(&trace, &grid, g, h) } else { None };
+    let rim = if passed < g * g {
+        let ok: Vec<bool> = grid.iter().map(|r| r.is_some()).collect();
+        rim_polygon(&|a, b| trace(a, b).is_some(), &ok, g, h)
+    } else {
+        None
+    };
     let mut um = u.clone();
     let (rim_stopped, rim_beyond) = match &rim {
         Some(poly) => crate::elements::apply_coverage(&mut um, &crate::elements::polygon_coverage(&u.grid, poly))?,

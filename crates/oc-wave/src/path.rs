@@ -43,14 +43,18 @@
 //! replaces with the tilted-plane angular spectrum (Matsushima, Schimmel &
 //! Wyrowski, *J. Opt. Soc. Am. A* 20, 1755 (2003)).
 //!
-//! Refused, by name: polarizing elements (the field is scalar), flat
-//! refracting, coated and tabulated surfaces, and anything else the field
-//! has no model for. Nothing is skipped silently.
+//! - **Plane-parallel plate, flat coating.** Plane wave by plane wave in the
+//!   field's angular spectrum ([`crate::planar`]), s or p.
+//!
+//! Refused, by name: polarizers and retarders (the field is scalar), measured
+//! tables (no phase), elements whose planes of incidence differ, and anything
+//! else the field has no model for. Nothing is skipped silently.
 
 use crate::beams::GaussianBeam;
 use crate::modulator::{dmd_reflect, lcos_reflect};
 use crate::propagate::propagate;
 use crate::report::{SamplingWarning, StepReport, WaveLedger};
+use crate::planar::{Plate, Pol};
 use crate::transfer::{fit_sphere, Smooth};
 use crate::{Cx, Fft2, Field2, Grid2, Method, Propagator, WaveError, WaveReport};
 use oc_core::id::{DetectorId, SourceId};
@@ -443,7 +447,108 @@ enum Ev {
     /// The field reaches the entry plane at the event's point and leaves
     /// from `exit` along `d_out`; `hit` is the chief ray's hit between.
     Transfer { hit: oc_core::seq3::SeqHit3, exit: Vec3, d_out: Vec3 },
+    /// A plane-parallel plate: the field reaches the plane before its first
+    /// face at the event's point and leaves from the plane behind its second.
+    Plate { first: oc_core::seq3::SeqHit3, second: oc_core::seq3::SeqHit3, exit: Vec3, plate: Plate },
     End,
+}
+
+/// A plane-parallel plate where the chain enters a body by `h` and leaves it
+/// by `h2`: both faces flat (every probe ray meets them along one normal),
+/// parallel, bare or with a residual AR, the medium the same on both sides.
+/// Returns the plate and the planes before and after it, or `None` for
+/// anything else, which is then traced face by face.
+fn plate_of(
+    scene: &Scene3,
+    h: &oc_core::seq3::SeqHit3,
+    h2: &oc_core::seq3::SeqHit3,
+    resume: Vec3,
+    next: Vec3,
+    half: f64,
+    lam: f64,
+) -> Option<(Plate, Vec3, Vec3)> {
+    use oc_trace::{trace3, LaunchRay3, TraceConfig3, TraceEventKind};
+    if h2.object != h.object || h2.kind != SeqHitKind::Body || h.action != SeqAction::Transmit || h2.action != SeqAction::Transmit {
+        return None;
+    }
+    let n = h.normal.normalize();
+    if n.dot(h2.normal.normalize()).abs() < 1.0 - 1e-12 {
+        return None;
+    }
+    let d = (h.point - resume).normalize();
+    let d_out = (next - h2.point).normalize();
+    if d.dot(d_out) < 1.0 - 1e-12 || (h.n_before - h2.n_after).abs() > 1e-12 || (h.n_after - h2.n_before).abs() > 1e-12 {
+        return None;
+    }
+    let body = scene.bodies.iter().find(|b| b.common.id == h.object)?;
+    let residual = |r: &SurfaceResponse| match r {
+        SurfaceResponse::DielectricFresnel { ar_residual } => ar_residual.sample(lam),
+        _ => None,
+    };
+    let r1 = residual(&body.surface.for_patch(h.patch).from_outside)?;
+    let r2 = residual(&body.surface.for_patch(h2.patch).from_inside)?;
+    // The planes before the first face and behind the second, over the window.
+    let x = if d.x.abs() < 0.9 { Vec3::X } else { Vec3::Y };
+    let x = (x - d * d.dot(x)).normalize();
+    let y = d.cross(x);
+    let corners = [(-half, -half), (half, -half), (-half, half), (half, half)];
+    let depth = |a: f64, b: f64| -(x * a + y * b).dot(n) / d.dot(n);
+    let s_min = corners.iter().map(|&(a, b)| depth(a, b)).fold(0.0f64, f64::min);
+    let s_max = corners.iter().map(|&(a, b)| depth(a, b)).fold(0.0f64, f64::max);
+    let entry = h.point + d * (s_min - 1e-3);
+    let exit = h2.point + d * (s_max + 1e-3);
+    if (entry - resume).dot(d) <= 0.0 || (next - exit).dot(d) <= 0.0 {
+        return None;
+    }
+    // Flat: along each of eight directions from the chief ray, out to where
+    // the faces end (found by bisection, so a small element is not missed),
+    // every ray meets the two faces square to n.
+    let probe = probe_scene(scene, h.object);
+    let cfg = TraceConfig3 { ghosts: false, polarization: false, record_events: true, bounds_mm: oc_trace::bounds_for_scene3(&probe), ..TraceConfig3::default() };
+    // The normals at the two faces where the ray from (a, b) meets them.
+    let faces = |a: f64, b: f64| -> Option<(Vec3, Vec3)> {
+        let ray = oc_core::vec3::Ray3::new(entry + x * a + y * b, d).ok()?;
+        let res = trace3(&probe, &[LaunchRay3 { ray, lambda_um: lam, flux: 1.0, source: None, pol: None }], &cfg);
+        let hits: Vec<(oc_core::id::PatchId, Vec3)> = res
+            .events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                TraceEventKind::Interact { surface, normal, .. } => Some((surface.patch, *normal)),
+                _ => None,
+            })
+            .take(2)
+            .collect();
+        (hits.len() == 2 && hits[0].0 == h.patch && hits[1].0 == h2.patch).then(|| (hits[0].1, hits[1].1))
+    };
+    let r_max = half * std::f64::consts::SQRT_2;
+    for k in 0..8 {
+        let t = std::f64::consts::PI * k as f64 / 4.0;
+        let (c, sn) = (t.cos(), t.sin());
+        let (mut lo, mut hi) = (0.0, r_max);
+        if faces(hi * c, hi * sn).is_none() {
+            for _ in 0..40 {
+                let mid = 0.5 * (lo + hi);
+                if faces(mid * c, mid * sn).is_some() {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+        } else {
+            lo = hi;
+        }
+        for f in [0.3, 0.6, 0.9, 0.999] {
+            let r = f * lo;
+            let (n1, n2) = faces(r * c, r * sn)?;
+            if n1.normalize().dot(n).abs() < 1.0 - 1e-9 || n2.normalize().dot(n).abs() < 1.0 - 1e-9 {
+                return None;
+            }
+        }
+    }
+    let thickness_mm = (h2.point - h.point).dot(n).abs();
+    let chief_opl_mm = h.n_before * (h.point - entry).length() + h.n_after * (h2.point - h.point).length() + h2.n_after * (exit - h2.point).length();
+    let plate = Plate { normal: n, thickness_mm, n_glass: h.n_after, n_out: h.n_before, residual: [r1, r2], chief_opl_mm };
+    Some((plate, entry, exit))
 }
 
 /// One chain of a wave path: the beam carried along one branch lineage of
@@ -460,6 +565,8 @@ struct ChainJob {
     launched: bool,
     /// Read out onto the detector's own grid, to be added to other arms.
     face: bool,
+    /// The polarization the field stands for.
+    pol: Pol,
     /// Each event: where the field reaches it, where it leaves from (the
     /// same point except after a transfer), and what it is.
     points: Vec<(Vec3, Vec3, Ev)>,
@@ -511,7 +618,7 @@ fn launch_field(spec: &WavePathSpec, grid: Grid2, lam: f64, n0: f64, power: f64,
 impl ChainJob {
     /// Plan the events along `seq` and frame the beam at the source; the
     /// field is launched when the chain first steps.
-    fn new(scene: &Arc<Scene3>, spec: &WavePathSpec, seq: oc_core::seq3::SequencePrescription3, power: f64, face: bool) -> Result<Self, WaveError> {
+    fn new(scene: &Arc<Scene3>, spec: &WavePathSpec, seq: oc_core::seq3::SequencePrescription3, power: f64, face: bool, pol: Pol) -> Result<Self, WaveError> {
         let src = scene
             .sources
             .iter()
@@ -532,7 +639,10 @@ impl ChainJob {
         // beam meets it; between faces the field diffracts inside the glass.
         let mut chain: Vec<(Vec3, Vec3, Ev)> = Vec::new();
         let mut resume = seq.launch.point;
-        for (k, h) in seq.hits.iter().enumerate() {
+        let mut k = 0;
+        while k < seq.hits.len() {
+            let h = &seq.hits[k];
+            k += 1;
             let curved = h.kind == SeqHitKind::Surface
                 && scene.surfaces.iter().any(|s| s.common.id == h.object && !matches!(s.geometry, SurfaceGeometry3::Plane { .. }));
             if h.kind != SeqHitKind::Body && !curved {
@@ -540,7 +650,20 @@ impl ChainJob {
                 resume = h.point;
                 continue;
             }
-            let next_point = seq.hits.get(k + 1).map_or(seq.terminal.point, |n| n.point);
+            // A plane-parallel plate is one closed-form step, its round trips
+            // included (crate::planar).
+            if h.kind == SeqHitKind::Body {
+                if let Some(h2) = seq.hits.get(k) {
+                    let next = seq.hits.get(k + 1).map_or(seq.terminal.point, |n| n.point);
+                    if let Some((plate, entry, exit)) = plate_of(scene, h, h2, resume, next, 0.5 * spec.window_mm, lam) {
+                        chain.push((entry, exit, Ev::Plate { first: h.clone(), second: h2.clone(), exit, plate }));
+                        resume = exit;
+                        k += 1;
+                        continue;
+                    }
+                }
+            }
+            let next_point = seq.hits.get(k).map_or(seq.terminal.point, |n| n.point);
             let d_in = (h.point - resume).normalize();
             let d_out = (next_point - h.point).normalize();
             let probe = probe_scene(scene, h.object);
@@ -587,10 +710,15 @@ impl ChainJob {
                     points.push((q, q, Ev::Aperture(ai)));
                 }
             }
-            // An aperture inside a face's slab has no place in the field's
-            // steps: refused by name rather than skipped.
-            if let Ev::Transfer { hit, .. } = &ev {
-                for (from, to) in [(p, hit.point), (hit.point, after)] {
+            // An aperture inside a face's slab, or a plate, has no place in
+            // the field's steps: refused by name rather than skipped.
+            let inside: Vec<(Vec3, Vec3, &oc_core::seq3::SeqHit3)> = match &ev {
+                Ev::Transfer { hit, .. } => vec![(p, hit.point, hit), (hit.point, after, hit)],
+                Ev::Plate { first, .. } => vec![(p, after, first)],
+                _ => Vec::new(),
+            };
+            for (from, to, hit) in inside {
+                {
                     let len = (to - from).length();
                     if len <= 0.0 {
                         continue;
@@ -623,6 +751,7 @@ impl ChainJob {
                     Ev::Hit(h) => format!("hit {} {:?} {at}", h.object.0, h.action),
                     Ev::Aperture(ai) => format!("aperture {ai} {at}"),
                     Ev::Transfer { hit, .. } => format!("transfer {} {:?} {at}", hit.object.0, hit.action),
+                    Ev::Plate { first, .. } => format!("plate {} {at}", first.object.0),
                     Ev::End => format!("end {at}"),
                 }
             })
@@ -636,6 +765,7 @@ impl ChainJob {
             n0,
             launched: false,
             face,
+            pol,
             points,
             keys,
             arms,
@@ -671,6 +801,93 @@ impl ChainJob {
 
     fn next_dir(&self, i: usize, here: Vec3, current: Vec3) -> Vec3 {
         self.points.get(i + 1).map_or(current, |(p, _, _)| (*p - here).normalize())
+    }
+
+    /// A plane-parallel plate: its rim laid on the field at the field's own
+    /// sampling, then the slab's closed form plane wave by plane wave.
+    fn plate_event(&mut self, first: &oc_core::seq3::SeqHit3, second: &oc_core::seq3::SeqHit3, exit: Vec3, plate: &Plate) -> Result<(), WaveError> {
+        use oc_trace::{trace3, LaunchRay3, TraceConfig3, TraceEventKind};
+        let beam = self.beam;
+        let lam = self.lam;
+        let before = self.u.power();
+        // The rim: where a ray from the plane before the plate meets the two
+        // faces in turn.
+        let probe = probe_scene(&self.scene, first.object);
+        let cfg = TraceConfig3 { ghosts: false, polarization: false, record_events: true, bounds_mm: oc_trace::bounds_for_scene3(&probe), ..TraceConfig3::default() };
+        let pass = |a: f64, b: f64| -> bool {
+            let Ok(ray) = oc_core::vec3::Ray3::new(beam.point(a, b), beam.d) else { return false };
+            let res = trace3(&probe, &[LaunchRay3 { ray, lambda_um: lam, flux: 1.0, source: None, pol: None }], &cfg);
+            let hits: Vec<_> = res
+                .events
+                .iter()
+                .filter_map(|e| match &e.kind {
+                    TraceEventKind::Interact { surface, .. } => Some(surface.patch),
+                    _ => None,
+                })
+                .take(2)
+                .collect();
+            hits == [first.patch, second.patch]
+        };
+        let g = 65usize;
+        let w = self.u.grid.width_mm(0).max(self.u.grid.width_mm(1));
+        let h = w / (g - 1) as f64;
+        let half = (g - 1) as f64 / 2.0;
+        let grid: Vec<bool> = (0..g * g).map(|k| pass(((k % g) as f64 - half) * h, ((k / g) as f64 - half) * h)).collect();
+        let rim = if grid.iter().all(|&p| p) {
+            "no rim within the window".to_string()
+        } else {
+            let poly = crate::transfer::rim_polygon(&pass, &grid, g, h)
+                .ok_or_else(|| WaveError::OutOfRange(format!("plate #{} ({}): the edge of what passes it is not star-shaped about the chief ray", first.object.0, first.label)))?;
+            let cov = crate::elements::polygon_coverage(&self.u.grid, &poly);
+            let (stopped, beyond) = crate::elements::apply_coverage(&mut self.u, &cov)?;
+            self.report.ledger.absorbed_aperture += stopped;
+            self.report.ledger.beyond_nyquist += beyond;
+            format!("its rim laid on the field with exact cell coverage, {:.3e} of the power stopped there", stopped / before.max(f64::MIN_POSITIVE))
+        };
+        let out = beam.turned(exit, beam.d);
+        let (v, st) = crate::planar::plate_step(&self.u, &beam, &out, plate, self.pol, &mut self.fft)?;
+        let l = &mut self.report.ledger;
+        l.other_arm += st.reflected;
+        l.left_window += st.beyond + st.left_window;
+        l.evanescent += st.evanescent;
+        l.resampling += st.rest;
+        let oblique = beam.d.dot(plate.normal).abs() < 1.0 - 1e-12;
+        let pol = match self.pol {
+            Pol::S(_) => "s",
+            Pol::P(_) => "p",
+            Pol::Unpolarized => "s = p",
+        };
+        let trips = match st.round_trips {
+            None => "every round trip".to_string(),
+            Some(m) => format!(
+                "{m} round trip(s), each {:.4} mm across the beam; the rest, beyond the window, {:.3e} of the power",
+                st.round_trip_shift_mm,
+                st.beyond / before.max(f64::MIN_POSITIVE)
+            ),
+        };
+        self.report.steps.push(element_step(
+            0.0,
+            format!(
+                "plate #{} ({}): {:.6} mm of index {:.6}, the slab's closed form plane wave by plane wave ({pol}), {trips}; {rim}; {:.3e} reflected",
+                first.object.0,
+                first.label,
+                plate.thickness_mm,
+                plate.n_glass,
+                st.reflected / before.max(f64::MIN_POSITIVE)
+            ),
+        ));
+        if oblique && self.pol == Pol::Unpolarized {
+            self.report.approx(format!("plate #{}: met obliquely by a field standing for unpolarized light, its s and p amplitudes averaged", first.object.0));
+        }
+        if oblique {
+            self.report.approx(
+                "planar layers: every plane wave takes its own angle's amplitude for the chain's s or p; plane waves off the plane of incidence see s and p slightly rotated, which is left out",
+            );
+        }
+        self.u = v;
+        self.beam = out;
+        self.u.n_medium = plate.n_out;
+        Ok(())
     }
 
     fn tilt_warn(&mut self, depth: f64) {
@@ -751,6 +968,55 @@ impl ChainJob {
                 (unit(zero_order.sample(lam)).ok_or_else(|| refuse(kind))?.sqrt(), None, Loss::Orders)
             }
             (SurfaceResponse::ThinLens { focal_length_mm }, _) => (1.0, Some((*focal_length_mm, s.common.transform.pos)), Loss::Absorbed),
+            // A zero-thickness refracting surface has the same medium on both
+            // sides: nothing to reflect, nothing to bend.
+            (SurfaceResponse::DielectricFresnel { .. }, SeqAction::Transmit) if (h.n_before - h.n_after).abs() < 1e-12 => (1.0, None, Loss::Absorbed),
+            // A coating: each plane wave of the field takes its own angle's
+            // amplitude (crate::planar), applied here; the handover then
+            // carries the field on unchanged.
+            (SurfaceResponse::Coating { coating }, SeqAction::Reflect | SeqAction::Transmit) => {
+                let reflect = h.action == SeqAction::Reflect;
+                let n0 = h.n_before;
+                let pol = self.pol;
+                // The amplitude on a table of cosines, read between its
+                // entries: it is smooth in the angle, and a transfer matrix
+                // per plane wave would cost the field's size in stacks.
+                let table: Vec<(Cx, f64, f64)> = (0..=1024)
+                    .map(|i| {
+                        let c = (i as f64 / 1024.0).max(1e-6);
+                        let at = |pp: bool| crate::planar::coating_arm(coating, reflect, n0, lam, c, pp);
+                        match pol.is_p() {
+                            Some(pp) => at(pp),
+                            None => at(false).and_then(|a| at(true).map(|b| ((a.0 + b.0) * 0.5, 0.5 * (a.1 + b.1), 0.5 * (a.2 + b.2)))),
+                        }
+                    })
+                    .collect::<Result<_, _>>()?;
+                let read = |c: f64| -> (Cx, f64, f64) {
+                    let x = (c.clamp(0.0, 1.0) * 1024.0).min(1023.999999);
+                    let (i, f) = (x.floor() as usize, x - x.floor());
+                    let (a, b) = (table[i], table[i + 1]);
+                    (a.0 * (1.0 - f) + b.0 * f, a.1 * (1.0 - f) + b.1 * f, a.2 * (1.0 - f) + b.2 * f)
+                };
+                let (v, other, absorbed, left) = crate::planar::surface_filter(&self.u, &beam, n_s, &read, &mut self.fft)?;
+                let l = &mut self.report.ledger;
+                l.other_arm += other;
+                l.absorbed_element += absorbed;
+                l.left_window += left;
+                self.u = v;
+                if beam.d.dot(n_s).abs() < 1.0 - 1e-12 && self.pol == Pol::Unpolarized {
+                    self.report.approx(format!("coating #{}: met obliquely by a field standing for unpolarized light, its s and p amplitudes averaged", h.object.0));
+                }
+                self.report.approx("coatings on the path: each plane wave takes its own angle's amplitude for the chain's s or p, from the transfer matrix; a plate-backed coating's plate is incoherent, as it declares");
+                (1.0, None, Loss::Absorbed)
+            }
+            (SurfaceResponse::MeasuredTable { .. }, _) => {
+                let e = WaveError::OutOfRange(format!(
+                    "table at #{} ({}): a measured table gives R and T without their phases, so the field has no amplitude to take from it",
+                    h.object.0, h.label
+                ));
+                self.report.rejected.push(e.to_string());
+                return Err(e);
+            }
             _ => {
                 let e = refuse(kind);
                 self.report.rejected.push(e.to_string());
@@ -967,6 +1233,10 @@ impl ChainJob {
                 self.beam = out;
                 return Ok(());
             }
+            Ev::Plate { first, second, exit, plate } => {
+                self.plate_event(&first, &second, exit, &plate)?;
+                return Ok(());
+            }
             Ev::Aperture(ai) => {
                 let a = &self.scene.apertures[ai];
                 let t = &a.common.transform;
@@ -1037,7 +1307,7 @@ impl ChainJob {
                 let d2 = self.next_dir(idx, p, beam.d);
                 let out = beam.turned(p, d2);
                 if let SurfaceResponse::Modulator { device, .. } = response {
-                    self.u = modulator_step(&self.u, &beam, &out, s, device, &h, &self.spec, &mut self.report)?;
+                    self.u = modulator_step(&self.u, &beam, &out, s, device, &h, &self.spec, self.pol, &mut self.report)?;
                 } else {
                     let (s, response) = (s.clone(), response.clone());
                     if matches!(response, SurfaceResponse::ExplicitRt { .. }) {
@@ -1633,7 +1903,60 @@ pub struct WaveJob {
 
 struct Mode {
     lambda_um: f64,
+    /// What the mode is, for the report: its line, and its polarization.
+    label: String,
     chains: Vec<Chain>,
+}
+
+/// The polarization modes a set of chains needs: one standing for
+/// unpolarized light, unless an element on a chain tells s from p obliquely
+/// (a plane-parallel plate, a flat coating), when an unpolarized source is
+/// two mutually incoherent modes, s and p of the plane of incidence those
+/// elements share, half its power each. Elements whose planes of incidence
+/// differ mix s and p, which a scalar field cannot carry: refused by name.
+fn polarization_modes(scene: &Scene3, seqs: &[oc_core::seq3::SequencePrescription3], half: f64, lam: f64) -> Result<Vec<Pol>, WaveError> {
+    let mut plane: Option<(Vec3, String)> = None;
+    for seq in seqs {
+        let mut prev = seq.launch.point;
+        for (k, h) in seq.hits.iter().enumerate() {
+            let d = (h.point - prev).normalize();
+            prev = h.point;
+            let n = h.normal.normalize();
+            let oblique = d.dot(n).abs() < 1.0 - 1e-9;
+            let coated = h.kind == SeqHitKind::Surface
+                && scene.surfaces.iter().any(|s| {
+                    s.common.id == h.object
+                        && matches!(s.geometry, SurfaceGeometry3::Plane { .. })
+                        && matches!(if d.dot(s.common.transform.rotate(Vec3::Z)) < 0.0 { &s.response_front } else { &s.response_back }, SurfaceResponse::Coating { .. })
+                });
+            let plate = h.kind == SeqHitKind::Body
+                && oblique
+                && seq.hits.get(k + 1).is_some_and(|h2| {
+                    let next = seq.hits.get(k + 2).map_or(seq.terminal.point, |x| x.point);
+                    let from = if k == 0 { seq.launch.point } else { seq.hits[k - 1].point };
+                    plate_of(scene, h, h2, from, next, half, lam).is_some()
+                });
+            if !(oblique && (coated || plate)) {
+                continue;
+            }
+            let pn = d.cross(n).normalize();
+            match &plane {
+                None => plane = Some((pn, format!("#{} ({})", h.object.0, h.label))),
+                Some((p0, who)) => {
+                    if pn.dot(*p0).abs() < 1.0 - 1e-9 {
+                        return Err(WaveError::OutOfRange(format!(
+                            "#{} ({}) and {who} have different planes of incidence, where s and p mix; the wave path's scalar field carries one linear polarization of a plane both share",
+                            h.object.0, h.label
+                        )));
+                    }
+                }
+            }
+        }
+    }
+    Ok(match plane {
+        None => vec![Pol::Unpolarized],
+        Some((n, _)) => vec![Pol::S(n), Pol::P(n)],
+    })
 }
 
 enum Chain {
@@ -1734,11 +2057,21 @@ impl WaveJob {
                 }
             }
             let face = seqs.len() > 1;
-            let chains = seqs
-                .into_iter()
-                .map(|seq| ChainJob::new(&shared, spec, seq, spec.power * w / total, face).map(|j| Chain::Running(Box::new(j))))
-                .collect::<Result<Vec<_>, _>>()?;
-            modes.push(Mode { lambda_um: lam, chains });
+            let pols = polarization_modes(scene, &seqs, 0.5 * spec.window_mm, lam)?;
+            let share = 1.0 / pols.len() as f64;
+            for pol in pols {
+                let chains = seqs
+                    .iter()
+                    .cloned()
+                    .map(|seq| ChainJob::new(&shared, spec, seq, spec.power * w / total * share, face, pol).map(|j| Chain::Running(Box::new(j))))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let label = match pol {
+                    Pol::Unpolarized => format!("λ {lam} µm"),
+                    Pol::S(_) => format!("λ {lam} µm, s"),
+                    Pol::P(_) => format!("λ {lam} µm, p"),
+                };
+                modes.push(Mode { lambda_um: lam, label, chains });
+            }
         }
         Ok(WaveJob { scene: shared, spec: *spec, revision, modes })
     }
@@ -1762,6 +2095,13 @@ impl WaveJob {
         self.modes.iter().map(|m| m.chains.len()).max().unwrap_or(0)
     }
     pub fn lines(&self) -> usize {
+        let mut l: Vec<f64> = self.modes.iter().map(|m| m.lambda_um).collect();
+        l.dedup();
+        l.len()
+    }
+    /// The mutually incoherent modes the job adds in power: its lines, each
+    /// once, or twice (s and p) where an element tells them apart.
+    pub fn modes(&self) -> usize {
         self.modes.len()
     }
 
@@ -1820,10 +2160,13 @@ impl WaveJob {
             }
             unreachable!("a lone chain stays running until it is finished");
         }
-        let lines = modes.len();
-        let mut results = Vec::with_capacity(lines);
+        let count = modes.len();
+        let mut lines: Vec<f64> = modes.iter().map(|m| m.lambda_um).collect();
+        lines.dedup();
+        let (lines, pols) = (lines.len(), count / lines.len().max(1));
+        let mut results = Vec::with_capacity(count);
         for m in modes {
-            let lam = m.lambda_um;
+            let lam = m.label.clone();
             let r = if m.chains.len() > 1 {
                 let faces = m
                     .chains
@@ -1849,7 +2192,7 @@ impl WaveJob {
         let mut iter = results.into_iter();
         let (lam0, mut total) = iter.next().expect("several");
         for st in &mut total.report.steps {
-            st.note = format!("λ {lam0} µm: {}", st.note);
+            st.note = format!("{lam0}: {}", st.note);
         }
         for (lam, r) in iter {
             if r.bins != total.bins {
@@ -1865,7 +2208,7 @@ impl WaveJob {
             add_losses(l, &r.report.ledger);
             for st in r.report.steps {
                 let mut st = st;
-                st.note = format!("λ {lam} µm: {}", st.note);
+                st.note = format!("{lam}: {}", st.note);
                 total.report.steps.push(st);
             }
             for w in r.report.warnings {
@@ -1878,9 +2221,14 @@ impl WaveJob {
                 total.report.approx(a);
             }
         }
-        total.report.approx(format!(
-            "{lines} spectral lines added in power, as mutually incoherent modes; the field shown is the strongest line's, at {lam0} µm"
-        ));
+        if lines > 1 {
+            total.report.approx(format!("{lines} spectral lines added in power, as mutually incoherent modes; the field shown is the first mode's, {lam0}"));
+        }
+        if pols > 1 {
+            total.report.approx(format!(
+                "unpolarized light as two mutually incoherent modes, s and p of the plane of incidence the path's elements share, added in power; the field shown is the first mode's, {lam0}"
+            ));
+        }
         Ok(total)
     }
 }
@@ -1917,6 +2265,7 @@ fn modulator_step(
     device: &oc_core::modulator::SpatialModulator,
     h: &oc_core::seq3::SeqHit3,
     spec: &WavePathSpec,
+    pol: Pol,
     report: &mut WaveReport,
 ) -> Result<Field2, WaveError> {
     let t = &s.common.transform;
@@ -1972,19 +2321,34 @@ fn modulator_step(
         }
         ModulatorKind::Lcos(_) => {
             let beam_kind = if h.action == SeqAction::Diffract { LcosBeam::Modulated } else { LcosBeam::Unmodulated };
-            report.approx("LCoS on the wave path: the beam is unpolarized, so each polarization beam carries half the reflected power; the two never interfere, and the one not followed is booked as another family");
-            // Unpolarized light, which is all a wave path carries (it refuses
-            // polarizers): of what the device reflects, half lies along its
-            // director and is modulated, half across it and is not (Zhang, You
-            // & Chu 2014). The chain follows one; the other is the family not
+            // Of what the device reflects, the part along its director is
+            // modulated and the part across it is not (Zhang, You & Chu 2014).
+            // A field standing for unpolarized light sends half each way; a
+            // field of one linear polarization, cos² and sin² of its angle to
+            // the director. The chain follows one; the other is the family not
             // followed. What the device absorbs or misses is the same for both.
+            let along = match (pol, &device.kind) {
+                (Pol::S(nrm) | Pol::P(nrm), ModulatorKind::Lcos(l)) => {
+                    let e = if matches!(pol, Pol::S(_)) { nrm } else { beam.d.cross(nrm).normalize() };
+                    let dl = l.director_deg.to_radians();
+                    let dir = t.rotate(Vec3::new(dl.cos(), dl.sin(), 0.0));
+                    let dir = (dir - beam.d * beam.d.dot(dir)).normalize();
+                    report.approx("LCoS on the wave path: the field's linear polarization split on the director, cos² modulated and sin² not; the two never interfere");
+                    e.dot(dir).powi(2)
+                }
+                _ => {
+                    report.approx("LCoS on the wave path: the beam is unpolarized, so each polarization beam carries half the reflected power; the two never interfere, and the one not followed is booked as another family");
+                    0.5
+                }
+            };
+            let share = if beam_kind == LcosBeam::Modulated { along } else { 1.0 - along };
             let (mut v, mut rep) = lcos_reflect(&on_dev, device, beam_kind)?;
             for z in &mut v.data {
-                *z *= std::f64::consts::FRAC_1_SQRT_2;
+                *z *= share.sqrt();
             }
-            split_off = 0.5 * (rep.ledger.detected + rep.ledger.beyond_nyquist);
-            rep.ledger.detected *= 0.5;
-            rep.ledger.beyond_nyquist *= 0.5;
+            split_off = (1.0 - share) * (rep.ledger.detected + rep.ledger.beyond_nyquist);
+            rep.ledger.detected *= share;
+            rep.ledger.beyond_nyquist *= share;
             (v, rep)
         }
     };

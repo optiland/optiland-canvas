@@ -207,6 +207,8 @@ incoming ray to the plane across the outgoing one:
 | aperture | as the tracer has it: light passes inside the opening, is stopped between the opening and the outer extent, and passes beyond the outer extent (an aperture with none is unbounded); each edge weighted by exact cell coverage, of the shape itself square to the beam and of its projection along the beam otherwise | thin element |
 | DMD, LCoS SLM | laid onto the device plane at `device_samples_per_pixel`, reflected by the device model ([DMD](dmd.md), [SLM](slm.md)), taken up across the outgoing ray; at an LCoS, half of what it reflects follows the chain (below) | thin element |
 | face of a refractive body, curved mirror or other curved surface | traced across the thin slab that holds the surface where the beam meets it (below), its rim laid on the field with exact cell coverage; between a body's faces the field diffracts inside the glass by the angular spectrum, in the glass's index | the slab is geometric: no diffraction across a surface's sag |
+| plane-parallel plate (a body entered and left by two flat, parallel faces, bare or with a residual AR) | one step: the closed-form slab, round trips included, on each plane wave of the field, then the angular spectrum across the planes (below) | exact for a plate of infinite extent, s or p; its rim laid on the field |
+| flat coated surface (`Coating`: a coated splitter, a dichroic) | each plane wave times the coating's complex `r` or `t` at its own angle, from the transfer matrix, then handed over like any flat element; a plate-backed coating's plate in series, without round trips, as the coating declares it incoherent | exact for the stack, s or p |
 | detector, `Readout::Projected` | power per pixel: each field cell's `\|U\|²ΔA` binned into the pixel its projection lands in, in sub-cells of at most an eighth of a pixel | power conserved to round-off |
 | detector, `Readout::Diffracted` | the last free-space step taken straight onto the detector by the zoomed angular spectrum (`asm_zoom`), at `s × s` points a pixel: a focal spot far smaller than the field's own samples is resolved, with no paraxial step | exact scalar propagation; the field repeats a window away when unpadded |
 
@@ -299,6 +301,40 @@ order: an iris on a Lee hologram's −1 order, off the chief ray, would block
 the chief ray itself. The wave path does not follow an order yet; the ray
 tracer's orders model (`RayModel::Orders`) traces them as rays.
 
+**Planar layers, plane wave by plane wave.** A planar interface keeps every
+plane wave's tangential wavevector, so each plane wave of a field meets it on
+its own, at its own angle: in the field's angular spectrum the interface is a
+multiplication, with no projection and no ray. A plane-parallel plate is so
+treated as one step: the closed-form slab
+`t₀₁t₁₂e^{iδ}/(1 − r₁₀r₁₂e^{2iδ})`, `δ = k₀n_g L cos θ_g`, relative to free
+space across the same planes (`× e^{−ik₀n₀L cos θ₀}`), then the exact angular
+spectrum from the plane before the plate to the plane behind it, the field
+shifted onto the chief ray's exit. The round trips between the faces are in
+the sum, so an etalon's multiple-beam fringes come out of it, and so does the
+lateral shift a tilted plate gives the beam (the slope of the slab's phase
+across the spectrum). A tilted plate's round trips leave the beam a
+round-trip shift apart; those that would land beyond the window are summed
+out of the series and booked as `left_window`, never wrapped back in. The
+amplitudes are in the tangential chart and power coordinates of a scattering
+two-port: `r = (y₁ − y₂)/(y₁ + y₂)`, `t = 2√(y₁y₂)/(y₁ + y₂)`,
+`y_s = n cos θ`, `y_p = n / cos θ`, unitary, with the Stokes signs of the
+splitters. A flat coated surface multiplies each plane wave by its coating's
+complex reflection or transmission, from `oc_core::thinfilm`'s transfer
+matrix put into that chart (its ray-frame `r_p` negated, its transmission
+scaled into power coordinates). A body that is not such a plate is still
+traced face by face, with the tracer's unpolarized transmittance.
+
+**Two polarizations.** The field is scalar. Where an element tells s from p
+obliquely (a plate, a coating), the chain carries one of two modes, s or p of
+the plane of incidence those elements share, and an unpolarized source is the
+two modes, mutually incoherent, half its power each, added in power like
+spectral lines [22]. Every plane wave takes its own angle's amplitude for that
+mode; that the plane waves off the plane of incidence see s and p slightly
+rotated is left out, and the report names it. Elements whose planes of
+incidence differ mix s and p, which needs Jones fields: refused by name. An
+LCoS met by an s or p field splits it on its director as `cos²` and `sin²` of
+its angle to it.
+
 **Interferometers: arms that meet.** Where splitter arms recombine on the
 detector, the axial ray reaches it by several chains. Each carries the same
 launched field along its own arm, and the arms' fields are added on the
@@ -344,11 +380,13 @@ power, and the lines add in power. So two lines' fringes wash out where they
 fall in antiphase, which the two-line test holds. The field shown is the
 strongest line's.
 
-**Refused, by name:** polarizers and retarders (the field is scalar), any
-response with no wave model, an aperture inside a face's slab, an LCoS whose
-two polarization beams both reach the detector (they add in power, and a
-scalar field carries one), a continuous spectrum (give the source lines: a
-sampling of it is the source's to choose), and more than 16 lines. A refusal
+**Refused, by name:** polarizers and retarders (the field is scalar), a
+measured table (it gives R and T without their phases), elements whose planes
+of incidence differ (s and p mix), any response with no wave model, an
+aperture inside a face's slab or a plate, an LCoS whose two polarization beams
+both reach the detector (they add in power, and a scalar field carries one), a
+continuous spectrum (give the source lines: a sampling of it is the source's
+to choose), and more than 16 lines. A refusal
 is an error naming what was refused; nothing is skipped and nothing is run at
 a wavelength the source did not ask for.
 
@@ -398,7 +436,7 @@ These are acceptance case C53, in `crates/oc-wave/tests/path.rs`.
 | `wave_power_agrees_with_rays_when_the_fresnel_number_is_large` | the f64 ray trace of the same scene, a uniform beam through a disc at `N_F` = 1264 | 1% | 0.12% |
 | `a_dmd_in_the_scene_focuses_its_orders_f_lambda_over_p_apart` | orders `λ/p` apart in direction cosine [10], so `fλ/p` apart at a lens's focus | 1% | 1.000; resampling 7.7e-6, `numerical` 2.8e-13 |
 | `slicing_a_wave_job_changes_no_bit` | the same path run in one step | bit-identical | identical |
-| `a_glass_plate_shifts_a_gaussian_as_free_space_of_t_over_n` | a plate of thickness `t`, index `n` is free space `t/n` to a Gaussian [13] | 1e-5 | 2.4e-6 (implied index within 2.3e-4) |
+| `a_glass_plate_shifts_a_gaussian_as_free_space_of_t_over_n` | a plate of thickness `t`, index `n` is free space `t/n` to a Gaussian [13]; faces anti-reflected, one closed-form step | 1e-5 | 1.9e-7 (implied index within 1.8e-5; face by face it was 2.4e-6 and 2.3e-4) |
 | `a_gaussian_through_a_singlet_waists_where_self_predicts` | Self [14] with the singlet's focal length and principal planes traced by the f64 tracer (an N-BK7 equiconvex lens, R ±50 mm, 4 mm) | 1e-3 | waist position 2.5e-4 of its Rayleigh range (2.9 µm); radius 5.1e-5 |
 | `a_tilted_plate_displaces_the_beam_where_the_rays_say` | the chief ray's landing point behind a plate at 30° | 0.05 pixel | 5.2e-5 mm |
 | `a_singlet_psf_matches_optiland_huygens_psf` | Optiland's `HuygensPSF` of the same singlet at f/10, at its paraxial focus (oracle, below) | Strehl ±0.01; rms 1e-2 of the ideal peak | Strehl 0.8653 against 0.8642; rms 1.2e-4 |
@@ -408,13 +446,18 @@ These are acceptance case C53, in `crates/oc-wave/tests/path.rs`.
 | `a_thin_lens_smaller_than_the_beam_lets_the_rest_pass_beside_it` | 10 µm behind a 0.5 mm thin lens: the lens's phase inside, free space's field outside, away from the edge | 2e-3 | 1.0e-3 inside; 3.0e-5 outside |
 | `a_lens_rim_smaller_than_the_beam_stops_and_diffracts_as_an_iris_against_it` | a 1 mm iris 1.5 µm before a lens too large to clip; the lens rim itself, with exact cover | power 3e-4; spot 2e-3 of peak | 1.1e-4 (the back face's rim stops 9e-4 of what reaches it, which is real); 3.5e-4 |
 | `an_lcos_on_the_path_sends_half_of_unpolarized_light_into_each_beam` | half of what the device meets in the unmodulated beam [26]; `sinc²(1/16)` of the modulated half in the first order [31] | 2e-3; 3e-3 | 5.9e-7; −2.0e-3 |
-| `a_glass_plate_delays_the_beam_by_its_optical_path` | `k₀(n − 1)t` less the Gouy change of the effective length [13] | 1e-4 rad | 2.6e-6 rad |
+| `a_glass_plate_delays_the_beam_by_its_optical_path` | `k₀(n − 1)t` less the Gouy change of the effective length [13] | 1e-4 rad | 8.9e-9 rad (face by face, 2.6e-6) |
 | `a_mach_zehnder_sends_all_the_power_out_of_its_two_ports_whatever_the_path_difference` | a lossless network is unitary: the two ports carry the input between them, `(1 ∓ cos Δφ)/2` each, at Δφ = 0, π/2, π, 3π/2 [23], [24] | sum 1e-3; share 2e-3 | sum 1.000; share within 1e-7 |
 | `a_michelson_with_a_tilted_mirror_makes_fringes_of_period_lambda_over_sin_2_alpha` | two arms crossing at 2α make fringes `λ/sin 2α` apart [1]; read from the power's spectrum across the face | 2e-3 | −7.1e-5 (the beams' curvature accounts for −3.5e-5) |
 | `moving_a_michelson_mirror_by_d_shifts_its_fringes_by_two_k_d` | four steps of λ/8 are four of π/2: `P₀ + P₂ = P₁ + P₃`; visibility 1; equal arms dark [1] | 1e-3; 0.995 | 2.8e-7; 1.000 |
 | `two_lines_wash_a_michelson_s_fringes_out_where_their_beats_cancel` | two incoherent lines [22]: visibility `\|cos(2πΔ(1/λ₁ − 1/λ₂))\|`, 1 at equal arms, 0 where the beats cancel | 0.99; 2e-2 | 0.9996; 1.6e-3 |
 | `a_continuous_source_is_refused_and_lines_add_in_power` | the lines' own runs, weighted; a continuum refused by name | 1e-12 | 1.8e-15 |
 | `an_lcos_whose_two_polarization_beams_both_reach_the_detector_is_refused_by_name` | orthogonal polarizations do not interfere [20] | refused | refused |
+| `a_thin_plate_is_an_etalon_transparent_at_seven_pi_and_dimmest_at_seven_and_a_half` | the closed-form slab at δ = 7π (`T = 1`, `t = (−1)⁷`) and 7.5π (`(1 − r²)²/(1 + r²)²`) [16] | 1e-6 | 6e-14 and 4e-14; the field 3.3e-7 from −e^{−ik₀L} |
+| `an_oblique_etalon_transmits_s_and_p_as_their_own_closed_forms` | at 31°, δ = 7.5π: unpolarized light transmits `(T_s + T_p)/2` [16], [22] | 1e-5 | 1.3e-7 |
+| `a_millimetre_plate_s_transmission_follows_its_round_trip_phase` | the closed form at δ = k₀nL ≈ 15 000 rad [16] | 1e-4 | −2.3e-5 (the beam's own angular spread, its plane waves' δ 5e-4 rad apart) |
+| `a_coated_surface_reflects_and_transmits_as_its_single_layer_s_closed_form` | a quarter-wave MgF₂ layer on crown glass, by the single-layer formula computed apart from the transfer matrix [16]: `(R_s + R_p)/2` at 45°, `(1 − R_f)(1 − R_b)` through the plate | 1e-6 | 1.6e-8; 3.1e-11 |
+| `coatings_whose_planes_of_incidence_differ_are_refused_by_name` | s of one plane is s and p of another | refused | refused |
 
 The propagation tests of W8 (acceptance case C57, `crates/oc-wave/tests/propagate.rs`):
 
@@ -583,8 +626,11 @@ The coating fixtures keep their own pin, `optiland==0.6.1`
   limit; diffraction is taken between faces, not inside a face's slab.
 - **On a wave path, the beam follows the chief ray.** Steering onto a chosen
   diffraction order is W7. Arms that recombine are added once: a cavity's
-  round trips (an etalon's, a Fabry–Perot's) are not followed, and a plate's
-  two faces do not interfere.
+  round trips are summed only inside a plane-parallel plate, where they are
+  in closed form; a cavity of two separate mirrors is not followed round.
+- **Two polarizations, one at a time.** A chain carries s or p of one plane
+  of incidence; elements whose planes differ are refused, and a lens's faces
+  take the tracer's unpolarized transmittance.
 - **No measured datasets.** Every reference above is a closed-form result or
   another implementation of the same integral. The DMD page compares with
   published device numbers, and says which are simulations.
@@ -629,7 +675,7 @@ entry says so.
 13. H. Kogelnik, T. Li, "Laser beams and resonators," *Appl. Opt.* 5(10), 1550–1567 (1966). (DOI to confirm.)
 14. S. A. Self, "Focusing of spherical Gaussian beams," *Appl. Opt.* 22(5), 658–661 (1983).
 15. NIST Digital Library of Mathematical Functions, ch. 7 (error functions and Fresnel integrals) and ch. 10 (Bessel functions), https://dlmf.nist.gov.
-16. M. Born, E. Wolf, *Principles of Optics*, 7th ed., Cambridge University Press (1999), the Airy pattern. (Section number to confirm.)
+16. M. Born, E. Wolf, *Principles of Optics*, 7th ed., Cambridge University Press (1999): the Airy pattern; the theory of stratified media, a single film and a plane-parallel plate's multiple-beam transmission. (Section numbers to confirm.)
 17. F. Wyrowski, M. Kuhn, "Introduction to field tracing," *J. Mod. Opt.* 58(5–6), 449–466 (2011), doi:10.1080/09500340.2010.532237. (The coupling of rays and fields; ADR 0003.)
 
 18. Optiland, https://github.com/optiland/optiland, `master` at `1e0513902c68948a727394c6226f3580c7261c65` (2026-10-14), cloned 2026-10-19: the oracle for C45.

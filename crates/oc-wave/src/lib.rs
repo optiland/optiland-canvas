@@ -42,6 +42,8 @@ pub mod modulator;
 #[cfg(feature = "scene")]
 pub mod path;
 #[cfg(feature = "scene")]
+pub mod planar;
+#[cfg(feature = "scene")]
 mod transfer;
 pub mod propagate;
 pub mod report;

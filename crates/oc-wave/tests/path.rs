@@ -61,6 +61,17 @@ fn lens(f: f64) -> SurfaceResponse {
     SurfaceResponse::ThinLens { focal_length_mm: f }
 }
 
+/// Give every body's faces a perfect anti-reflection: bare Fresnel with its
+/// reflectance scaled to nothing.
+fn perfect_ar(s: &mut Scene3) {
+    let ar = SurfaceResponse::DielectricFresnel { ar_residual: oc_core::scene3::SpectralScalar::Constant(0.0) };
+    for b in &mut s.bodies {
+        b.surface.default.from_outside = ar.clone();
+        b.surface.default.from_inside = ar.clone();
+        b.surface.overrides.clear();
+    }
+}
+
 #[test]
 fn a_gaussian_through_empty_space_spreads_as_kogelnik_and_li_say() {
     // [13], through the scene's own source, sequence and detector.
@@ -729,6 +740,9 @@ fn a_glass_plate_shifts_a_gaussian_as_free_space_of_t_over_n() {
     let src = source(&mut s);
     let g = SingletGeom { r1_mm: f64::INFINITY, r2_mm: f64::INFINITY, thickness_mm: t, semi_aperture_mm: 12.0, conic1: 0.0, conic2: 0.0 };
     s.add_singlet(Vec3::new(100.0, 0.0, 0.0), g, 1.5168, 64.17);
+    // Perfectly anti-reflected faces: one pass, no round trips (those are the
+    // etalon test's).
+    perfect_ar(&mut s);
     let n = s.bodies[0].material.index_at(LAM, &oc_core::material::GlassCatalog::builtin()).unwrap();
     let det = s.add_area_detector(Vec3::new(l, 0.0, 0.0), -Vec3::X, 1.0, 1.0, [16, 16]);
     s.validate().unwrap();
@@ -782,7 +796,7 @@ fn a_tilted_plate_displaces_the_beam_where_the_rays_say() {
     measured("tilted plate: wave centroid vs chief ray, mm", e);
     assert!((ray.x.hypot(ray.y) - shift).abs() < 1e-9, "the rays shift {} vs {shift}", ray.x.hypot(ray.y));
     assert!(e < 0.05 * du, "{cu}, {cv} vs {ray:?}");
-    assert!(r.report.steps.iter().any(|st| st.note.contains("rays move up to")));
+    assert!(r.report.steps.iter().any(|st| st.note.contains("plate #") && st.note.contains("round trip")), "{:?}", r.report.steps);
 }
 
 #[test]
@@ -1153,6 +1167,7 @@ fn a_glass_plate_delays_the_beam_by_its_optical_path() {
         if plate {
             let g = SingletGeom { r1_mm: f64::INFINITY, r2_mm: f64::INFINITY, thickness_mm: t, semi_aperture_mm: 12.0, conic1: 0.0, conic2: 0.0 };
             s.add_singlet(Vec3::new(100.0, 0.0, 0.0), g, 1.5168, 64.17);
+            perfect_ar(&mut s);
         }
         let det = s.add_area_detector(Vec3::new(l, 0.0, 0.0), -Vec3::X, 1.0, 1.0, [16, 16]);
         s.validate().unwrap();
@@ -1199,4 +1214,183 @@ fn an_lcos_whose_two_polarization_beams_both_reach_the_detector_is_refused_by_na
     s.validate().unwrap();
     let e = wave_path(&s, &spec(src, det, 0.3, 128, 2.0), 1).unwrap_err().to_string();
     assert!(e.contains("both its polarization beams"), "{e}");
+}
+
+/// A bare plane-parallel plate of N-BK7, `t` mm thick, at x = 100, its faces
+/// tilted `tilt_deg` about Z; a 0.5 mm Gaussian, held by the window to four
+/// radii; a detector at x = 200.
+fn etalon(t: f64, tilt_deg: f64, with_plate: bool) -> (WavePathResult, f64) {
+    use oc_core::build3::SingletGeom;
+    let mut s = Scene3::new();
+    let src = source(&mut s);
+    let mut n = 1.0;
+    if with_plate {
+        let g = SingletGeom { r1_mm: f64::INFINITY, r2_mm: f64::INFINITY, thickness_mm: t, semi_aperture_mm: 12.0, conic1: 0.0, conic2: 0.0 };
+        let id = s.add_singlet(Vec3::new(100.0, 0.0, 0.0), g, 1.5168, 64.17);
+        if tilt_deg != 0.0 {
+            assert!(s.set_object_rotation_z_deg(id.0, tilt_deg));
+        }
+        n = s.bodies[0].material.index_at(LAM, &oc_core::material::GlassCatalog::builtin()).unwrap();
+    }
+    let det = s.add_area_detector(Vec3::new(200.0, 0.0, 0.0), -Vec3::X, 3.0, 3.0, [32, 32]);
+    s.validate().unwrap();
+    (wave_path(&s, &spec(src, det, 0.5, 256, 4.0), 1).unwrap(), n)
+}
+
+/// The closed-form slab (bundle M16): a lossless slab of index `n` in air,
+/// met at `theta0`, its round-trip phase `delta`: `(T_s, T_p)`, from
+/// `r = (y₀ − y₁)/(y₀ + y₁)` with `y_s = n cos θ`, `y_p = n / cos θ`.
+fn slab_t(n: f64, theta0: f64, delta: f64) -> (f64, f64) {
+    let c0 = theta0.cos();
+    let cg = (1.0 - (theta0.sin() / n).powi(2)).sqrt();
+    let t = |r: f64| {
+        let r2 = r * r;
+        (1.0 - r2).powi(2) / ((1.0 - r2).powi(2) + 4.0 * r2 * delta.sin().powi(2))
+    };
+    (t((c0 - n * cg) / (c0 + n * cg)), t((1.0 / c0 - n / cg) / (1.0 / c0 + n / cg)))
+}
+
+#[test]
+fn a_thin_plate_is_an_etalon_transparent_at_seven_pi_and_dimmest_at_seven_and_a_half() {
+    // Bundle B05 [1]: a bare slab's round trips sum to
+    // t = (1 − r²)e^{iδ}/(1 − r²e^{2iδ}): at δ = 7π it is transparent with
+    // t = (−1)⁷, at δ = 7.5π it transmits (1 − r²)²/(1 + r²)². Both against
+    // free space across the same planes, whose phase k₀L the plate replaces.
+    let (free, _) = etalon(0.0, 0.0, false);
+    let n = etalon(1.0, 0.0, true).1;
+    let k0 = 2.0 * std::f64::consts::PI / (LAM / 1000.0);
+    for (m, want_t) in [(7.0, None), (7.5, Some(()))] {
+        let l = m * std::f64::consts::PI / (k0 * n);
+        let (r, _) = etalon(l, 0.0, true);
+        let (ts, _) = slab_t(n, 0.0, m * std::f64::consts::PI);
+        let got = r.report.ledger.detected / free.report.ledger.detected;
+        measured(&format!("etalon at δ = {m}π, normal incidence: transmission against the closed form"), got - ts);
+        assert!((got - ts).abs() < 1e-6, "{got} vs {ts}");
+        if want_t.is_none() {
+            let c = r.field.grid.n[0] / 2;
+            let ratio = r.field.at(c, c) / free.field.at(c, c);
+            let want = -oc_wave::Cx::expi(-k0 * l);
+            measured("etalon at δ = 7π: the field at the centre against −e^{−ik₀L} times free space's", (ratio - want).abs());
+            assert!((ratio - want).abs() < 1e-6, "{ratio:?} vs {want:?}");
+        }
+        assert!(r.report.steps.iter().any(|st| st.note.contains("every round trip")), "{:?}", r.report.steps);
+    }
+}
+
+#[test]
+fn an_oblique_etalon_transmits_s_and_p_as_their_own_closed_forms() {
+    // Bundle B05 at 31°: s and p have their own interface reflections, so
+    // their transmissions differ at δ = 7.5π; unpolarized light, the two
+    // modes half each, transmits their mean.
+    let (free, _) = etalon(0.0, 0.0, false);
+    let n = etalon(1.0, 0.0, true).1;
+    let k0 = 2.0 * std::f64::consts::PI / (LAM / 1000.0);
+    let th = 31f64.to_radians();
+    let l = 7.5 * std::f64::consts::PI / (k0 * (n * n - th.sin().powi(2)).sqrt());
+    let (r, _) = etalon(l, 31.0, true);
+    let (ts, tp) = slab_t(n, th, 7.5 * std::f64::consts::PI);
+    let got = r.report.ledger.detected / free.report.ledger.detected;
+    measured("etalon at 31°, δ = 7.5π: unpolarized transmission against (T_s + T_p)/2", got - 0.5 * (ts + tp));
+    assert!((ts - tp).abs() > 1e-3, "the test needs s and p apart: {ts} {tp}");
+    assert!((got - 0.5 * (ts + tp)).abs() < 1e-5, "{got} vs {}", 0.5 * (ts + tp));
+    assert!(r.report.approximated.iter().any(|a| a.contains("two mutually incoherent modes, s and p")), "{:?}", r.report.approximated);
+}
+
+#[test]
+fn a_millimetre_plate_s_transmission_follows_its_round_trip_phase() {
+    // The same closed form at δ = k₀nL ≈ 15 000 rad: the round trips are
+    // summed at the field's own phase, not wrapped or lost.
+    let (free, _) = etalon(0.0, 0.0, false);
+    let (r, n) = etalon(1.0, 0.0, true);
+    let k0 = 2.0 * std::f64::consts::PI / (LAM / 1000.0);
+    let (ts, _) = slab_t(n, 0.0, k0 * n * 1.0);
+    let got = r.report.ledger.detected / free.report.ledger.detected;
+    measured("1 mm plate: transmission against the closed form at its round-trip phase", got - ts);
+    assert!((got - ts).abs() < 1e-4, "{got} vs {ts}");
+}
+
+/// A single quarter-wave layer of MgF₂ (1.38, quarter-wave at normal
+/// incidence) on a crown-glass plate (1.52, bare back face): the front and the
+/// back response of a flat surface.
+fn quarter_wave_on_a_plate() -> (SurfaceResponse, SurfaceResponse) {
+    use oc_core::thinfilm::{Coating, CoatingBacking, ExitFace, FilmLayer, FilmMaterial, Incidence};
+    let (n1, ns) = (1.38, 1.52);
+    let layer = FilmLayer::new(FilmMaterial::constant("film", n1), LAM * 1000.0 / (4.0 * n1));
+    let c = Coating {
+        layers: vec![layer],
+        backing: CoatingBacking::Plate { substrate: FilmMaterial::constant("glass", ns), exit: ExitFace::Bare, thickness_mm: 0.0 },
+        incidence: Incidence::Film,
+        design: None,
+    };
+    (SurfaceResponse::Coating { coating: c.clone() }, SurfaceResponse::Coating { coating: c.seen_from_behind() })
+}
+
+/// That coating on a flat surface tilted `tilt_deg` in a 0.5 mm Gaussian; the
+/// detector catches `reflect`ed or transmitted light.
+fn coated(tilt_deg: f64, reflect: bool) -> WavePathResult {
+    let (front, back) = quarter_wave_on_a_plate();
+    let mut s = Scene3::new();
+    let src = source(&mut s);
+    s.add_planar_element(Vec3::new(50.0, 0.0, 0.0), 10.0, tilt_deg, front, back);
+    let det = if reflect {
+        s.add_area_detector(Vec3::new(50.0, 60.0, 0.0), -Vec3::Y, 3.0, 3.0, [32, 32])
+    } else {
+        s.add_area_detector(Vec3::new(150.0, 0.0, 0.0), -Vec3::X, 3.0, 3.0, [32, 32])
+    };
+    s.validate().unwrap();
+    wave_path(&s, &spec(src, det, 0.5, 256, 4.0), 1).unwrap()
+}
+
+#[test]
+fn a_coated_surface_reflects_and_transmits_as_its_single_layer_s_closed_form() {
+    // A single layer: r = (r₀₁ + r₁₂e^{2iβ})/(1 + r₀₁r₁₂e^{2iβ}), β = k₀n₁d cos θ₁,
+    // each interface's Fresnel amplitude for its polarization (Born & Wolf
+    // [16], the theory of stratified media), computed here on its own, apart
+    // from the canvas's transfer matrix. At 45° reflection, unpolarized light
+    // reflects (R_s + R_p)/2; at normal incidence the plate transmits
+    // (1 − R_front)(1 − R_back), its two faces in series, as the coating
+    // declares its plate incoherent.
+    let (n0, n1, ns) = (1.0f64, 1.38f64, 1.52f64);
+    let lam = LAM / 1000.0;
+    let d = lam / (4.0 * n1);
+    let single = |theta0: f64, p: bool| -> f64 {
+        let s0 = theta0.sin();
+        let (c0, c1, cs) = (theta0.cos(), (1.0 - (s0 / n1).powi(2)).sqrt(), (1.0 - (s0 / ns).powi(2)).sqrt());
+        let fr = |na: f64, ca: f64, nb: f64, cb: f64| if p { (nb * ca - na * cb) / (nb * ca + na * cb) } else { (na * ca - nb * cb) / (na * ca + nb * cb) };
+        let (r01, r12) = (fr(n0, c0, n1, c1), fr(n1, c1, ns, cs));
+        let e = oc_wave::Cx::expi(2.0 * 2.0 * std::f64::consts::PI / lam * n1 * d * c1);
+        let r = (oc_wave::Cx::real(r01) + e * r12) / (oc_wave::Cx::ONE + e * (r01 * r12));
+        r.norm_sqr()
+    };
+    let launched_through = |r: &WavePathResult| r.report.ledger.detected / r.report.ledger.launched;
+    let refl = coated(135.0, true);
+    let want_r = 0.5 * (single(std::f64::consts::FRAC_PI_4, false) + single(std::f64::consts::FRAC_PI_4, true));
+    measured("single-layer coating at 45°: reflected power against (R_s + R_p)/2", launched_through(&refl) - want_r);
+    assert!((launched_through(&refl) - want_r).abs() < 1e-6, "{} vs {want_r}", launched_through(&refl));
+    let thru = coated(180.0, false);
+    let rf = single(0.0, false);
+    let rb = ((ns - 1.0) / (ns + 1.0)).powi(2);
+    let want_t = (1.0 - rf) * (1.0 - rb);
+    measured("single-layer coating on a plate, normal incidence: transmitted against (1 − R_f)(1 − R_b)", launched_through(&thru) - want_t);
+    assert!((launched_through(&thru) - want_t).abs() < 1e-6, "{} vs {want_t}", launched_through(&thru));
+    assert!(rf < 0.02 && rf > 0.01, "a quarter-wave MgF₂ on crown glass reflects 1.3%: {rf}");
+}
+
+#[test]
+fn coatings_whose_planes_of_incidence_differ_are_refused_by_name() {
+    // s of one plane of incidence is a mix of s and p of another, which a
+    // scalar field of one linear polarization cannot carry: a coating that
+    // folds the beam in the XY plane, then one that folds it out of it.
+    let (front, back) = quarter_wave_on_a_plate();
+    let mut s = Scene3::new();
+    let src = source(&mut s);
+    s.add_planar_element(Vec3::new(50.0, 0.0, 0.0), 10.0, 135.0, front.clone(), back.clone());
+    s.add_planar_element(Vec3::new(50.0, 50.0, 0.0), 10.0, 0.0, front, back);
+    let n = Vec3::new(0.0, -1.0, 1.0).normalize();
+    let q = glam::DQuat::from_rotation_arc(Vec3::Z, n);
+    s.surfaces.last_mut().unwrap().common.transform = oc_core::Isometry3::new(Vec3::new(50.0, 50.0, 0.0), [q.x, q.y, q.z, q.w]).unwrap();
+    let det = s.add_area_detector(Vec3::new(50.0, 50.0, 60.0), -Vec3::Z, 3.0, 3.0, [16, 16]);
+    s.validate().unwrap();
+    let e = wave_path(&s, &spec(src, det, 0.5, 128, 4.0), 1).unwrap_err().to_string();
+    assert!(e.contains("different planes of incidence"), "{e}");
 }

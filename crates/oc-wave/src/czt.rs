@@ -191,6 +191,73 @@ pub fn fraunhofer_zoom(
     Ok((v, report))
 }
 
+/// The Fresnel field on an arbitrary output grid `out`, `z_mm` ahead: the
+/// Fresnel integral as one transform, `U₂ = e^{ikz}e^{ik|x₂|²/2z}/(iλz) ·
+/// F{U₁e^{ik|x₁|²/2z}}(x₂/λz)` (Goodman, the Fresnel diffraction integral
+/// written as a Fourier transform), taken by [`czt2`] so the output window and
+/// pitch are free: a beam that has left a focus can be followed onto a window
+/// many times the one it came from. Paraxial, with the error of the
+/// paraxial propagator (`crate::propagate::paraxial_error`); the input chirp
+/// is sampled while `z` exceeds the input's critical distance, and the report
+/// says where it is not.
+pub fn fresnel_zoom(u: &Field2, z_mm: f64, out: Grid2, fft: &mut Fft2) -> Result<(Field2, WaveReport), WaveError> {
+    if !(z_mm.is_finite() && z_mm > 0.0) {
+        return Err(WaveError::OutOfRange("a Fresnel step onto a new grid goes forward, a positive distance".into()));
+    }
+    out.validate()?;
+    let lam = u.wavelength_in_medium_mm();
+    let k = u.k_mm();
+    let mut report = WaveReport::default();
+    report.ledger.launched = u.power();
+    let mut chirped = u.clone();
+    let g = u.grid;
+    let mut step: f64 = 0.0;
+    for j in 0..g.n[1] {
+        for i in 0..g.n[0] {
+            let (x, y) = g.xy(i, j);
+            let idx = g.idx(i, j);
+            chirped.data[idx] *= Cx::expi(k * (x * x + y * y) / (2.0 * z_mm));
+            if u.data[idx].norm_sqr() > 0.0 {
+                step = step.max(k * (x.abs() * g.pitch_mm[0]).max(y.abs() * g.pitch_mm[1]) / z_mm);
+            }
+        }
+    }
+    if step > std::f64::consts::PI {
+        report.warn(SamplingWarning::Undersampled { what: "the Fresnel chirp of a zoomed step".into(), max_phase_step_rad: step });
+    }
+    let (u0, v0) = (u.carrier[0] / lam, u.carrier[1] / lam);
+    let lz = lam * z_mm;
+    let f0 = [out.coord(0, 0) / lz - u0, out.coord(1, 0) / lz - v0];
+    let df = [out.pitch_mm[0] / lz, out.pitch_mm[1] / lz];
+    let mut data = czt2(&chirped, f0, df, out.n, fft);
+    let pre = Cx::expi(k * z_mm) / Cx::new(0.0, lz);
+    for j in 0..out.n[1] {
+        for i in 0..out.n[0] {
+            let (x, y) = out.xy(i, j);
+            data[out.idx(i, j)] *= pre * Cx::expi(k * (x * x + y * y) / (2.0 * z_mm));
+        }
+    }
+    let mut v = u.clone();
+    v.grid = out;
+    v.data = data;
+    v.carrier = [0.0, 0.0];
+    v.frame = advance(u, z_mm);
+    v.opl_ref_mm = u.opl_ref_mm + u.n_medium * z_mm;
+    report.ledger.detected = v.power();
+    report.ledger.left_window = (report.ledger.launched - report.ledger.detected).max(0.0);
+    report.ledger.close();
+    report.steps.push(StepReport {
+        method: Method::FresnelIr,
+        z_mm,
+        sampling: None,
+        note: format!(
+            "Fresnel by chirp-z onto a {}×{} window, pitch {:.4e} × {:.4e} mm",
+            out.n[0], out.n[1], out.pitch_mm[0], out.pitch_mm[1]
+        ),
+    });
+    Ok((v, report))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

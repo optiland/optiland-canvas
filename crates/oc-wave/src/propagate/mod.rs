@@ -33,9 +33,11 @@ use crate::{Cx, Field2, Fft2, WaveError, WaveReport};
 pub enum Propagator {
     /// Chosen per step and recorded in the report: the band-limited angular
     /// spectrum up to the critical distance, where it is exact and loses
-    /// nothing; beyond it, the Fresnel impulse response when its paraxial
-    /// phase error is below 0.1 rad, otherwise the band-limited angular
-    /// spectrum with its loss booked.
+    /// nothing; beyond it, whichever of the Fresnel impulse response and the
+    /// band-limited angular spectrum makes the smaller error on this very
+    /// field, both known from its spectrum before either runs: the paraxial
+    /// step's exactly ([`paraxial_error`]), the band limit's as the field it
+    /// would remove ([`band_limit_error`]).
     Auto,
     AngularSpectrum(AsmOptions),
     FresnelTf,
@@ -75,9 +77,9 @@ pub fn propagate(
         return Ok((u.clone(), report));
     }
 
-    let how = match how {
-        Propagator::Auto => choose(u, z_mm),
-        h => h,
+    let (how, paraxial) = match how {
+        Propagator::Auto => choose(u, z_mm, fft),
+        h => (h, None),
     };
     let out = match how {
         Propagator::AngularSpectrum(opts) => asm::run(u, z_mm, opts, fft, &mut report)?,
@@ -87,24 +89,110 @@ pub fn propagate(
         Propagator::RsDirect => rs_direct::run(u, z_mm, fft, &mut report)?,
         Propagator::Auto => unreachable!("resolved above"),
     };
+    if let Some((ep, eb)) = paraxial {
+        if let Some(st) = report.steps.last_mut() {
+            st.note += &format!(
+                "; chosen on this field's errors: the paraxial step's {ep:.2e} (exact, from its spectrum), the band limit's {eb:.2e}"
+            );
+        }
+    }
+    if matches!(how, Propagator::FresnelTf | Propagator::FresnelIr) {
+        let e = paraxial.map_or_else(|| paraxial_error(u, z_mm, fft), |p| p.0);
+        if paraxial.is_none() {
+            if let Some(st) = report.steps.last_mut() {
+                st.note += &format!("; the paraxial step's error on this field {e:.2e} (exact, from its spectrum)");
+            }
+        }
+        if e > 1e-4 {
+            report.warn(SamplingWarning::Paraxial { field_error: e });
+        }
+    }
     report.ledger.detected = out.power();
     report.ledger.close();
     Ok((out, report))
 }
 
-/// The [`Propagator::Auto`] rule. Decided from the sampling alone, before
-/// anything runs, so the choice is reproducible and can be explained.
-fn choose(u: &Field2, z_mm: f64) -> Propagator {
+/// The paraxial (Fresnel) propagator's error on this field over `z_mm`,
+/// exactly: with `κ = √(k² − |q|²)` and its paraxial form `κ₂ = k − |q|²/2k`,
+///
+/// ```text
+/// ‖(U − U₂)g‖² = Σ_q 4 sin²(z(κ − κ₂)/2) |ĝ(q)|²,   κ − κ₂ = −|q|⁴ / (2k(k + κ)²),
+/// ```
+///
+/// the identity of the bundle's M13 (Eq. M32), the difference in its stable
+/// form, summed over the field's own angular spectrum, its carrier included.
+/// An evanescent plane wave, which the paraxial propagator carries unchanged
+/// and the exact one does not, counts whole. Returned relative to the
+/// field's norm, `‖(U − U₂)g‖/‖g‖`. Unlike a bound from the window's corner it
+/// knows where the field's power actually is: a narrow beam tilted far off
+/// its plane's normal is paraxial in nothing.
+pub fn paraxial_error(u: &Field2, z_mm: f64, fft: &mut Fft2) -> f64 {
+    regime_errors(u, z_mm, fft).0
+}
+
+/// The field a band-limited angular-spectrum step over `z_mm` would remove,
+/// relative to the field's norm: the root of the power its spectrum holds
+/// outside the band limit of Matsushima & Shimobaba (2009) for the window
+/// padded twice, Eqs. (13), (18)–(20), as `asm` applies it.
+pub fn band_limit_error(u: &Field2, z_mm: f64, fft: &mut Fft2) -> f64 {
+    regime_errors(u, z_mm, fft).1
+}
+
+/// Both errors from one transform of the field.
+fn regime_errors(u: &Field2, z_mm: f64, fft: &mut Fft2) -> (f64, f64) {
+    let n = u.grid.n;
+    let mut buf = u.data.clone();
+    crate::fft::ifftshift2(&mut buf, n);
+    fft.forward(&mut buf, n, u.grid.cell_area_mm2());
+    let lam = u.wavelength_in_medium_mm();
+    let k = 2.0 * std::f64::consts::PI / lam;
+    let (u0, v0) = (u.carrier[0] / lam, u.carrier[1] / lam);
+    // The band limit for the window padded twice, as the step would run.
+    let (du, dv) = (1.0 / (2.0 * u.grid.width_mm(0)), 1.0 / (2.0 * u.grid.width_mm(1)));
+    let u_lim = 1.0 / (lam * ((2.0 * du * z_mm).powi(2) + 1.0).sqrt());
+    let v_lim = 1.0 / (lam * ((2.0 * dv * z_mm).powi(2) + 1.0).sqrt());
+    let (mut err, mut cut, mut tot) = (0.0, 0.0, 0.0);
+    for ky in 0..n[1] {
+        let fy = u.grid.fft_freq(1, ky) + v0;
+        for kx in 0..n[0] {
+            let fx = u.grid.fft_freq(0, kx) + u0;
+            let e = buf[ky * n[0] + kx].norm_sqr();
+            tot += e;
+            if fx * fx / (u_lim * u_lim) + lam * lam * fy * fy > 1.0 || lam * lam * fx * fx + fy * fy / (v_lim * v_lim) > 1.0 {
+                cut += e;
+            }
+            let q2 = (2.0 * std::f64::consts::PI).powi(2) * (fx * fx + fy * fy);
+            let w = k * k - q2;
+            if w <= 0.0 {
+                err += e;
+                continue;
+            }
+            let dk = -q2 * q2 / (2.0 * k * (k + w.sqrt()).powi(2));
+            err += 4.0 * (0.5 * z_mm * dk).sin().powi(2) * e;
+        }
+    }
+    if tot > 0.0 {
+        ((err / tot).sqrt(), (cut / tot).sqrt())
+    } else {
+        (0.0, 0.0)
+    }
+}
+
+/// The [`Propagator::Auto`] rule, decided before anything runs so the choice
+/// is reproducible and can be explained: from the sampling up to the critical
+/// distance; beyond it, the smaller of the two errors this field would meet,
+/// which are returned with the choice.
+fn choose(u: &Field2, z_mm: f64, fft: &mut Fft2) -> (Propagator, Option<(f64, f64)>) {
     let padded_width = (2 * u.grid.n[0]) as f64 * u.grid.pitch_mm[0];
     let zc = critical_distance_mm(u.grid.pitch_mm[0], padded_width, u.wavelength_in_medium_mm());
     if z_mm.abs() <= zc {
-        return Propagator::AngularSpectrum(AsmOptions::default());
+        return (Propagator::AngularSpectrum(AsmOptions::default()), None);
     }
-    let reach = 0.5 * padded_width.hypot((2 * u.grid.n[1]) as f64 * u.grid.pitch_mm[1]);
-    if fresnel_phase_error_rad(reach, z_mm.abs(), u.wavelength_in_medium_mm()) < 0.1 {
-        Propagator::FresnelIr
+    let (ep, eb) = regime_errors(u, z_mm, fft);
+    if ep <= eb {
+        (Propagator::FresnelIr, Some((ep, eb)))
     } else {
-        Propagator::AngularSpectrum(AsmOptions::default())
+        (Propagator::AngularSpectrum(AsmOptions::default()), Some((ep, eb)))
     }
 }
 

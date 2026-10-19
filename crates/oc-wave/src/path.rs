@@ -364,6 +364,103 @@ fn centred(mut g: Grid2) -> Grid2 {
     g
 }
 
+/// A field's second moments, across its plane and in angle, per axis: its
+/// centroid `x̄` and variance `σ²`, its mean direction `θ̄` (a direction
+/// cosine, the carrier included) and angular variance `σ_θ²`, and the cross
+/// moment `C = ⟨(x − x̄)θ⟩`, `θ = ∂φ/∂x / k` the local direction. Under
+/// paraxial propagation a distance `z` they give the beam's size exactly,
+/// `σ²(z) = σ² + 2zC + z²σ_θ²` (the second-moment law of the Wigner
+/// distribution; A. E. Siegman, *Proc. SPIE* 1224, 2 (1990)), whatever the
+/// beam's shape: what re-gridding needs to choose the window at the next
+/// plane before the field is carried there.
+struct Moments {
+    mean: [f64; 2],
+    var: [f64; 2],
+    tilt: [f64; 2],
+    spread: [f64; 2],
+    cross: [f64; 2],
+}
+
+impl Moments {
+    fn of(u: &Field2, fft: &mut Fft2) -> Option<Moments> {
+        let g = u.grid;
+        let k = u.k_mm();
+        let (mut p, mut mx, mut my) = (0.0, 0.0, 0.0);
+        for j in 0..g.n[1] {
+            for i in 0..g.n[0] {
+                let (x, y) = g.xy(i, j);
+                let w = u.at(i, j).norm_sqr();
+                p += w;
+                mx += w * x;
+                my += w * y;
+            }
+        }
+        if p <= 0.0 || p.is_nan() {
+            return None;
+        }
+        let (mx, my) = (mx / p, my / p);
+        // The local direction θ = α + c·x + the rest: the fitted sphere and
+        // tilt analytically, what they leave by the phase difference of
+        // neighbouring samples (which a sphere turning most of a radian a
+        // sample would make a finite difference understate).
+        let ([c, al, be], _) = fit_sphere(u);
+        let sm = Smooth::with(u, [c, al - u.carrier[0], be - u.carrier[1]]);
+        let rest = |i: usize, j: usize| {
+            let (x, y) = g.xy(i, j);
+            sm.at(x, y) * Cx::expi(-k * (0.5 * c * (x * x + y * y) + (al - u.carrier[0]) * x + (be - u.carrier[1]) * y))
+        };
+        let (mut vx, mut vy, mut cx, mut cy) = (0.0, 0.0, 0.0, 0.0);
+        for j in 0..g.n[1] {
+            for i in 0..g.n[0] {
+                let (x, y) = g.xy(i, j);
+                let w = u.at(i, j).norm_sqr();
+                if w == 0.0 {
+                    continue;
+                }
+                vx += w * (x - mx).powi(2);
+                vy += w * (y - my).powi(2);
+                let tx = if i > 0 && i + 1 < g.n[0] { (rest(i + 1, j) * rest(i - 1, j).conj()).arg() / (2.0 * g.pitch_mm[0] * k) } else { 0.0 };
+                let ty = if j > 0 && j + 1 < g.n[1] { (rest(i, j + 1) * rest(i, j - 1).conj()).arg() / (2.0 * g.pitch_mm[1] * k) } else { 0.0 };
+                cx += (x - mx) * w * (al + c * x + tx);
+                cy += (y - my) * w * (be + c * y + ty);
+            }
+        }
+        // The angular moments from the field's spectrum.
+        let n = g.n;
+        let mut buf = u.data.clone();
+        crate::fft::ifftshift2(&mut buf, n);
+        fft.forward(&mut buf, n, g.cell_area_mm2());
+        let lam = u.wavelength_in_medium_mm();
+        let (u0, v0) = (u.carrier[0] / lam, u.carrier[1] / lam);
+        let (mut q, mut tx, mut ty, mut sx, mut sy) = (0.0, 0.0, 0.0, 0.0, 0.0);
+        for ky in 0..n[1] {
+            let fy = g.fft_freq(1, ky) + v0;
+            for kx in 0..n[0] {
+                let fx = g.fft_freq(0, kx) + u0;
+                let w = buf[ky * n[0] + kx].norm_sqr();
+                q += w;
+                tx += w * lam * fx;
+                ty += w * lam * fy;
+                sx += w * (lam * fx).powi(2);
+                sy += w * (lam * fy).powi(2);
+            }
+        }
+        let (tx, ty) = (tx / q, ty / q);
+        Some(Moments {
+            mean: [mx, my],
+            var: [vx / p, vy / p],
+            tilt: [tx, ty],
+            spread: [(sx / q - tx * tx).max(0.0), (sy / q - ty * ty).max(0.0)],
+            cross: [cx / p, cy / p],
+        })
+    }
+
+    /// The rms radius along `axis`, `z` on.
+    fn sigma_at(&self, axis: usize, z: f64) -> f64 {
+        (self.var[axis] + 2.0 * z * self.cross[axis] + z * z * self.spread[axis]).max(0.0).sqrt()
+    }
+}
+
 /// The scene with one element alone: nothing else can meet its rays.
 fn probe_scene(scene: &Scene3, object: oc_core::id::ObjectId) -> Scene3 {
     let mut probe = scene.clone();
@@ -890,6 +987,65 @@ impl ChainJob {
         Ok(())
     }
 
+    /// Carry the field `z` on onto a window fitted to the beam there, when
+    /// the one it has would no longer suit it: when the beam, six of its rms
+    /// radii across (`Moments`), would fill less than a quarter of the window
+    /// (a focus, a pinhole's plane), or, on a window already narrowed, more
+    /// than four fifths of it. The window is centred on the beam's predicted
+    /// centroid, keeps its sample count, and never grows past the one the
+    /// spec declares. `None` to stay on the window the field has.
+    ///
+    /// Narrowing, the zoomed angular spectrum carries it, exactly, padded
+    /// enough that the plane waves' walk over `z` stays inside; widening from
+    /// a narrow window past its critical distance, the zoomed Fresnel
+    /// transform, whose paraxial error on the field is reported.
+    fn regrid(&mut self, z: f64) -> Result<Option<(Field2, WaveReport)>, WaveError> {
+        let Some(m) = Moments::of(&self.u, &mut self.fft) else { return Ok(None) };
+        let g = self.u.grid;
+        let n = g.n[0].max(g.n[1]);
+        let half_now = 0.5 * g.width_mm(0).max(g.width_mm(1));
+        let half_max = 0.5 * self.spec.window_mm;
+        let needed = 6.0 * m.sigma_at(0, z).max(m.sigma_at(1, z));
+        let lam = self.u.wavelength_in_medium_mm();
+        // A window no narrower than a few dozen wavelengths.
+        let target = needed.min(half_max).max(16.0 * lam);
+        let shrink = target < 0.25 * half_now;
+        let grow = half_now < half_max * (1.0 - 1e-9) && needed > 0.8 * half_now;
+        if !(shrink || grow) {
+            return Ok(None);
+        }
+        let half = if grow { (2.0 * needed).min(half_max) } else { target };
+        let centre = [m.mean[0] + z * m.tilt[0], m.mean[1] + z * m.tilt[1]];
+        let pitch = 2.0 * half / n as f64;
+        let out = Grid2::new([n, n], [pitch, pitch], centre)?;
+        // How far the field's plane waves walk across the beam over z.
+        let walk = z * (m.tilt[0].abs().max(m.tilt[1].abs()) + 4.0 * m.spread[0].max(m.spread[1]).sqrt());
+        let width_in = 2.0 * half_now;
+        let zc = g.width_mm(0) * g.pitch_mm[0] / lam;
+        let ((v, mut r), how) = if walk <= width_in {
+            (crate::asm_zoom(&self.u, z, out, 2, &mut self.fft)?, "the zoomed angular spectrum")
+        } else if z > zc {
+            let e = crate::propagate::paraxial_error(&self.u, z, &mut self.fft);
+            let mut step = crate::czt::fresnel_zoom(&self.u, z, out, &mut self.fft)?;
+            if e > 1e-4 {
+                step.1.warn(SamplingWarning::Paraxial { field_error: e });
+            }
+            (step, "the zoomed Fresnel transform")
+        } else {
+            let pad = ((2.0 * walk / width_in).ceil() as usize).clamp(2, 8);
+            (crate::asm_zoom(&self.u, z, out, pad, &mut self.fft)?, "the zoomed angular spectrum, padded")
+        };
+        r.steps.push(element_step(
+            z,
+            format!(
+                "the field carried {z:.4} mm onto a new window {:.4e} mm across ({n}², pitch {pitch:.4e} mm), where the beam is predicted {:.4e} mm across (six rms radii), by {how}",
+                2.0 * half,
+                needed
+            ),
+        ));
+        Ok(Some((v, r)))
+    }
+
     fn tilt_warn(&mut self, depth: f64) {
         let dx = self.u.grid.pitch_mm[0];
         if depth > dx * dx / self.u.wavelength_in_medium_mm() {
@@ -1160,10 +1316,14 @@ impl ChainJob {
         if matches!(ev, Ev::End) && (self.face || matches!(self.spec.readout, Readout::Diffracted { .. })) {
             return Ok(());
         }
-        // Free space up to this event.
+        // Free space up to this event, onto a window fitted to the beam there
+        // when the one it has would no longer suit it.
         let z = (p - self.beam.origin).dot(self.beam.d);
         if z > 1e-12 {
-            let (v, r) = propagate(&self.u, z, Propagator::Auto, &mut self.fft)?;
+            let (v, r) = match self.regrid(z)? {
+                Some(step) => step,
+                None => propagate(&self.u, z, Propagator::Auto, &mut self.fft)?,
+            };
             merge(&mut self.report, r);
             self.u = v;
             self.beam.origin = p;

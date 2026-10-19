@@ -83,10 +83,30 @@ before its band limit stops cutting what matters. The tests show that, and
 `Auto` hands such steps to the Fresnel impulse response.
 
 **`Auto`'s rule:**
-- the band-limited angular spectrum up to `z_c`;
-- beyond `z_c`, the Fresnel impulse response if its paraxial phase error
-  `πρ⁴/(4λz³)` over the whole padded window is below 0.1 rad [1];
-- otherwise the band-limited angular spectrum, with its losses booked.
+- the band-limited angular spectrum up to `z_c`, where it is exact and the
+  band limit removes nothing;
+- beyond `z_c`, whichever of the Fresnel impulse response and the
+  band-limited angular spectrum makes the smaller error on this very field,
+  both known from its spectrum before either runs, and both written into the
+  step's note.
+
+The paraxial step's error is known exactly. With `κ = √(k² − |q|²)` and its
+paraxial form `κ₂ = k − |q|²/2k`, the exact and the paraxial propagators
+differ on a field `g` by
+
+```text
+‖(U − U₂)g‖² = Σ_q 4 sin²(z(κ − κ₂)/2) |ĝ(q)|²,   κ − κ₂ = −|q|⁴ / (2k(k + κ)²),
+```
+
+which follows from Parseval's theorem because both are diagonal in the plane
+waves; the difference is written in its stable form. `paraxial_error` sums it
+over the field's own spectrum, its carrier included, so a narrow beam tilted
+far from its plane's normal is not mistaken for a paraxial one, as a bound
+from the window's corner (the old rule, `πρ⁴/(4λz³) < 0.1` rad [1]) would.
+The band limit's error is the field it would remove, `band_limit_error`.
+Every Fresnel step, chosen or forced, says its paraxial error in its note,
+and above `1e-4` raises the `Paraxial` warning with it. The identity holds
+to 5e-8 between the canvas's own two propagators (test below).
 
 **Padding and wrap-around.** The angular spectrum and both Fresnel methods
 zero-pad to `2×` the samples (rounded up to a size with only 2, 3 and 5 as
@@ -288,6 +308,28 @@ point read; only the slowly varying rest is interpolated. The singlet's
 unexplained remainder fell from 3.7% to 0.04% of the launched power. What
 interpolation still costs is booked at each step as `resampling`.
 
+**Windows fitted to the beam.** One window for a whole path cannot both hold
+a wide beam and resolve the focus it is brought to: a 1 mm beam focused by
+f = 100 mm has a 20 µm waist, under two samples of a 6 mm window of 512. So
+before each free-space step the path predicts the beam's size at the next
+plane from the field's own second moments, its variance `σ²`, its angular
+variance `σ_θ²` and their cross moment `C = ⟨(x − x̄)θ⟩` (the local direction
+`θ` from the phase gradient, the fitted sphere taken out first so that a
+steep wavefront is not understated): under paraxial propagation
+`σ²(z) = σ² + 2zC + z²σ_θ²` exactly, whatever the beam's shape (the
+second-moment law; A. E. Siegman [25]). When the beam, six rms radii across,
+would fill less than a quarter of the window, or on a window already
+narrowed more than four fifths of it, the field is carried onto a window
+fitted to it, centred on its predicted centroid, with the same sample count
+and never wider than the declared window. Narrowing, the zoomed angular
+spectrum carries it, exactly, padded enough that its plane waves' walk over
+the step stays inside; widening from a narrow window past its critical
+distance, the zoomed Fresnel transform, the Fresnel integral as one chirp-z
+transform onto the new grid, its paraxial error reported. A pinhole at a
+focus is then laid on the focus at the focus's own sampling, and a 10× beam
+expander keeps its beam resolved from 0.2 mm through a 50 µm focus to 2 mm
+(tests below).
+
 **What the path follows at a modulator.** The chief ray, and so the beam,
 leaves a DMD along the reflection off the facet it hits, and an SLM along the
 phase gradient there (or specularly, for the unmodulated arm). The beam is
@@ -431,7 +473,7 @@ These are acceptance case C53, in `crates/oc-wave/tests/path.rs`.
 | `a_thin_lens_in_the_scene_focuses_like_self` | Self's waist [14] | 1e-4 | 8.1e-10 |
 | `a_fold_mirror_hands_on_the_mirror_image_exactly` | image theory [1]: folded path = straight path | 1e-9 | 2.0e-11 of peak |
 | `an_aperture_on_the_path_is_found_although_the_trace_logs_no_event` | a Gaussian through a disc passes `1 − exp(−2a²/w²)` [13] | 1e-4 | 3.2e-5 |
-| `a_4f_system_images_at_minus_f2_over_f1_and_its_iris_cuts_the_spectrum` | the image waist `w₀f₂/f₁` [1]; a Fourier-plane iris passes `1 − exp(−2r²/w_F²)`, `w_F = λf₁/(πw₀)` [13]; the ledger | 1e-4; 2e-3; 1e-6 | within 1e-4; 1.6e-3; 4.7e-14 |
+| `a_4f_system_images_at_minus_f2_over_f1_and_its_iris_cuts_the_spectrum` | the image waist `w₀f₂/f₁` [1]; a Fourier-plane iris passes `1 − exp(−2r²/w_F²)`, `w_F = λf₁/(πw₀)` [13]; the ledger | 1e-4; 2e-3; 1e-6 | within 1e-4; 1.8e-5 (1.6e-3 before the window was fitted to the focus); 8.7e-14 |
 | `wave_and_ray_agree_on_where_the_beam_lands` | the chief ray's landing point on a tilted fold | 0.05 pixel | 3.2e-4 mm (0.003 pixel) |
 | `wave_power_agrees_with_rays_when_the_fresnel_number_is_large` | the f64 ray trace of the same scene, a uniform beam through a disc at `N_F` = 1264 | 1% | 0.12% |
 | `a_dmd_in_the_scene_focuses_its_orders_f_lambda_over_p_apart` | orders `λ/p` apart in direction cosine [10], so `fλ/p` apart at a lens's focus | 1% | 1.000; resampling 7.7e-6, `numerical` 2.8e-13 |
@@ -458,6 +500,8 @@ These are acceptance case C53, in `crates/oc-wave/tests/path.rs`.
 | `a_millimetre_plate_s_transmission_follows_its_round_trip_phase` | the closed form at δ = k₀nL ≈ 15 000 rad [16] | 1e-4 | −2.3e-5 (the beam's own angular spread, its plane waves' δ 5e-4 rad apart) |
 | `a_coated_surface_reflects_and_transmits_as_its_single_layer_s_closed_form` | a quarter-wave MgF₂ layer on crown glass, by the single-layer formula computed apart from the transfer matrix [16]: `(R_s + R_p)/2` at 45°, `(1 − R_f)(1 − R_b)` through the plate | 1e-6 | 1.6e-8; 3.1e-11 |
 | `coatings_whose_planes_of_incidence_differ_are_refused_by_name` | s of one plane is s and p of another | refused | refused |
+| `a_pinhole_at_a_lens_s_focus_passes_what_the_focused_gaussian_puts_through_it` | a waist on a lens of focal length f has radius λf/(πw₀) at the focal plane (bundle M30, [13]): a pinhole of that radius stops `exp(−2)` | 1e-5 | 5.7e-7 |
+| `a_ten_times_beam_expander_widens_the_beam_as_the_abcd_law_says` | the radius at the second lens by the Gaussian ABCD law [13], through a 50 µm focus | 1e-5 | 3.9e-7 |
 
 The propagation tests of W8 (acceptance case C57, `crates/oc-wave/tests/propagate.rs`):
 
@@ -529,6 +573,8 @@ run them with `-- --nocapture` to print the measured values.
 | `asm_forward_then_back_returns_the_field` | reversibility [1] | 1e-12 | 1.4e-13 of peak |
 | `rayleigh_sommerfeld_direct_agrees_with_band_limited_asm` | [4] against [2]: two discretizations of one integral (verification) | 1e-4 | 3.9e-12 of peak |
 | `the_band_limit_reports_the_power_it_removes` | the ledger closes [2] | 1e-12 | 32.5% removed and booked |
+| `the_paraxial_step_s_error_is_the_identity_s_exactly` | `‖(U − U₂)g‖² = Σ 4 sin²(z(κ − κ₂)/2)\|ĝ\|²` between the band-unlimited angular spectrum and the Fresnel transfer function on the same grid, a Gaussian tilted 0.15 rad; a forced Fresnel step's `Paraxial` warning carries the value | 1e-6 | 5.0e-8 |
+| `voelz_regime_picks_the_transfer_function_below_the_critical_distance` | `Auto` below and beyond `z_c`: beyond it the smaller error, a Gaussian's band limit removing 2.5e-8 against the paraxial step's 2.5e-6 | exact choice | angular spectrum |
 | `an_aperture_passes_exactly_its_area_of_a_uniform_field` | exact cell coverage | 1e-12 | passes, all four shapes |
 | `voelz_regime_picks_the_transfer_function_below_the_critical_distance` | `z_c = LΔx/λ` [3] | exact | passes |
 | `fresnel_integrals_and_bessel_functions_match_the_tables` | DLMF ch. 7 and 10 [15] | 1e-10 | passes |
@@ -686,5 +732,6 @@ entry says so.
 22. E. Wolf, "New theory of partial coherence in the space–frequency domain. Part I: spectra and cross spectra of steady-state sources," *J. Opt. Soc. Am.* 72(3), 343–351 (1982), doi:10.1364/JOSA.72.000343. (Mutually incoherent modes add in power.)
 23. G. G. Stokes, "On the perfect blackness of the central spot in Newton's rings, and on the verification of Fresnel's formulae for the intensities of reflected and refracted rays," *Cambridge and Dublin Mathematical Journal* 4, 1–14 (1849). (The Stokes relations: `r' = −r`, `tt' = 1 − r²`.)
 24. A. Zeilinger, "General properties of lossless beam splitters in interferometry," *Am. J. Phys.* 49(9), 882–883 (1981), doi:10.1119/1.12387. (A lossless splitter is a unitary two-port. DOI to confirm.)
+25. A. E. Siegman, "New developments in laser resonators," *Proc. SPIE* 1224, 2–14 (1990). (The second-moment beam width and its quadratic law in z, for any beam. DOI to confirm.)
 
 The FFT is `rustfft` 6.4.1 (MIT OR Apache-2.0).

@@ -289,6 +289,7 @@ DOI where one exists. The master list is the Sources section of
 | C57 | tilted planes and the shifted angular spectrum | W8 ✅ (the tilted plane read through a bilinear spectrum: 5.9e-4, not the 1e-10 an exact method would give; used for tilted detectors, not yet for oblique elements) | `oc-wave/tests/propagate.rs`, `oc-wave/tests/path.rs` |
 | C58 | interferometers on the wave path: a Mach–Zehnder's two ports carry all the power at every phase (unitary splitters), a Michelson's fringes λ/sin 2α apart and moved 2k₀d by its mirror, two incoherent lines washing the fringes out where their beats cancel; a continuum and an LCoS's two polarization beams refused by name | the wave-optics review, I2 ✅ | `oc-wave/tests/path.rs`; `oc-trace/src/sequence3.rs` (`extract_sequences3`) |
 | C59 | planar layers on the wave path, plane wave by plane wave: an etalon transparent at δ = 7π and dimmest at 7.5π, s and p at 31°, a millimetre plate at its round-trip phase, a single-layer coating against its closed form in reflection and transmission, a plate as free space of t/n to 1.9e-7; planes of incidence that differ refused | the wave-optics review, I3 ✅ | `oc-wave/src/planar.rs`, `oc-wave/tests/path.rs` |
+| C60 | sampling where the beam focuses: the paraxial step's exact error against the propagators' own difference, `Auto` by the smaller of two known errors, a pinhole at a lens's focus against exp(−2), a 10× expander against the ABCD law | the wave-optics review, I4 ✅ | `oc-wave/tests/propagate.rs`, `oc-wave/tests/path.rs` |
 
 ## Per-PR checklist
 

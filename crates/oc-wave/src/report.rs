@@ -53,8 +53,9 @@ pub enum SamplingWarning {
     WrapAround { edge_fraction: f64 },
     /// A method was forced outside the regime its source supports.
     OutsideRegime { method: Method, reason: String },
-    /// The estimated Fresnel (paraxial) phase error, radians.
-    Paraxial { phase_err_rad: f64 },
+    /// The relative field error of a paraxial (Fresnel) step, exact for the
+    /// field it ran on: `‖(U − U₂)g‖/‖g‖` (`crate::propagate::paraxial_error`).
+    Paraxial { field_error: f64 },
     /// The step ran on a coarse preview grid; its numbers are not for display.
     CoarsePreview { n: [usize; 2] },
     /// A tilted element was evaluated on its projection; the depth across the

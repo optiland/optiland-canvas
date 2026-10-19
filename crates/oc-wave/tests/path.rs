@@ -1394,3 +1394,65 @@ fn coatings_whose_planes_of_incidence_differ_are_refused_by_name() {
     let e = wave_path(&s, &spec(src, det, 0.5, 128, 4.0), 1).unwrap_err().to_string();
     assert!(e.contains("different planes of incidence"), "{e}");
 }
+
+#[test]
+fn a_pinhole_at_a_lens_s_focus_passes_what_the_focused_gaussian_puts_through_it() {
+    // [13] and bundle M30: a Gaussian whose waist w₀ sits on a lens of focal
+    // length f has radius w(f) = λf/(πw₀) at the focal plane, so a pinhole of
+    // that radius there stops exp(−2) of it. The focus, 20 µm here, is under
+    // two samples of the 6 mm window the beam arrives on (which holds the
+    // beam to three radii); the path carries the field onto a window fitted
+    // to the focus first, then back out to the declared one.
+    let (w0, f) = (1.0, 100.0);
+    let mut s = Scene3::new();
+    let src = source(&mut s);
+    s.add_planar_element(Vec3::new(50.0, 0.0, 0.0), 10.0, 0.0, lens(f), lens(f));
+    let wf = LAM / 1000.0 * f / (std::f64::consts::PI * w0);
+    s.add_aperture(Vec3::new(50.0 + f, 0.0, 0.0), 0.2, 0.0);
+    s.apertures.last_mut().unwrap().shape.clear_opening = oc_core::scene3::PlanarShape2::Disc { radius_mm: wf };
+    let det = s.add_area_detector(Vec3::new(250.0, 0.0, 0.0), -Vec3::X, 2.0, 2.0, [32, 32]);
+    s.validate().unwrap();
+    let mut sp = spec(src, det, w0, 512, 6.0);
+    sp.beam = BeamProfile::Gaussian { waist_radius_mm: w0, waist_offset_mm: 50.0 };
+    let r = wave_path(&s, &sp, 1).unwrap();
+    let l = r.report.ledger;
+    let stopped = l.absorbed_aperture / l.launched;
+    let want = (-2.0f64).exp();
+    measured("pinhole of radius λf/πw₀ at a lens's focus: power stopped against exp(−2)", stopped - want);
+    assert!((stopped - want).abs() < 1e-5, "{stopped} vs {want}");
+    assert!(r.report.steps.iter().any(|st| st.note.contains("onto a new window")), "{:?}", r.report.steps.iter().map(|s| &s.note).collect::<Vec<_>>());
+    assert!(l.numerical.abs() < 1e-10, "{l:?}");
+}
+
+#[test]
+fn a_ten_times_beam_expander_widens_the_beam_as_the_abcd_law_says() {
+    // [13] in ABCD form: a waist w₀ on a lens f₁, a lens f₂ at f₁ + f₂, the
+    // beam's radius at the second lens from the q parameter carried through:
+    // 1/q₁ = 1/q₀ − 1/f₁, q₂ = q₁ + f₁ + f₂, w² = −λ/(π Im(1/q₂)). The beam
+    // goes from 0.2 mm through a 50 µm focus to 2 mm: the path narrows its
+    // window onto the first lens's beam, then widens it again.
+    let (w0, f1, f2) = (0.2, 50.0, 500.0);
+    let mut s = Scene3::new();
+    let src = source(&mut s);
+    s.add_planar_element(Vec3::new(50.0, 0.0, 0.0), 10.0, 0.0, lens(f1), lens(f1));
+    s.add_planar_element(Vec3::new(50.0 + f1 + f2, 0.0, 0.0), 20.0, 0.0, lens(f2), lens(f2));
+    let det = s.add_area_detector(Vec3::new(50.0 + f1 + f2 + 0.01, 0.0, 0.0), -Vec3::X, 4.0, 4.0, [32, 32]);
+    s.validate().unwrap();
+    // A window that holds the 2 mm beam to three radii.
+    let mut sp = spec(src, det, w0, 512, 12.0);
+    sp.beam = BeamProfile::Gaussian { waist_radius_mm: w0, waist_offset_mm: 50.0 };
+    let r = wave_path(&s, &sp, 1).unwrap();
+    let lam = LAM / 1000.0;
+    let q0 = oc_wave::Cx::new(0.0, std::f64::consts::PI * w0 * w0 / lam);
+    let q1 = oc_wave::Cx::ONE / (oc_wave::Cx::ONE / q0 - oc_wave::Cx::real(1.0 / f1));
+    let q2 = q1 + oc_wave::Cx::real(f1 + f2);
+    let want = (-lam / (std::f64::consts::PI * (oc_wave::Cx::ONE / q2).im)).sqrt();
+    let w = second_moment_radius_x(&r.field);
+    measured("10× expander: radius at the second lens against the ABCD law, relative", w / want - 1.0);
+    assert!((w / want - 1.0).abs() < 1e-5, "{w} vs {want}");
+    assert!(want / w0 > 9.5 && want / w0 < 11.0, "an expander of about ten: {}", want / w0);
+    let narrowed = r.report.steps.iter().filter(|st| st.note.contains("onto a new window")).count();
+    assert!(narrowed >= 2, "narrowed onto the small beam and widened again: {narrowed}");
+    let l = r.report.ledger;
+    assert!(l.detected / l.launched > 0.999, "{l:?}");
+}

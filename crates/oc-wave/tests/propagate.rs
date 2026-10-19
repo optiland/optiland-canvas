@@ -89,10 +89,47 @@ fn voelz_regime_picks_the_transfer_function_below_the_critical_distance() {
     // In regime, no warning.
     let (_, r) = propagate(&u, 20.0, Propagator::FresnelTf, &mut fft).unwrap();
     assert!(r.warnings.is_empty(), "{:?}", r.warnings);
-    // Beyond z_c, where the Fresnel phase error is small, Auto picks the
-    // impulse response.
+    // Beyond z_c Auto takes the smaller of the two errors this field would
+    // meet, both known from its spectrum: this Gaussian's spectrum lies
+    // inside the band limit but for its far tails, so the angular spectrum
+    // removes less than the paraxial step's small error. (Where the band
+    // limit cuts,
+    // a hard-edged aperture's far field, the impulse response wins: the
+    // Heurtley test in analytic_fields.rs.)
     let (_, r) = propagate(&u, 200.0, Propagator::Auto, &mut fft).unwrap();
-    assert_eq!(r.steps[0].method, Method::FresnelIr);
+    assert_eq!(r.steps[0].method, Method::AngularSpectrum { band_limited: true });
+    assert!(r.steps[0].note.contains("chosen on this field's errors"), "{}", r.steps[0].note);
+    let (eb, ep) = (oc_wave::propagate::band_limit_error(&u, 200.0, &mut fft), oc_wave::propagate::paraxial_error(&u, 200.0, &mut fft));
+    measured("Gaussian at 200 mm: the band limit's error", eb);
+    measured("Gaussian at 200 mm: the paraxial step's error", ep);
+    assert!(eb < ep && ep < 1e-5, "{eb} {ep}");
+}
+
+#[test]
+fn the_paraxial_step_s_error_is_the_identity_s_exactly() {
+    // Bundle M13, Eq. M32 (B08): the difference between the exact and the
+    // paraxial propagator on a field is Σ 4 sin²(z(κ − κ₂)/2)|ĝ|², and is
+    // bounded by z²Σ|κ − κ₂|²|ĝ|². Both propagators run here on the same
+    // twice-padded grid, so the identity holds to round-off on what stays in
+    // the window. A Gaussian tilted 0.15 rad, whose spectrum sits far from
+    // the axis, so the error is large enough to measure.
+    let g = Grid2::square(256, 0.004).unwrap();
+    let mut u = gaussian(g, 0.5, 1.0, 0.08, 0.0, 1.0, [0.0, 0.0]).unwrap();
+    u.carrier = [0.15, 0.0];
+    let mut fft = Fft2::new();
+    let z = 2.0;
+    let exact = Propagator::AngularSpectrum(AsmOptions { band_limit: false, pad: 2 });
+    let (a, _) = propagate(&u, z, exact, &mut fft).unwrap();
+    let (b, _) = propagate(&u, z, Propagator::FresnelTf, &mut fft).unwrap();
+    let diff: f64 = a.data.iter().zip(&b.data).map(|(x, y)| (*x - *y).norm_sqr()).sum::<f64>().sqrt();
+    let norm: f64 = u.data.iter().map(|x| x.norm_sqr()).sum::<f64>().sqrt();
+    let want = oc_wave::propagate::paraxial_error(&u, z, &mut fft);
+    measured("paraxial error: the propagators' difference against the identity, relative", diff / norm / want - 1.0);
+    assert!(want > 1e-3, "{want}");
+    assert!((diff / norm / want - 1.0).abs() < 1e-6, "{} vs {want}", diff / norm);
+    // Forced, the paraxial step says how wrong it was.
+    let (_, r) = propagate(&u, z, Propagator::FresnelTf, &mut fft).unwrap();
+    assert!(r.warnings.iter().any(|w| matches!(w, SamplingWarning::Paraxial { field_error } if (field_error - want).abs() < 1e-12)), "{:?}", r.warnings);
 }
 
 #[test]

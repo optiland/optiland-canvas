@@ -1666,3 +1666,95 @@ fn crossed_polarizers_before_a_lens_leave_it_a_dark_field_to_carry() {
     assert!(r.field.power() + r.field_y.as_ref().unwrap().power() < 1e-30);
     assert!((l.absorbed_element - l.launched).abs() < 1e-12, "{l:?}");
 }
+
+#[test]
+fn a_dmd_s_orders_cross_a_singlet_each_about_its_own_direction() {
+    // [10] and [17]: the DMD of the test above, its orders λ/p = 63 mrad
+    // apart and its blaze between two of them, through an N-BK7 singlet
+    // (R ±8 mm, 2 mm thick) at twice its focal length; the orders overlap on
+    // the lens, so a field of several directions crosses each face. The
+    // chief ray leaves along the blaze, which no order follows: traced about
+    // it, the brightest order would depart from its reference by its angle to
+    // it, and gather the piston k₀θ²L/2 per slab that the plane-face test of
+    // `transfer` measures. The path carries the orders apart, so each crosses
+    // the faces about its own direction, departing from it only by its own
+    // spread.
+    use oc_core::modulator::{facet_normal, DmdSpec, DmdState, ModulatorKind, Pattern, SpatialModulator, TiltAxis};
+    let p_um = 10.0;
+    let mut s = Scene3::new();
+    let src = source(&mut s);
+    let mk = |value: u16| SpatialModulator {
+        pixels: [401, 401],
+        pitch_um: p_um,
+        kind: ModulatorKind::Dmd(DmdSpec { tilt_deg: 12.0, tilt_axis: TiltAxis::Side, mirror_fill: 0.95, reflectance: 1.0, window_transmittance: 1.0 }),
+        pattern: Pattern::Uniform { value },
+    };
+    let dmd_pos = Vec3::new(100.0, 0.0, 0.0);
+    let id = s.add_modulator(dmd_pos, 180.0 - 24.0, mk(1)).unwrap();
+    let t = s.surfaces.iter().find(|x| x.common.id.0 == id).unwrap().common.transform;
+    let n_dev = t.rotate(Vec3::Z);
+    let bis = (n_dev - Vec3::X).normalize();
+    let ModulatorKind::Dmd(spec_d) = &mk(1).kind else { unreachable!() };
+    let on = t.rotate(facet_normal(spec_d, DmdState::On));
+    let value = if on.dot(bis) > t.rotate(facet_normal(spec_d, DmdState::Off)).dot(bis) { 1 } else { 0 };
+    if let SurfaceResponse::Modulator { device, .. } = &mut s.surfaces.iter_mut().find(|x| x.common.id.0 == id).unwrap().response_front {
+        device.pattern = Pattern::Uniform { value };
+    }
+    let lens_pos = dmd_pos + n_dev * 16.2;
+    let g = oc_core::build3::SingletGeom { r1_mm: 8.0, r2_mm: -8.0, thickness_mm: 2.0, semi_aperture_mm: 2.5, conic1: 0.0, conic2: 0.0 };
+    s.add_singlet(lens_pos, g, 1.5168, 64.17);
+    let q = glam::DQuat::from_rotation_arc(Vec3::X, n_dev);
+    s.bodies.last_mut().unwrap().common.transform = oc_core::Isometry3::new(lens_pos, [q.x, q.y, q.z, q.w]).unwrap();
+    perfect_ar(&mut s);
+    let det = s.add_area_detector(lens_pos + n_dev * 16.2, -n_dev, 1.5, 1.5, [16, 16]);
+    s.validate().unwrap();
+    // A window of 5.12 mm at 1024 samples holds directions to 63 mrad: the
+    // two orders either side of the blaze, the others booked beyond its band.
+    let mut sp = spec(src, det, 0.1, 1024, 5.12);
+    sp.beam = BeamProfile::Gaussian { waist_radius_mm: 0.1, waist_offset_mm: 100.0 };
+    sp.device_samples_per_pixel = 4;
+    let r = wave_path(&s, &sp, 1).unwrap();
+    let apart = r.report.approximated.iter().find(|a| a.contains("of its orders apart")).cloned();
+    assert!(apart.is_some(), "{:?}", r.report.approximated);
+    // The orders nearest the blaze, and their angle to it.
+    let spec_dir = Vec3::X - n_dev * (2.0 * Vec3::X.dot(n_dev));
+    let (ex, ey) = (t.rotate(Vec3::X), t.rotate(Vec3::Y));
+    let step = LAM / 1000.0 / (p_um / 1000.0);
+    let nearest = (-12i64..=12)
+        .filter_map(|m| {
+            let (a, b) = (spec_dir.dot(ex) + m as f64 * step, spec_dir.dot(ey));
+            let z2 = 1.0 - a * a - b * b;
+            (z2 > 0.0).then(|| (ex * a + ey * b + n_dev * z2.sqrt()).dot(n_dev).clamp(-1.0, 1.0).acos())
+        })
+        .fold(f64::INFINITY, f64::min);
+    // Each face's report: how far the field's directions depart from the
+    // references they were traced along, power-weighted over the orders (a
+    // weak order at the window's band edge departs by its fold, and the
+    // steepest departure says so).
+    let read = |key: &str| -> Vec<f64> {
+        r.report
+            .approximated
+            .iter()
+            .filter(|a| a.contains("geometric field tracing"))
+            .filter_map(|a| {
+                let at = a.find(key)? + key.len();
+                a[at..].split(' ').next()?.parse::<f64>().ok()
+            })
+            .collect()
+    };
+    let (worst, rms) = (read("depart from it by up to "), read("(rms "));
+    let rms_max = rms.iter().cloned().fold(0.0, f64::max);
+    measured("DMD orders through a singlet: the nearest order's angle to the chief ray, mrad", 1e3 * nearest);
+    measured("DMD orders through a singlet: the orders' rms departure from their own references, the larger face's, mrad", rms_max);
+    measured("DMD orders through a singlet: the steepest departure, the larger face's, mrad", worst.iter().cloned().fold(0.0, f64::max));
+    assert!(nearest > 0.02, "the blaze must lie between orders: {nearest}");
+    assert_eq!(rms.len(), 2, "one note per face: {:?}", r.report.approximated);
+    assert!(rms_max < 0.1 * 1e3 * nearest, "{rms:?} against {nearest}");
+    // The orders, carried apart, each through an operator of its own, add
+    // back with a cross term their ledgers do not hold; the DMD's take-up
+    // onto the narrow beam's fine window resamples a little of the power.
+    let l = r.report.ledger;
+    measured("DMD orders through a singlet: numerical, of the launched", l.numerical / l.launched);
+    measured("DMD orders through a singlet: resampling, of the launched", l.resampling / l.launched);
+    assert!(l.numerical.abs() < 1e-6 && l.resampling.abs() < 2e-2, "{l:?}");
+}

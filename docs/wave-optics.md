@@ -259,8 +259,8 @@ and along each direction by bisection for the face's edge, so a lens smaller
 than the window is not missed), and between faces the field diffracts
 inside the glass. Across a slab the f64
 tracer carries one ray from each point of a grid, up to 257 × 257, through a
-copy of the scene holding the element alone, along the arriving field's
-wavefront (a sphere and tilt fitted to its phase gradient). Each ray gives
+copy of the scene holding the element alone, along a reference wavefront
+fixed by the geometry (below). Each ray gives
 where it crosses the exit plane, its optical path and its transmittance; the
 field that leaves is
 
@@ -281,8 +281,55 @@ the chief ray is still resolved to the ray grid, and the report says so. The
 faces' reflection (unpolarized) is booked as `other_arm`: light the chain does
 not follow, not absorbed. A curved mirror is the same transfer with the exit
 plane across the reflected ray. The report names the rays traced, how far
-they moved across the beam, and how far the arriving field's rays depart
-from the fitted sphere.
+they moved across the beam, and how far the arriving field's directions
+depart from the reference, with what that departure moves.
+
+**A transfer that is one operator.** The rays a face is traced with follow a
+reference wavefront that the field does not choose. The path carries the
+beam's Gaussian parameter `q` across each axis of its frame from the declared
+beam (a top-hat as the Gaussian of its radius) through every element before:
+free space adds its length, a thin lens its power, a plate the free space its
+glass is worth (`t/n`), and a traced face its paraxial matrices, from five
+rays through it, in reduced form across the change of index
+(`q̂' = (Aq̂ + B)/(Cq̂ + D)`, `q̂ = q/n` [13], [28]). The reference is the
+wavefront `Re 1/q` about the chief ray. Traced for a reference and a window,
+the map is the transfer's operator, the same for any field on that window: a
+field's two polarization components take one map, and
+`T(u₁ + u₂) = T(u₁) + T(u₂)` to round-off (5.7e-17). With a sphere fitted to
+each field it was given, as before, the same two Gaussians tilted ±10 mrad
+missed it by 0.15: their sum was traced along a direction that was neither's.
+
+A wrong reference costs more than its lateral walk `θ·L` across the slab. A
+field tilted `θ` from the rays it is traced along gathers the phase of their
+straight run, where its own plane waves advance by `k cos θ`: a piston of
+`kθ²L/2` too much. Against the exact plane-wave-by-plane-wave interface
+(Goodman [1]; Born & Wolf [16]), a Gaussian tilted 10 mrad through a plane
+face 0.4 mm deep is within 4.9e-4 traced about its own direction, and 0.15
+off traced about the chief ray, its piston 0.1486 rad against the 0.1479 of
+`k₀θ²/2·(L_air + L_glass/n)` (tests below). So each face's report gives the
+departure, the steepest where the field holds a hundredth of its peak and the
+power-weighted rms, with the move it makes across the slab and the phase it
+gathers there.
+
+A modulator's field holds several directions at once: its orders. Where a
+traced face lies ahead, the field leaving a DMD or an LCoS is cut, in its
+angular spectrum, into the cells of the device's lattice of orders
+(directions `λ/p` apart in the device's plane [10]; about the specular
+reflection for a DMD, whose facets only weight the orders, and about the
+followed beam for an LCoS), and each order is carried apart as far as the
+detector with a reference ray of its own: its direction, walked through free
+space, turned by a thin lens and traced through each face. Each order then
+crosses each face about its own direction, and the orders add back into one
+field at the detector. At most nine are carried apart, each of at least 1e-4
+of the power; a weaker one joins its nearest, and one that free space has
+emptied rejoins the strongest. Through an N-BK7 singlet, R ±8 mm, a DMD
+whose blaze lies 27 mrad from its nearest order crosses both faces with an
+rms departure of 0.36 mrad; traced about the chief ray, its brightest
+orders would have departed by their 27 and 36 mrad.
+
+The orders carried apart are the lattice's. A hologram's own orders, inside
+one cell of the lattice, share their cell's reference, and their departure
+from it is in the report.
 
 **One phase clock.** The samples carry the whole phase: every propagator
 multiplies them by its full transfer function, `e^{ikz}` included, and a
@@ -302,9 +349,11 @@ from one sample to the next lowers its amplitude in between,
 `|(1 − s) + s·e^{iφ}|² = 1 − 2s(1 − s)(1 − cos φ)`, a power loss of about
 `φ²/6` per axis averaged over a cell. A beam converging inside a lens turns
 most of a radian a sample at its edge, which lost 3.7% of the power at the
-singlet's second face and dimmed its pupil edge. So the field's fitted sphere
-and tilt are taken out of the samples first and put back exactly at the
-point read; only the slowly varying rest is interpolated. The singlet's
+singlet's second face and dimmed its pupil edge. So a smooth wavefront is
+taken out of the samples first and put back exactly at the point read (a
+transfer's reference; for the other hand-overs a sphere and tilt fitted to
+the field, which only choose how it is interpolated); only the slowly varying
+rest is interpolated. The singlet's
 unexplained remainder fell from 3.7% to 0.04% of the launched power. What
 interpolation still costs is booked at each step as `resampling`.
 
@@ -325,10 +374,18 @@ and never wider than the declared window. Narrowing, the zoomed angular
 spectrum carries it, exactly, padded enough that its plane waves' walk over
 the step stays inside; widening from a narrow window past its critical
 distance, the zoomed Fresnel transform, the Fresnel integral as one chirp-z
-transform onto the new grid, its paraxial error reported. A pinhole at a
-focus is then laid on the focus at the focus's own sampling, and a 10× beam
-expander keeps its beam resolved from 0.2 mm through a 50 µm focus to 2 mm
-(tests below).
+transform onto the new grid, its paraxial error reported. A coarser window
+holds fewer directions: the plane waves beyond its band are taken out of the
+field first, and booked as `beyond_nyquist`, for free space keeps every plane
+wave and the new samples, read at their points, would fold them back in at
+directions they do not have. A pinhole at a focus is then laid on the focus
+at the focus's own sampling, and a 10× beam expander keeps its beam resolved
+from 0.2 mm through a 50 µm focus to 2 mm (tests below). A modulator met by a
+narrow beam, on a window finer than a few samples a pixel, is laid on a
+device grid at least twice as fine as the beam's own (up to 32 samples a
+pixel): read between device samples it did not have, the DMD's take-up onto a
+0.1 mm beam's window resampled 7.5% of the power at four samples a pixel, and
+1.4% at 32.
 
 **What the path follows at a modulator.** The chief ray, and so the beam,
 leaves a DMD along the reflection off the facet it hits, and an SLM along the
@@ -523,9 +580,19 @@ These are acceptance case C53, in `crates/oc-wave/tests/path.rs`.
 | `a_retarder_between_crossed_polarizers_passes_half_sin2_2phi_sin2_half_delta` | `sin²2φ·sin²(δ/2)/2` [26], [27] at five (φ, δ); circular light from a quarter-wave plate at 45°, `1/4` through any analyzer | 1e-9 | 9.6e-15; 4.8e-15 |
 | `tilted_crossed_polarizers_leak_as_the_ray_tracer_says` | crossed at ±45° to the plane of incidence, met at 40°: the f64 tracer's polarized trace of the chief ray, bare and in glass of 1.5 (one model, two implementations); bare, `(sin²θ/(1 + cos²θ))²/2` from the axes' projection | 1e-6; 1e-9 | 1.8e-14 and 3.5e-14; 1.9e-14 |
 | `a_half_wave_plate_in_one_arm_of_a_mach_zehnder_takes_its_fringes_away_and_a_polarizer_brings_them_back` | Fresnel–Arago [27]: half the launched in the X port at every Δφ; behind an analyzer at β, `1/4 − cos Δφ·cos 2(θ − β)/4` [26], θ = 20°, β = 20°, 50°, 65° | 1e-6 | 4.9e-8 |
+| `a_dmd_s_orders_cross_a_singlet_each_about_its_own_direction` | the orders of a DMD whose blaze lies between two of them, through an N-BK7 singlet (R ±8 mm): each crosses each face about its own direction [10], [17]; the chief ray lies 27 mrad from the nearest | rms departure 2.7 mrad; `numerical` 1e-6 | 0.36 mrad; 5.6e-9 (resampling 1.4e-2 at the DMD's take-up) |
 | `crossed_polarizers_before_a_lens_leave_it_a_dark_field_to_carry` | the chain is geometry: behind crossed polarizers a singlet carries an all-zero field, the ledger closed | 1e-12 | detected 1.7e-33 |
 | `a_pinhole_at_a_lens_s_focus_passes_what_the_focused_gaussian_puts_through_it` | a waist on a lens of focal length f has radius λf/(πw₀) at the focal plane (bundle M30, [13]): a pinhole of that radius stops `exp(−2)` | 1e-5 | 5.7e-7 |
 | `a_ten_times_beam_expander_widens_the_beam_as_the_abcd_law_says` | the radius at the second lens by the Gaussian ABCD law [13], through a 50 µm focus | 1e-5 | 3.9e-7 |
+
+The transfer's own tests (acceptance case C62, `crates/oc-wave/src/transfer.rs`):
+
+| Test | Held against | Gate | Measured |
+|---|---|---|---|
+| `a_transfer_about_a_fixed_reference_is_linear_in_the_field` | `T(u₁ + u₂) = T(u₁) + T(u₂)`, two Gaussians tilted ±10 mrad through a lens face; with a sphere fitted to each field (before I6), the same | 1e-12 | 5.7e-17; 0.15 |
+| `a_tilted_beam_through_a_plane_face_matches_the_exact_interface_when_traced_about_its_own_direction` | the plane interface plane wave by plane wave (0.1 mm of air, `√(1 − R)`, 0.3 mm of N-BK7) [1], [16]; traced about the chief ray, the piston `k₀θ²/2·(L_air + L_glass/n)` | 1e-3; 2% | 4.9e-4; 0.1486 rad against 0.1479 |
+| `a_tilted_beam_crosses_a_curved_face_where_its_rays_do` | a Gaussian 0.3 mm off the axis and tilted 30 mrad through a face of R 8 mm: its centroid against its traced rays' (geometric field tracing [17]; a check of the map against the rays it is fitted to) | 3 nm | 1.4 nm (the rays' own centroid lies 11 nm from the central ray) |
+| `each_lobe_traced_about_its_own_direction_matches_it_traced_alone` | the same lobe about its own direction and about the chief ray's: what one reference for all costs | departure reported | 0.15 relative |
 
 The propagation tests of W8 (acceptance case C57, `crates/oc-wave/tests/propagate.rs`):
 
@@ -694,7 +761,10 @@ The coating fixtures keep their own pin, `optiland==0.6.1`
   (`TiltProjection`, reported); only the detector's diffracted readout uses
   the tilted-plane spectrum.
 - **Lenses face by face.** A face is traced across its sag in the geometric
-  limit; diffraction is taken between faces, not inside a face's slab.
+  limit; diffraction is taken between faces, not inside a face's slab. Its
+  rays follow the beam's paraxial wavefront, not the field's own: a field that
+  departs from it (aberrations, a hologram's orders inside one lattice cell)
+  is traced along it, and the report gives the departure.
 - **On a wave path, the beam follows the chief ray.** Steering onto a chosen
   diffraction order is W7. Arms that recombine are added once: a cavity's
   round trips are summed only inside a plane-parallel plate, where they are
@@ -761,5 +831,6 @@ entry says so.
 25. A. E. Siegman, "New developments in laser resonators," *Proc. SPIE* 1224, 2–14 (1990). (The second-moment beam width and its quadratic law in z, for any beam. DOI to confirm.)
 26. R. C. Jones, "A new calculus for the treatment of optical systems. I. Description and discussion of the calculus," *J. Opt. Soc. Am.* 31(7), 488–493 (1941), doi:10.1364/JOSA.31.000488. (A polarizer and a retarder as 2×2 matrices on the field's two components.)
 27. E. Hecht, *Optics*, 5th ed., Pearson (2017), ch. 8 (polarization): Malus's law; a retarder between crossed polarizers; the Fresnel–Arago laws. (Section numbers to confirm against the edition.)
+28. A. E. Siegman, *Lasers*, University Science Books (1986), ch. 15 and 20: ray matrices in reduced form across media of different index, and the ABCD law for a Gaussian beam's `q`. (Chapters to confirm.)
 
 The FFT is `rustfft` 6.4.1 (MIT OR Apache-2.0).

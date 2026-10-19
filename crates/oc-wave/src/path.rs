@@ -68,7 +68,7 @@ use crate::modulator::{dmd_reflect, lcos_reflect};
 use crate::propagate::propagate;
 use crate::report::{SamplingWarning, StepReport, WaveLedger};
 use crate::planar::{Plate, Pol};
-use crate::transfer::{fit_sphere, Smooth};
+use crate::transfer::{fit_sphere, Reference, Smooth, TracedMap};
 use crate::{Cx, Fft2, Field2, Grid2, Method, Propagator, WaveError, WaveReport};
 use oc_core::id::{DetectorId, SourceId};
 use oc_core::modulator::{DmdState, LcosBeam, ModulatorKind};
@@ -513,6 +513,42 @@ impl Arm {
     }
 }
 
+/// `u` with the plane waves a window `out` cannot hold taken out, those
+/// beyond its band about the field's carrier, and the power they carried;
+/// `u` as it is when `out` is no coarser.
+fn band_to(u: &Field2, out: &Grid2, fft: &mut Fft2) -> (Field2, f64) {
+    let g = u.grid;
+    let lim = [0.5 / out.pitch_mm[0], 0.5 / out.pitch_mm[1]];
+    if out.pitch_mm[0] <= g.pitch_mm[0] * (1.0 + 1e-12) && out.pitch_mm[1] <= g.pitch_mm[1] * (1.0 + 1e-12) {
+        return (u.clone(), 0.0);
+    }
+    let n = g.n;
+    let mut b = u.data.clone();
+    crate::fft::ifftshift2(&mut b, n);
+    fft.forward(&mut b, n, g.cell_area_mm2());
+    let df = g.freq_pitch(0) * g.freq_pitch(1);
+    let mut removed = 0.0;
+    for ky in 0..n[1] {
+        let fy = g.fft_freq(1, ky);
+        for kx in 0..n[0] {
+            let fx = g.fft_freq(0, kx);
+            if fx.abs() > lim[0] || fy.abs() > lim[1] {
+                let a = &mut b[ky * n[0] + kx];
+                removed += a.norm_sqr() * df;
+                *a = Cx::ZERO;
+            }
+        }
+    }
+    if removed == 0.0 {
+        return (u.clone(), 0.0);
+    }
+    fft.inverse(&mut b, n, df);
+    crate::fft::fftshift2(&mut b, n);
+    let mut v = u.clone();
+    v.data = b;
+    (v, removed)
+}
+
 /// A window a field is to be carried onto, and how.
 struct Regrid {
     out: Grid2,
@@ -797,8 +833,93 @@ struct ChainJob {
     next: usize,
     beam: Beam,
     u: Field2,
+    /// The beam's Gaussian parameter across each axis of its frame, in the
+    /// medium it is in (`q = z + i z_R`, its curvature `Re 1/q`), carried from
+    /// the source's declared beam through each element's paraxial matrices:
+    /// the wavefront a transfer's rays are traced along, which the field
+    /// itself does not choose.
+    q: [Cx; 2],
+    /// The ray that reference is about, across the beam: its point and
+    /// direction cosines `[a, b, tx, ty]`, the chief ray's zeros unless the
+    /// field is one of a modulator's orders.
+    at: [f64; 4],
+    /// The map traced at an event, kept for the other component.
+    cache: Option<(usize, Arc<TracedMap>)>,
+    /// How far an event's fields departed from the references their
+    /// transfer traced them along, gathered over its orders and components.
+    departures: Option<Departures>,
+    /// A modulator's other orders, each carried apart with its own reference
+    /// ray while a traced element lies ahead; `u`, `uy` and `at` are the
+    /// strongest one. Their sum is the field.
+    rest: Vec<Lobe>,
     report: WaveReport,
     fft: Fft2,
+}
+
+/// What a transfer's fields departed from their references by, over every
+/// order and component it carried.
+#[derive(Default)]
+struct Departures {
+    what: &'static str,
+    id: u64,
+    curvature: f64,
+    slab: f64,
+    k: f64,
+    orders: bool,
+    power: f64,
+    worst: f64,
+    rms2: f64,
+}
+
+impl Departures {
+    /// A field of power `p`: its steepest departure counts where it holds a
+    /// millionth of what the transfer carried so far, its rms by its power.
+    fn add(&mut self, p: f64, worst: f64, rms: f64) {
+        self.power += p;
+        self.rms2 += p * rms * rms;
+        if p >= 1e-6 * self.power {
+            self.worst = self.worst.max(worst);
+        }
+    }
+
+    fn note(&self) -> String {
+        let about = if self.orders { "about each order's own ray" } else { "about the chief ray" };
+        let rms = (self.rms2 / self.power.max(f64::MIN_POSITIVE)).sqrt();
+        format!(
+            "{} #{}: geometric field tracing (no diffraction inside the element; rays traced along a reference fixed by the geometry, the beam's paraxial wavefront, curvature {:.4e} /mm, {about}; the field's directions depart from it by up to {:.3} mrad where it holds a hundredth of its peak (rms {:.3} mrad), which across the {:.4} mm slab moves its light by up to {:.2e} mm and its phase by up to {:.2e} rad; unpolarized transmittance of the faces)",
+            self.what,
+            self.id,
+            self.curvature,
+            1e3 * self.worst,
+            1e3 * rms,
+            self.slab,
+            self.worst * self.slab,
+            0.5 * self.k * self.worst * self.worst * self.slab
+        )
+    }
+}
+
+/// One of a modulator's orders, carried apart from the others.
+struct Lobe {
+    u: Field2,
+    uy: Option<Field2>,
+    at: [f64; 4],
+}
+
+/// The most orders of a modulator carried apart, each holding at least 1e-4
+/// of the field's power; the weaker ones join their nearest.
+const MAX_LOBES: usize = 9;
+
+/// The Gaussian parameter of the declared beam at the launch plane, in a
+/// medium of index `n0`: a Gaussian's own, a top-hat's as the Gaussian of its
+/// radius with its waist there (H. Kogelnik, T. Li, *Appl. Opt.* 5, 1550
+/// (1966)).
+fn launch_q(spec: &WavePathSpec, lam_um: f64, n0: f64) -> Cx {
+    let lam = lam_um / 1000.0 / n0;
+    match spec.beam {
+        BeamProfile::Gaussian { waist_radius_mm, waist_offset_mm } => Cx::new(-waist_offset_mm, std::f64::consts::PI * waist_radius_mm * waist_radius_mm / lam),
+        BeamProfile::TopHat { radius_mm } => Cx::new(0.0, std::f64::consts::PI * radius_mm * radius_mm / lam),
+    }
 }
 
 /// The field a source launches on `grid`, with the ledger of the launch.
@@ -994,6 +1115,11 @@ impl ChainJob {
             next: 0,
             beam,
             u,
+            q: [launch_q(spec, lam, n0); 2],
+            at: [0.0; 4],
+            cache: None,
+            departures: None,
+            rest: Vec::new(),
             report,
             fft: Fft2::new(),
         })
@@ -1136,17 +1262,22 @@ impl ChainJob {
     /// a narrow window past its critical distance, the zoomed Fresnel
     /// transform, whose paraxial error on the field is reported.
     fn regrid_plan(&mut self, z: f64) -> Result<Option<Regrid>, WaveError> {
-        let mx = Moments::of(&self.u, &mut self.fft);
-        let my = match &self.uy {
-            Some(uy) => Moments::of(uy, &mut self.fft),
-            None => None,
-        };
-        let m = match (mx, my) {
-            (Some(a), Some(b)) => a.with(&b),
-            (Some(a), None) => a,
-            (None, Some(b)) => b,
-            (None, None) => return Ok(None),
-        };
+        let mut fields: Vec<&Field2> = vec![&self.u];
+        fields.extend(self.uy.as_ref());
+        for l in &self.rest {
+            fields.push(&l.u);
+            fields.extend(l.uy.as_ref());
+        }
+        let mut m: Option<Moments> = None;
+        for f in fields {
+            if let Some(a) = Moments::of(f, &mut self.fft) {
+                m = Some(match m {
+                    Some(b) => b.with(&a),
+                    None => a,
+                });
+            }
+        }
+        let Some(m) = m else { return Ok(None) };
         let g = self.u.grid;
         let n = g.n[0].max(g.n[1]);
         let half_now = 0.5 * g.width_mm(0).max(g.width_mm(1));
@@ -1178,8 +1309,14 @@ impl ChainJob {
         Ok(Some(Regrid { out, how, half, needed }))
     }
 
-    /// Carry `u` `z` on onto the window a plan chose.
+    /// Carry `u` `z` on onto the window a plan chose. A coarser window holds
+    /// fewer directions: the plane waves beyond its band are taken out first
+    /// and booked (`beyond_nyquist`), since free space keeps every plane wave
+    /// and the new samples, read at their points, would fold them back in at
+    /// directions they do not have.
     fn regrid_apply(&mut self, u: &Field2, z: f64, pl: &Regrid) -> Result<(Field2, WaveReport), WaveError> {
+        let (banded, beyond) = band_to(u, &pl.out, &mut self.fft);
+        let u = &banded;
         let ((v, mut r), how) = match pl.how {
             RegridHow::Zoom(2) => (crate::asm_zoom(u, z, pl.out, 2, &mut self.fft)?, "the zoomed angular spectrum"),
             RegridHow::Zoom(pad) => (crate::asm_zoom(u, z, pl.out, pad, &mut self.fft)?, "the zoomed angular spectrum, padded"),
@@ -1193,10 +1330,12 @@ impl ChainJob {
             }
         };
         let n = pl.out.n[0];
+        r.ledger.beyond_nyquist += beyond;
+        let cut = if beyond > 0.0 { format!("; {:.3e} of its power in directions beyond the new window's band taken out first", beyond / (beyond + u.power()).max(f64::MIN_POSITIVE)) } else { String::new() };
         r.steps.push(element_step(
             z,
             format!(
-                "the field carried {z:.4} mm onto a new window {:.4e} mm across ({n}², pitch {:.4e} mm), where the beam is predicted {:.4e} mm across (six rms radii), by {how}",
+                "the field carried {z:.4} mm onto a new window {:.4e} mm across ({n}², pitch {:.4e} mm), where the beam is predicted {:.4e} mm across (six rms radii), by {how}{cut}",
                 2.0 * pl.half,
                 pl.out.pitch_mm[0],
                 pl.needed
@@ -1476,6 +1615,11 @@ impl ChainJob {
             next: self.next,
             beam: self.beam,
             u,
+            q: self.q,
+            at: self.at,
+            cache: None,
+            departures: None,
+            rest: Vec::new(),
             report: WaveReport { ledger: WaveLedger { launched, ..Default::default() }, ..Default::default() },
             fft: Fft2::new(),
         }
@@ -1753,38 +1897,273 @@ impl ChainJob {
         // A diffracted readout takes the last step itself, onto the detector,
         // and so does an arm read out to be added to others.
         if matches!(ev, Ev::End) && (self.face || matches!(self.spec.readout, Readout::Diffracted { .. })) {
+            self.merge_lobes();
             return Ok(());
         }
         // Free space up to this event, onto a window fitted to the beam there
-        // when the one it has would no longer suit it; both components onto
-        // the same one.
+        // when the one it has would no longer suit it; both components, and
+        // every order carried apart, onto the same one.
         let z = (p - self.beam.origin).dot(self.beam.d);
         if z > 1e-12 {
-            let plan = self.regrid_plan(z)?;
-            let (v, r) = match &plan {
-                Some(pl) => self.regrid_apply(&self.u.clone(), z, pl)?,
-                None => propagate(&self.u, z, Propagator::Auto, &mut self.fft)?,
-            };
-            merge(&mut self.report, r);
-            self.u = v;
-            if let Some(uy) = self.uy.take() {
-                let (vy, ry) = match &plan {
-                    Some(pl) => self.regrid_apply(&uy, z, pl)?,
-                    None => propagate(&uy, z, Propagator::Auto, &mut self.fft)?,
-                };
-                let mut ry = ry;
-                ry.steps.clear();
-                merge(&mut self.report, ry);
-                self.uy = Some(vy);
+            self.free_space(z, p)?;
+        }
+        let (beam_in, n_in) = (self.beam, self.u.n_medium);
+        self.element_any(idx, &ev, p)?;
+        if !self.rest.is_empty() {
+            // The other orders through the same element, each about its own
+            // reference ray; the report keeps the first one's step.
+            let beam_out = self.beam;
+            let n = self.report.steps.len();
+            let mut lobes = std::mem::take(&mut self.rest);
+            for l in &mut lobes {
+                std::mem::swap(&mut self.u, &mut l.u);
+                std::mem::swap(&mut self.uy, &mut l.uy);
+                std::mem::swap(&mut self.at, &mut l.at);
+                self.beam = beam_in;
+                let r = self.element_any(idx, &ev, p);
+                std::mem::swap(&mut self.u, &mut l.u);
+                std::mem::swap(&mut self.uy, &mut l.uy);
+                std::mem::swap(&mut self.at, &mut l.at);
+                r?;
+                self.report.steps.truncate(n);
             }
-            self.beam.origin = p;
-            self.u.frame = self.beam.iso();
-            if let Some(uy) = &mut self.uy {
-                uy.frame = self.beam.iso();
+            self.rest = lobes;
+            self.beam = beam_out;
+        }
+        if let Some(d) = self.departures.take() {
+            self.report.approx(d.note());
+        }
+        self.paraxial(&ev, p, &beam_in, n_in)?;
+        let transfer_ahead = self.points[idx + 1..].iter().any(|(_, _, e)| matches!(e, Ev::Transfer { .. }));
+        if !transfer_ahead {
+            self.merge_lobes();
+        } else if let Ev::Hit(h) = &ev {
+            self.split_orders(h, &beam_in)?;
+        }
+        if matches!(ev, Ev::End) {
+            self.merge_lobes();
+        }
+        Ok(())
+    }
+
+    /// The orders carried apart added back into one field.
+    fn merge_lobes(&mut self) {
+        if self.rest.is_empty() {
+            return;
+        }
+        self.at = [0.0; 4];
+        for l in std::mem::take(&mut self.rest) {
+            for (a, b) in self.u.data.iter_mut().zip(&l.u.data) {
+                *a += *b;
+            }
+            if let (Some(uy), Some(ly)) = (&mut self.uy, &l.uy) {
+                for (a, b) in uy.data.iter_mut().zip(&ly.data) {
+                    *a += *b;
+                }
             }
         }
+    }
+
+    /// Where a modulator's field meets a traced element further on, carry
+    /// its orders apart: the field's angular spectrum cut into the cells of
+    /// the device's lattice of orders (directions `λ/p` apart in the device's
+    /// plane [Harvey & Vernold 1998], about the specular reflection for a DMD,
+    /// whose facets only weight the orders, and about the beam the chain
+    /// follows for an LCoS), each order a field of its own with its own
+    /// reference ray, its direction. A transfer then traces each order along
+    /// its own direction rather than all of them along one; the fields add
+    /// back to the one field at the detector.
+    fn split_orders(&mut self, h: &oc_core::seq3::SeqHit3, beam_in: &Beam) -> Result<(), WaveError> {
+        let scene = Arc::clone(&self.scene);
+        let Some(s) = scene.surfaces.iter().find(|s| s.common.id == h.object) else { return Ok(()) };
+        let t = s.common.transform;
+        let nrm = t.rotate(Vec3::Z);
+        let response = if beam_in.d.dot(nrm) < 0.0 { &s.response_front } else { &s.response_back };
+        let SurfaceResponse::Modulator { device, .. } = response else { return Ok(()) };
+        self.merge_lobes();
+        self.at = [0.0; 4];
+        let (ex, ey) = (t.rotate(Vec3::X), t.rotate(Vec3::Y));
+        let out = self.beam;
+        let centre = match device.kind {
+            ModulatorKind::Dmd(_) => beam_in.d - nrm * (2.0 * beam_in.d.dot(nrm)),
+            ModulatorKind::Lcos(_) => out.d,
+        };
+        let side = if out.d.dot(nrm) >= 0.0 { 1.0 } else { -1.0 };
+        let lam = self.u.wavelength_in_medium_mm();
+        let step = lam / device.pitch_mm();
+        let (cx, cy) = (centre.dot(ex), centre.dot(ey));
+        let g = self.u.grid;
+        let n = g.n;
+        let spectrum = |f: &Field2, fft: &mut Fft2| {
+            let mut b = f.data.clone();
+            crate::fft::ifftshift2(&mut b, n);
+            fft.forward(&mut b, n, g.cell_area_mm2());
+            b
+        };
+        let sx = spectrum(&self.u, &mut self.fft);
+        let sy = self.uy.as_ref().map(|u| spectrum(u, &mut self.fft));
+        // Each plane wave's order: the lattice point nearest its direction's
+        // part along the device's plane.
+        let (u0, v0) = (self.u.carrier[0] / lam, self.u.carrier[1] / lam);
+        let mut order = vec![(0i64, 0i64); n[0] * n[1]];
+        let mut power: std::collections::HashMap<(i64, i64), f64> = std::collections::HashMap::new();
+        for ky in 0..n[1] {
+            let fy = g.fft_freq(1, ky) + v0;
+            for kx in 0..n[0] {
+                let fx = g.fft_freq(0, kx) + u0;
+                let (tx, ty) = (lam * fx, lam * fy);
+                let tz = (1.0 - tx * tx - ty * ty).max(0.0).sqrt();
+                let d = out.x * tx + out.y * ty + out.d * tz;
+                let o = (((d.dot(ex) - cx) / step).round() as i64, ((d.dot(ey) - cy) / step).round() as i64);
+                let k = ky * n[0] + kx;
+                order[k] = o;
+                *power.entry(o).or_default() += sx[k].norm_sqr() + sy.as_ref().map_or(0.0, |y| y[k].norm_sqr());
+            }
+        }
+        let total: f64 = power.values().sum();
+        let mut ranked: Vec<((i64, i64), f64)> = power.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0)));
+        let kept: Vec<(i64, i64)> = ranked.iter().filter(|(_, p)| *p >= 1e-4 * total).take(MAX_LOBES).map(|x| x.0).collect();
+        // An order's direction across the outgoing beam.
+        let dir = |o: (i64, i64)| -> Option<[f64; 2]> {
+            let (a, b) = (cx + o.0 as f64 * step, cy + o.1 as f64 * step);
+            let z2 = 1.0 - a * a - b * b;
+            (z2 > 0.0).then(|| {
+                let d = ex * a + ey * b + nrm * (side * z2.sqrt());
+                [d.dot(out.x), d.dot(out.y)]
+            })
+        };
+        let kept: Vec<((i64, i64), [f64; 2])> = kept.into_iter().filter_map(|o| dir(o).map(|d| (o, d))).collect();
+        if kept.len() <= 1 {
+            // One order: the field is traced about its direction.
+            if let Some((_, d)) = kept.first() {
+                self.at = [0.0, 0.0, d[0], d[1]];
+            }
+            return Ok(());
+        }
+        // Every order joins its nearest kept one.
+        let mut join: std::collections::HashMap<(i64, i64), usize> = std::collections::HashMap::new();
+        let nearest = |o: (i64, i64)| {
+            kept.iter()
+                .enumerate()
+                .min_by_key(|(_, (k, _))| (k.0 - o.0).pow(2) + (k.1 - o.1).pow(2))
+                .map_or(0, |(i, _)| i)
+        };
+        let df = g.freq_pitch(0) * g.freq_pitch(1);
+        let mut lobe = |spec: &[Cx], which: usize, like: &Field2, fft: &mut Fft2| -> Field2 {
+            let mut b: Vec<Cx> = spec
+                .iter()
+                .zip(&order)
+                .map(|(z, o)| if *join.entry(*o).or_insert_with(|| nearest(*o)) == which { *z } else { Cx::ZERO })
+                .collect();
+            fft.inverse(&mut b, n, df);
+            crate::fft::fftshift2(&mut b, n);
+            let mut f = like.clone();
+            f.data = b;
+            f
+        };
+        let mut lobes = Vec::with_capacity(kept.len());
+        for (i, (_, d)) in kept.iter().enumerate() {
+            let u = lobe(&sx, i, &self.u, &mut self.fft);
+            let uy = match (&sy, &self.uy) {
+                (Some(y), Some(like)) => Some(lobe(y, i, like, &mut self.fft)),
+                _ => None,
+            };
+            lobes.push(Lobe { u, uy, at: [0.0, 0.0, d[0], d[1]] });
+        }
+        let first = lobes.remove(0);
+        self.u = first.u;
+        self.uy = first.uy;
+        self.at = first.at;
+        self.rest = lobes;
+        let count = self.rest.len() + 1;
+        if let Some(st) = self.report.steps.last_mut() {
+            st.note += &format!("; its field carried on as {count} of the device's orders apart, each traced about its own direction through the elements ahead");
+        }
+        self.report.approx(format!(
+            "the field leaving modulator #{} carried as {count} of its orders apart (the device's lattice, λ/p apart; at most {MAX_LOBES}, each of at least 1e-4 of the power, a weaker order joining its nearest), each traced through the lenses ahead about its own direction; their sum is the field",
+            h.object.0
+        ));
+        Ok(())
+    }
+
+    /// The field `z` on to `p`, both components onto one window; the
+    /// reference's wavefront and ray with it.
+    fn free_space(&mut self, z: f64, p: Vec3) -> Result<(), WaveError> {
+        let plan = self.regrid_plan(z)?;
+        let (v, r) = match &plan {
+            Some(pl) => self.regrid_apply(&self.u.clone(), z, pl)?,
+            None => propagate(&self.u, z, Propagator::Auto, &mut self.fft)?,
+        };
+        merge(&mut self.report, r);
+        self.u = v;
+        if let Some(uy) = self.uy.take() {
+            let (vy, ry) = match &plan {
+                Some(pl) => self.regrid_apply(&uy, z, pl)?,
+                None => propagate(&uy, z, Propagator::Auto, &mut self.fft)?,
+            };
+            let mut ry = ry;
+            ry.steps.clear();
+            merge(&mut self.report, ry);
+            self.uy = Some(vy);
+        }
+        let mut lobes = std::mem::take(&mut self.rest);
+        for l in &mut lobes {
+            for f in std::iter::once(&mut l.u).chain(l.uy.as_mut()) {
+                let (v, mut r) = match &plan {
+                    Some(pl) => self.regrid_apply(f, z, pl)?,
+                    None => propagate(f, z, Propagator::Auto, &mut self.fft)?,
+                };
+                r.steps.clear();
+                merge(&mut self.report, r);
+                *f = v;
+            }
+        }
+        // An order free space has emptied, its power booked as it left,
+        // rejoins the strongest.
+        let pw = |u: &Field2, uy: &Option<Field2>| u.power() + uy.as_ref().map_or(0.0, |f| f.power());
+        let total: f64 = pw(&self.u, &self.uy) + lobes.iter().map(|l| pw(&l.u, &l.uy)).sum::<f64>();
+        let (spent, kept): (Vec<Lobe>, Vec<Lobe>) = lobes.into_iter().partition(|l| pw(&l.u, &l.uy) < 1e-9 * total);
+        for l in spent {
+            for (a, b) in self.u.data.iter_mut().zip(&l.u.data) {
+                *a += *b;
+            }
+            if let (Some(uy), Some(ly)) = (&mut self.uy, &l.uy) {
+                for (a, b) in uy.data.iter_mut().zip(&ly.data) {
+                    *a += *b;
+                }
+            }
+        }
+        self.rest = kept;
+        self.beam.origin = p;
+        let iso = self.beam.iso();
+        self.u.frame = iso;
+        if let Some(uy) = &mut self.uy {
+            uy.frame = iso;
+        }
+        for q in &mut self.q {
+            *q += Cx::real(z);
+        }
+        let walk = |at: &mut [f64; 4]| {
+            let tz = (1.0 - at[2] * at[2] - at[3] * at[3]).max(1e-12).sqrt();
+            at[0] += z * at[2] / tz;
+            at[1] += z * at[3] / tz;
+        };
+        walk(&mut self.at);
+        for l in &mut self.rest {
+            l.u.frame = iso;
+            if let Some(uy) = &mut l.uy {
+                uy.frame = iso;
+            }
+            walk(&mut l.at);
+        }
+        Ok(())
+    }
+
+    /// The element at event `idx`, on the field of one component or two.
+    fn element_any(&mut self, idx: usize, ev: &Ev, p: Vec3) -> Result<(), WaveError> {
         if self.uy.is_some() && !matches!(ev, Ev::End | Ev::Aperture(_)) {
-            return self.element_polarized(idx, &ev, p);
+            return self.element_polarized(idx, ev, p);
         }
         if matches!(ev, Ev::Aperture(_)) {
             if let Some(uy) = self.uy.take() {
@@ -1792,13 +2171,88 @@ impl ChainJob {
                 self.element(idx, ev.clone(), p)?;
                 let ux = std::mem::replace(&mut self.u, uy);
                 let n = self.report.steps.len();
-                self.element(idx, ev, p)?;
+                self.element(idx, ev.clone(), p)?;
                 self.report.steps.truncate(n);
                 self.uy = Some(std::mem::replace(&mut self.u, ux));
                 return Ok(());
             }
         }
-        self.element(idx, ev, p)
+        self.element(idx, ev.clone(), p)
+    }
+
+    /// The reference the next transfer's rays follow: the beam's paraxial
+    /// wavefront about the reference ray.
+    fn reference(&self) -> Reference {
+        let c = |q: Cx| (Cx::ONE / q).re;
+        Reference { curv: [c(self.q[0]), c(self.q[1])], tilt: [self.at[2], self.at[3]], centre: [self.at[0], self.at[1]] }
+    }
+
+    /// The reference's wavefront and ray through the element at an event,
+    /// from the geometry alone: a transfer's paraxial matrices from rays
+    /// traced through it, a thin lens's power, a plate as the free space its
+    /// glass is worth (`t/n`); a flat element hands the beam's frame on as it
+    /// is. `beam_in` and `n_in` are the beam's frame and medium before it.
+    fn paraxial(&mut self, ev: &Ev, p: Vec3, beam_in: &Beam, n_in: f64) -> Result<(), WaveError> {
+        match ev {
+            Ev::Transfer { hit, .. } => {
+                let probe = probe_scene(&self.scene, hit.object);
+                let out = self.beam;
+                let n_out = hit.n_after;
+                if let Some(m) = crate::transfer::abcd(&probe, self.lam, beam_in, &out, n_in, n_out) {
+                    for (q, m) in self.q.iter_mut().zip(m) {
+                        *q = crate::transfer::q_through(*q, m, n_in, n_out);
+                    }
+                } else {
+                    self.report.approx(format!("#{}: its paraxial matrices could not be traced, so the reference wavefront is carried through it unchanged", hit.object.0));
+                }
+                let mut ats: Vec<[f64; 4]> = vec![self.at];
+                ats.extend(self.rest.iter().map(|l| l.at));
+                for a in &mut ats {
+                    if *a == [0.0; 4] {
+                        continue;
+                    }
+                    match crate::transfer::ray_through(&probe, self.lam, beam_in, &out, a[0], a[1], [a[2], a[3]]) {
+                        Some((x, t, _)) => *a = [x[0], x[1], t[0], t[1]],
+                        None => self.report.approx(format!("#{}: the reference ray of one of the field's orders misses it, and is carried on as it was", hit.object.0)),
+                    }
+                }
+                self.at = ats[0];
+                for (l, a) in self.rest.iter_mut().zip(&ats[1..]) {
+                    l.at = *a;
+                }
+            }
+            Ev::Hit(h) => {
+                let s = self.scene.surfaces.iter().find(|s| s.common.id == h.object);
+                let lens = s.and_then(|s| {
+                    let r = if beam_in.d.dot(s.common.transform.rotate(Vec3::Z)) < 0.0 { &s.response_front } else { &s.response_back };
+                    match r {
+                        SurfaceResponse::ThinLens { focal_length_mm } => Some(*focal_length_mm),
+                        _ => None,
+                    }
+                });
+                if let Some(f) = lens {
+                    for q in &mut self.q {
+                        *q = Cx::ONE / (Cx::ONE / *q - Cx::real(1.0 / f));
+                    }
+                    // The frame turns with the chief ray: a reference ray
+                    // turns by its own height on the lens less the chief's.
+                    for a in std::iter::once(&mut self.at).chain(self.rest.iter_mut().map(|l| &mut l.at)) {
+                        a[2] -= a[0] / f;
+                        a[3] -= a[1] / f;
+                    }
+                }
+            }
+            Ev::Plate { first, second, exit, plate } => {
+                let (n_g, n_out) = (plate.n_glass, plate.n_out);
+                let glass = (second.point - first.point).length();
+                let worth = (first.point - p).length() / n_in + glass / n_g + (*exit - second.point).length() / n_out;
+                for q in &mut self.q {
+                    *q = (*q * (1.0 / n_in) + Cx::real(worth)) * n_out;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     /// The element at event `idx`, on the field `u` (one component of two,
@@ -1815,7 +2269,16 @@ impl ChainJob {
                 let out = beam.turned(exit, d_out);
                 let before = self.u.power();
                 let rays = self.spec.grid_n.clamp(65, 257);
-                let (v, st) = crate::transfer::transfer(&probe, &self.u, &beam, &out, last.n_after, rays)?;
+                let r = self.reference();
+                let map = match &self.cache {
+                    Some((i, m)) if *i == idx && m.fits(self.u.grid, &r) => Arc::clone(m),
+                    _ => {
+                        let m = Arc::new(crate::transfer::trace_map(&probe, self.u.grid, self.u.lambda_um, &beam, &out, rays, &r)?);
+                        self.cache = Some((idx, Arc::clone(&m)));
+                        m
+                    }
+                };
+                let (v, st) = crate::transfer::apply(&map, &self.u, &out, last.n_after)?;
                 let l = &mut self.report.ledger;
                 // The rim and the mount stop light; the faces reflect it into
                 // a path the chain does not follow.
@@ -1852,12 +2315,10 @@ impl ChainJob {
                         first.object.0
                     ));
                 }
-                self.report.approx(format!(
-                    "{what} #{}: geometric field tracing (no diffraction inside the element; rays traced along the arriving wavefront's fitted sphere, curvature {:.4e} /mm, which its rays depart from by up to {:.3} mrad; unpolarized transmittance of the faces)",
-                    first.object.0,
-                    st.curvature,
-                    1e3 * st.arriving_ray_angle
-                ));
+                let k_in = self.u.k_mm();
+                let orders = !self.rest.is_empty() || self.at != [0.0; 4];
+                let note = self.departures.get_or_insert(Departures { what, id: first.object.0, curvature: st.curvature, slab: st.slab_mm, k: k_in, orders, ..Default::default() });
+                note.add(before, st.arriving_ray_angle, st.arriving_ray_rms);
                 if st.max_phase_step > std::f64::consts::PI {
                     self.report.warn(SamplingWarning::Undersampled {
                         what: format!("the field after {what} #{}", first.object.0),
@@ -2936,9 +3397,11 @@ fn modulator_step(
     let t = &s.common.transform;
     let n_s = t.rotate(Vec3::Z);
     // The device-plane grid: the beam window's footprint, at a few samples a
-    // pixel.
+    // pixel, and no coarser than the beam's own samples (a window fitted to a
+    // narrow beam is finer than a few samples a pixel, and the take-up would
+    // read the device's facets between samples it does not have), up to 32.
     let p = device.pitch_mm();
-    let per = spec.device_samples_per_pixel.max(2);
+    let per = spec.device_samples_per_pixel.max(2).max(((2.0 * p / u.grid.pitch_mm[0].min(u.grid.pitch_mm[1])).ceil() as usize).min(32));
     let dxd = p / per as f64;
     let half = 0.5 * u.grid.width_mm(0);
     let mut lo = [f64::INFINITY; 2];

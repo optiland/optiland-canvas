@@ -4,8 +4,11 @@ Version 3 is version 2 ([ocanvas-format-v2.md](ocanvas-format-v2.md)) plus what
 real coatings need: a film catalogue with provenance, layers that name their
 catalogue entry, materials with a dispersion formula, a form, a source and a
 nominal value, a semi-infinite opaque substrate, and the fidelity profile the
-scene is traced under. Every addition is optional on read, so a version 3
-reader reads version 2 unchanged.
+scene is traced under. It also carries the
+[spatial light modulators](#spatial-light-modulators) and
+[coherent beams](#coherent-beams) of the wave-optics work.
+Every addition is optional on read, so a version 3 reader reads version 2
+unchanged.
 
 The browser saves version 3. `Scene3::to_json_v2` writes version 2 for older
 readers (the optikit-v2 vendored kernel among them) and returns what it could
@@ -212,6 +215,65 @@ per side, `Front` and `Back`; a body face `Front` outside and `Back` inside.
 A semi-infinite absorbing substrate: what the stack transmits into it is
 absorbed there. Lit from its film side only.
 
+## Spatial light modulators
+
+A DMD or an LCoS SLM is a surface response, `Modulator`, on a standalone
+planar rectangle the size of its pixel array ([DMD](dmd.md), [SLM](slm.md)):
+
+```json
+"response_front": { "Modulator": { "device": {
+  "pixels": [1920, 1080],
+  "pitch_um": 7.56,
+  "kind": { "Dmd": { "tilt_deg": 12.0, "tilt_axis": "Diagonal", "mirror_fill": 0.97,
+                     "reflectance": 0.89, "window_transmittance": 0.97 } },
+  "pattern": { "Generated": { "BinaryGrating": { "period_px": 8.0, "duty": 0.5, "angle_deg": 0.0, "phase": 0.0 } } }
+} } }
+```
+
+| Field | Meaning |
+|---|---|
+| `pixels` | columns along the surface's local `X`, rows along `Y` |
+| `pitch_um` | the square pixels' pitch |
+| `kind.Dmd` | `tilt_deg` (below 45°), `tilt_axis` `Diagonal` or `Side`, `mirror_fill` a mirror's side over the pitch, the mirror's `reflectance`, the window's `window_transmittance` per pass |
+| `kind.Lcos` | `director_deg` in the device plane, `lut` (`Linear { levels, max_phase_rad }` or `Table { phase_rad }`), `design_lambda_um`, `pixel_fill`, the dead space's `gap_amplitude` and `gap_phase_rad`, `fringing_um`, `reflectance` |
+| `pattern` | `Uniform { value }`; `Generated` (`BinaryGrating`, `BlazedGrating`, `FresnelLens`, `Vortex`, `Lee`, `Sum`); or `Explicit`, one value per pixel |
+
+A DMD pixel's value is its state: 0 OFF, 1 ON, 2 flat. An SLM pixel's value is
+its grey level, which the `lut` turns into a phase.
+
+An `Explicit` pattern is stored packed, so a full-HD bitmap stays small:
+
+```json
+"pattern": { "Explicit": { "bits": 1, "count": 4, "data": "AGA=", "fnv1a": "af63dd4c8601ee3f" } }
+```
+
+`bits` is 1, 8 or 16 per pixel, the smallest that holds the largest value;
+1-bit values are packed eight to a byte, most significant first, and 16-bit
+values little-endian. `data` is the base64 (RFC 4648) of the PackBits
+(Apple TN1023) of those bytes, and `fnv1a` the 64-bit FNV-1a of the unpacked
+bytes, as hex. A damaged pattern fails its checksum on load and the document
+is refused.
+
+The variant is new, so a document containing a modulator does not open in a
+kernel older than it. A modulator works from its front: one placed on a
+surface's back loads, but the tracer and the preview refuse it by name.
+
+## Coherent beams
+
+A source may declare the coherent beam it launches on a wave path
+([wave optics](wave-optics.md#the-wave-path)); its rays are unaffected:
+
+```json
+"coherence": { "Gaussian": { "waist_radius_mm": 0.3, "waist_offset_mm": -20.0 } }
+```
+
+`Gaussian` is a beam of `1/e²` radius `waist_radius_mm` at its waist,
+`waist_offset_mm` downstream of the source along its axis (negative:
+upstream); `TopHat { radius_mm }` is a uniform, flat-phase disc at the source.
+The beam's power is the source's `flux`. Absent, the source is traced as rays
+only, and the key is left out on save. A version 2 kernel ignores the key, and
+drops it if it saves the file again.
+
 ## Writing version 2
 
 `Scene3::to_json_v2` drops every version 3 addition and lists what that cost:
@@ -229,3 +291,5 @@ absorbed there. Lit from its film side only.
 | `adapt` on any other design | dropped | yes |
 | `MeasuredTable` | `ExplicitRt` of its unpolarized R and T at its first angle, refusing outside its wavelengths | yes |
 | `temperature_c`, `object_temperatures`, a material's `thermal` | dropped | yes |
+| a source's `coherence` | dropped | yes |
+| a `Modulator` response (DMD or SLM) | `Absorber` on the same rectangle: v2 has no response that sends light where a micromirror or a phase pattern does, and a flat mirror would send it the wrong way | yes |

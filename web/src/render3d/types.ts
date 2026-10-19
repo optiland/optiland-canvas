@@ -24,6 +24,7 @@ export type MaterialRole =
   | "dichroic"
   | "polarizing"
   | "grating"
+  | "modulator"
   | "error";
 
 /** A coated face's display colours (linear RGB): its reflectance and its

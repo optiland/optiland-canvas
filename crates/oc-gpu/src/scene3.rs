@@ -1178,6 +1178,9 @@ fn classify_surface(r: &TwoSidedSurfaceResponse) -> Result<u32, String> {
         SurfaceResponse::MeasuredTable { .. } => {
             Err("measured table as a body's default response (not yet in the f32 preview)".into())
         }
+        SurfaceResponse::Modulator { .. } => {
+            Err("spatial light modulator on a body patch (only standalone surfaces carry one)".into())
+        }
     }
 }
 
@@ -1377,6 +1380,172 @@ pub enum GpuResponse {
         /// `oc_core::thinfilm::Coating::reflection_is_stray`.
         stray: bool,
     },
+    /// A DMD in the geometric limit, as tracer3's `modulator_ray` traces it.
+    Micromirror(std::sync::Arc<GpuMicromirror>),
+    /// An LCoS SLM in the geometric limit, as tracer3's `modulator_ray`
+    /// traces it with polarization off.
+    PhaseModulator(std::sync::Arc<GpuPhaseModulator>),
+}
+
+/// The pixel array of a DMD or an SLM: the pitch in NORMALIZED units, and
+/// the columns (local `X`) and rows (local `Y`), centred on the surface's
+/// origin as `oc_core::modulator::SpatialModulator::pixel_center_mm` puts them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PixelArray32 {
+    pub pitch: f32,
+    pub pixels: [u32; 2],
+}
+
+impl PixelArray32 {
+    /// The pixel a local point `(x, y)` falls in, `None` off the array.
+    pub fn pixel(&self, x: f32, y: f32) -> Option<(u32, u32)> {
+        let fx = x / self.pitch + self.pixels[0] as f32 * 0.5;
+        let fy = y / self.pitch + self.pixels[1] as f32 * 0.5;
+        if fx < 0.0 || fy < 0.0 || fx >= self.pixels[0] as f32 || fy >= self.pixels[1] as f32 {
+            return None;
+        }
+        Some((fx.floor() as u32, fy.floor() as u32))
+    }
+
+    /// The centre of pixel `(i, j)` in local coordinates.
+    pub fn center(&self, i: u32, j: u32) -> Vec2 {
+        Vec2::new(
+            (i as f32 - (self.pixels[0] as f32 - 1.0) * 0.5) * self.pitch,
+            (j as f32 - (self.pixels[1] as f32 - 1.0) * 0.5) * self.pitch,
+        )
+    }
+}
+
+/// Mirror states per pixel: one state for the whole array, or two bits per
+/// pixel, twelve to an `f32` (exact integers below 2^24, so the arena carries
+/// them unchanged), row-major with `X` fastest.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MirrorStates {
+    Uniform(u32),
+    Packed(Vec<f32>),
+}
+
+/// States one `f32` of [`MirrorStates::Packed`] holds.
+pub const STATES_PER_WORD: usize = 12;
+
+impl MirrorStates {
+    /// Pixel `q`'s state: 0 OFF, 1 ON, 2 flat (`DmdState::value`).
+    pub fn state(&self, q: usize) -> u32 {
+        match self {
+            MirrorStates::Uniform(v) => *v,
+            MirrorStates::Packed(w) => (w[q / STATES_PER_WORD] as u32 >> (2 * (q % STATES_PER_WORD))) & 3,
+        }
+    }
+}
+
+/// A DMD for the preview.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GpuMicromirror {
+    pub array: PixelArray32,
+    /// Power reflectance of a mirror, the window's two passes included.
+    pub r: f32,
+    /// Linear mirror fill: a mirror's side over the pitch.
+    pub fill: f32,
+    /// The facet's local unit normal in each state, indexed by state value.
+    pub normals: [Vec3; 3],
+    /// The hinge axis and the in-plane direction across it.
+    pub hinge: [Vec2; 2],
+    pub states: MirrorStates,
+}
+
+/// An LCoS SLM for the preview.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GpuPhaseModulator {
+    pub array: PixelArray32,
+    /// The pitch in µm, which the phase-gradient steering is per.
+    pub pitch_um: f32,
+    /// Power reflectance of an electrode.
+    pub r: f32,
+    /// Linear pixel fill: an electrode's side over the pitch.
+    pub fill: f32,
+    /// Power reflectance of the dead space, `|g|²`.
+    pub gap_r: f32,
+    pub design_lambda_um: f32,
+    /// Each pixel's phase at the design wavelength, row-major with `X`
+    /// fastest; empty for a uniform pattern, which steers nothing.
+    pub phase: Vec<f32>,
+}
+
+/// Pixels whose phase the preview will carry: 4 bytes each, 16 MB.
+pub const MAX_PREVIEW_PHASE_PIXELS: usize = 1 << 22;
+/// Pixels whose mirror state the preview will carry: 2 bits each, 4 MB.
+pub const MAX_PREVIEW_MIRROR_PIXELS: usize = 1 << 24;
+
+fn compile_modulator(device: &oc_core::modulator::SpatialModulator, scale: f64) -> Result<GpuResponse, String> {
+    use oc_core::modulator::{facet_normal, hinge, DmdState, ModulatorKind, Pattern};
+    device
+        .validate()
+        .map_err(|e| format!("DMD or SLM with an invalid device ({e})"))?;
+    let [nx, ny] = [device.pixels[0] as usize, device.pixels[1] as usize];
+    let count = nx * ny;
+    let array = PixelArray32 {
+        pitch: (device.pitch_mm() / scale) as f32,
+        pixels: device.pixels,
+    };
+    let uniform = matches!(device.pattern, Pattern::Uniform { .. });
+    Ok(match &device.kind {
+        ModulatorKind::Dmd(d) => {
+            if !uniform && count > MAX_PREVIEW_MIRROR_PIXELS {
+                return Err(format!(
+                    "DMD pattern of {count} pixels (the preview carries up to {MAX_PREVIEW_MIRROR_PIXELS}; the reference traces it)"
+                ));
+            }
+            let state = |q: usize| DmdState::from_value(device.value(q % nx, q / nx)).value() as u32;
+            let states = if uniform {
+                MirrorStates::Uniform(state(0))
+            } else {
+                MirrorStates::Packed(
+                    (0..count.div_ceil(STATES_PER_WORD))
+                        .map(|w| {
+                            let lo = w * STATES_PER_WORD;
+                            (lo..(lo + STATES_PER_WORD).min(count))
+                                .map(|q| state(q) << (2 * (q - lo)))
+                                .sum::<u32>() as f32
+                        })
+                        .collect(),
+                )
+            };
+            let n = |s: DmdState| {
+                let v = facet_normal(d, s);
+                Vec3::new(v.x as f32, v.y as f32, v.z as f32)
+            };
+            let (a, w) = hinge(d.tilt_axis);
+            GpuResponse::Micromirror(std::sync::Arc::new(GpuMicromirror {
+                array,
+                r: (d.reflectance * d.window_transmittance * d.window_transmittance) as f32,
+                fill: d.mirror_fill as f32,
+                normals: [n(DmdState::Off), n(DmdState::On), n(DmdState::Flat)],
+                hinge: [Vec2::new(a.x as f32, a.y as f32), Vec2::new(w.x as f32, w.y as f32)],
+                states,
+            }))
+        }
+        ModulatorKind::Lcos(l) => {
+            if !uniform && count > MAX_PREVIEW_PHASE_PIXELS {
+                return Err(format!(
+                    "SLM pattern of {count} pixels (the preview carries up to {MAX_PREVIEW_PHASE_PIXELS}; the reference traces it)"
+                ));
+            }
+            let phase = if uniform {
+                Vec::new()
+            } else {
+                (0..count).map(|q| l.lut.phase(device.value(q % nx, q / nx)) as f32).collect()
+            };
+            GpuResponse::PhaseModulator(std::sync::Arc::new(GpuPhaseModulator {
+                array,
+                pitch_um: device.pitch_um as f32,
+                r: l.reflectance as f32,
+                fill: l.pixel_fill as f32,
+                gap_r: (l.gap_amplitude * l.gap_amplitude) as f32,
+                design_lambda_um: l.design_lambda_um as f32,
+                phase,
+            }))
+        }
+    })
 }
 
 /// Bilinear lookup into a baked coating grid. The CPU mirror and the shader do
@@ -1482,6 +1651,9 @@ fn compile_response(
     let coat_lambdas = bake.lambdas;
     Ok(match r {
         SurfaceResponse::Absorber => GpuResponse::Absorber,
+        // The geometric limit, pixel for pixel: the pattern travels to the
+        // GPU as each pixel's mirror state or phase.
+        SurfaceResponse::Modulator { device, .. } => compile_modulator(device, scale)?,
         SurfaceResponse::ThinLens { focal_length_mm } => GpuResponse::ThinLens {
             f: (focal_length_mm / scale) as f32,
         },
@@ -1798,6 +1970,11 @@ fn compile_surface(
         }
     };
     let (rot, pos) = rigid(&s.common.transform, norm);
+    // tracer3 reads a modulator from its front only and refuses one facing
+    // backward, so the preview does too.
+    if matches!(s.response_back, SurfaceResponse::Modulator { .. }) {
+        return Err("DMD or SLM on a surface's back (a modulator faces its front)".into());
+    }
     Ok(GpuSurface3 {
         rot,
         pos,

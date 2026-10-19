@@ -1,0 +1,39 @@
+[package]
+name = "oc-wave"
+description = "Optiland Canvas scalar wave optics: sampled complex fields, FFT propagation, thin elements. f64."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+# Coupling to the 3D scene: the wave path along the sequence the f64 tracer
+# extracts (W4). Off by default: the propagation core needs no scene model.
+scene = ["oc-core/scene3", "dep:oc-trace"]
+# rayon over the row and column passes of a 2D transform. Off for wasm32,
+# which has no threads; the browser runs the same code serially in a worker.
+parallel = ["dep:rayon"]
+
+[dependencies]
+oc-core.workspace = true
+# Serial (no rayon), so the wave path builds for wasm32 too.
+oc-trace = { path = "../oc-trace", default-features = false, features = ["trace3"], optional = true }
+glam.workspace = true
+serde.workspace = true
+rayon = { workspace = true, optional = true }
+# The one FFT in the workspace, kept out of oc-core and oc-trace on purpose
+# (ADR 0003): the kernel crates stay at glam + serde(_json) + optional rayon.
+# Pure Rust, MIT OR Apache-2.0, builds for wasm32-unknown-unknown.
+rustfft = "6.4.1"
+
+[dev-dependencies]
+serde_json.workspace = true
+# The wave-path tests read the chain the tracer extracts.
+oc-trace = { path = "../oc-trace", default-features = false, features = ["trace3"] }
+
+# The gallery's scene-coupled datasets need the scene model.
+[[example]]
+name = "gallery_scene"
+required-features = ["scene"]

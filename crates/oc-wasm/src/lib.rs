@@ -49,6 +49,10 @@ mod fidelity_ui;
 mod catalog_ui;
 mod coating_ui;
 mod grating_ui;
+/// DMDs and LCoS SLMs: add one, read and edit its device and pattern.
+mod modulator_ui;
+/// The coherent wave path: a source's beam, and a wave job run in steps.
+mod wave_ui;
 
 /// The Fresnel lens: add one, read its recipe, rebuild it from an edited one.
 mod fresnel;
@@ -178,6 +182,10 @@ pub struct Canvas {
     /// This worker's share of a reference a pool of workers traces
     /// ([`Canvas::pool_prepare`]).
     pool: std::cell::RefCell<Option<Pool3>>,
+    /// A wave path being carried an event at a time ([`Canvas::wave_step`]).
+    wave_job: std::cell::RefCell<Option<oc_wave::path::WaveJob>>,
+    /// The last finished wave path.
+    wave_result: std::cell::RefCell<Option<oc_wave::path::WavePathResult>>,
 }
 
 /// One f64 reference trace, and what it was traced for.
@@ -264,6 +272,8 @@ impl Canvas {
             reference: std::cell::RefCell::new(None),
             reference_job: std::cell::RefCell::new(None),
             pool: std::cell::RefCell::new(None),
+            wave_job: std::cell::RefCell::new(None),
+            wave_result: std::cell::RefCell::new(None),
         }
     }
 
@@ -1852,6 +1862,22 @@ impl Canvas {
     /// How the browser should preview the scene (§10.3): `"exact_planar"`,
     /// `"full_3d"`, `"legacy_planar"`, or `"none"` when nothing is loaded. This
     /// is the badge; it never labels a legacy result full 3D.
+    /// What the f32 preview leaves out of its picture, and why:
+    /// `[{"object": id, "reason": "..."}]`. The rays it draws pass straight
+    /// through these, so the view names them; the f64 reference traces them.
+    #[wasm_bindgen(js_name = previewOmittedJSON)]
+    pub fn preview_omitted_json(&self) -> String {
+        let Some(g) = self.fast_scene() else {
+            return "[]".into();
+        };
+        let items: Vec<String> = g
+            .rejected
+            .iter()
+            .map(|r| format!("{{\"object\":{},\"reason\":{}}}", r.object, json_str(&r.kind)))
+            .collect();
+        format!("[{}]", items.join(","))
+    }
+
     #[wasm_bindgen(js_name = previewMode)]
     pub fn preview_mode(&self) -> String {
         match &self.scene3 {
@@ -2762,6 +2788,8 @@ impl Canvas {
                 // A grating's light leaves in new directions, not as R and T:
                 // `gratingJSON` carries its orders.
                 SurfaceResponse::Grating { .. } => ("null".into(), "null".into()),
+                // A DMD or an SLM sends light per pixel, by pattern: no R or T.
+                SurfaceResponse::Modulator { .. } => ("null".into(), "null".into()),
             };
             let dichroic = DichroicSpec::from_response(r).map_or("null".into(), |d| {
                 format!(
@@ -2858,7 +2886,7 @@ impl Canvas {
                 SurfaceResponse::Polarizer { .. } | SurfaceResponse::Retarder { .. } => {
                     (None, None)
                 }
-                SurfaceResponse::Grating { .. } => (None, None),
+                SurfaceResponse::Grating { .. } | SurfaceResponse::Modulator { .. } => (None, None),
             };
             out.push(rr.unwrap_or(f64::NAN));
             out.push(tt.unwrap_or(f64::NAN));
@@ -5092,6 +5120,9 @@ pub(crate) fn surface_object_kind(s: &oc_core::scene3::SurfaceObject3) -> &'stat
         "beamsplitter"
     } else if f == "grating" || b == "grating" {
         "grating"
+    } else if f == "dmd" || f == "slm" {
+        // A pixelated modulator: its kind names which.
+        f
     } else if f == "polarizer" || f == "retarder" {
         // Named, because "surface" tells a reader nothing and these two are
         // not interchangeable: one absorbs half the light and one absorbs none.
@@ -6219,6 +6250,7 @@ mod scene3_tests {
                 seed: 1,
                 sequence: SamplingSequence::Grid,
             },
+            coherence: None,
         });
 
         // A detector past the focus, facing back down the axis. Its local +Z
@@ -6314,6 +6346,7 @@ mod scene3_tests {
                 seed: 1,
                 sequence: SamplingSequence::Grid,
             },
+            coherence: None,
         });
 
         // A mirror at the origin whose normal folds +X to (0, 0.6, 0.8): out of

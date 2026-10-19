@@ -336,6 +336,8 @@ fn response_to_spec(object: u64, r: &SurfaceResponse) -> Result<SurfaceSpec, Red
         SurfaceResponse::ThinLens { .. } => Err(unsupported("thin lens")),
         // v1 has no diffraction at all.
         SurfaceResponse::Grating { .. } => Err(unsupported("grating")),
+        // Nor pixels, nor a mirror per pixel.
+        SurfaceResponse::Modulator { .. } => Err(unsupported("spatial light modulator")),
     }
 }
 

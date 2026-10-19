@@ -720,6 +720,22 @@ pub enum SurfaceResponse {
         #[serde(default)]
         crystal: Option<Waveplate>,
     },
+    /// A pixelated spatial light modulator: a digital micromirror device or a
+    /// phase-only LCoS SLM, with the pattern it displays. The device is centred
+    /// on the surface's origin, its pixel axes on local `X` and `Y`, facing
+    /// local `+Z` ([`crate::modulator`]).
+    ///
+    /// The ray tracer sees it in the geometric limit: a ray reflects off the
+    /// mirror facet of the pixel it hits, or is steered by the local phase
+    /// gradient. Its diffraction is the wave engine's (`oc-wave`). Only
+    /// meaningful on a standalone planar surface's front; a body patch
+    /// authoring one is rejected.
+    Modulator {
+        device: Box<crate::modulator::SpatialModulator>,
+        /// How the ray tracer treats it: the geometric limit unless set.
+        #[serde(default, skip_serializing_if = "crate::modulator::RayModel::is_geometric")]
+        ray_model: crate::modulator::RayModel,
+    },
 }
 
 impl Default for SurfaceResponse {
@@ -958,6 +974,10 @@ impl SurfaceResponse {
                     }
                 }
                 Ok(())
+            }
+            Self::Modulator { device, ray_model } => {
+                device.validate().map_err(|e| range("device", &e.to_string()))?;
+                ray_model.validate().map_err(|e| range("ray_model", &e.to_string()))
             }
         }
     }
@@ -1778,6 +1798,42 @@ pub struct Source3 {
     /// source is explicitly calibrated, and nothing here calibrates one.
     pub flux: f64,
     pub samples: SourceSampling,
+    /// The coherent beam this source launches on a wave path
+    /// (`oc_wave::path`), with the source's flux as its power. The rays it
+    /// emits are unaffected. Absent for a source traced only as rays, and
+    /// then left out on save.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coherence: Option<CoherentBeam>,
+}
+
+/// A coherent beam's profile at its source, for the wave path.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum CoherentBeam {
+    /// A Gaussian of `1/e²` radius `waist_radius_mm` at its waist,
+    /// `waist_offset_mm` downstream of the source along its axis (negative:
+    /// upstream).
+    Gaussian { waist_radius_mm: f64, waist_offset_mm: f64 },
+    /// A uniform, flat-phase disc of `radius_mm` at the source.
+    TopHat { radius_mm: f64 },
+}
+
+impl CoherentBeam {
+    /// Why the beam cannot be launched, if it cannot.
+    pub fn check(&self) -> Result<(), String> {
+        match *self {
+            CoherentBeam::Gaussian { waist_radius_mm, waist_offset_mm } => {
+                if !(waist_radius_mm.is_finite() && waist_radius_mm > 0.0 && waist_offset_mm.is_finite()) {
+                    return Err(format!("a Gaussian beam needs a positive waist and a finite offset, not {waist_radius_mm} mm at {waist_offset_mm} mm"));
+                }
+            }
+            CoherentBeam::TopHat { radius_mm } => {
+                if !(radius_mm.is_finite() && radius_mm > 0.0) {
+                    return Err(format!("a top-hat beam needs a positive radius, not {radius_mm} mm"));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -2959,6 +3015,9 @@ impl Scene3 {
                 field: field.to_string(),
                 reason: reason.to_string(),
             };
+            if let Some(beam) = &s.coherence {
+                beam.check().map_err(|e| range("coherence", &e))?;
+            }
             match s.spatial {
                 SpatialDistribution3::Point => {}
                 SpatialDistribution3::Rectangle {

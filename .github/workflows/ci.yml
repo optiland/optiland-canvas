@@ -60,6 +60,17 @@ jobs:
         run: cargo clippy -p oc-gpu --features gpu3 --all-targets -- -D warnings
       - name: test (3D preview, CPU mirror)
         run: cargo test -p oc-gpu --features gpu3
+      # Scalar wave optics (ADR 0003). The workspace steps above cover its
+      # default build; these turn on its optional features and prove the crate
+      # still builds for the browser, which has no threads.
+      - name: clippy (wave optics, all features)
+        run: cargo clippy -p oc-wave --all-features --all-targets -- -D warnings
+      - name: test (wave optics, all features)
+        run: cargo test -p oc-wave --all-features
+      - name: build (wave optics for wasm32)
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo build -p oc-wave --target wasm32-unknown-unknown
 
   # The same preview suites with the wgpu backend on a software Vulkan driver
   # (lavapipe). Allowed to fail for one release while its reliability on the

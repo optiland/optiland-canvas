@@ -103,6 +103,9 @@ fn response_role(r: &SurfaceResponse) -> &'static str {
         // it is.
         "polarizer" | "retarder" => "polarizing",
         "grating" => "grating",
+        // A DMD or an SLM: an array of tiny mirrors or electrodes behind a
+        // window, drawn as one.
+        "dmd" | "slm" => "modulator",
         _ => "generic_dielectric",
     }
 }

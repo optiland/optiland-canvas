@@ -251,6 +251,43 @@ run in `crates/oc-py/tests/test_coating_fixtures.py` (frozen) and
 Every MUST in the coating-fidelity spec maps to one of these cases; the spec's
 work packages name theirs in their exit criteria.
 
+## Wave cases C35 onward
+
+The scalar wave optics epic ([ADR 0003](adr/0003-scalar-wave-optics-engine.md),
+milestones W0–W8). Like the rest of this manifest, the cases are listed before
+the evidence exists. A row without ✅ is owed by the milestone it names, in the
+file it names.
+
+Every reference cited by a case is named in the test that holds it, with its
+DOI where one exists. The master list is the Sources section of
+`docs/wave-optics.md` (W1).
+
+| Case | What | Milestone | Held by |
+|---|---|---|---|
+| C35 | `Cx` moved out of `thinfilm`, and no coating number changed | W0 ✅ | `oc-core/src/complex.rs` tests; C33's corpus (`oc-trace/tests/fidelity3.rs`) unchanged |
+| C36 | the 2D transform: Parseval scale, kernel sign, centring | W0 ✅ | `oc-wave/tests/fft.rs` |
+| C37 | every propagator conserves power or books the loss | W1 ✅ | `oc-wave/tests/propagate.rs` |
+| C38 | Fraunhofer: the square aperture's sinc², the Airy pattern and its encircled energy | W1 ✅ | `oc-wave/tests/analytic_fields.rs` |
+| C39 | the exact on-axis Rayleigh–Sommerfeld field of a circular aperture (Heurtley 1973) | W1 ✅ | `analytic_fields.rs` |
+| C40 | Fresnel diffraction of a square against the Fresnel integrals; the Voelz–Roggemann regimes | W1 ✅ | `analytic_fields.rs`, `propagate.rs` |
+| C41 | a Gaussian beam spreads as Kogelnik and Li say, and a thin lens focuses it where Self says | W1 ✅ | `analytic_fields.rs` |
+| C42 | the exact Talbot distance of a cosine grating | W1 ✅ | `analytic_fields.rs` |
+| C43 | direct Rayleigh–Sommerfeld against the band-limited angular spectrum | W1 ✅ | `propagate.rs` |
+| C44 | chirp-z zoom against the direct DFT; the Airy zero sampled exactly | W2 ✅ | `oc-wave/tests/czt.rs` |
+| C45 | the Fraunhofer PSF against Optiland's `ScalarFFTPSF` and `MMDFTPSF` (oracle, not validation) | W2 ✅ | `oc-py/tests/test_wave_oracles.py` |
+| C46 | DMD orders on the direction-cosine grid; the sampled far field against the analytic envelope; the factorized against the sampled; unit-cell power | W3a ✅ | `oc-wave/tests/dmd.rs` |
+| C47 | the blazed number against Popoff et al. 2024, Fig. 5 | W3a ✅ | `dmd.rs` |
+| C48 | average photopic diffraction efficiency against TI DLPA083B Table 6-1 (a vendor simulation; six rows within ±3 pp, the 5.4 µm f/2.4 row +4.4 pp, held to ±5 pp and named) | W3a ✅ | `dmd.rs` |
+| C49 | N-level phase quantization, dead space and wavelength detuning | W3b ✅ | `oc-wave/tests/slm.rs` |
+| C50 | the LCoS director split; fringing against quadrature | W3b ✅ | `slm.rs` (fringing against direct quadrature in Rust) |
+| C51 | holograms: Lee, superpixel (Goorden 2014), Gerchberg–Saxton, spiral phase | W3 (Lee generator, Gerchberg–Saxton and the spiral phase ✅; superpixel owed) | `dmd.rs`, `slm.rs` |
+| C52 | modulators in the scene: the geometric ray limit, preview parity, the v3 round trip and the v2 loss | W4a ✅ | `oc-trace/tests/modulator3.rs`; `oc-gpu/tests/cpu3_vs_f64.rs`, `gpu3_vs_cpu3.rs` (the GPU suite run on Vulkan: one Windows machine's D3D12 compiler, FXC, rejects `shader3.wgsl` before and after this work) |
+| C53 | the wave path: free space, apertures the trace never logged, the 4f cutoff, the ledger, agreement with rays at large Fresnel number, a DMD's orders in the scene, a resumable job | W4b ✅ | `oc-wave/tests/path.rs` |
+| C54 | the app: DMD and SLM from the palette, the wave dock | W5 ✅ (the pattern is not drawn in the 3D view; the coarse field during a drag is not done) | `web/tests/wave.spec.ts`, `modulator.spec.ts` |
+| C55 | real optics in the wave path: a plate and a singlet against Kogelnik–Li and Self, a tilted plate against the rays, a singlet's PSF against Optiland's `HuygensPSF` (a fixture from the clone; oracle, not validation) | W6 ✅ (face-by-face field tracing, not a single phase screen: see wave-optics.md) | `oc-wave/tests/path.rs`; `tools/fixtures/huygens_singlet.py` |
+| C56 | ray-traced orders against the unit cell; `untraced_orders` in the ledger; TI through the tracer; a wave path that follows a chosen order, so a Fourier-plane iris can pick a Lee hologram's −1 order (moved from W4b: the chief ray leaves a DMD along the facet's reflection, and an iris off it would block the chain) | W7 (orders, the ledger, TI through the tracer and an LCoS staircase ✅; the Lee reconstruction through an iris owed) | `oc-trace/tests/modulator_orders3.rs` |
+| C57 | tilted planes and the shifted angular spectrum | W8 ✅ (the tilted plane read through a bilinear spectrum: 5.9e-4, not the 1e-10 an exact method would give; used for tilted detectors, not yet for oblique elements) | `oc-wave/tests/propagate.rs`, `oc-wave/tests/path.rs` |
+
 ## Per-PR checklist
 
 Before opening any PR in this epic:

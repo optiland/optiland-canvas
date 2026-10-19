@@ -749,6 +749,7 @@ fn surface_kind(scene: &Scene3, id: ObjectId) -> &'static str {
         SurfaceResponse::ThinLens { .. } => "an ideal thin lens",
         SurfaceResponse::Grating { .. } => "a diffraction grating",
         SurfaceResponse::DielectricFresnel { .. } => "a bare zero-thickness interface",
+        SurfaceResponse::Modulator { .. } => "a spatial light modulator (DMD or SLM)",
     }
 }
 

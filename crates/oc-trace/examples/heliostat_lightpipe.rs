@@ -970,6 +970,7 @@ fn bench(slit: Vec3, rows: &[[f64; 2]], gain: &[(f64, f64)], lo_um: f64, hi_um: 
             seed: 0,
             sequence: SamplingSequence::Sobol,
         },
+        coherence: None,
     });
     // `SUN_PIECES=<n>`: the same light from `n` rectangles that follow the
     // strip's arc ([`sun_pieces`]).

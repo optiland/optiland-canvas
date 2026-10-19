@@ -26,7 +26,7 @@ use oc_core::scene3::OutOfRangePolicy;
 
 use crate::scene3::{
     DetShape, GpuAperture3, GpuBody3, GpuDetector3, GpuResponse, GpuScene3, GpuShape2, GpuSurface3,
-    RevFace, Spectral32,
+    MirrorStates, PixelArray32, RevFace, Spectral32,
 };
 
 // Face-shape kinds (the finite region of a plane). Shared by surfaces, apertures,
@@ -55,6 +55,25 @@ pub const RESP_FLAG_STRAY: u32 = 1;
 /// `Response3Buf::flags`: a transmission grating. Must match the shader's
 /// `RESP_FLAG_TRANSMIT`.
 pub const RESP_FLAG_TRANSMIT: u32 = 2;
+/// A DMD in the geometric limit. `r` is the mirror's power reflectance
+/// (window included); `t` the pixel array: `value` the pitch, `tab_start`
+/// the packed mirror states, `tab_count` the columns, `policy` the rows; `ar`
+/// the mirror: `value` the linear fill, `tab_start` eight `verts` holding the
+/// three facet normals (`[x, y]`, `[z, 0]` for OFF, ON, flat) and the hinge
+/// and across-hinge directions, `policy` the state of a uniform array. With
+/// `RESP_FLAG_PER_PIXEL` the states are two bits per pixel, twelve to an
+/// exact-integer `f32`, two `f32` to a vertex, row-major with `X` fastest.
+pub const RESP_MICROMIRROR: u32 = 7;
+/// An LCoS SLM in the geometric limit. `r` the electrodes' power
+/// reflectance; `t` the pixel array as for [`RESP_MICROMIRROR`], `tab_start`
+/// the phases at the design wavelength, two to a vertex; `ar.value` the
+/// linear fill and `ar.tab_start` two `verts`: `[|g|², design λ µm]` and
+/// `[pitch µm, 0]`. Without `RESP_FLAG_PER_PIXEL` the pattern is uniform and
+/// steers nothing.
+pub const RESP_PHASE_MODULATOR: u32 = 8;
+/// `Response3Buf::flags`: a modulator carries a value per pixel. Must match
+/// the shader's `RESP_FLAG_PER_PIXEL`.
+pub const RESP_FLAG_PER_PIXEL: u32 = 4;
 
 // Out-of-range policies of a tabulated response scalar.
 pub const POLICY_ERROR: u32 = 0;
@@ -366,6 +385,17 @@ fn encode_spectral(s: &Spectral32, verts: &mut Vec<Vert3Buf>) -> Spectral3Buf {
     }
 }
 
+/// A modulator's pixel array in a response scalar's slots (see
+/// [`RESP_MICROMIRROR`]).
+fn pixel_array(a: &PixelArray32, start: u32) -> Spectral3Buf {
+    Spectral3Buf {
+        value: a.pitch,
+        tab_start: start,
+        tab_count: a.pixels[0],
+        policy: a.pixels[1],
+    }
+}
+
 thread_local! {
     /// The coating grids already written to `verts` during one pack, by the
     /// address of their shared grid. Cleared at the start of each pack.
@@ -379,6 +409,8 @@ fn encode_response(resp: &GpuResponse, verts: &mut Vec<Vert3Buf>) -> Response3Bu
     let flags = match resp {
         GpuResponse::CoatingGrid { stray: true, .. } => RESP_FLAG_STRAY,
         GpuResponse::Grating { transmit: true, .. } => RESP_FLAG_TRANSMIT,
+        GpuResponse::Micromirror(m) if matches!(m.states, MirrorStates::Packed(_)) => RESP_FLAG_PER_PIXEL,
+        GpuResponse::PhaseModulator(m) if !m.phase.is_empty() => RESP_FLAG_PER_PIXEL,
         _ => 0,
     };
     let (kind, r, t, ar) = match resp {
@@ -390,6 +422,35 @@ fn encode_response(resp: &GpuResponse, verts: &mut Vec<Vert3Buf>) -> Response3Bu
             (RESP_EXPLICIT_RT, r, encode_spectral(t, verts), zero)
         }
         GpuResponse::ThinLens { f } => (RESP_THIN_LENS, constant(*f), zero, zero),
+        GpuResponse::Micromirror(m) => {
+            let geom = verts.len() as u32;
+            for n in m.normals {
+                verts.push([n.x, n.y]);
+                verts.push([n.z, 0.0]);
+            }
+            verts.extend(m.hinge.iter().map(|v| [v.x, v.y]));
+            let (start, uniform) = match &m.states {
+                MirrorStates::Uniform(v) => (0, *v),
+                MirrorStates::Packed(words) => {
+                    let start = verts.len() as u32;
+                    verts.extend(words.chunks(2).map(|c| [c[0], c.get(1).copied().unwrap_or(0.0)]));
+                    (start, 0)
+                }
+            };
+            let array = pixel_array(&m.array, start);
+            let mirror = Spectral3Buf { value: m.fill, tab_start: geom, tab_count: 0, policy: uniform };
+            (RESP_MICROMIRROR, constant(m.r), array, mirror)
+        }
+        GpuResponse::PhaseModulator(m) => {
+            let params = verts.len() as u32;
+            verts.push([m.gap_r, m.design_lambda_um]);
+            verts.push([m.pitch_um, 0.0]);
+            let start = verts.len() as u32;
+            verts.extend(m.phase.chunks(2).map(|c| [c[0], c.get(1).copied().unwrap_or(0.0)]));
+            let array = pixel_array(&m.array, start);
+            let cell = Spectral3Buf { value: m.fill, tab_start: params, tab_count: 0, policy: 0 };
+            (RESP_PHASE_MODULATOR, constant(m.r), array, cell)
+        }
         GpuResponse::Grating { k, eta, zero: z0, .. } => {
             let r = encode_spectral(eta, verts);
             (RESP_GRATING, r, encode_spectral(z0, verts), constant(*k))

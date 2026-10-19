@@ -648,7 +648,7 @@ pub struct EncodedPart3 {
 }
 
 /// Bumped whenever [`EncodedPart3::numbers`] changes layout.
-const PART_LAYOUT: f64 = 4.0;
+const PART_LAYOUT: f64 = 5.0;
 /// One detector hit record, as f64s.
 const HIT_FIELDS: usize = 24;
 
@@ -703,6 +703,7 @@ impl TracePart3 {
             l.absorbed_surface,
             l.blocked_aperture,
             l.truncated_flux,
+            l.untraced_orders,
             l.numerical_loss,
         ]);
         let t = &r.terminations;
@@ -882,6 +883,7 @@ impl TraceMerge3 {
             &mut l.absorbed_surface,
             &mut l.blocked_aperture,
             &mut l.truncated_flux,
+            &mut l.untraced_orders,
             &mut l.numerical_loss,
         ] {
             *f = next()?;
@@ -1578,7 +1580,8 @@ fn after_interaction(
     b.blocked += l.blocked_aperture - before.blocked_aperture;
     b.detected += l.detected_incident - before.detected_incident;
     b.escaped += l.escaped - before.escaped;
-    b.truncated += l.truncated_flux - before.truncated_flux;
+    // Orders not followed are flux not followed, like a threshold's.
+    b.truncated += (l.truncated_flux - before.truncated_flux) + (l.untraced_orders - before.untraced_orders);
     b.numerical += l.numerical_loss - before.numerical_loss;
 }
 
@@ -2058,6 +2061,16 @@ fn interact_surface(
         push_event(r, cfg, w, point, opl_at, lens_interact(children));
         return;
     }
+    // A pixelated modulator acts per pixel, at the point hit: handled here, in
+    // the surface's frame, in the geometric limit (its diffraction is the wave
+    // engine's, `oc-wave`).
+    if let SurfaceResponse::Modulator { device, ray_model } = response {
+        modulator_ray(
+            scene, stack, r, cfg, w, s, device, *ray_model, from_front, surface_ref, point, n_oppose, n_here,
+            flux_at, opl_at, min_flux,
+        );
+        return;
+    }
     // A grating sends light along its grating vector, which is a direction in
     // the element like a lens's axes: handled here, in the surface's frame.
     if let SurfaceResponse::Grating {
@@ -2464,6 +2477,364 @@ fn interact_surface(
         min_flux,
         film_temperature(scene, cfg, s.common.id.0),
     );
+}
+
+/// Where a ray met a modulator in the orders ray model, and the model's limits.
+struct OrdersAt {
+    i: usize,
+    j: usize,
+    surface_ref: SurfaceRef,
+    point: Vec3,
+    n_oppose: Vec3,
+    n_here: f64,
+    flux_at: f64,
+    opl_at: f64,
+    min_flux: f64,
+    max_orders: u32,
+    min_efficiency: f64,
+}
+
+/// A ray on a DMD or an SLM in the orders ray model: the brightest
+/// diffraction orders of the pattern's unit cell where it hits
+/// (`oc_core::modulator::unit_cell_orders`, Harvey's renormalization: J. E.
+/// Harvey et al., *Proc. SPIE* 8122, 812205 (2011)), each a child ray along
+/// its direction (the grating equation in direction cosines: Harvey &
+/// Vernold, *Appl. Opt.* 37, 8158 (1998)) carrying `η` of the arriving flux.
+/// What the cell's dead space keeps is absorbed; the orders past the count or
+/// below the threshold are booked as untraced. An LCoS splits on its director
+/// first, each component with its own table, as in the geometric limit.
+/// `false` when the orders have no closed form here (an LCoS with fringing,
+/// a device not in air): the caller traces the geometric limit and says so.
+fn modulator_orders(
+    stack: &mut Vec<RayWork>,
+    r: &mut LocalResult,
+    cfg: &TraceConfig3,
+    w: &RayWork,
+    s: &SurfaceObject3,
+    device: &oc_core::modulator::SpatialModulator,
+    at: &OrdersAt,
+) -> bool {
+    use oc_core::modulator::{local_unit_cell, unit_cell_orders, LcosBeam, ModulatorKind, OrderModel};
+    if (at.n_here - 1.0).abs() > 1e-9 {
+        return false;
+    }
+    let t = &s.common.transform;
+    let d_local = t.quat().inverse() * w.ray.dir;
+    let (cell, exact) = local_unit_cell(device, at.i, at.j);
+    let feature = match device.kind {
+        ModulatorKind::Dmd(_) => PhysicsFeature::Micromirror,
+        ModulatorKind::Lcos(_) => PhysicsFeature::PhaseModulator,
+    };
+    // The light's components: the whole state for a DMD; for an LCoS, the
+    // parts along and across the director (reflectance is in the tables).
+    let mut parts: Vec<(Stokes, Option<Vec3>, LcosBeam)> = Vec::new();
+    match &device.kind {
+        ModulatorKind::Dmd(_) => {
+            let st = if cfg.polarized() { w.state_at(at.flux_at) } else { Stokes::unpolarized(at.flux_at) };
+            parts.push((st, None, LcosBeam::Modulated));
+        }
+        ModulatorKind::Lcos(l) => {
+            let director = t.rotate(Vec3::new(l.director_deg.to_radians().cos(), l.director_deg.to_radians().sin(), 0.0));
+            let q = director - w.ray.dir * w.ray.dir.dot(director);
+            let a_in = if q.length() > 1e-9 { q.normalize() } else { w.pol.x };
+            let stokes = w.state_at(at.flux_at).rotated(polarization::frame_angle(w.ray.dir, w.pol.x, a_in));
+            for (jx, jy, beam) in [(1.0, 0.0, LcosBeam::Modulated), (0.0, 1.0, LcosBeam::Unmodulated)] {
+                let m = Mueller::from_diagonal_jones(oc_core::thinfilm::Cx::real(jx), oc_core::thinfilm::Cx::real(jy));
+                let st = if cfg.polarized() { m.apply(&stokes) } else { Stokes::unpolarized(m.unpolarized_gain() * at.flux_at) };
+                parts.push((st, Some(director), beam));
+            }
+        }
+    }
+    // Every candidate order, brightest first.
+    let mut candidates: Vec<(f64, Vec3, Stokes, Option<Vec3>, LcosBeam)> = Vec::new();
+    let mut absorbed = 0.0;
+    for (st, director, beam) in parts {
+        if st.s0 <= 0.0 {
+            continue;
+        }
+        let Ok(table) = unit_cell_orders(device, &cell, w.lambda, d_local, OrderModel::HarveyRenormalized, beam) else {
+            return false;
+        };
+        absorbed += st.s0 * (1.0 - table.total).max(0.0);
+        for o in &table.orders {
+            candidates.push((st.s0 * o.efficiency, (t.quat() * o.dir).normalize(), st.scaled(o.efficiency), director, beam));
+        }
+    }
+    candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut children = Vec::new();
+    let mut untraced = 0.0;
+    for (k, (flux, dir, st, director, _)) in candidates.into_iter().enumerate() {
+        if k >= at.max_orders as usize || flux < at.min_efficiency * at.flux_at {
+            untraced += flux;
+            continue;
+        }
+        let x = match director {
+            Some(dv) => {
+                let q = dv - dir * dir.dot(dv);
+                if q.length() > 1e-9 { q.normalize() } else { polarization::transport_frame(w.pol.x, w.ray.dir, dir) }
+            }
+            None => polarization::transport_frame(w.pol.x, w.ray.dir, dir),
+        };
+        if let Some(id) = spawn(stack, r, cfg, w, at.point, dir, PolRay { stokes: st, x }, at.opl_at, false, false, at.min_flux) {
+            children.push((ChildRole::Diffract, id));
+        }
+    }
+    r.report.note_exact(feature);
+    r.report.note_approx(
+        feature,
+        "diffraction orders of the local unit cell (scalar thin element, Harvey renormalized); the brightest are traced, the rest booked as untraced orders",
+    );
+    if !exact {
+        r.report.note_approx(feature, "the pattern does not repeat in whole pixels here: an 8 × 8 window is taken as one period");
+    }
+    r.ledger.absorbed_surface += absorbed;
+    r.ledger.untraced_orders += untraced;
+    if children.is_empty() {
+        r.terminations.record(TerminationReason::AbsorbedSurface);
+    }
+    push_event(
+        r,
+        cfg,
+        w,
+        at.point,
+        at.opl_at,
+        TraceEventKind::Interact {
+            surface: at.surface_ref,
+            body: false,
+            normal: at.n_oppose,
+            n1: at.n_here,
+            n2: at.n_here,
+            children,
+        },
+    );
+    true
+}
+
+/// A ray on a DMD or an LCoS SLM, in the geometric limit.
+///
+/// - **DMD.** The ray reflects off the facet of the mirror it hits, tilted to
+///   that pixel's state, as an ideal mirror of power reflectance `R·T_w²`
+///   (`T_w` per pass of the window). The dead space between mirrors, and
+///   anything outside the array, absorbs. The facet normal comes from
+///   `oc_core::modulator::facet_normal`; the hit is on a mirror when it falls
+///   inside the mirror's outline projected onto the array plane.
+/// - **LCoS.** On an electrode the state splits on the liquid crystal's
+///   director (Zhang, You & Chu, *Light Sci. Appl.* 3, e213 (2014)): the
+///   component along it is steered by the local phase gradient, the change in
+///   tangential direction cosines being `(λ/2π)∇φ` (the grating equation for
+///   a phase profile, after Harvey & Vernold, *Appl. Opt.* 37, 8158 (1998)),
+///   and gains the optical path `φλ/2π`; the orthogonal component reflects
+///   specularly. The dead space reflects specularly with `|g|²`.
+///
+/// Diffraction orders are not traced here: the report says so.
+#[allow(clippy::too_many_arguments)]
+fn modulator_ray(
+    scene: &Scene3,
+    stack: &mut Vec<RayWork>,
+    r: &mut LocalResult,
+    cfg: &TraceConfig3,
+    w: &RayWork,
+    s: &SurfaceObject3,
+    device: &oc_core::modulator::SpatialModulator,
+    ray_model: oc_core::modulator::RayModel,
+    from_front: bool,
+    surface_ref: SurfaceRef,
+    point: Vec3,
+    n_oppose: Vec3,
+    n_here: f64,
+    flux_at: f64,
+    opl_at: f64,
+    min_flux: f64,
+) {
+    use oc_core::modulator::{facet_normal, DmdState, ModulatorKind};
+    use oc_core::scene3::SpectralScalar;
+    let temp = film_temperature(scene, cfg, s.common.id.0);
+    let apply = |stack: &mut Vec<RayWork>, r: &mut LocalResult, resp: &SurfaceResponse, normal: Vec3| {
+        apply_response(
+            stack, r, cfg, w, resp, surface_ref, point, normal, n_here, n_here, false, flux_at, opl_at,
+            min_flux, temp,
+        );
+    };
+    if !from_front || device.validate().is_err() {
+        r.report
+            .reject(CapabilityIssue::UnsupportedSurfaceResponse { surface: surface_ref, reason: None });
+        r.ledger.numerical_loss += flux_at;
+        r.terminations.record(TerminationReason::UnsupportedPhysics);
+        push_event(
+            r,
+            cfg,
+            w,
+            point,
+            opl_at,
+            TraceEventKind::Interact {
+                surface: surface_ref,
+                body: false,
+                normal: n_oppose,
+                n1: n_here,
+                n2: n_here,
+                children: Vec::new(),
+            },
+        );
+        return;
+    }
+    let t = &s.common.transform;
+    let p_local = t.inverse_transform_point(point);
+    let p = device.pitch_mm();
+    let [nx, ny] = [device.pixels[0] as usize, device.pixels[1] as usize];
+    let fx = p_local.x / p + nx as f64 / 2.0;
+    let fy = p_local.y / p + ny as f64 / 2.0;
+    let inside = fx >= 0.0 && fy >= 0.0 && fx < nx as f64 && fy < ny as f64;
+    let (i, j) = (fx.floor().max(0.0) as usize, fy.floor().max(0.0) as usize);
+    match &device.kind {
+        ModulatorKind::Dmd(d) => {
+            r.report.note_exact(PhysicsFeature::Micromirror);
+            r.report.note_approx(
+                PhysicsFeature::Micromirror,
+                "geometric limit: each mirror a tilted ideal reflector; diffraction orders are not traced (see the wave engine)",
+            );
+            if !inside {
+                apply(stack, r, &SurfaceResponse::Absorber, n_oppose);
+                return;
+            }
+            if let oc_core::modulator::RayModel::Orders { max_orders, min_efficiency } = ray_model {
+                let at = OrdersAt { i, j, surface_ref, point, n_oppose, n_here, flux_at, opl_at, min_flux, max_orders, min_efficiency };
+                if modulator_orders(stack, r, cfg, w, s, device, &at) {
+                    return;
+                }
+                r.report.note_approx(
+                    PhysicsFeature::Micromirror,
+                    "orders asked for, but the device is not in air: traced in the geometric limit",
+                );
+            }
+            let state = DmdState::from_value(device.value(i, j));
+            let c = device.pixel_center_mm(i, j);
+            // Inside the projected mirror? Undo the projection: across the
+            // hinge the outline is compressed by cos θ.
+            let n_local = facet_normal(d, state);
+            let (h, wv) = oc_core::modulator::hinge(d.tilt_axis);
+            let (dx, dy) = (p_local.x - c[0], p_local.y - c[1]);
+            let (sh, sw) = (dx * h.x + dy * h.y, (dx * wv.x + dy * wv.y) / n_local.z);
+            let (ux, uy) = (h.x * sh + wv.x * sw, h.y * sh + wv.y * sw);
+            let half = 0.5 * d.mirror_fill * p;
+            if ux.abs() > half || uy.abs() > half {
+                apply(stack, r, &SurfaceResponse::Absorber, n_oppose);
+                return;
+            }
+            let normal = (t.quat() * n_local).normalize();
+            let refl = d.reflectance * d.window_transmittance * d.window_transmittance;
+            let mirror = SurfaceResponse::Mirror { reflectivity: SpectralScalar::Constant(refl) };
+            // The facet faces the light only if the ray runs against it.
+            let facing = if w.ray.dir.dot(normal) < 0.0 { normal } else { -normal };
+            apply(stack, r, &mirror, facing);
+        }
+        ModulatorKind::Lcos(l) => {
+            r.report.note_exact(PhysicsFeature::PhaseModulator);
+            r.report.note_approx(
+                PhysicsFeature::PhaseModulator,
+                "geometric limit: phase-gradient steering of the director component; diffraction orders are not traced (see the wave engine)",
+            );
+            if !inside {
+                apply(stack, r, &SurfaceResponse::Absorber, n_oppose);
+                return;
+            }
+            if let oc_core::modulator::RayModel::Orders { max_orders, min_efficiency } = ray_model {
+                let at = OrdersAt { i, j, surface_ref, point, n_oppose, n_here, flux_at, opl_at, min_flux, max_orders, min_efficiency };
+                if modulator_orders(stack, r, cfg, w, s, device, &at) {
+                    return;
+                }
+                r.report.note_approx(
+                    PhysicsFeature::PhaseModulator,
+                    "orders asked for, but they have no closed form here (fringing, or not in air): traced in the geometric limit",
+                );
+            }
+            let c = device.pixel_center_mm(i, j);
+            let half = 0.5 * l.pixel_fill * p;
+            if (p_local.x - c[0]).abs() > half || (p_local.y - c[1]).abs() > half {
+                let gap = SurfaceResponse::Mirror {
+                    reflectivity: SpectralScalar::Constant(l.gap_amplitude * l.gap_amplitude),
+                };
+                apply(stack, r, &gap, n_oppose);
+                return;
+            }
+            if (w.lambda - l.design_lambda_um).abs() > 1e-12 {
+                r.report.note_approx(
+                    PhysicsFeature::PhaseModulator,
+                    "phase scaled as λ₀/λ: the liquid crystal's dispersion is not modelled",
+                );
+            }
+            let scale = l.design_lambda_um / w.lambda;
+            let phase = |ii: usize, jj: usize| l.lut.phase(device.value(ii, jj)) * scale;
+            let wrap = |a: f64| (a + std::f64::consts::PI).rem_euclid(2.0 * std::f64::consts::PI) - std::f64::consts::PI;
+            let grad = |lo: (usize, usize), hi: (usize, usize), span: f64| wrap(phase(hi.0, hi.1) - phase(lo.0, lo.1)) / span;
+            let gx = {
+                let (a, b) = (i.saturating_sub(1), (i + 1).min(nx - 1));
+                if a == b { 0.0 } else { grad((a, j), (b, j), (b - a) as f64 * p) }
+            };
+            let gy = {
+                let (a, b) = (j.saturating_sub(1), (j + 1).min(ny - 1));
+                if a == b { 0.0 } else { grad((i, a), (i, b), (b - a) as f64 * p) }
+            };
+            let lam_mm = w.lambda / 1000.0 / n_here;
+            let d_local = t.quat().inverse() * w.ray.dir;
+            let tx = d_local.x + lam_mm * gx / (2.0 * std::f64::consts::PI);
+            let ty = d_local.y + lam_mm * gy / (2.0 * std::f64::consts::PI);
+            let steered = (tx * tx + ty * ty < 1.0).then(|| t.quat() * Vec3::new(tx, ty, (1.0 - tx * tx - ty * ty).sqrt()));
+            let specular = reflect3(w.ray.dir, n_oppose);
+            // The state on the director, seen across the ray.
+            let director = t.rotate(Vec3::new(l.director_deg.to_radians().cos(), l.director_deg.to_radians().sin(), 0.0));
+            let across = |d: Vec3, a: Vec3| {
+                let q = a - d * d.dot(a);
+                if q.length() > 1e-9 { q.normalize() } else { polarization::transport_frame(w.pol.x, w.ray.dir, d) }
+            };
+            let a_in = across(w.ray.dir, director);
+            let stokes = w.state_at(flux_at).rotated(polarization::frame_angle(w.ray.dir, w.pol.x, a_in));
+            let rr = l.reflectance;
+            let part = |jx: f64, jy: f64| -> Stokes {
+                let m = Mueller::from_diagonal_jones(oc_core::thinfilm::Cx::real(jx), oc_core::thinfilm::Cx::real(jy));
+                if cfg.polarized() {
+                    m.apply(&stokes).scaled(rr)
+                } else {
+                    Stokes::unpolarized(m.unpolarized_gain() * flux_at * rr)
+                }
+            };
+            let (mod_s, orth_s) = (part(1.0, 0.0), part(0.0, 1.0));
+            let mut children = Vec::new();
+            let mut kept = 0.0;
+            if let Some(dir) = steered {
+                kept += mod_s.s0;
+                let pol = PolRay { stokes: mod_s, x: across(dir, director) };
+                let extra = phase(i, j) * lam_mm / (2.0 * std::f64::consts::PI);
+                if let Some(id) = spawn(stack, r, cfg, w, point, dir, pol, opl_at + extra, false, false, min_flux) {
+                    children.push((ChildRole::Diffract, id));
+                }
+            }
+            kept += orth_s.s0;
+            let ax = across(specular, director);
+            let pol = PolRay { stokes: orth_s, x: specular.cross(ax).normalize() };
+            if let Some(id) = spawn(stack, r, cfg, w, point, specular, pol, opl_at, false, false, min_flux) {
+                children.push((ChildRole::Reflect, id));
+            }
+            r.ledger.absorbed_surface += (flux_at - kept).max(0.0);
+            if children.is_empty() {
+                r.terminations.record(TerminationReason::AbsorbedSurface);
+            }
+            push_event(
+                r,
+                cfg,
+                w,
+                point,
+                opl_at,
+                TraceEventKind::Interact {
+                    surface: surface_ref,
+                    body: false,
+                    normal: n_oppose,
+                    n1: n_here,
+                    n2: n_here,
+                    children,
+                },
+            );
+        }
+    }
 }
 
 /// The temperature object `id`'s films are at under `temperature: Declared`;
@@ -3006,7 +3377,8 @@ fn apply_response(
         SurfaceResponse::ThinLens { .. }
         | SurfaceResponse::Grating { .. }
         | SurfaceResponse::Polarizer { .. }
-        | SurfaceResponse::Retarder { .. } => {
+        | SurfaceResponse::Retarder { .. }
+        | SurfaceResponse::Modulator { .. } => {
             r.report
                 .reject(CapabilityIssue::UnsupportedSurfaceResponse { surface, reason: None });
             r.ledger.numerical_loss += flux_at;

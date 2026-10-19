@@ -98,6 +98,36 @@ fixtures (the evanescent branch), `test_c19_*` (Δ) and
 `test_optiland_puts_the_rhomb_phase_on_the_growing_branch` (Optiland's
 retardance past the critical angle is the negative of the true one).
 
+## Fourier and propagation conventions
+
+The scalar wave optics in `oc-wave` (ADR 0003) uses the same time dependence,
+`exp(-iωt)`, and so does its main reference, Goodman's *Introduction to Fourier
+Optics*, 4th ed. (W. H. Freeman/Macmillan Learning, 2017, ISBN
+978-1-319-11916-4). Everything below follows from it.
+
+| Quantity | Convention |
+|---|---|
+| Plane wave along `+z` | `exp(+ikz)`, `k = 2πn/λ` |
+| Forward transform | `Û(f) = Σ U(x) exp(−i2π f·x) ΔxΔy`, the sampled Fourier integral |
+| Inverse transform | `U(x) = Σ Û(f) exp(+i2π f·x) Δf_xΔf_y`, `Δf = 1/(NΔx)` |
+| Parseval | `Σ\|U\|²ΔxΔy = Σ\|Û\|²Δf_xΔf_y`, exactly, with the two scales above |
+| Field normalization | `\|U\|²` is flux per mm²; `Σ\|U\|²ΔA` is the field's flux, relative unless the source is calibrated |
+| Sample layout | sample `i` at `center + (i − ⌊n/2⌋)·Δx`; `ifftshift` puts the window centre at the transform origin |
+| Analytic carrier | the true field is `data · exp(ik(α₀x + β₀y))`, with `(α₀, β₀)` direction cosines held outside the samples |
+
+The propagators that land with W1 add their transfer functions to this table:
+the angular spectrum `H = exp(+i2πz√((n/λ)² − f²))`, the Fresnel impulse
+response `h = e^{ikz}/(iλz)·exp(ik r²/2z)` and the thin lens
+`t = exp(−ik r²/2f)` (so `f > 0` converges) are all Goodman's, in this
+convention.
+
+Held by `oc-wave/tests/fft.rs`:
+- `fft2_is_unitary_under_parseval` pins the scales.
+- `the_centered_transform_of_a_shifted_gaussian_is_a_gaussian_with_the_shift_phase`
+  pins the sign of the kernel and the centring. A Gaussian shifted by `a`
+  must come back as `exp(−πf²)·exp(−i2πfa)`, so a flipped kernel or a lost
+  shift fails it.
+
 ## Surfaces and sides
 
 A geometric normal identifies which material is on which side. The tracer hands
@@ -194,6 +224,14 @@ the same physical answer.
 | Plate backing | Substrate far thicker than the coherence length | Thin substrates would interfere and do not here |
 | Scalar responses (`Mirror`, `ExplicitRt`, `DielectricFresnel`) | Unpolarized light, one interaction | They carry no phase, so they cannot be given a Jones matrix; see below |
 | GRIN | Not implemented; traces as a homogeneous medium at `base_index` | Any quantitative GRIN claim |
+| Wave: band-limited angular spectrum (`oc-wave`) | The first Rayleigh–Sommerfeld solution, scalar, homogeneous isotropic medium, between parallel planes; exact up to the critical distance `LΔx/λ`, band-limited beyond it with the removed power booked | Vector fields, high-NA focusing, coupling to structures; a window too small for the far field shows as booked band-limit loss |
+| Wave: Fresnel transfer function and impulse response | The paraxial (Fresnel) approximation, each on its side of the critical distance (Voelz & Roggemann 2009) | Phase error `πρ⁴/(4λz³)` not small; the other side of `z_c` (reported `OutsideRegime`) |
+| Wave: Fraunhofer | Source Fresnel number below 0.1 | Anything nearer (reported) |
+| Wave: thin elements (apertures, thin lens, phase screens) | A transmittance in one plane; apertures anti-aliased by exact cell area | The element's thickness; edge diffraction beyond the grid's Nyquist band (booked as `beyond_nyquist`, not modelled); features below ~14λ, where scalar theory's error exceeds ±5% (Pommet, Moharam & Grann 1994) |
+| Wave: DMD (`oc_core::modulator`, `oc_wave::modulator`) | Thin element: each mirror reflects as its tilted plane, over its outline projected onto the array plane; orders in direction cosines; Harvey's normalization by default ([dmd.md](../dmd.md)) | Mirror shading at oblique incidence, edges, hinges, curvature; pitch below ~14λ (flagged); the superpixel method (not implemented) |
+| Wave: LCoS SLM | Thin element: phase from a table at `λ₀`, scaled `λ₀/λ` (flagged); dead space unmodulated; fringing as linear broadening; scalar field per polarization ([slm.md](../slm.md)) | LC dynamics and flicker, birefringence dispersion, angle dependence of the phase; pixel below ~14λ (flagged) |
+| DMD and SLM in the ray tracers (reference and preview) | The geometric limit: a ray reflects off the facet it hits, or is steered by the local phase gradient `(λ/2π)∇φ`; reported as approximated. Or, in the reference only, the orders ray model: the brightest orders of the local unit cell as child rays, the rest booked as untraced | In the geometric limit, diffraction (the wave path carries it); in the orders model, coherence between hits, an aperiodic pattern beyond an 8 × 8 window, fringing, a device not in air |
+| Wave path (`oc_wave::path`) | A coherent beam along the chief ray's chain; thin elements; a flat mirror by image theory; each face of a body and each curved surface by geometric field tracing across its sag, the field diffracting between faces; an oblique element by projection along the rays (`TiltProjection`) | Diffraction inside a face's slab; polarizing elements (refused); a chosen diffraction order (W7); the tilt projection's depth beyond `Δx²/λ` (reported) |
 
 **Power data does not determine phase.** `Rs`, `Rp`, `Ts`, `Tp` fix the
 magnitudes of a Jones element's diagonal and say nothing about the relative phase

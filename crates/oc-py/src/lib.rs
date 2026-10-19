@@ -25,6 +25,8 @@ use pyo3::create_exception;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
+mod wave;
+
 create_exception!(
     _native,
     OcanvasError,
@@ -478,9 +480,10 @@ fn to_py_err<E: std::fmt::Display>(e: E) -> PyErr {
 /// so it is audited here rather than left to a default nobody read.
 ///
 /// The claim holds. Every function below is a pure `&str` → `String` call into
-/// `oc-core`: no `#[pyclass]`, no statics, no interior mutability, no `unsafe`,
-/// and no state that outlives a call. There is nothing for two threads to race
-/// on.
+/// `oc-core`, or (the `wave_*` functions) a pure `bytes` → `bytes` call into
+/// `oc-wave` that owns its transform buffers for the length of the call: no
+/// `#[pyclass]`, no statics, no interior mutability, no `unsafe`, and no state
+/// that outlives a call. There is nothing for two threads to race on.
 ///
 /// It is also moot for the wheel we ship: `abi3-py39` targets the stable ABI, and
 /// free-threaded CPython has its own (`cp313t`), so this build is loaded by
@@ -502,6 +505,11 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(validate, m)?)?;
     m.add_function(wrap_pyfunction!(format_version, m)?)?;
     m.add_function(wrap_pyfunction!(format_magic, m)?)?;
+    m.add_function(wrap_pyfunction!(wave::wave_propagate, m)?)?;
+    m.add_function(wrap_pyfunction!(wave::wave_fraunhofer_zoom, m)?)?;
+    m.add_function(wrap_pyfunction!(wave::modulator_orders, m)?)?;
+    m.add_function(wrap_pyfunction!(wave::dmd_projector_efficiency, m)?)?;
+    m.add_function(wrap_pyfunction!(wave::gerchberg_saxton, m)?)?;
     m.add("OCANVAS_VERSION", OCANVAS_VERSION)?;
     m.add("OCANVAS_FORMAT", OCANVAS_FORMAT)?;
     m.add("READABLE_VERSIONS", READABLE_VERSIONS.to_vec())?;

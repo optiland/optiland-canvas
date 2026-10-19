@@ -198,6 +198,7 @@
       .cv-stack-i { width: 14px; opacity: 0.6; text-align: right; }
       .cv-stack-t { width: 64px; background: #0a1220; color: #e8f6ff; border: 1px solid #24344d; border-radius: 4px; padding: 1px 3px; font: inherit; }
       .cv-stack-u, .cv-stack-qw { opacity: 0.6; }
+      .cv-select { max-width: 230px; background: #0a1220; color: #e8f6ff; border: 1px solid #24344d; border-radius: 4px; font: inherit; }
       .cv-film-pick { max-width: 210px; background: #0a1220; color: #e8f6ff; border: 1px solid #24344d; border-radius: 4px; font: inherit; }
       .cv-report { margin-top: 2px; line-height: 1.35; }
       .cv-dialog { position: fixed; z-index: 50; left: 50%; top: 12%; transform: translateX(-50%); width: min(560px, 92vw);
@@ -385,6 +386,30 @@
         <div class="row" id="wlSwatches" style="gap:3px; flex-wrap:wrap; min-height:14px"></div>
       </details>
       <label class="row">ray density <input type="range" id="density" min="8" max="240" value="16" /></label>
+      <details id="cohFold" title="the coherent beam the source launches on a wave path (the detector dock's wave mode); its rays are unchanged">
+        <summary id="cohSummary">coherent beam: none</summary>
+        <label class="row"><span style="width:38px">beam</span>
+          <select id="cohType" style="flex:1; background:#0a1220; color:#e8f6ff; border:1px solid #24344d; border-radius:4px; padding:2px 4px; font:inherit">
+            <option value="none">none (rays only)</option>
+            <option value="gaussian">Gaussian</option>
+            <option value="tophat">top-hat (uniform disc)</option>
+          </select></label>
+        <label class="row" title="the Gaussian's 1/e² radius at its waist, or the top-hat's radius"><span id="cohL0" style="width:38px">w₀</span>
+          <input type="number" id="cohP0" value="0.5" min="0" step="0.1" style="width:60px; background:#0a1220; color:#e8f6ff; border:1px solid #24344d; border-radius:4px; padding:2px 4px; font:inherit" />
+          <span style="opacity:0.5">mm</span></label>
+        <label class="row" id="cohRow1" title="where the waist is, along the beam from the source (negative: behind it)"><span style="width:38px">waist</span>
+          <input type="number" id="cohP1" value="0" step="10" style="width:60px; background:#0a1220; color:#e8f6ff; border:1px solid #24344d; border-radius:4px; padding:2px 4px; font:inherit" />
+          <span style="opacity:0.5">mm</span></label>
+        <label class="row" title="the field's width across the beam, and its samples across: finer is slower (the dock says which method ran and what it booked)"><span style="width:38px">field</span>
+          <input type="number" id="cohWindow" value="4" min="0.1" step="0.5" style="width:60px; background:#0a1220; color:#e8f6ff; border:1px solid #24344d; border-radius:4px; padding:2px 4px; font:inherit" />
+          <span style="opacity:0.5">mm</span>
+          <select id="cohN" style="width:64px; background:#0a1220; color:#e8f6ff; border:1px solid #24344d; border-radius:4px; font:inherit">
+            <option value="128">128²</option>
+            <option value="256" selected>256²</option>
+            <option value="512">512²</option>
+            <option value="1024">1024²</option>
+          </select></label>
+      </details>
       <label class="row"><input type="checkbox" id="ghosts" /> ghost layer</label>
       <label class="row">ghost bounces
         <input type="number" id="ghostBounces" value="2" min="0" max="8" step="1"
@@ -419,6 +444,12 @@
       <div class="m4row" id="detModes">
         <button class="m4btn active" id="detHeatmap" title="2D binning: incident flux per detector cell">heatmap</button>
         <button class="m4btn" id="detSpot" title="spot diagram: the actual ray-detector intersection points">spot</button>
+        <button class="m4btn" id="detWave" title="the coherent wave path: the source's coherent beam carried by diffraction along the traced chain to a rectangular detector (f64, oc-wave)">wave</button>
+      </div>
+      <div class="m4row" id="waveModes" style="display:none">
+        <button class="m4btn active" id="waveLinear" title="the power on each detector pixel, linear">linear</button>
+        <button class="m4btn" id="waveLog" title="the same on a log scale, six decades">log</button>
+        <button class="m4btn" id="wavePhaseBtn" title="the arriving field across the beam: phase as hue, amplitude as brightness">phase</button>
       </div>
       <canvas id="hist" width="228" height="150"></canvas>
       <div id="dockNums">—</div>
@@ -464,6 +495,10 @@
           <button class="m4btn" id="addGrating" title="add a plane diffraction grating facing the beam, 600 lines/mm, grooves out of the section plane so it disperses in it (the f32 preview and the f64 reference both trace it)">＋ grating</button>
           <button class="m4btn" id="addPolarizer" title="add an ideal linear polarizer facing the beam (unpolarized light loses half its flux here; the f32 preview cannot show this, the f64 reference can)">＋ polarizer</button>
           <button class="m4btn" id="addRetarder" title="add an ideal quarter-wave plate, fast axis at 45° (turns linear light circular; f64 reference only)">＋ waveplate</button>
+        </div>
+        <div class="m4row">
+          <button class="m4btn" id="addDmd" title="add a digital micromirror device facing the beam: TI DLP9000's pitch and tilt (7.56 µm, 12° about the diagonal), all mirrors ON. Both tracers reflect each ray off the mirror it hits; the wave path carries its diffraction orders">＋ DMD</button>
+          <button class="m4btn" id="addSlm" title="add a generic phase-only LCoS SLM facing the beam (8 µm pixels, an 8-bit table spanning a wave at 633 nm). Both tracers steer by the phase gradient; the wave path carries its diffraction">＋ SLM</button>
         </div>
         <div class="m4row">
           <button class="m4btn" id="addDetector" title="add an area detector (movable/tiltable; add as many as you like)">＋ detector</button>

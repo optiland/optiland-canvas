@@ -35,6 +35,8 @@ __pycache__/
 .pytest_cache/
 crates/oc-py/build/
 crates/oc-py/dist/
+# the extension module a local `maturin develop` builds into the package
+crates/oc-py/python/optiland_canvas/_native.*
 
 # OS / editor cruft
 .DS_Store

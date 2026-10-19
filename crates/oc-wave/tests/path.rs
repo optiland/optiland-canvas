@@ -1,0 +1,735 @@
+//! The coherent wave path through a scene (acceptance case C53).
+//!
+//! Sources:
+//! - [13] H. Kogelnik, T. Li, *Appl. Opt.* 5(10), 1550–1567 (1966): Gaussian
+//!   beam propagation; the power a Gaussian puts through a centred disc of
+//!   radius `a`, `1 − exp(−2a²/w²)`; the waist `λf/(πw₀)` at a lens's focus.
+//! - [14] S. A. Self, *Appl. Opt.* 22(5), 658–661 (1983): the thin-lens
+//!   transformation of a Gaussian waist.
+//! - [1] J. W. Goodman, *Introduction to Fourier Optics*, 4th ed. (2017): the
+//!   4f system images with magnification `−f₂/f₁`, its Fourier plane holding
+//!   the object's spectrum at `λf₁` per unit spatial frequency; a flat mirror's
+//!   reflected field is the incident field's mirror image.
+//! - [10] J. E. Harvey, C. L. Vernold, *Appl. Opt.* 37(34), 8158 (1998): a
+//!   grating's orders, here a DMD's, are `λ/p` apart in direction cosine, so a
+//!   lens of focal length `f` focuses them `fλ/p` apart.
+//!
+//! Numbered as in docs/wave-optics.md; retrieved 2026-10-19.
+
+#![cfg(feature = "scene")]
+
+mod common;
+
+use common::{measured, second_moment_radius_x};
+use oc_core::id::{DetectorId, SourceId};
+use oc_core::scene::Spectrum;
+use oc_core::scene3::{Scene3, SurfaceResponse};
+use oc_core::vec3::Vec3;
+use oc_wave::beams::{rayleigh_range_mm, GaussianBeam};
+use oc_wave::path::{wave_path, BeamProfile, Readout, WavePathResult, WavePathSpec};
+use oc_wave::SamplingWarning;
+
+const LAM: f64 = 0.6328;
+
+fn source(s: &mut Scene3) -> SourceId {
+    s.add_collimated_beam(Vec3::ZERO, 1.0, 1.0, 1, Spectrum::Monochromatic(LAM))
+}
+
+fn spec(source: SourceId, detector: DetectorId, w0: f64, grid_n: usize, window_mm: f64) -> WavePathSpec {
+    WavePathSpec {
+        source,
+        detector,
+        beam: BeamProfile::Gaussian { waist_radius_mm: w0, waist_offset_mm: 0.0 },
+        power: 1.0,
+        grid_n,
+        window_mm,
+        device_samples_per_pixel: 4,
+        readout: Readout::Projected,
+    }
+}
+
+fn lens(f: f64) -> SurfaceResponse {
+    SurfaceResponse::ThinLens { focal_length_mm: f }
+}
+
+#[test]
+fn a_gaussian_through_empty_space_spreads_as_kogelnik_and_li_say() {
+    // [13], through the scene's own source, sequence and detector.
+    let mut s = Scene3::new();
+    let src = source(&mut s);
+    let det = s.add_area_detector(Vec3::new(300.0, 0.0, 0.0), -Vec3::X, 3.0, 3.0, [64, 64]);
+    s.validate().unwrap();
+    let r = wave_path(&s, &spec(src, det, 0.2, 512, 6.0), 1).unwrap();
+    let w = second_moment_radius_x(&r.field);
+    let want = 0.2 * (1.0 + (300.0 / rayleigh_range_mm(0.2, LAM, 1.0)).powi(2)).sqrt();
+    measured("scene wave path, Gaussian radius after 300 mm, relative error", ((w - want) / want).abs());
+    assert!(((w - want) / want).abs() < 1e-5);
+    let b = GaussianBeam::new(0.2, LAM, 1.0, 1.0);
+    let mut worst: f64 = 0.0;
+    for j in 0..512 {
+        for i in 0..512 {
+            let (x, y) = r.field.grid.xy(i, j);
+            worst = worst.max((r.field.at(i, j) - b.value(x, y, 300.0)).abs());
+        }
+    }
+    let peak = b.value(0.0, 0.0, 300.0).abs();
+    measured("scene wave path, Gaussian field after 300 mm, worst / peak", worst / peak);
+    assert!(worst / peak < 1e-5);
+    let on: f64 = r.power.iter().sum();
+    assert!((on - 1.0).abs() < 1e-9, "the detector catches the whole beam: {on}");
+    assert!(r.report.ledger.numerical.abs() < 1e-9, "{:?}", r.report.ledger);
+}
+
+#[test]
+fn a_thin_lens_in_the_scene_focuses_like_self() {
+    // [14]: waist 0.5 mm at the source, lens f = 200 mm at s = 100 mm.
+    let (w0, f, s_lens) = (0.5, 200.0, 100.0);
+    let zr = rayleigh_range_mm(w0, LAM, 1.0);
+    let s2 = 1.0 / (1.0 / f - 1.0 / (s_lens + zr * zr / (s_lens - f)));
+    let w2 = w0 / ((1.0 - s_lens / f).powi(2) + (zr / f).powi(2)).sqrt();
+    let mut s = Scene3::new();
+    let src = source(&mut s);
+    s.add_planar_element(Vec3::new(s_lens, 0.0, 0.0), 10.0, 0.0, lens(f), lens(f));
+    let det = s.add_area_detector(Vec3::new(s_lens + s2, 0.0, 0.0), -Vec3::X, 1.0, 1.0, [32, 32]);
+    s.validate().unwrap();
+    let r = wave_path(&s, &spec(src, det, w0, 512, 4.096), 1).unwrap();
+    assert!(r.report.steps.iter().any(|st| st.note.contains("thin lens")));
+    let w = second_moment_radius_x(&r.field);
+    measured("scene thin lens, Self waist radius, relative error", ((w - w2) / w2).abs());
+    assert!(((w - w2) / w2).abs() < 1e-4, "{w} vs {w2}");
+}
+
+#[test]
+fn a_fold_mirror_hands_on_the_mirror_image_exactly() {
+    // [1]: a flat mirror's reflected field is the incident field's mirror
+    // image. Folded through 90° or carried straight, the beam must arrive the
+    // same, and the image-theory handover reports no tilt projection.
+    let mut folded = Scene3::new();
+    let src = source(&mut folded);
+    folded.add_planar_mirror(Vec3::new(97.0, -3.0, 0.0), Vec3::new(103.0, 3.0, 0.0), 1.0).unwrap();
+    let det = folded.add_area_detector(Vec3::new(100.0, 200.0, 0.0), -Vec3::Y, 3.0, 3.0, [32, 32]);
+    folded.validate().unwrap();
+    let a = wave_path(&folded, &spec(src, det, 0.2, 256, 3.0), 1).unwrap();
+    // The straight reference takes the same two steps, 100 mm and 200 mm, so
+    // the propagators match and only the handover differs.
+    let g = oc_wave::Grid2::square(256, 3.0 / 256.0).unwrap();
+    let u0 = GaussianBeam::new(0.2, LAM, 1.0, 1.0).sample(g, 0.0).unwrap();
+    let mut fft = oc_wave::Fft2::new();
+    let u1 = oc_wave::propagate(&u0, 100.0, oc_wave::Propagator::Auto, &mut fft).unwrap().0;
+    let b = oc_wave::propagate(&u1, 200.0, oc_wave::Propagator::Auto, &mut fft).unwrap().0;
+    assert!(!a.report.warnings.iter().any(|w| matches!(w, SamplingWarning::TiltProjection { .. })));
+    let peak = b.data.iter().map(|z| z.abs()).fold(0.0, f64::max);
+    let mut worst: f64 = 0.0;
+    for (x, y) in a.field.data.iter().zip(&b.data) {
+        worst = worst.max((x.abs() - y.abs()).abs());
+    }
+    measured("folded vs straight wave path, |U| worst / peak", worst / peak);
+    assert!(worst / peak < 1e-9, "{worst}");
+}
+
+#[test]
+fn an_aperture_on_the_path_is_found_although_the_trace_logs_no_event() {
+    // [13]: a centred disc of radius a passes 1 − exp(−2a²/w²) of a Gaussian.
+    let (w0, a) = (0.5, 0.4);
+    let mut s = Scene3::new();
+    let src = source(&mut s);
+    s.add_aperture(Vec3::new(50.0, 0.0, 0.0), a, 0.0);
+    let det = s.add_area_detector(Vec3::new(100.0, 0.0, 0.0), -Vec3::X, 3.0, 3.0, [16, 16]);
+    s.validate().unwrap();
+    let r = wave_path(&s, &spec(src, det, w0, 512, 4.0), 1).unwrap();
+    assert!(r.report.steps.iter().any(|st| st.note.contains("aperture")));
+    let w = w0 * (1.0 + (50.0 / rayleigh_range_mm(w0, LAM, 1.0)).powi(2)).sqrt();
+    let want = (-2.0 * a * a / (w * w)).exp();
+    let blocked = r.report.ledger.absorbed_aperture / r.report.ledger.launched;
+    measured("aperture on the path, blocked fraction, |Δ|", (blocked - want).abs());
+    assert!((blocked - want).abs() < 1e-4, "{blocked} vs {want}");
+}
+
+/// A 4f system: lenses f₁ and f₂, the object at the front focal plane.
+fn four_f(iris: Option<f64>) -> (Scene3, SourceId, DetectorId) {
+    let (f1, f2) = (100.0, 50.0);
+    let mut s = Scene3::new();
+    let src = source(&mut s);
+    s.add_planar_element(Vec3::new(f1, 0.0, 0.0), 10.0, 0.0, lens(f1), lens(f1));
+    if let Some(r) = iris {
+        // The builder keeps openings of at least 0.2 mm for drawing; this iris
+        // is set directly.
+        s.add_aperture(Vec3::new(2.0 * f1, 0.0, 0.0), r, 0.0);
+        s.apertures.last_mut().unwrap().shape.clear_opening = oc_core::scene3::PlanarShape2::Disc { radius_mm: r };
+    }
+    s.add_planar_element(Vec3::new(2.0 * f1 + f2, 0.0, 0.0), 10.0, 0.0, lens(f2), lens(f2));
+    let det = s.add_area_detector(Vec3::new(2.0 * f1 + 2.0 * f2, 0.0, 0.0), -Vec3::X, 2.0, 2.0, [64, 64]);
+    s.validate().unwrap();
+    (s, src, det)
+}
+
+#[test]
+fn a_4f_system_images_at_minus_f2_over_f1_and_its_iris_cuts_the_spectrum() {
+    // [1]: the image is the object scaled by −f₂/f₁ = −1/2. A Gaussian object
+    // of waist w₀ images to a waist w₀/2 at the back focal plane.
+    let w0 = 0.3;
+    let (s, src, det) = four_f(None);
+    let r = wave_path(&s, &spec(src, det, w0, 512, 4.0), 1).unwrap();
+    let w = second_moment_radius_x(&r.field);
+    measured("4f image waist / (w₀ f₂/f₁)", w / (w0 * 0.5));
+    assert!((w / (w0 * 0.5) - 1.0).abs() < 1e-4, "{w}");
+    // The Fourier plane holds the spectrum: a waist λf₁/(πw₀) [13]. An iris
+    // of radius r there passes 1 − exp(−2r²/w_F²): the coherent cutoff at
+    // spatial frequency r/(λf₁).
+    let wf = LAM / 1000.0 * 100.0 / (std::f64::consts::PI * w0);
+    let iris = 0.8 * wf;
+    let (s, src, det) = four_f(Some(iris));
+    let r = wave_path(&s, &spec(src, det, w0, 512, 4.0), 1).unwrap();
+    let blocked = r.report.ledger.absorbed_aperture / r.report.ledger.launched;
+    let want = (-2.0 * iris * iris / (wf * wf)).exp();
+    measured("4f Fourier-plane iris, blocked fraction, |Δ|", (blocked - want).abs());
+    assert!((blocked - want).abs() < 2e-3, "{blocked} vs {want}");
+    // The ledger closes along the path.
+    let l = r.report.ledger;
+    measured("4f with iris, ledger numerical / launched", l.numerical.abs() / l.launched);
+    assert!(l.numerical.abs() < 1e-6 * l.launched, "{l:?}");
+}
+
+#[test]
+fn wave_and_ray_agree_on_where_the_beam_lands() {
+    // A mirror tilted off 45° sends the beam off the detector's centre; the
+    // wave's power centroid must land where the chief ray does.
+    let mut s = Scene3::new();
+    let src = source(&mut s);
+    let a = 40f64.to_radians();
+    let half = Vec3::new(a.cos(), a.sin(), 0.0) * 3.0;
+    let c = Vec3::new(100.0, 0.0, 0.0);
+    s.add_planar_mirror(c - half, c + half, 1.0).unwrap();
+    let det = s.add_area_detector(Vec3::new(100.0, 150.0, 0.0), -Vec3::Y, 30.0, 3.0, [600, 60]);
+    s.validate().unwrap();
+    let r: WavePathResult = wave_path(&s, &spec(src, det, 0.3, 256, 4.0), 1).unwrap();
+    let seq = oc_trace::extract_sequence3(&s, src, det, 1).unwrap();
+    let (nu, nv) = (r.bins[0], r.bins[1]);
+    let (du, dv) = (60.0 / nu as f64, 6.0 / nv as f64);
+    let (mut s0, mut su, mut sv) = (0.0, 0.0, 0.0);
+    for j in 0..nv {
+        for i in 0..nu {
+            let p = r.power[j * nu + i];
+            s0 += p;
+            su += p * (-30.0 + (i as f64 + 0.5) * du);
+            sv += p * (-3.0 + (j as f64 + 0.5) * dv);
+        }
+    }
+    let (cu, cv) = (su / s0, sv / s0);
+    let ray = seq.terminal.uv_mm;
+    let e = ((cu - ray.x).powi(2) + (cv - ray.y).powi(2)).sqrt();
+    measured("wave centroid vs chief ray on the detector, mm", e);
+    assert!(e < 0.05 * du, "{cu}, {cv} vs {ray:?}");
+}
+
+#[test]
+fn a_dmd_in_the_scene_focuses_its_orders_f_lambda_over_p_apart() {
+    // [10]: a 10 µm, 12° side-tilt DMD lit at 24°, its ON mirrors sending the
+    // beam along the device normal; a lens f = 15 mm across that beam focuses
+    // the orders f·λ/p = 0.949 mm apart on the detector.
+    use oc_core::modulator::{facet_normal, DmdSpec, DmdState, ModulatorKind, Pattern, SpatialModulator, TiltAxis};
+    let p_um = 10.0;
+    let mut s = Scene3::new();
+    let src = source(&mut s);
+    let phi = 180.0 - 24.0;
+    let mk = |value: u16| SpatialModulator {
+        // Odd, so the chief ray meets a mirror's centre rather than a gap.
+        pixels: [401, 401],
+        pitch_um: p_um,
+        kind: ModulatorKind::Dmd(DmdSpec {
+            tilt_deg: 12.0,
+            tilt_axis: TiltAxis::Side,
+            mirror_fill: 0.95,
+            reflectance: 1.0,
+            window_transmittance: 1.0,
+        }),
+        pattern: Pattern::Uniform { value },
+    };
+    let dmd_pos = Vec3::new(100.0, 0.0, 0.0);
+    let id = s.add_modulator(dmd_pos, phi, mk(1)).unwrap();
+    // Pick the state whose facet sends the beam back along the device normal.
+    let t = s.surfaces.iter().find(|x| x.common.id.0 == id).unwrap().common.transform;
+    let n_dev = t.rotate(Vec3::Z);
+    let bis = (n_dev - Vec3::X).normalize();
+    let ModulatorKind::Dmd(spec_d) = &mk(1).kind else { unreachable!() };
+    let on = t.rotate(facet_normal(spec_d, DmdState::On));
+    let value = if on.dot(bis) > t.rotate(facet_normal(spec_d, DmdState::Off)).dot(bis) { 1 } else { 0 };
+    if let SurfaceResponse::Modulator { device, .. } = &mut s.surfaces.iter_mut().find(|x| x.common.id.0 == id).unwrap().response_front {
+        device.pattern = Pattern::Uniform { value };
+    }
+    let f = 15.0;
+    // The lens sits 5 mm along the outgoing ray, small enough (1 mm) that the
+    // incoming chief ray passes beside it; the wave path applies no lens rim.
+    let lens_pos = dmd_pos + n_dev * 5.0;
+    let lens_tilt = n_dev.y.atan2(n_dev.x).to_degrees();
+    s.add_planar_element(lens_pos, 1.0, lens_tilt, lens(f), lens(f));
+    let det = s.add_area_detector(lens_pos + n_dev * f, -n_dev, 1.25, 1.25, [16, 16]);
+    s.validate().unwrap();
+    let mut sp = spec(src, det, 0.3, 1024, 2.56);
+    sp.device_samples_per_pixel = 4;
+    let r = wave_path(&s, &sp, 1).unwrap();
+    assert!(r.report.steps.iter().any(|st| st.note.contains("dmd")), "{:?}", r.report.steps);
+    // The field at the lens's focus, across the chief ray. Every direction on
+    // the path lies in the XY plane, so the beam's x axis stays in it and the
+    // orders (m, 0) lie along the row through the centre.
+    let g = r.field.grid;
+    let jc = g.n[1] / 2;
+    let row: Vec<f64> = (0..g.n[0]).map(|i| r.field.at(i, jc).norm_sqr()).collect();
+    let max = row.iter().cloned().fold(0.0, f64::max);
+    let mut peaks = vec![];
+    for i in 2..g.n[0] - 2 {
+        if row[i] > 0.01 * max && row[i] >= row[i - 1] && row[i] >= row[i + 1] && row[i] > row[i - 2] && row[i] > row[i + 2] {
+            let off = 0.5 * (row[i - 1] - row[i + 1]) / (row[i - 1] - 2.0 * row[i] + row[i + 1]);
+            peaks.push(g.coord(0, i) + off * g.pitch_mm[0]);
+        }
+    }
+    let want = f * LAM / 1000.0 / (p_um / 1000.0);
+    measured("DMD orders focused: number of peaks above 1%", peaks.len() as f64);
+    assert!(peaks.len() >= 2, "{peaks:?}");
+    for w in peaks.windows(2) {
+        let gap = w[1] - w[0];
+        measured("DMD orders focused: spacing / (fλ/p)", gap / want);
+        assert!((gap / want - 1.0).abs() < 0.01, "{gap} vs {want}");
+    }
+    let l = r.report.ledger;
+    measured("DMD wave path: detected / launched", l.detected / l.launched);
+    measured("DMD wave path: numerical / launched", l.numerical / l.launched);
+    eprintln!("{l:?}");
+    assert!(l.numerical.abs() < 1e-3 * l.launched, "{l:?}");
+}
+
+#[test]
+fn slicing_a_wave_job_changes_no_bit() {
+    // A worker runs the path an event at a time so that it can drop a stale
+    // job between events; that must not change the answer.
+    use oc_wave::path::WaveJob;
+    let wf = LAM / 1000.0 * 100.0 / (std::f64::consts::PI * 0.3);
+    let (s, src, det) = four_f(Some(0.8 * wf));
+    let sp = spec(src, det, 0.3, 256, 4.0);
+    let whole = wave_path(&s, &sp, 7).unwrap();
+    let mut job = WaveJob::new(&s, &sp, 7).unwrap();
+    assert_eq!(job.revision(), 7);
+    let events = job.events();
+    assert!(events >= 4, "lens, iris, lens, detector: {events}");
+    let mut steps = 0;
+    while !job.step(1).unwrap() {
+        steps += 1;
+        assert_eq!(job.done(), steps);
+    }
+    let sliced = job.finish().unwrap();
+    assert_eq!(whole, sliced, "the sliced job differs from the whole one");
+    // The detector is not read before the chain is done.
+    let mut early = WaveJob::new(&s, &sp, 7).unwrap();
+    early.step(1).unwrap();
+    assert!(early.finish().is_err());
+}
+
+#[test]
+fn wave_power_agrees_with_rays_when_the_fresnel_number_is_large() {
+    // A uniform beam of radius R through a centred opening of radius a: at a
+    // Fresnel number a²/(λz) above 1000 the power reaching the detector is
+    // the geometric share a²/R² to well within 1% (Goodman [1]: the edge's
+    // diffraction is a fringe of width ~√(λz) around a large bright area),
+    // and the f64 ray tracer, which knows no diffraction, must say the same.
+    use oc_trace::{trace3, LaunchRay3, TraceConfig3};
+    let (r_beam, a, z) = (3.0, 2.0, 5.0);
+    let nf = a * a / (LAM / 1000.0 * z);
+    assert!(nf > 1000.0, "{nf}");
+    let mut s = Scene3::new();
+    let src = source(&mut s);
+    s.add_aperture(Vec3::new(10.0, 0.0, 0.0), a, 0.0);
+    let det = s.add_area_detector(Vec3::new(10.0 + z, 0.0, 0.0), -Vec3::X, 8.0, 8.0, [32, 32]);
+    s.validate().unwrap();
+
+    let mut sp = spec(src, det, 0.3, 1024, 8.0);
+    sp.beam = BeamProfile::TopHat { radius_mm: r_beam };
+    let r = wave_path(&s, &sp, 1).unwrap();
+    let wave = r.report.ledger.detected / r.report.ledger.launched;
+
+    // Rays on a square grid filling the same disc, equal flux each.
+    let n = 600;
+    let h = 2.0 * r_beam / n as f64;
+    let mut launch = Vec::new();
+    for j in 0..n {
+        for i in 0..n {
+            let (y, zz) = (-r_beam + (i as f64 + 0.5) * h, -r_beam + (j as f64 + 0.5) * h);
+            if y * y + zz * zz <= r_beam * r_beam {
+                launch.push(LaunchRay3 {
+                    ray: oc_core::vec3::Ray3::new(Vec3::new(0.0, y, zz), Vec3::X).unwrap(),
+                    lambda_um: LAM,
+                    flux: 1.0,
+                    source: None,
+                    pol: None,
+                });
+            }
+        }
+    }
+    let count = launch.len() as f64;
+    let res = trace3(&s, &launch, &TraceConfig3::default());
+    let rays = res.detectors.iter().find(|d| d.detector == det).unwrap().total_incident / count;
+    let geometric = (a / r_beam).powi(2);
+    measured("wave vs rays, power share on the detector, relative difference", (wave - rays).abs() / rays);
+    measured("wave share vs a²/R², relative", (wave - geometric).abs() / geometric);
+    measured("ray share vs a²/R², relative", (rays - geometric).abs() / geometric);
+    assert!((wave - rays).abs() < 0.01 * rays, "wave {wave} vs rays {rays}");
+}
+
+#[test]
+fn a_source_carries_its_coherent_beam_through_the_file_and_into_its_wave_path() {
+    // The beam is the scene's: saved with the source, launched with the
+    // source's flux as its power, dropped by name when written as v2.
+    use oc_core::scene3::CoherentBeam;
+    let mut s = Scene3::new();
+    let src = source(&mut s);
+    let det = s.add_area_detector(Vec3::new(100.0, 0.0, 0.0), -Vec3::X, 3.0, 3.0, [16, 16]);
+    s.validate().unwrap();
+    // No beam declared: refused by name.
+    let e = WavePathSpec::for_source(&s, src, det, 256, 4.0).unwrap_err();
+    assert!(e.to_string().contains("no coherent beam"), "{e}");
+
+    s.sources[0].coherence = Some(CoherentBeam::Gaussian { waist_radius_mm: 0.3, waist_offset_mm: -20.0 });
+    s.sources[0].flux = 2.5;
+    s.validate().unwrap();
+    let back = Scene3::from_json(&s.to_json()).unwrap();
+    assert_eq!(back.sources, s.sources);
+    assert!(s.to_json().contains("coherence"));
+    let sp = WavePathSpec::for_source(&back, src, det, 256, 4.0).unwrap();
+    assert_eq!(sp.beam, BeamProfile::Gaussian { waist_radius_mm: 0.3, waist_offset_mm: -20.0 });
+    let r = wave_path(&back, &sp, 1).unwrap();
+    assert!((r.report.ledger.launched - 2.5).abs() < 1e-9 * 2.5, "{:?}", r.report.ledger);
+
+    // A source traced only as rays writes no key at all.
+    let mut plain = s.clone();
+    plain.sources[0].coherence = None;
+    assert!(!plain.to_json().contains("coherence"));
+
+    let (v2, losses) = s.to_json_v2();
+    assert!(!v2.contains("coherence"));
+    assert!(losses.iter().any(|l| l.contains("coherent beam")), "{losses:?}");
+
+    s.sources[0].coherence = Some(CoherentBeam::TopHat { radius_mm: -1.0 });
+    assert!(s.validate().is_err());
+}
+
+#[test]
+fn a_source_of_many_wavelengths_is_refused_by_name() {
+    // A coherent field has one wavelength; a white source is not run at
+    // whichever one the chief ray drew.
+    let mut s = Scene3::new();
+    let src = s.add_collimated_beam(Vec3::ZERO, 1.0, 1.0, 1, Spectrum::Lines(vec![(0.486, 1.0), (0.656, 1.0)]));
+    let det = s.add_area_detector(Vec3::new(100.0, 0.0, 0.0), -Vec3::X, 3.0, 3.0, [16, 16]);
+    s.validate().unwrap();
+    let e = wave_path(&s, &spec(src, det, 0.3, 64, 4.0), 1).unwrap_err().to_string();
+    assert!(e.contains("2 lines") && e.contains("single line"), "{e}");
+}
+
+/// The singlet's paraxial focal length and principal planes, traced by the
+/// f64 tracer with rays 1 µm off the axis: `(efl, x_H, x_H')`.
+fn traced_cardinal_points(s: &Scene3, lens_x: f64) -> (f64, f64, f64) {
+    use oc_trace::{trace3, LaunchRay3, TraceConfig3};
+    let cfg = TraceConfig3 { ghosts: false, polarization: false, ..TraceConfig3::default() };
+    let leaf = |origin: Vec3, dir: Vec3| {
+        let ray = oc_core::vec3::Ray3::new(origin, dir).unwrap();
+        let r = trace3(s, &[LaunchRay3 { ray, lambda_um: LAM, flux: 1.0, source: None, pol: None }], &cfg);
+        let last = *r.segments.iter().max_by(|a, b| a.opl0_mm.partial_cmp(&b.opl0_mm).unwrap()).unwrap();
+        (last.a, (last.b - last.a).normalize())
+    };
+    let h = 1e-3;
+    let (a, d) = leaf(Vec3::new(lens_x - 20.0, h, 0.0), Vec3::X);
+    let x_f2 = a.x - a.y / d.y * d.x;
+    let efl = -h * d.x / d.y;
+    let (a, d) = leaf(Vec3::new(lens_x + 20.0, h, 0.0), -Vec3::X);
+    let x_f1 = a.x - a.y / d.y * d.x;
+    (efl, x_f1 + efl, x_f2 - efl)
+}
+
+#[test]
+fn a_gaussian_through_a_singlet_waists_where_self_predicts() {
+    // [14], with the singlet's own focal length and principal planes from the
+    // f64 tracer: a real N-BK7 biconvex lens (R ±50 mm, 4 mm thick), not an
+    // ideal one, carried by geometric field tracing [17].
+    use oc_core::build3::SingletGeom;
+    let (w0, lens_x) = (0.2, 100.0);
+    let mut s = Scene3::new();
+    let src = source(&mut s);
+    s.add_singlet(Vec3::new(lens_x, 0.0, 0.0), SingletGeom::biconvex(), 1.5168, 64.17);
+    let mut probe = s.clone();
+    probe.sources.clear();
+    let (f, x_h, x_h2) = traced_cardinal_points(&probe, lens_x);
+    let zr = rayleigh_range_mm(w0, LAM, 1.0);
+    let s1 = x_h; // the input waist sits at the source, x = 0
+    let s2 = 1.0 / (1.0 / f - 1.0 / (s1 + zr * zr / (s1 - f)));
+    let w2 = w0 / ((1.0 - s1 / f).powi(2) + (zr / f).powi(2)).sqrt();
+    let zr2 = std::f64::consts::PI * w2 * w2 / (LAM / 1000.0);
+    eprintln!("traced f = {f:.6} mm, H at {x_h:.6}, H' at {x_h2:.6}; Self: waist {w2:.6} mm at {:.6}", x_h2 + s2);
+    // Radii either side of the predicted waist; a parabola in w² finds the
+    // simulated waist.
+    let mut rows = Vec::new();
+    let mut last_report = None;
+    for k in -2..=2 {
+        let z = x_h2 + s2 + 0.5 * zr2 * k as f64;
+        let mut sc = s.clone();
+        let det = sc.add_area_detector(Vec3::new(z, 0.0, 0.0), -Vec3::X, 1.0, 1.0, [16, 16]);
+        sc.validate().unwrap();
+        let r = wave_path(&sc, &spec(src, det, w0, 512, 2.048), 1).unwrap();
+        let w = second_moment_radius_x(&r.field);
+        rows.push((z, w * w));
+        last_report = Some(r.report);
+    }
+    let rep = last_report.unwrap();
+    assert!(rep.steps.iter().any(|st| st.note.contains("field traced through it")), "{:?}", rep.steps);
+    // Least-squares parabola w² = c0 + c1 z + c2 z² about the predicted waist.
+    let zc = x_h2 + s2;
+    let (mut m, mut v) = ([[0.0f64; 3]; 3], [0.0f64; 3]);
+    for (z, y) in &rows {
+        let t = z - zc;
+        let f = [1.0, t, t * t];
+        for i in 0..3 {
+            v[i] += f[i] * y;
+            for j in 0..3 {
+                m[i][j] += f[i] * f[j];
+            }
+        }
+    }
+    // Cramer's rule on the 3 × 3 normal equations.
+    let det3 = |a: [[f64; 3]; 3]| {
+        a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1]) - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0])
+            + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0])
+    };
+    let d = det3(m);
+    let col = |k: usize| {
+        let mut a = m;
+        for i in 0..3 {
+            a[i][k] = v[i];
+        }
+        det3(a) / d
+    };
+    let (c0, c1, c2) = (col(0), col(1), col(2));
+    let dz = -c1 / (2.0 * c2);
+    let w_min = (c0 - c1 * c1 / (4.0 * c2)).sqrt();
+    measured("singlet: simulated waist offset from Self's, / Rayleigh range", dz / zr2);
+    measured("singlet: simulated waist radius vs Self's, relative", (w_min - w2) / w2);
+    assert!((dz / s2).abs() < 1e-3, "waist {dz} mm from Self's s'' = {s2}");
+    assert!(((w_min - w2) / w2).abs() < 1e-3, "{w_min} vs {w2}");
+    // The ledger closes, the faces' reflection booked.
+    let l = rep.ledger;
+    assert!(l.absorbed_element > 0.07 && l.absorbed_element < 0.10, "two N-BK7 faces reflect about 8%: {l:?}");
+    assert!(l.numerical.abs() < 1e-3 * l.launched, "{l:?}");
+}
+
+#[test]
+fn a_glass_plate_shifts_a_gaussian_as_free_space_of_t_over_n() {
+    // [13] in ABCD form: a plate of thickness t and index n is, to the beam,
+    // free space of length t/n. A Gaussian through a 10 mm N-BK7 plate must
+    // spread as one carried 160 − t + t/n mm through air. Transporting it by
+    // rays through the whole plate would not (inside its Rayleigh range a
+    // beam's curvature does not grow by the distance travelled); the path
+    // diffracts it inside the glass and traces only the faces.
+    use oc_core::build3::SingletGeom;
+    let (w0, t, l) = (0.2, 10.0, 160.0);
+    let mut s = Scene3::new();
+    let src = source(&mut s);
+    let g = SingletGeom { r1_mm: f64::INFINITY, r2_mm: f64::INFINITY, thickness_mm: t, semi_aperture_mm: 12.0, conic1: 0.0, conic2: 0.0 };
+    s.add_singlet(Vec3::new(100.0, 0.0, 0.0), g, 1.5168, 64.17);
+    let n = s.bodies[0].material.index_at(LAM, &oc_core::material::GlassCatalog::builtin()).unwrap();
+    let det = s.add_area_detector(Vec3::new(l, 0.0, 0.0), -Vec3::X, 1.0, 1.0, [16, 16]);
+    s.validate().unwrap();
+    let r = wave_path(&s, &spec(src, det, w0, 512, 2.048), 1).unwrap();
+    let w = second_moment_radius_x(&r.field);
+    let zr = rayleigh_range_mm(w0, LAM, 1.0);
+    let want = w0 * (1.0 + ((l - t + t / n) / zr).powi(2)).sqrt();
+    let implied_n = t / (zr * ((w / w0).powi(2) - 1.0).sqrt() - l + t);
+    measured("plate: radius against free space of t/n, relative", (w - want) / want);
+    measured("plate: index implied by the radius, minus the glass's", implied_n - n);
+    assert!(((w - want) / want).abs() < 1e-5, "{w} vs {want}");
+    // Two faces reflect, the rest arrives; the ledger closes.
+    let l = r.report.ledger;
+    assert!(l.numerical.abs() < 1e-6 * l.launched, "{l:?}");
+}
+
+#[test]
+fn a_tilted_plate_displaces_the_beam_where_the_rays_say() {
+    // A plate tilted θ displaces a beam by t·sin θ·(1 − cos θ/√(n² − sin² θ))
+    // (geometric optics); the field crosses each face obliquely, so the
+    // face's transfer has to move it across the beam. The wave's centroid on
+    // the detector must land where the f64 chief ray does.
+    use oc_core::build3::SingletGeom;
+    let (t, theta) = (10.0, 30f64.to_radians());
+    let mut s = Scene3::new();
+    let src = source(&mut s);
+    let g = SingletGeom { r1_mm: f64::INFINITY, r2_mm: f64::INFINITY, thickness_mm: t, semi_aperture_mm: 12.0, conic1: 0.0, conic2: 0.0 };
+    let id = s.add_singlet(Vec3::new(100.0, 0.0, 0.0), g, 1.5168, 64.17);
+    assert!(s.set_object_rotation_z_deg(id.0, theta.to_degrees()));
+    let n = s.bodies[0].material.index_at(LAM, &oc_core::material::GlassCatalog::builtin()).unwrap();
+    let det = s.add_area_detector(Vec3::new(160.0, 0.0, 0.0), -Vec3::X, 4.0, 4.0, [400, 400]);
+    s.validate().unwrap();
+    let r = wave_path(&s, &spec(src, det, 0.3, 512, 3.0), 1).unwrap();
+    let seq = oc_trace::extract_sequence3(&s, src, det, 1).unwrap();
+    let (nu, nv) = (r.bins[0], r.bins[1]);
+    let (du, dv) = (8.0 / nu as f64, 8.0 / nv as f64);
+    let (mut s0, mut su, mut sv) = (0.0, 0.0, 0.0);
+    for j in 0..nv {
+        for i in 0..nu {
+            let p = r.power[j * nu + i];
+            s0 += p;
+            su += p * (-4.0 + (i as f64 + 0.5) * du);
+            sv += p * (-4.0 + (j as f64 + 0.5) * dv);
+        }
+    }
+    let (cu, cv) = (su / s0, sv / s0);
+    let ray = seq.terminal.uv_mm;
+    let shift = t * theta.sin() * (1.0 - theta.cos() / (n * n - theta.sin().powi(2)).sqrt());
+    measured("tilted plate: displacement of the chief ray, mm (against the formula)", (ray.x.hypot(ray.y) - shift).abs());
+    let e = ((cu - ray.x).powi(2) + (cv - ray.y).powi(2)).sqrt();
+    measured("tilted plate: wave centroid vs chief ray, mm", e);
+    assert!((ray.x.hypot(ray.y) - shift).abs() < 1e-9, "the rays shift {} vs {shift}", ray.x.hypot(ray.y));
+    assert!(e < 0.05 * du, "{cu}, {cv} vs {ray:?}");
+    assert!(r.report.steps.iter().any(|st| st.note.contains("rays move up to")));
+}
+
+#[test]
+fn a_singlet_psf_matches_optiland_huygens_psf() {
+    // The oracle (verification, not validation; docs/validation.md): Optiland's
+    // HuygensPSF of the same singlet, from the clone of
+    // github.com/optiland/optiland recorded in the fixture, generated by
+    // tools/fixtures/huygens_singlet.py. An equiconvex lens, R ±50 mm, 4 mm,
+    // index 1.5168, at f/10, stop at its first surface, at its paraxial focus:
+    // Strehl 0.864 from its spherical aberration. Here the canvas carries a
+    // uniform beam through an iris at that surface and the real lens (a
+    // geometric field trace of each face, diffraction between, [17]) and reads
+    // the focus with the zoomed angular spectrum, no paraxial step anywhere.
+    use oc_core::build3::SingletGeom;
+    use oc_trace::{trace3, LaunchRay3, TraceConfig3};
+    let fx: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/huygens_singlet.json")).unwrap();
+    let lam = fx["lambda_um"].as_f64().unwrap();
+    let epd = fx["epd_mm"].as_f64().unwrap();
+    let image = fx["image_distance_from_back_vertex_mm"].as_f64().unwrap();
+    let grid: Vec<f64> = fx["grid_mm"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+    let psf: Vec<Vec<f64>> = fx["psf_rows_y_then_x"].as_array().unwrap().iter()
+        .map(|r| r.as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect()).collect();
+    let n_img = grid.len();
+    let spacing = grid[1] - grid[0];
+    eprintln!("oracle: {}", fx["oracle"]);
+
+    let mut s = Scene3::new();
+    let src = s.add_collimated_beam(Vec3::new(97.9, 0.0, 0.0), 3.0, 3.0, 1, Spectrum::Monochromatic(lam));
+    let g = SingletGeom { r1_mm: 50.0, r2_mm: -50.0, thickness_mm: 4.0, semi_aperture_mm: 12.0, conic1: 0.0, conic2: 0.0 };
+    s.add_singlet(Vec3::new(100.0, 0.0, 0.0), g, 1.5168, 64.17);
+    s.add_aperture(Vec3::new(97.999, 0.0, 0.0), 0.5 * epd, 0.0);
+    s.apertures.last_mut().unwrap().shape.clear_opening = oc_core::scene3::PlanarShape2::Disc { radius_mm: 0.5 * epd };
+    let width = n_img as f64 * spacing;
+    let det = s.add_area_detector(Vec3::new(102.0 + image, 0.0, 0.0), -Vec3::X, 0.5 * width, 0.5 * width, [n_img, n_img]);
+    s.validate().unwrap();
+    let mut sp = spec(src, det, 0.3, 2048, 6.0);
+    sp.beam = BeamProfile::TopHat { radius_mm: 2.8 };
+    // One point a pixel, at its centre: the oracle's values are point values.
+    sp.readout = Readout::Diffracted { samples_per_pixel: 1 };
+    let r = wave_path(&s, &sp, 1).unwrap();
+    for st in &r.report.steps {
+        eprintln!("  {}", st.note);
+    }
+
+    // The ideal peak for this pupil: P·π·sin²α/λ², α the half-angle the
+    // exit pupil subtends at the point read (the paraxial focus): the peak of
+    // a perfect spherical wave filling that pupil. Not the marginal ray's own
+    // angle, which the spherical aberration tilts by its ray error (here by
+    // 0.38%, 0.76% in the peak). Both rays traced: the exit pupil is where a
+    // ray through the stop's centre crosses the axis in image space, and the
+    // pupil's edge is the marginal ray's height there.
+    let mut lens = s.clone();
+    lens.sources.clear();
+    lens.apertures.clear();
+    lens.detectors.clear();
+    let last = |o: Vec3, d: Vec3| {
+        let ray = oc_core::vec3::Ray3::new(o, d.normalize()).unwrap();
+        let tr = trace3(&lens, &[LaunchRay3 { ray, lambda_um: lam, flux: 1.0, source: None, pol: None }],
+            &TraceConfig3 { ghosts: false, polarization: false, ..TraceConfig3::default() });
+        let l = *tr.segments.iter().max_by(|a, b| a.opl0_mm.partial_cmp(&b.opl0_mm).unwrap()).unwrap();
+        (l.a, (l.b - l.a).normalize())
+    };
+    let (pc, dc) = last(Vec3::new(97.999, 0.0, 0.0), Vec3::new(1.0, 1e-3, 0.0));
+    let x_xp = pc.x - pc.y / dc.y * dc.x;
+    let (pm, dm) = last(Vec3::new(90.0, 0.5 * epd, 0.0), Vec3::X);
+    let h_xp = (pm.y + (x_xp - pm.x) * dm.y / dm.x).abs();
+    let na = h_xp / h_xp.hypot(102.0 + image - x_xp);
+    eprintln!("exit pupil {:.6} mm before the back vertex, radius {h_xp:.6} mm; sin α {na:.6}, the marginal ray's sine {:.6}", 102.0 - x_xp, dm.y.abs());
+    {
+        // The canvas lens's own paraxial focus at this wavelength, against the oracle's.
+        let ray = oc_core::vec3::Ray3::new(Vec3::new(90.0, 1e-3, 0.0), Vec3::X).unwrap();
+        let tr = trace3(&lens, &[LaunchRay3 { ray, lambda_um: lam, flux: 1.0, source: None, pol: None }],
+            &TraceConfig3 { ghosts: false, polarization: false, ..TraceConfig3::default() });
+        let l = tr.segments.iter().max_by(|a, b| a.opl0_mm.partial_cmp(&b.opl0_mm).unwrap()).unwrap();
+        let d = (l.b - l.a).normalize();
+        let xf = l.a.x - l.a.y / d.y * d.x;
+        let n_glass = lens.bodies[0].material.index_at(lam, &oc_core::material::GlassCatalog::builtin()).unwrap();
+        eprintln!("canvas: n({lam}) = {n_glass:.8}; paraxial focus {:.6} mm after the back vertex (oracle {image:.6}); EFL {:.6}", xf - 102.0, -1e-3 * d.x / d.y);
+    }
+    let lam_mm = lam / 1000.0;
+    let i0 = r.arriving * std::f64::consts::PI * na * na / (lam_mm * lam_mm);
+    let pix = spacing * spacing;
+    // The canvas's PSF on the oracle's points, normalized like the oracle's.
+    let canvas: Vec<f64> = r.power.iter().map(|p| 100.0 * p / pix / i0).collect();
+    let c = n_img / 2;
+    let strehl = canvas[c * n_img + c] / 100.0;
+    let strehl_oracle = fx["strehl"].as_f64().unwrap();
+    let mut sq = 0.0;
+    for j in 0..n_img {
+        for i in 0..n_img {
+            sq += (canvas[j * n_img + i] - psf[j][i]).powi(2);
+        }
+    }
+    let rms = (sq / (n_img * n_img) as f64).sqrt() / 100.0;
+    measured("singlet PSF: Strehl, canvas minus Optiland HuygensPSF", strehl - strehl_oracle);
+    measured("singlet PSF: rms difference over the image grid, / ideal peak", rms);
+    eprintln!("canvas Strehl {strehl:.6}, oracle {strehl_oracle:.6}, NA {na:.6}");
+    let (sc, so): (f64, f64) = (canvas.iter().sum(), psf.iter().flatten().sum());
+    eprintln!("sums over the grid: canvas {sc:.4} oracle {so:.4} ratio {:.6}", sc / so);
+    // Measured: Strehl 0.8653 against 0.8642, rms 1.2e-4 of the ideal peak,
+    // the sums over the grid 0.08% apart. What is left is of the order of the
+    // canvas's sampling (0.06% finer than 2.9 µm) and of the reference
+    // (a uniform spherical cap peaks 0.06% above π·sin²α/λ² at f/10).
+    assert!((strehl - strehl_oracle).abs() < 0.01, "{strehl} vs {strehl_oracle}");
+    assert!(rms < 1e-2, "{rms}");
+}
+
+#[test]
+fn a_tilted_detector_reads_the_beam_on_its_own_plane() {
+    // The diffracted readout of a face tilted 30°: the spectrum rotated onto
+    // its plane (Matsushima, Schimmel & Wyrowski 2003 [6]) rather than the
+    // field projected along the beam. At each pixel the irradiance must be
+    // Kogelnik and Li's [13] at that point of the tilted plane, times the
+    // obliquity cos 30°, and the face must catch the whole beam.
+    let w0 = 0.2;
+    let mut s = Scene3::new();
+    let src = source(&mut s);
+    let th = 30f64.to_radians();
+    let det = s.add_area_detector(Vec3::new(100.0, 0.0, 0.0), -Vec3::new(th.cos(), th.sin(), 0.0), 0.6, 0.6, [48, 48]);
+    s.validate().unwrap();
+    let mut sp = spec(src, det, w0, 256, 2.048);
+    sp.readout = Readout::Diffracted { samples_per_pixel: 1 };
+    let r = wave_path(&s, &sp, 1).unwrap();
+    assert!(r.report.steps.iter().any(|st| st.note.contains("tilted")), "{:?}", r.report.steps);
+    assert!(!r.report.warnings.iter().any(|w| matches!(w, SamplingWarning::TiltProjection { .. })));
+    let d = s.detectors.iter().find(|x| x.common.id.0 == det.0).unwrap();
+    let t = d.common.transform;
+    let (du, dv) = (1.2 / 48.0, 1.2 / 48.0);
+    let zr = rayleigh_range_mm(w0, LAM, 1.0);
+    let (mut worst, mut peak, mut on_face): (f64, f64, f64) = (0.0, 0.0, 0.0);
+    for j in 0..48 {
+        for i in 0..48 {
+            let p = t.transform_point(Vec3::new(-0.6 + (i as f64 + 0.5) * du, -0.6 + (j as f64 + 0.5) * dv, 0.0));
+            let w = w0 * (1.0 + (p.x / zr).powi(2)).sqrt();
+            let want = 2.0 / (std::f64::consts::PI * w * w) * (-2.0 * (p.y * p.y + p.z * p.z) / (w * w)).exp() * th.cos();
+            let got = r.power[j * 48 + i] / (du * dv);
+            peak = peak.max(want);
+            on_face += want * du * dv;
+            worst = worst.max((got - want).abs());
+        }
+    }
+    let caught = r.report.ledger.detected / r.report.ledger.launched;
+    measured("tilted detector: irradiance against Kogelnik–Li on the tilted plane, worst / peak", worst / peak);
+    measured("tilted detector: power caught against Kogelnik–Li's on the face, relative", (caught - on_face) / on_face);
+    assert!(worst / peak < 2e-3, "{}", worst / peak);
+    assert!(((caught - on_face) / on_face).abs() < 2e-3, "{caught} vs {on_face}");
+}

@@ -36,6 +36,9 @@ js-sys = "0.3"
 # metrics come from here, never the f32 interactive path (§4.1). `trace3` adds the
 # f64 full-3D reference path (PR 3D-04), the authority behind the 3D preview.
 oc-trace = { path = "../oc-trace", default-features = false, features = ["trace3"] }
+# The scalar wave engine (W5): the coherent wave path a worker runs in steps,
+# serial (no rayon) for wasm. Brings rustfft, confined there (ADR 0003).
+oc-wave = { path = "../oc-wave", default-features = false, features = ["scene"] }
 # The openUC2 adapter (§5.2): catalogue, setup, and placement. oc-core and the
 # tracers stay domain-free; everything openUC2-shaped lives behind this.
 oc-openuc2 = { path = "../oc-openuc2" }

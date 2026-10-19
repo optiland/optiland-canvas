@@ -31,6 +31,7 @@ fn collimated_disc(scene: &mut Scene3, at_x: f64, radius_mm: f64, samples: u32) 
             seed: 0,
             sequence: SamplingSequence::Grid,
         },
+        coherence: None,
     });
     let _ = LayerId(0);
 }

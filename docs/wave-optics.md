@@ -594,6 +594,19 @@ The transfer's own tests (acceptance case C62, `crates/oc-wave/src/transfer.rs`)
 | `a_tilted_beam_crosses_a_curved_face_where_its_rays_do` | a Gaussian 0.3 mm off the axis and tilted 30 mrad through a face of R 8 mm: its centroid against its traced rays' (geometric field tracing [17]; a check of the map against the rays it is fitted to) | 3 nm | 1.4 nm (the rays' own centroid lies 11 nm from the central ray) |
 | `each_lobe_traced_about_its_own_direction_matches_it_traced_alone` | the same lobe about its own direction and about the chief ray's: what one reference for all costs | departure reported | 0.15 relative |
 
+Cases adopted from the wave-optics specification bundle v1.0.0 [29], its
+frozen fixtures in the canvas's units (acceptance case C63,
+`crates/oc-wave/tests/bundle.rs`):
+
+| Test | Held against | Gate | Measured |
+|---|---|---|---|
+| `b02_finite_modes_are_carried_by_the_exact_diagonal_transport` | B02: six periodic modes, two components, of a 128 × 96 µm cell on 32 × 24, 550 nm, each multiplied by `e^{id√(k² − \|q\|²)}`, at 3, 7 and 10 mm (the angular spectrum without padding or band limit [1]); 3 + 7 against 10; forward and back | 2e-11 (the bundle's finite-matrix tolerance) | 1.4e-11; 8.5e-12; 5.8e-16 |
+| `b02_the_fft_spectrum_is_the_explicit_finite_dft` | B02: the FFT against the explicit DFT at every frequency | 2e-11 | 6.2e-16 |
+| `b10_an_aperture_acts_at_its_plane_and_the_order_matters` | B10: `U_after M U_before` (7 mm, the integer circle of 6 steps, 11 mm; quadratic Fresnel on a 240 µm cell) by FFT against the explicit DFT; the misplaced order against the fixture's frozen 0.4329834561 | 2e-11 | 2.6e-15; 6.8e-14 |
+| `b10_a_gaussian_through_a_circular_hole_passes_one_minus_e_to_the_minus_half` | B10, M34: `1 − e^{−2a²/w²}` for w = 0.1 mm, a = 0.05 mm, through exact cell coverage: what the mask does not stop | 1e-4, and second order in the spacing | −4.4e-5 at 2 µm, −1.1e-5 at 1 µm (the boundary quadrature of a sampled field; the bundle's 2e-10 is for a quadrature of the continuum) |
+| `a_sinusoidal_phase_mask_puts_j_m_squared_into_its_orders` | M14: `e^{iβ cos Gx}` has coefficients `i^m J_m(β)` (Jacobi–Anger, DLMF 10.12.1 [15]); β = 2, orders to ±12, power and phase | 1e-10; 1e-7 rad | 1.8e-15; 1.2e-8 rad (the Gaussian cut at four radii) |
+| `two_slits_make_the_far_field_of_m35` | M35: two slits' far field `2a sinc(aq/2) cos(dq/2)` [1], the sampled mask's cell factor `(πfΔx)/sin(πfΔx)` carried | 1e-9 of peak | 8.5e-16 |
+
 The propagation tests of W8 (acceptance case C57, `crates/oc-wave/tests/propagate.rs`):
 
 | Test | Held against | Gate | Measured |
@@ -832,5 +845,6 @@ entry says so.
 26. R. C. Jones, "A new calculus for the treatment of optical systems. I. Description and discussion of the calculus," *J. Opt. Soc. Am.* 31(7), 488–493 (1941), doi:10.1364/JOSA.31.000488. (A polarizer and a retarder as 2×2 matrices on the field's two components.)
 27. E. Hecht, *Optics*, 5th ed., Pearson (2017), ch. 8 (polarization): Malus's law; a retarder between crossed polarizers; the Fresnel–Arago laws. (Section numbers to confirm against the edition.)
 28. A. E. Siegman, *Lasers*, University Science Books (1986), ch. 15 and 20: ray matrices in reduced form across media of different index, and the ABCD law for a Gaussian beam's `q`. (Chapters to confirm.)
+29. Wave-optics specification bundle v1.0.0 (`wave_optics_agent_bundle_v1.zip`, supplied by the project, 2026-10-19): `01_MODEL.md` M14, M34, M35; `03_BENCHMARKS.md` B02, B10; `config/benchmark_cases.json`, frozen fixtures. (A specification, not a published source; its own references are in `04_REFERENCES.md`.)
 
 The FFT is `rustfft` 6.4.1 (MIT OR Apache-2.0).

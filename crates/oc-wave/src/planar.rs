@@ -33,13 +33,13 @@
 //! `r_p`, and its transmitted amplitudes into power coordinates by
 //! `√t_power_scale`.
 //!
-//! **Polarization.** A field is scalar. A chain that meets an element telling
-//! s from p obliquely carries one of two modes, s or p of the plane of
-//! incidence that element and the chief ray share; an unpolarized source is
-//! the two modes, mutually incoherent, half its power each. Every plane wave
-//! of the field takes its own angle's amplitude for that mode; that the plane
-//! waves off the plane of incidence see s and p slightly rotated is left out,
-//! and the report names it.
+//! **Polarization.** The path hands these steps one polarization at a time,
+//! s or p of the plane of incidence the element and the chief ray share: a
+//! chain whose elements tell s from p carries two components, turned into
+//! each element's s and p before it (`crate::path`). Every plane wave of the
+//! field takes its own angle's amplitude for that polarization; that the
+//! plane waves off the plane of incidence see s and p slightly rotated is
+//! left out, and the report names it.
 
 use crate::fft::{fftshift2, ifftshift2, next_fast_len};
 use crate::path::Beam;
@@ -59,13 +59,16 @@ pub enum Pol {
     S(Vec3),
     /// Linear, in that plane: p.
     P(Vec3),
+    /// The one component an element acts on, already projected out of a
+    /// field of two (an LCoS's director component).
+    Projected,
 }
 
 impl Pol {
     /// `Some(true)` for p, `Some(false)` for s.
     pub fn is_p(&self) -> Option<bool> {
         match self {
-            Pol::Unpolarized => None,
+            Pol::Unpolarized | Pol::Projected => None,
             Pol::S(_) => Some(false),
             Pol::P(_) => Some(true),
         }

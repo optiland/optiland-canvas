@@ -22,6 +22,12 @@
 //! - [23] G. G. Stokes (1849), and [24] A. Zeilinger, *Am. J. Phys.* 49, 882
 //!   (1981): a lossless splitter is a unitary two-port, its reflections from
 //!   the two sides of opposite sign.
+//! - [26] R. C. Jones, *J. Opt. Soc. Am.* 31(7), 488–493 (1941): the Jones
+//!   calculus, a polarizer and a retarder as 2×2 matrices on the field's two
+//!   components.
+//! - [27] E. Hecht, *Optics*, 5th ed. (2017), ch. 8: Malus's law; a retarder
+//!   between crossed polarizers; the Fresnel–Arago laws, orthogonally
+//!   polarized beams do not interfere.
 //!
 //! Numbered as in docs/wave-optics.md; retrieved 2026-10-19.
 
@@ -1186,34 +1192,53 @@ fn a_glass_plate_delays_the_beam_by_its_optical_path() {
 }
 
 #[test]
-fn an_lcos_whose_two_polarization_beams_both_reach_the_detector_is_refused_by_name() {
+fn an_lcos_whose_two_polarization_beams_both_reach_the_detector_adds_them_in_power() {
     // [20]: an LCoS's modulated and unmodulated beams are orthogonally
-    // polarized; meeting on a detector they add in power, never as fields.
-    // A uniform device sends both back the same way, so both chains reach the
-    // detector; the scalar path refuses rather than make them interfere.
+    // polarized, the modulated one along the director; meeting on a detector
+    // they add in power [27], whatever phase the device puts on one of them.
+    // A uniform device sends both back the same way: the detector reads the
+    // same for any uniform level, and each beam carries half of unpolarized
+    // light.
     use oc_core::modulator::{LcosSpec, ModulatorKind, Pattern, PhaseLut, SpatialModulator};
-    let dev = SpatialModulator {
-        pixels: [64, 64],
-        pitch_um: 8.0,
-        kind: ModulatorKind::Lcos(LcosSpec {
-            director_deg: 0.0,
-            lut: PhaseLut::Linear { levels: 256, max_phase_rad: 2.0 * std::f64::consts::PI },
-            design_lambda_um: LAM,
-            pixel_fill: 1.0,
-            gap_amplitude: 0.0,
-            gap_phase_rad: 0.0,
-            fringing_um: 0.0,
-            reflectance: 1.0,
-        }),
-        pattern: Pattern::Uniform { value: 40 },
+    let run = |value: u16| {
+        let dev = SpatialModulator {
+            pixels: [64, 64],
+            pitch_um: 8.0,
+            kind: ModulatorKind::Lcos(LcosSpec {
+                director_deg: 0.0,
+                lut: PhaseLut::Linear { levels: 256, max_phase_rad: 2.0 * std::f64::consts::PI },
+                design_lambda_um: LAM,
+                pixel_fill: 1.0,
+                gap_amplitude: 0.0,
+                gap_phase_rad: 0.0,
+                fringing_um: 0.0,
+                reflectance: 1.0,
+            }),
+            pattern: Pattern::Uniform { value },
+        };
+        let mut s = Scene3::new();
+        let src = source(&mut s);
+        s.add_modulator(Vec3::new(100.0, 0.0, 0.0), 180.0, dev).unwrap();
+        let det = s.add_area_detector(Vec3::new(-50.0, 0.0, 0.0), Vec3::X, 1.0, 1.0, [16, 16]);
+        s.validate().unwrap();
+        wave_path(&s, &spec(src, det, 0.3, 128, 2.0), 1).unwrap()
     };
-    let mut s = Scene3::new();
-    let src = source(&mut s);
-    s.add_modulator(Vec3::new(100.0, 0.0, 0.0), 180.0, dev).unwrap();
-    let det = s.add_area_detector(Vec3::new(-50.0, 0.0, 0.0), Vec3::X, 1.0, 1.0, [16, 16]);
-    s.validate().unwrap();
-    let e = wave_path(&s, &spec(src, det, 0.3, 128, 2.0), 1).unwrap_err().to_string();
-    assert!(e.contains("both its polarization beams"), "{e}");
+    let (a, b) = (run(40), run(200));
+    let (la, lb) = (a.report.ledger, b.report.ledger);
+    measured("LCoS, both beams on one detector: uniform level 40 against 200, detected, relative", la.detected / lb.detected - 1.0);
+    assert!((la.detected / lb.detected - 1.0).abs() < 1e-9, "{la:?} vs {lb:?}");
+    assert!(a.report.steps.iter().any(|st| st.note.contains("2 arms added")), "{:?}", a.report.steps);
+    assert!(a.field_y.is_some(), "two components");
+    // Neither beam is lost to the other: both reach the detector. The
+    // device, 0.512 mm square, meets erf(√2·0.256/w)² of the beam, and what
+    // misses it is absorbed.
+    assert!(la.other_family.abs() < 1e-12 * la.launched, "{la:?}");
+    let w = 0.3 * (1.0 + (100.0 / rayleigh_range_mm(0.3, LAM, 1.0)).powi(2)).sqrt();
+    let on_dev = common::erf(std::f64::consts::SQRT_2 * 0.256 / w).powi(2);
+    let met = 1.0 - la.absorbed_element / la.launched;
+    measured("LCoS, both beams: what the device meets against erf(√2a/w)²", met - on_dev);
+    assert!((met - on_dev).abs() < 1e-3, "{met} vs {on_dev}: {la:?}");
+    assert!(la.numerical.abs() < 1e-10, "{la:?}");
 }
 
 /// A bare plane-parallel plate of N-BK7, `t` mm thick, at x = 100, its faces
@@ -1293,7 +1318,7 @@ fn an_oblique_etalon_transmits_s_and_p_as_their_own_closed_forms() {
     measured("etalon at 31°, δ = 7.5π: unpolarized transmission against (T_s + T_p)/2", got - 0.5 * (ts + tp));
     assert!((ts - tp).abs() > 1e-3, "the test needs s and p apart: {ts} {tp}");
     assert!((got - 0.5 * (ts + tp)).abs() < 1e-5, "{got} vs {}", 0.5 * (ts + tp));
-    assert!(r.report.approximated.iter().any(|a| a.contains("two mutually incoherent modes, s and p")), "{:?}", r.report.approximated);
+    assert!(r.report.approximated.iter().any(|a| a.contains("two mutually incoherent modes")), "{:?}", r.report.approximated);
 }
 
 #[test]
@@ -1376,11 +1401,29 @@ fn a_coated_surface_reflects_and_transmits_as_its_single_layer_s_closed_form() {
     assert!(rf < 0.02 && rf > 0.01, "a quarter-wave MgF₂ on crown glass reflects 1.3%: {rf}");
 }
 
+/// The single layer's reflectance at `theta0`, for s or `p`: Born & Wolf
+/// [16], r = (r₀₁ + r₁₂e^{2iβ})/(1 + r₀₁r₁₂e^{2iβ}), β = k₀n₁d cos θ₁, apart
+/// from the canvas's transfer matrix; the layer of `quarter_wave_on_a_plate`.
+fn single_layer_r(theta0: f64, p: bool) -> f64 {
+    let (n0, n1, ns) = (1.0f64, 1.38f64, 1.52f64);
+    let lam = LAM / 1000.0;
+    let d = lam / (4.0 * n1);
+    let s0 = theta0.sin();
+    let (c0, c1, cs) = (theta0.cos(), (1.0 - (s0 / n1).powi(2)).sqrt(), (1.0 - (s0 / ns).powi(2)).sqrt());
+    let fr = |na: f64, ca: f64, nb: f64, cb: f64| if p { (nb * ca - na * cb) / (nb * ca + na * cb) } else { (na * ca - nb * cb) / (na * ca + nb * cb) };
+    let (r01, r12) = (fr(n0, c0, n1, c1), fr(n1, c1, ns, cs));
+    let e = oc_wave::Cx::expi(2.0 * 2.0 * std::f64::consts::PI / lam * n1 * d * c1);
+    let r = (oc_wave::Cx::real(r01) + e * r12) / (oc_wave::Cx::ONE + e * (r01 * r12));
+    r.norm_sqr()
+}
+
 #[test]
-fn coatings_whose_planes_of_incidence_differ_are_refused_by_name() {
-    // s of one plane of incidence is a mix of s and p of another, which a
-    // scalar field of one linear polarization cannot carry: a coating that
-    // folds the beam in the XY plane, then one that folds it out of it.
+fn coatings_whose_planes_of_incidence_differ_reflect_s_of_one_as_p_of_the_other() {
+    // A coating that folds the beam in the XY plane, then one that folds it
+    // out of it, both at 45°: the first's s (along Z) lies in the second's
+    // plane of incidence, so it is the second's p. Unpolarized light reflects
+    // (R₁ₛR₂ₚ + R₁ₚR₂ₛ)/2 [26], not the (R₁ₛR₂ₛ + R₁ₚR₂ₚ)/2 of a shared
+    // plane; the field carries both components through both.
     let (front, back) = quarter_wave_on_a_plate();
     let mut s = Scene3::new();
     let src = source(&mut s);
@@ -1391,8 +1434,15 @@ fn coatings_whose_planes_of_incidence_differ_are_refused_by_name() {
     s.surfaces.last_mut().unwrap().common.transform = oc_core::Isometry3::new(Vec3::new(50.0, 50.0, 0.0), [q.x, q.y, q.z, q.w]).unwrap();
     let det = s.add_area_detector(Vec3::new(50.0, 50.0, 60.0), -Vec3::Z, 3.0, 3.0, [16, 16]);
     s.validate().unwrap();
-    let e = wave_path(&s, &spec(src, det, 0.5, 128, 4.0), 1).unwrap_err().to_string();
-    assert!(e.contains("different planes of incidence"), "{e}");
+    let r = wave_path(&s, &spec(src, det, 0.5, 128, 4.0), 1).unwrap();
+    let got = r.report.ledger.detected / r.report.ledger.launched;
+    let (rs, rp) = (single_layer_r(std::f64::consts::FRAC_PI_4, false), single_layer_r(std::f64::consts::FRAC_PI_4, true));
+    let want = rs * rp;
+    let shared = 0.5 * (rs * rs + rp * rp);
+    measured("two coatings in crossed planes: reflected power against (R1s R2p + R1p R2s)/2, relative", got / want - 1.0);
+    assert!((shared / want - 1.0).abs() > 0.1, "the test needs the planes to matter: {shared} vs {want}");
+    assert!((got / want - 1.0).abs() < 1e-5, "{got} vs {want}");
+    assert!(r.field_y.is_some());
 }
 
 #[test]
@@ -1455,4 +1505,164 @@ fn a_ten_times_beam_expander_widens_the_beam_as_the_abcd_law_says() {
     assert!(narrowed >= 2, "narrowed onto the small beam and widened again: {narrowed}");
     let l = r.report.ledger;
     assert!(l.detected / l.launched > 0.999, "{l:?}");
+}
+
+/// Elements in a row along +X from a source at the origin, each square to the
+/// beam, and a detector at x = 200: what of a 0.5 mm Gaussian, launched
+/// unpolarized, reaches it.
+fn through(elements: &[(f64, SurfaceResponse)]) -> f64 {
+    let mut s = Scene3::new();
+    let src = source(&mut s);
+    for (x, r) in elements {
+        s.add_planar_element(Vec3::new(*x, 0.0, 0.0), 10.0, 0.0, r.clone(), r.clone());
+    }
+    let det = s.add_area_detector(Vec3::new(200.0, 0.0, 0.0), -Vec3::X, 3.0, 3.0, [16, 16]);
+    s.validate().unwrap();
+    let r = wave_path(&s, &spec(src, det, 0.5, 128, 4.0), 1).unwrap();
+    assert!(r.report.ledger.numerical.abs() < 1e-10, "{:?}", r.report.ledger);
+    r.report.ledger.detected / r.report.ledger.launched
+}
+
+fn polarizer(axis_deg: f64, extinction: f64) -> SurfaceResponse {
+    SurfaceResponse::Polarizer { axis_deg, extinction: oc_core::scene3::AngularScalar::Constant(extinction), substrate_index: 1.0 }
+}
+
+fn retarder(axis_deg: f64, retardance_deg: f64) -> SurfaceResponse {
+    SurfaceResponse::Retarder { axis_deg, retardance_deg, substrate_index: 1.0, crystal: None }
+}
+
+#[test]
+fn two_polarizers_pass_unpolarized_light_as_malus_s_law_says() {
+    // [27] Malus: of unpolarized light the first polarizer passes half, the
+    // second cos²θ of that. Crossed sheets that leak ε each pass ε exactly
+    // [26]: each of the two modes is blocked once.
+    for th in [0.0f64, 30.0, 60.0, 90.0] {
+        let got = through(&[(50.0, polarizer(0.0, 0.0)), (100.0, polarizer(th, 0.0))]);
+        let want = 0.5 * th.to_radians().cos().powi(2);
+        measured(&format!("Malus's law at {th}°: transmitted against cos²θ/2"), got - want);
+        assert!((got - want).abs() < 1e-9, "{th}: {got} vs {want}");
+    }
+    let eps = 1e-4;
+    let got = through(&[(50.0, polarizer(0.0, eps)), (100.0, polarizer(90.0, eps))]);
+    measured("crossed polarizers of extinction 1e-4: transmitted against ε, relative", got / eps - 1.0);
+    assert!((got / eps - 1.0).abs() < 1e-6, "{got}");
+}
+
+#[test]
+fn a_retarder_between_crossed_polarizers_passes_half_sin2_2phi_sin2_half_delta() {
+    // [26], [27]: a retarder of retardance δ, its fast axis φ from the first
+    // of two crossed polarizers, passes sin²2φ·sin²(δ/2) of what the first
+    // polarizer passes, half of unpolarized light. A quarter-wave plate at
+    // 45° makes circular light, which any analyzer halves.
+    for (phi, delta) in [(45.0f64, 180.0f64), (22.5, 180.0), (45.0, 90.0), (30.0, 60.0), (10.0, 120.0)] {
+        let got = through(&[(50.0, polarizer(0.0, 0.0)), (75.0, retarder(phi, delta)), (100.0, polarizer(90.0, 0.0))]);
+        let want = 0.5 * (2.0 * phi.to_radians()).sin().powi(2) * (0.5 * delta.to_radians()).sin().powi(2);
+        measured(&format!("retarder φ = {phi}°, δ = {delta}° between crossed polarizers: against sin²2φ sin²(δ/2)/2"), got - want);
+        assert!((got - want).abs() < 1e-9, "{phi} {delta}: {got} vs {want}");
+    }
+    for th in [0.0, 45.0, 90.0, 120.0] {
+        let got = through(&[(50.0, polarizer(0.0, 0.0)), (75.0, retarder(45.0, 90.0)), (100.0, polarizer(th, 0.0))]);
+        measured(&format!("circular light through an analyzer at {th}°: against 1/4"), got - 0.25);
+        assert!((got - 0.25).abs() < 1e-9, "{th}: {got}");
+    }
+}
+
+#[test]
+fn tilted_crossed_polarizers_leak_as_the_ray_tracer_says() {
+    // Crossed polarizers at ±45° to a plane of incidence, both met at 40°
+    // (the plane's normal, world Z, lies at 40° in these elements' local
+    // frame, so their axes are at 85° and 175°):
+    // their axes, projected across the beam, are no longer at right angles,
+    // so the pair leaks, which is why a display has a viewing angle. The
+    // wave path applies the tracer's Jones matrix at the chief ray, the
+    // element's faces in glass of 1.5 included in the second case: a check
+    // of one model in two implementations, not of the physics. Bare, the
+    // axes projected across the ray meet at cos γ = sin²θ/(1 + cos²θ), so
+    // the pair passes (cos γ)²/2 of unpolarized light; in glass the ray is
+    // straighter and the pair leaks less.
+    use oc_trace::{trace3, LaunchRay3, TraceConfig3};
+    let mut leaks = Vec::new();
+    for n_sub in [1.0, 1.5] {
+        let mut s = Scene3::new();
+        let src = source(&mut s);
+        for (x, axis) in [(50.0, 85.0), (100.0, 175.0)] {
+            let r = SurfaceResponse::Polarizer { axis_deg: axis, extinction: oc_core::scene3::AngularScalar::Constant(0.0), substrate_index: n_sub };
+            s.add_planar_element(Vec3::new(x, 0.0, 0.0), 10.0, 40.0, r.clone(), r);
+        }
+        let det = s.add_area_detector(Vec3::new(200.0, 0.0, 0.0), -Vec3::X, 3.0, 3.0, [16, 16]);
+        s.validate().unwrap();
+        let r = wave_path(&s, &spec(src, det, 0.5, 128, 4.0), 1).unwrap();
+        let wave = r.report.ledger.detected / r.report.ledger.launched;
+        let launch = [LaunchRay3 { ray: oc_core::vec3::Ray3::new(Vec3::ZERO, Vec3::X).unwrap(), lambda_um: LAM, flux: 1.0, source: None, pol: None }];
+        let res = trace3(&s, &launch, &TraceConfig3::default());
+        let rays = res.detectors.iter().find(|d| d.detector == det).unwrap().total_incident;
+        measured(&format!("tilted crossed polarizers in glass of {n_sub}: wave against the ray tracer, relative"), wave / rays - 1.0);
+        assert!((wave / rays - 1.0).abs() < 1e-6, "{wave} vs {rays}");
+        assert!(r.report.ledger.numerical.abs() < 1e-10, "{:?}", r.report.ledger);
+        leaks.push(wave);
+    }
+    let th = 40f64.to_radians();
+    let want = 0.5 * (th.sin().powi(2) / (1.0 + th.cos().powi(2))).powi(2);
+    measured("tilted crossed polarizers, bare: leak against (sin²θ/(1 + cos²θ))²/2, relative", leaks[0] / want - 1.0);
+    assert!((leaks[0] / want - 1.0).abs() < 1e-9, "{} vs {want}", leaks[0]);
+    assert!(leaks[1] > 1e-3 && leaks[1] < 0.2 * leaks[0], "{leaks:?}");
+}
+
+#[test]
+fn a_half_wave_plate_in_one_arm_of_a_mach_zehnder_takes_its_fringes_away_and_a_polarizer_brings_them_back() {
+    // [27] Fresnel–Arago: orthogonally polarized beams do not interfere. A
+    // half-wave plate in one arm of a Mach–Zehnder, its fast axis at θ, turns
+    // each polarization into its mirror image about θ; unpolarized light then
+    // adds in power at the output, half the launched in the X port at every
+    // path difference. An analyzer at β behind the port brings the fringes
+    // back with visibility cos 2(θ − β) [26]: the port passes
+    // 1/4 − cos Δφ·cos 2(θ − β)/4, where without the plate it would carry
+    // (1 − cos Δφ)/2.
+    let k0 = 2.0 * std::f64::consts::PI / (LAM / 1000.0);
+    let theta = 20.0f64;
+    for j in 0..4 {
+        let dphi = j as f64 * std::f64::consts::FRAC_PI_2;
+        let delta = dphi / (k0 * std::f64::consts::SQRT_2);
+        for analyzer in [None, Some(theta), Some(theta + 45.0), Some(theta + 30.0)] {
+            let (mut s, src, dx, _) = mach_zehnder(delta);
+            let hwp = retarder(theta, 180.0);
+            s.add_planar_element(Vec3::new(100.0, 0.0, 0.0), 10.0, 0.0, hwp.clone(), hwp);
+            if let Some(beta) = analyzer {
+                let a = polarizer(beta, 0.0);
+                s.add_planar_element(Vec3::new(200.0, 100.0, 0.0), 10.0, 0.0, a.clone(), a);
+            }
+            s.validate().unwrap();
+            let r = wave_path(&s, &spec(src, dx, 0.5, 256, 4.0), 1).unwrap();
+            let got = r.report.ledger.detected / r.report.ledger.launched;
+            let want = match analyzer {
+                None => 0.5,
+                Some(beta) => 0.25 - 0.25 * dphi.cos() * (2.0 * (theta - beta).to_radians()).cos(),
+            };
+            measured(&format!("Mach–Zehnder, half-wave plate in one arm, Δφ = {j}·π/2, analyzer {analyzer:?}: X port against the Jones calculus"), got - want);
+            assert!((got - want).abs() < 1e-6, "{j} {analyzer:?}: {got} vs {want}");
+            assert!(r.report.steps.iter().any(|st| st.note.contains("2 arms added")));
+            assert!(!r.report.approximated.iter().any(|a| a.contains("arms added in a scalar field")), "{:?}", r.report.approximated);
+        }
+    }
+}
+
+#[test]
+fn crossed_polarizers_before_a_lens_leave_it_a_dark_field_to_carry() {
+    // The chain is geometry: crossed polarizers pass nothing, and the lens
+    // and the detector behind them still have a field to carry, all zeros.
+    use oc_core::build3::SingletGeom;
+    let mut s = Scene3::new();
+    let src = source(&mut s);
+    s.add_planar_element(Vec3::new(20.0, 0.0, 0.0), 10.0, 0.0, polarizer(0.0, 0.0), polarizer(0.0, 0.0));
+    s.add_planar_element(Vec3::new(30.0, 0.0, 0.0), 10.0, 0.0, polarizer(90.0, 0.0), polarizer(90.0, 0.0));
+    let g = SingletGeom { r1_mm: 50.0, r2_mm: -50.0, thickness_mm: 4.0, semi_aperture_mm: 10.0, conic1: 0.0, conic2: 0.0 };
+    s.add_singlet(Vec3::new(50.0, 0.0, 0.0), g, 1.5168, 64.17);
+    let det = s.add_area_detector(Vec3::new(120.0, 0.0, 0.0), -Vec3::X, 3.0, 3.0, [16, 16]);
+    s.validate().unwrap();
+    let r = wave_path(&s, &spec(src, det, 0.5, 128, 4.0), 1).unwrap();
+    let l = r.report.ledger;
+    assert!(l.detected < 1e-30, "{l:?}");
+    assert!([l.numerical, l.resampling, l.left_window, l.other_ports].iter().all(|v| v.is_finite() && v.abs() < 1e-12), "{l:?}");
+    assert!(r.field.power() + r.field_y.as_ref().unwrap().power() < 1e-30);
+    assert!((l.absorbed_element - l.launched).abs() < 1e-12, "{l:?}");
 }

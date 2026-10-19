@@ -177,7 +177,7 @@ impl Canvas {
             "detector": r.detector.0,
             "bins": r.bins,
             "report": r.report,
-            "field": { "n": r.field.grid.n, "pitchMm": r.field.grid.pitch_mm, "lambdaUm": r.field.lambda_um },
+            "field": { "n": r.field.grid.n, "pitchMm": r.field.grid.pitch_mm, "lambdaUm": r.field.lambda_um, "polarized": r.field_y.is_some() },
             "power": r.power.iter().sum::<f64>(),
         })
         .to_string()
@@ -190,13 +190,18 @@ impl Canvas {
     }
 
     /// `|U|²` of the field arriving at the detector, across the chief ray,
-    /// row-major, `x` fastest.
+    /// row-major, `x` fastest; of a field of two polarization components,
+    /// their sum.
     #[wasm_bindgen(js_name = waveFieldIntensity)]
     pub fn wave_field_intensity(&self) -> Vec<f64> {
-        self.wave_result.borrow().as_ref().map_or_else(Vec::new, |r| r.field.data.iter().map(|c| c.norm_sqr()).collect())
+        self.wave_result.borrow().as_ref().map_or_else(Vec::new, |r| match &r.field_y {
+            Some(y) => r.field.data.iter().zip(&y.data).map(|(a, b)| a.norm_sqr() + b.norm_sqr()).collect(),
+            None => r.field.data.iter().map(|c| c.norm_sqr()).collect(),
+        })
     }
 
-    /// The phase of the same field, radians in `(−π, π]`, carrier excluded.
+    /// The phase of the same field, radians in `(−π, π]`, carrier excluded;
+    /// of a field of two polarization components, the `x` one's.
     #[wasm_bindgen(js_name = wavePhase)]
     pub fn wave_phase(&self) -> Vec<f64> {
         self.wave_result.borrow().as_ref().map_or_else(Vec::new, |r| r.field.data.iter().map(|c| c.arg()).collect())

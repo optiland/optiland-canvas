@@ -94,10 +94,12 @@ alone.
 
 **On the wave path** the field follows the arm the chief ray took: the
 modulated one where it was steered, the unmodulated one where it reflected
-([wave path](wave-optics.md#the-wave-path)). The path carries unpolarized
-light, so the arm takes half of what the device reflects and the other half
-is booked as the family not followed; the two never interfere. The report
-names that approximation.
+([wave path](wave-optics.md#the-wave-path)). The path carries the field's two
+polarization components through an LCoS, and the arm takes the one it is
+made of, along the director or across it: half of unpolarized light. The
+other is booked as the family not followed, less the device's own share of
+it. Where both beams reach the detector they are two chains, orthogonally
+polarized, and add in power.
 
 **In a file** the device is part of the version 3 document. Written as version
 2 it becomes an absorber of the same footprint, and the loss is named

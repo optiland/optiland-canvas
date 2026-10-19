@@ -136,10 +136,15 @@ pub fn axial_launch(source: &Source3) -> Result<LaunchRay3, SequenceError> {
 ///
 /// `flux_eps` is far below the default because a legitimate chain through k
 /// lossy splitters carries `~0.5^k` of the launch flux, and culling it would
-/// turn a real sequence into a false [`SequenceError::NotReached`].
+/// turn a real sequence into a false [`SequenceError::NotReached`]. The trace
+/// is unpolarized for the same reason: crossed polarizers on the path pass
+/// nothing of a polarized ray, though the chain through them is as real as
+/// any, and a polarizer in an unpolarized trace is the half it passes of
+/// unpolarized light.
 fn extraction_config(revision: u64) -> TraceConfig3 {
     TraceConfig3 {
         ghosts: false,
+        polarization: false,
         record_events: true,
         record_detector_hits: false,
         max_depth: 64,

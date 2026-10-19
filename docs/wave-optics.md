@@ -332,11 +332,15 @@ expander keeps its beam resolved from 0.2 mm through a 50 µm focus to 2 mm
 
 **What the path follows at a modulator.** The chief ray, and so the beam,
 leaves a DMD along the reflection off the facet it hits, and an SLM along the
-phase gradient there (or specularly, for the unmodulated arm). The beam is
-unpolarized (the path refuses polarizers), so of what an LCoS reflects, half
-lies along its director and is modulated and half is not [26]; the two never
-interfere, and the half the chain does not follow is booked as
-`other_family`. The field keeps
+phase gradient there (or specularly, for the unmodulated arm). Of the field
+an LCoS meets, the component along its director is modulated and the one
+across it is not [20]: the chain carries two components (below) and takes
+into its beam the one that beam is made of. Of the other, the device takes
+the same share (its fill and reflectance do not tell the beams apart), and
+the rest goes into the other beam, booked as `other_family`. Where both beams
+reach the detector, each is a chain of its own; they meet orthogonally
+polarized and add in power, and the ledger books each beam's share once. The
+field keeps
 every diffraction order that falls inside its window; orders outside are
 booked as `beyond_nyquist` or `left_window`. It does not steer onto a chosen
 order: an iris on a Lee hologram's −1 order, off the chief ray, would block
@@ -364,18 +368,33 @@ splitters. A flat coated surface multiplies each plane wave by its coating's
 complex reflection or transmission, from `oc_core::thinfilm`'s transfer
 matrix put into that chart (its ray-frame `r_p` negated, its transmission
 scaled into power coordinates). A body that is not such a plate is still
-traced face by face, with the tracer's unpolarized transmittance.
+traced face by face, both polarization components taking the tracer's
+unpolarized transmittance.
 
-**Two polarizations.** The field is scalar. Where an element tells s from p
-obliquely (a plate, a coating), the chain carries one of two modes, s or p of
-the plane of incidence those elements share, and an unpolarized source is the
-two modes, mutually incoherent, half its power each, added in power like
-spectral lines [22]. Every plane wave takes its own angle's amplitude for that
-mode; that the plane waves off the plane of incidence see s and p slightly
-rotated is left out, and the report names it. Elements whose planes of
-incidence differ mix s and p, which needs Jones fields: refused by name. An
-LCoS met by an s or p field splits it on its director as `cos²` and `sin²` of
-its angle to it.
+**Two polarization components.** A chain that meets an element telling
+polarizations apart (a polarizer, a retarder, an LCoS, or a flat coating or a
+plate met obliquely) carries two fields, the components along its beam
+frame's `x` and `y`: a Jones vector at every sample [26]. At each element the
+pair is turned into that element's own s and p (`ŝ` normal to its plane of
+incidence, `p̂ = ŝ × d` on either side, turned with the beam so that its part
+along the surface is kept, the chart the amplitudes are written in), each
+component carried through the element as a field of that polarization alone,
+and the pair turned into the outgoing beam's frame. Square to the beam, the
+element's s and p are the beam's own axes. A polarizer or a retarder then
+applies its Jones matrix there, as the ray tracer applies it to a ray along
+the chief ray: the element's front face, its layer on its own axis (its local
+`+X` turned `axis_deg` towards `+Y`, projected across the direction inside
+its glass, so that crossed polarizers leak off axis), its back face; one
+matrix for the whole field, which the report names. An unpolarized source is
+two launches, along `x` and along `y`, mutually incoherent and half its power
+each, added in power like spectral lines [22], whatever the basis: the sum is
+the same in any. Elements in different planes of incidence are so carried
+through in turn, the s of one becoming a mix of the next one's s and p. Every
+plane wave of a planar step takes its own angle's amplitude for its
+polarization; that the plane waves off the plane of incidence see s and p
+slightly rotated is left out, and the report names it. A chain whose elements
+cannot tell polarizations apart carries one field standing for unpolarized
+light.
 
 **Interferometers: arms that meet.** Where splitter arms recombine on the
 detector, the axial ray reaches it by several chains. Each carries the same
@@ -409,8 +428,11 @@ chain did not:
 Each arm's field is weighted on the face by the root of its obliquity, so that
 one arm alone reads as it would by itself. Two arms crossing at an angle make
 fringes of period `λ/|t₁ − t₂|`, `t` the directions' components along the face;
-a period under two of the readout's points is flagged `Undersampled`. The
-field is scalar, so the arms' polarizations are taken as the same and the
+a period under two of the readout's points is flagged `Undersampled`. Arms of
+two components are added component by component, so orthogonally polarized
+arms do not interfere [27]: a half-wave plate in one arm of a Mach–Zehnder
+takes its fringes away, and an analyzer behind it brings them back. Where the
+chains carry one field, the arms' polarizations are taken as the same and the
 fringes' visibility is an upper bound (named in the report). An arm read out
 at a tilt goes through the tilted-plane spectrum, whose reading between
 spectral samples is its approximation (5.9e-4 in its own test).
@@ -422,12 +444,9 @@ power, and the lines add in power. So two lines' fringes wash out where they
 fall in antiphase, which the two-line test holds. The field shown is the
 strongest line's.
 
-**Refused, by name:** polarizers and retarders (the field is scalar), a
-measured table (it gives R and T without their phases), elements whose planes
-of incidence differ (s and p mix), any response with no wave model, an
-aperture inside a face's slab or a plate, an LCoS whose two polarization beams
-both reach the detector (they add in power, and a scalar field carries one), a
-continuous spectrum (give the source lines: a sampling of it is the source's
+**Refused, by name:** a measured table (it gives R and T without their
+phases), any response with no wave model, an aperture inside a face's slab or
+a plate, a continuous spectrum (give the source lines: a sampling of it is the source's
 to choose), and more than 16 lines. A refusal
 is an error naming what was refused; nothing is skipped and nothing is run at
 a wavelength the source did not ask for.
@@ -487,19 +506,24 @@ These are acceptance case C53, in `crates/oc-wave/tests/path.rs`.
 | `a_fold_mirror_smaller_than_the_beam_reflects_only_what_meets_it` | a 0.6 mm disc at 45° in a 1 mm Gaussian [13]: the power off its projected ellipse, by quadrature, passes beside it | 1e-4 | 1.5e-5 |
 | `a_thin_lens_smaller_than_the_beam_lets_the_rest_pass_beside_it` | 10 µm behind a 0.5 mm thin lens: the lens's phase inside, free space's field outside, away from the edge | 2e-3 | 1.0e-3 inside; 3.0e-5 outside |
 | `a_lens_rim_smaller_than_the_beam_stops_and_diffracts_as_an_iris_against_it` | a 1 mm iris 1.5 µm before a lens too large to clip; the lens rim itself, with exact cover | power 3e-4; spot 2e-3 of peak | 1.1e-4 (the back face's rim stops 9e-4 of what reaches it, which is real); 3.5e-4 |
-| `an_lcos_on_the_path_sends_half_of_unpolarized_light_into_each_beam` | half of what the device meets in the unmodulated beam [26]; `sinc²(1/16)` of the modulated half in the first order [31] | 2e-3; 3e-3 | 5.9e-7; −2.0e-3 |
+| `an_lcos_on_the_path_sends_half_of_unpolarized_light_into_each_beam` | half of what the device meets in the unmodulated beam [20]; `sinc²(1/16)` of the modulated half in the first order [21] | 2e-3; 3e-3 | −5.9e-7; −2.0e-3 |
 | `a_glass_plate_delays_the_beam_by_its_optical_path` | `k₀(n − 1)t` less the Gouy change of the effective length [13] | 1e-4 rad | 8.9e-9 rad (face by face, 2.6e-6) |
 | `a_mach_zehnder_sends_all_the_power_out_of_its_two_ports_whatever_the_path_difference` | a lossless network is unitary: the two ports carry the input between them, `(1 ∓ cos Δφ)/2` each, at Δφ = 0, π/2, π, 3π/2 [23], [24] | sum 1e-3; share 2e-3 | sum 1.000; share within 1e-7 |
 | `a_michelson_with_a_tilted_mirror_makes_fringes_of_period_lambda_over_sin_2_alpha` | two arms crossing at 2α make fringes `λ/sin 2α` apart [1]; read from the power's spectrum across the face | 2e-3 | −7.1e-5 (the beams' curvature accounts for −3.5e-5) |
 | `moving_a_michelson_mirror_by_d_shifts_its_fringes_by_two_k_d` | four steps of λ/8 are four of π/2: `P₀ + P₂ = P₁ + P₃`; visibility 1; equal arms dark [1] | 1e-3; 0.995 | 2.8e-7; 1.000 |
 | `two_lines_wash_a_michelson_s_fringes_out_where_their_beats_cancel` | two incoherent lines [22]: visibility `\|cos(2πΔ(1/λ₁ − 1/λ₂))\|`, 1 at equal arms, 0 where the beats cancel | 0.99; 2e-2 | 0.9996; 1.6e-3 |
 | `a_continuous_source_is_refused_and_lines_add_in_power` | the lines' own runs, weighted; a continuum refused by name | 1e-12 | 1.8e-15 |
-| `an_lcos_whose_two_polarization_beams_both_reach_the_detector_is_refused_by_name` | orthogonal polarizations do not interfere [20] | refused | refused |
+| `an_lcos_whose_two_polarization_beams_both_reach_the_detector_adds_them_in_power` | the two beams are orthogonally polarized [20] and add in power [27]: the detector reads the same whatever uniform phase the device puts on one; the device meets `erf(√2a/w)²` [13] | 1e-9; 1e-3 | 0 (identical); −2.7e-4 |
 | `a_thin_plate_is_an_etalon_transparent_at_seven_pi_and_dimmest_at_seven_and_a_half` | the closed-form slab at δ = 7π (`T = 1`, `t = (−1)⁷`) and 7.5π (`(1 − r²)²/(1 + r²)²`) [16] | 1e-6 | 6e-14 and 4e-14; the field 3.3e-7 from −e^{−ik₀L} |
 | `an_oblique_etalon_transmits_s_and_p_as_their_own_closed_forms` | at 31°, δ = 7.5π: unpolarized light transmits `(T_s + T_p)/2` [16], [22] | 1e-5 | 1.3e-7 |
 | `a_millimetre_plate_s_transmission_follows_its_round_trip_phase` | the closed form at δ = k₀nL ≈ 15 000 rad [16] | 1e-4 | −2.3e-5 (the beam's own angular spread, its plane waves' δ 5e-4 rad apart) |
 | `a_coated_surface_reflects_and_transmits_as_its_single_layer_s_closed_form` | a quarter-wave MgF₂ layer on crown glass, by the single-layer formula computed apart from the transfer matrix [16]: `(R_s + R_p)/2` at 45°, `(1 − R_f)(1 − R_b)` through the plate | 1e-6 | 1.6e-8; 3.1e-11 |
-| `coatings_whose_planes_of_incidence_differ_are_refused_by_name` | s of one plane is s and p of another | refused | refused |
+| `coatings_whose_planes_of_incidence_differ_reflect_s_of_one_as_p_of_the_other` | two 45° folds in crossed planes: `(R₁ₛR₂ₚ + R₁ₚR₂ₛ)/2`, each `R` by the single-layer formula [16], [26]; a shared plane's `(R₁ₛR₂ₛ + R₁ₚR₂ₚ)/2` is 12% away | 1e-5, relative | −1.1e-6 |
+| `two_polarizers_pass_unpolarized_light_as_malus_s_law_says` | Malus [27]: `cos²θ/2` at 0°, 30°, 60°, 90°; crossed sheets of extinction ε pass ε [26] | 1e-9; 1e-6, relative | 1.0e-14; 2.0e-14 |
+| `a_retarder_between_crossed_polarizers_passes_half_sin2_2phi_sin2_half_delta` | `sin²2φ·sin²(δ/2)/2` [26], [27] at five (φ, δ); circular light from a quarter-wave plate at 45°, `1/4` through any analyzer | 1e-9 | 9.6e-15; 4.8e-15 |
+| `tilted_crossed_polarizers_leak_as_the_ray_tracer_says` | crossed at ±45° to the plane of incidence, met at 40°: the f64 tracer's polarized trace of the chief ray, bare and in glass of 1.5 (one model, two implementations); bare, `(sin²θ/(1 + cos²θ))²/2` from the axes' projection | 1e-6; 1e-9 | 1.8e-14 and 3.5e-14; 1.9e-14 |
+| `a_half_wave_plate_in_one_arm_of_a_mach_zehnder_takes_its_fringes_away_and_a_polarizer_brings_them_back` | Fresnel–Arago [27]: half the launched in the X port at every Δφ; behind an analyzer at β, `1/4 − cos Δφ·cos 2(θ − β)/4` [26], θ = 20°, β = 20°, 50°, 65° | 1e-6 | 4.9e-8 |
+| `crossed_polarizers_before_a_lens_leave_it_a_dark_field_to_carry` | the chain is geometry: behind crossed polarizers a singlet carries an all-zero field, the ledger closed | 1e-12 | detected 1.7e-33 |
 | `a_pinhole_at_a_lens_s_focus_passes_what_the_focused_gaussian_puts_through_it` | a waist on a lens of focal length f has radius λf/(πw₀) at the focal plane (bundle M30, [13]): a pinhole of that radius stops `exp(−2)` | 1e-5 | 5.7e-7 |
 | `a_ten_times_beam_expander_widens_the_beam_as_the_abcd_law_says` | the radius at the second lens by the Gaussian ABCD law [13], through a 50 µm focus | 1e-5 | 3.9e-7 |
 
@@ -661,8 +685,9 @@ The coating fixtures keep their own pin, `optiland==0.6.1`
 
 ## What it does not do
 
-- **Scalar only.** No vector diffraction, no polarization in the field, no
-  high-NA focusing. Scalar theory's error exceeds ±5% for features below about
+- **Scalar diffraction.** No vector diffraction and no high-NA focusing: the
+  field's two polarization components diffract each as a scalar field, and
+  the longitudinal component is not carried. Scalar theory's error exceeds ±5% for features below about
   14 wavelengths [11].
 - **Oblique elements by projection.** A lens, an aperture or a modulator seen
   obliquely is handed over by projecting the field along the rays
@@ -674,9 +699,10 @@ The coating fixtures keep their own pin, `optiland==0.6.1`
   diffraction order is W7. Arms that recombine are added once: a cavity's
   round trips are summed only inside a plane-parallel plate, where they are
   in closed form; a cavity of two separate mirrors is not followed round.
-- **Two polarizations, one at a time.** A chain carries s or p of one plane
-  of incidence; elements whose planes differ are refused, and a lens's faces
-  take the tracer's unpolarized transmittance.
+- **One Jones matrix per element.** A polarizer, a retarder or an LCoS's
+  director acts on the whole field as on its chief ray, a coating or a plate
+  on each plane wave as in the chief ray's plane of incidence, and a lens's
+  faces give both components the tracer's unpolarized transmittance.
 - **No measured datasets.** Every reference above is a closed-form result or
   another implementation of the same integral. The DMD page compares with
   published device numbers, and says which are simulations.
@@ -733,5 +759,7 @@ entry says so.
 23. G. G. Stokes, "On the perfect blackness of the central spot in Newton's rings, and on the verification of Fresnel's formulae for the intensities of reflected and refracted rays," *Cambridge and Dublin Mathematical Journal* 4, 1–14 (1849). (The Stokes relations: `r' = −r`, `tt' = 1 − r²`.)
 24. A. Zeilinger, "General properties of lossless beam splitters in interferometry," *Am. J. Phys.* 49(9), 882–883 (1981), doi:10.1119/1.12387. (A lossless splitter is a unitary two-port. DOI to confirm.)
 25. A. E. Siegman, "New developments in laser resonators," *Proc. SPIE* 1224, 2–14 (1990). (The second-moment beam width and its quadratic law in z, for any beam. DOI to confirm.)
+26. R. C. Jones, "A new calculus for the treatment of optical systems. I. Description and discussion of the calculus," *J. Opt. Soc. Am.* 31(7), 488–493 (1941), doi:10.1364/JOSA.31.000488. (A polarizer and a retarder as 2×2 matrices on the field's two components.)
+27. E. Hecht, *Optics*, 5th ed., Pearson (2017), ch. 8 (polarization): Malus's law; a retarder between crossed polarizers; the Fresnel–Arago laws. (Section numbers to confirm against the edition.)
 
 The FFT is `rustfft` 6.4.1 (MIT OR Apache-2.0).

@@ -19,17 +19,25 @@
 //! point is then the field at the entry point whose ray lands there,
 //!
 //! ```text
-//! U_out(x') = U_in(x) · √(T / |∂x'/∂x|) · exp(ik₀ (OPL(x) − OPL_chief)),
+//! U_out(x') = U_in(x) · √(T / |∂x'/∂x|) · exp(ik₀ OPL(x)),
 //! ```
 //!
-//! so power is conserved ray tube by ray tube, less what the faces reflect.
+//! so power is conserved ray tube by ray tube, less what the faces reflect,
+//! and the field keeps its phase on the same clock as free space (the samples
+//! carry the whole phase, `OPL` from the entry plane included).
 //!
 //! The map `x → x'` and the path are represented as a fitted affine map and
 //! quadratic plus the residuals on the ray grid, interpolated bilinearly. A
 //! lens's path is nearly quadratic and its map nearly affine, so the residuals
 //! are small and smooth. Light whose ray misses the element's faces, or does
-//! anything the chief ray did not, is taken as stopped by the mount and
-//! booked as absorbed; so is a ray-grid cell on the rim.
+//! anything the chief ray did not, is taken as stopped by the mount. Where
+//! that region's edge, the rim, is star-shaped about the chief ray, it is
+//! found by bisection on traced rays and laid on the arriving field as a
+//! polygon with exact cell coverage, so the rim diffracts at the field's own
+//! sampling rather than the ray grid's; the map is carried a couple of rays
+//! past it, where the field is already zero, so no ray-grid cell is lost at
+//! the edge. Otherwise the rim is resolved to the ray grid, and the report
+//! says so.
 //!
 //! The rays are traced along the arriving field's own wavefront: a sphere and
 //! a tilt fitted to its phase gradient, weighted by its intensity, so a beam
@@ -57,6 +65,13 @@ pub(crate) struct TransferStats {
     /// faces (the scalar, unpolarized transmittance).
     pub stopped: f64,
     pub reflected: f64,
+    /// Stopped by the rim laid on the arriving field, and diffracted by its
+    /// edge beyond the grid's band; whether the rim was resolved that way.
+    pub rim_stopped: f64,
+    pub rim_beyond: f64,
+    pub rim_resolved: bool,
+    /// The arriving power, after the rim, that the map carries on.
+    pub carried: f64,
     /// Power whose rays land outside the exit window.
     pub left_window: f64,
     /// The largest move across the beam between entry and exit, mm.
@@ -375,6 +390,80 @@ fn smooth_phase(k: f64, s: [f64; 3], a: f64, b: f64) -> f64 {
     k * (s[1] * a + s[2] * b + 0.5 * s[0] * (a * a + b * b))
 }
 
+/// The edge of the region of the entry plane whose rays pass the element, as
+/// a polygon of 720 vertices about the chief ray: along each azimuth, the
+/// first ray of the grid that fails brackets the edge, which bisection on
+/// traced rays then finds to a millionth of the ray spacing. `None` when the
+/// region is not star-shaped about the chief ray (a ray passes again beyond
+/// the edge), or the bracket does not hold.
+fn rim_polygon(trace: &dyn Fn(f64, f64) -> Option<RayOut>, grid: &[Option<RayOut>], g: usize, h: f64) -> Option<Vec<[f64; 2]>> {
+    let half = (g - 1) as f64 / 2.0;
+    let r_max = half * h * std::f64::consts::SQRT_2;
+    let on_grid = |a: f64, b: f64| -> Option<bool> {
+        let (i, j) = ((a / h + half).round(), (b / h + half).round());
+        if i < 0.0 || j < 0.0 || i > (g - 1) as f64 || j > (g - 1) as f64 {
+            return None;
+        }
+        Some(grid[j as usize * g + i as usize].is_some())
+    };
+    const M: usize = 720;
+    let mut poly = Vec::with_capacity(M);
+    for k in 0..M {
+        let th = 2.0 * std::f64::consts::PI * k as f64 / M as f64;
+        let (c, s) = (th.cos(), th.sin());
+        let mut r_fail = None;
+        let mut r = 0.0;
+        while r <= r_max {
+            match on_grid(r * c, r * s) {
+                None => break,
+                Some(true) => {}
+                Some(false) => {
+                    r_fail = Some(r);
+                    break;
+                }
+            }
+            r += 0.5 * h;
+        }
+        let Some(rf) = r_fail else {
+            // Rays pass out to the window's edge along this azimuth.
+            poly.push([2.0 * r_max * c, 2.0 * r_max * s]);
+            continue;
+        };
+        let mut q = rf;
+        while q <= r_max {
+            if on_grid(q * c, q * s) == Some(true) {
+                return None;
+            }
+            q += 0.5 * h;
+        }
+        let mut lo = (rf - 1.5 * h).max(0.0);
+        while lo > 0.0 && trace(lo * c, lo * s).is_none() {
+            lo = (lo - h).max(0.0);
+        }
+        trace(lo * c, lo * s)?;
+        let mut hi = rf + 0.5 * h;
+        let mut tries = 0;
+        while trace(hi * c, hi * s).is_some() {
+            hi += h;
+            tries += 1;
+            if tries > 4 {
+                return None;
+            }
+        }
+        while hi - lo > 1e-6 * h {
+            let mid = 0.5 * (lo + hi);
+            if trace(mid * c, mid * s).is_some() {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        let re = 0.5 * (lo + hi);
+        poly.push([re * c, re * s]);
+    }
+    Some(poly)
+}
+
 /// Carry `u` (across `inc`, at the entry plane) through the element `probe`
 /// holds, to the exit plane across `out`, in a medium of index `n_out`, with
 /// `rays` rays across the field's window.
@@ -428,6 +517,14 @@ pub(crate) fn transfer(
     if passed < 9 {
         return Err(WaveError::OutOfRange("fewer than nine rays pass the element".into()));
     }
+    // The rim at the field's own sampling, laid on the arriving field.
+    let rim = if passed < g * g { rim_polygon(&trace, &grid, g, h) } else { None };
+    let mut um = u.clone();
+    let (rim_stopped, rim_beyond) = match &rim {
+        Some(poly) => crate::elements::apply_coverage(&mut um, &crate::elements::polygon_coverage(&u.grid, poly))?,
+        None => (0.0, 0.0),
+    };
+    let u = &um;
     // Fit the map and the path on coordinates scaled to the window.
     let s = 0.5 * w;
     let mut rows_x = Vec::with_capacity(passed);
@@ -459,6 +556,48 @@ pub(crate) fn transfer(
                 map.ry[k] = r.y - fy;
                 map.rp[k] = (r.opl - chief.opl) - map.fit_p(a, b);
                 walk = walk.max(((r.x - a).powi(2) + (r.y - b).powi(2)).sqrt());
+            }
+        }
+    }
+    // Past a resolved rim, the map carried two rays on: each failed ray next
+    // to a passing one takes its neighbours' mean residuals and transmittance.
+    if rim.is_some() {
+        for _ in 0..2 {
+            let live: Vec<bool> = map.rays.iter().map(|r| r.is_some()).collect();
+            for j in 0..g {
+                for i in 0..g {
+                    let k = j * g + i;
+                    if live[k] {
+                        continue;
+                    }
+                    let (mut n, mut sx, mut sy, mut sp, mut st) = (0.0, 0.0, 0.0, 0.0, 0.0);
+                    for dj in -1i64..=1 {
+                        for di in -1i64..=1 {
+                            let (ii, jj) = (i as i64 + di, j as i64 + dj);
+                            if ii < 0 || jj < 0 || ii >= g as i64 || jj >= g as i64 {
+                                continue;
+                            }
+                            let kk = jj as usize * g + ii as usize;
+                            if let (true, Some(r)) = (live[kk], map.rays[kk]) {
+                                n += 1.0;
+                                sx += map.rx[kk];
+                                sy += map.ry[kk];
+                                sp += map.rp[kk];
+                                st += r.t;
+                            }
+                        }
+                    }
+                    if n > 0.0 {
+                        let (a, b) = ((i as f64 - half) * h, (j as f64 - half) * h);
+                        let (fx, fy) = map.fit_x(a, b);
+                        let fp = map.fit_p(a, b);
+                        let (rx, ry, rp) = (sx / n, sy / n, sp / n);
+                        map.rx[k] = rx;
+                        map.ry[k] = ry;
+                        map.rp[k] = rp;
+                        map.rays[k] = Some(RayOut { x: fx + rx, y: fy + ry, opl: chief.opl + fp + rp, t: st / n });
+                    }
+                }
             }
         }
     }
@@ -506,7 +645,7 @@ pub(crate) fn transfer(
             v.data[idx] = match map.inverse(x, y).and_then(|(a, b)| map.at(a, b).map(|r| (a, b, r))) {
                 Some((a, b, (_, _, opl, t, det))) if det.abs() > 1e-12 => {
                     paths[idx] = opl;
-                    full(a, b) * (t.clamp(0.0, 1.0) / det.abs()).sqrt() * Cx::expi(k0 * opl)
+                    full(a, b) * (t.clamp(0.0, 1.0) / det.abs()).sqrt() * Cx::expi(k0 * (chief.opl + opl))
                 }
                 _ => Cx::ZERO,
             };
@@ -537,6 +676,10 @@ pub(crate) fn transfer(
             passed,
             stopped,
             reflected,
+            rim_stopped,
+            rim_beyond,
+            rim_resolved: rim.is_some(),
+            carried: u.power(),
             left_window: left,
             walk_off_mm: walk,
             curvature: curv,

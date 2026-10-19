@@ -16,7 +16,7 @@
 //! holds, and the edge error falls as `Δx²` rather than `Δx`.
 
 use crate::report::{Method, SamplingWarning, StepReport};
-use crate::{Cx, Field2, WaveError, WaveReport};
+use crate::{Cx, Field2, Grid2, WaveError, WaveReport};
 use std::f64::consts::PI;
 
 /// A region of the plane, in the plane's local mm.
@@ -180,23 +180,171 @@ fn polygon_rect_area(v: &[[f64; 2]], x0: f64, x1: f64, y0: f64, y1: f64) -> f64 
     }
 }
 
-/// The transmittance of an aperture on `u`'s grid: each sample's covered
-/// fraction of its cell. `opaque_inside` inverts it (a stop, an obscuration).
-pub fn aperture_mask(u: &Field2, shape: &Shape, opaque_inside: bool) -> Result<Vec<f64>, WaveError> {
+/// The covered fraction of each cell of `grid` by `shape`, exactly: the closed
+/// forms above for a rectangle, a disc and an annulus, and for a polygon
+/// [`polygon_coverage`].
+pub fn coverage(grid: &Grid2, shape: &Shape) -> Result<Vec<f64>, WaveError> {
     shape.validate()?;
-    let g = u.grid;
-    let [dx, dy] = g.pitch_mm;
+    if let Shape::Polygon(v) = shape {
+        return Ok(polygon_coverage(grid, v));
+    }
+    let [dx, dy] = grid.pitch_mm;
     let cell = dx * dy;
-    let mut t = Vec::with_capacity(g.len());
-    for j in 0..g.n[1] {
-        for i in 0..g.n[0] {
-            let (x, y) = g.xy(i, j);
-            let f = (shape.cell_overlap(x - 0.5 * dx, x + 0.5 * dx, y - 0.5 * dy, y + 0.5 * dy) / cell)
-                .clamp(0.0, 1.0);
-            t.push(if opaque_inside { 1.0 - f } else { f });
+    let mut t = Vec::with_capacity(grid.len());
+    for j in 0..grid.n[1] {
+        for i in 0..grid.n[0] {
+            let (x, y) = grid.xy(i, j);
+            t.push((shape.cell_overlap(x - 0.5 * dx, x + 0.5 * dx, y - 0.5 * dy, y + 0.5 * dy) / cell).clamp(0.0, 1.0));
         }
     }
     Ok(t)
+}
+
+/// The covered fraction of each cell of `grid` by a simple polygon (convex or
+/// not, either orientation), exactly and in time that grows with the
+/// boundary rather than the area. The cells within a cell of the boundary
+/// take the polygon's area clipped to them; every other cell lies wholly on
+/// one side, which its centre's side says, found by crossing each row's
+/// centre line with the edges.
+pub fn polygon_coverage(grid: &Grid2, poly: &[[f64; 2]]) -> Vec<f64> {
+    let [nx, ny] = grid.n;
+    let [dx, dy] = grid.pitch_mm;
+    let mut f = vec![0.0; nx * ny];
+    let n = poly.len();
+    if n < 3 {
+        return f;
+    }
+    // Cell (i, j) spans [ex + i·dx, ex + (i + 1)·dx] × [ey + j·dy, ey + (j + 1)·dy].
+    let ex = grid.coord(0, 0) - 0.5 * dx;
+    let ey = grid.coord(1, 0) - 0.5 * dy;
+    // The window, two cells wider each way: an edge is walked only there.
+    let (wx0, wx1) = (ex - 2.0 * dx, ex + (nx as f64 + 2.0) * dx);
+    let (wy0, wy1) = (ey - 2.0 * dy, ey + (ny as f64 + 2.0) * dy);
+    let mut edge = vec![false; nx * ny];
+    let step = 0.25 * dx.min(dy);
+    for k in 0..n {
+        let (p, q) = (poly[k], poly[(k + 1) % n]);
+        // Liang–Barsky: the part of the edge inside the widened window.
+        let (ddx, ddy) = (q[0] - p[0], q[1] - p[1]);
+        let (mut t0, mut t1) = (0.0f64, 1.0f64);
+        let mut keep = true;
+        for (pp, qq) in [(-ddx, p[0] - wx0), (ddx, wx1 - p[0]), (-ddy, p[1] - wy0), (ddy, wy1 - p[1])] {
+            if pp == 0.0 {
+                if qq < 0.0 {
+                    keep = false;
+                }
+            } else {
+                let r = qq / pp;
+                if pp < 0.0 {
+                    t0 = t0.max(r);
+                } else {
+                    t1 = t1.min(r);
+                }
+            }
+        }
+        if !keep || t0 > t1 {
+            continue;
+        }
+        let len = (ddx * ddx + ddy * ddy).sqrt() * (t1 - t0);
+        let m = (len / step).ceil().max(1.0) as usize;
+        for s in 0..=m {
+            let t = t0 + (t1 - t0) * s as f64 / m as f64;
+            let (x, y) = (p[0] + t * ddx, p[1] + t * ddy);
+            let (ci, cj) = (((x - ex) / dx).floor() as i64, ((y - ey) / dy).floor() as i64);
+            for j in cj - 1..=cj + 1 {
+                for i in ci - 1..=ci + 1 {
+                    if i >= 0 && j >= 0 && (i as usize) < nx && (j as usize) < ny {
+                        edge[j as usize * nx + i as usize] = true;
+                    }
+                }
+            }
+        }
+    }
+    let mut xs: Vec<f64> = Vec::new();
+    for j in 0..ny {
+        let yc = ey + (j as f64 + 0.5) * dy;
+        xs.clear();
+        for k in 0..n {
+            let (a, b) = (poly[k], poly[(k + 1) % n]);
+            if (a[1] > yc) != (b[1] > yc) {
+                xs.push(a[0] + (yc - a[1]) * (b[0] - a[0]) / (b[1] - a[1]));
+            }
+        }
+        xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        for pair in xs.chunks_exact(2) {
+            // The cells whose centre ex + (i + ½)dx lies in [left, right).
+            let i0 = ((pair[0] - ex) / dx - 0.5).ceil().clamp(0.0, nx as f64) as usize;
+            let i1 = ((pair[1] - ex) / dx - 0.5).ceil().clamp(0.0, nx as f64) as usize;
+            for v in &mut f[j * nx + i0..j * nx + i1.max(i0)] {
+                *v = 1.0;
+            }
+        }
+    }
+    let cell = dx * dy;
+    for j in 0..ny {
+        for i in 0..nx {
+            if edge[j * nx + i] {
+                let (x0, y0) = (ex + i as f64 * dx, ey + j as f64 * dy);
+                f[j * nx + i] = (polygon_rect_area(poly, x0, x0 + dx, y0, y0 + dy) / cell).clamp(0.0, 1.0);
+            }
+        }
+    }
+    f
+}
+
+/// A regular polygon of `n` sides about `c` with the area of the disc of
+/// radius `r`: its circumradius is `r·√(θ / sin θ)`, `θ = 2π/n`, so its edges
+/// cross the circle and depart from it by at most about `r·(π/n)²/2`.
+pub fn disc_polygon(c: [f64; 2], r: f64, n: usize) -> Vec<[f64; 2]> {
+    let n = n.max(8);
+    let th = 2.0 * PI / n as f64;
+    let rr = r * (th / th.sin()).sqrt();
+    (0..n)
+        .map(|k| {
+            let a = k as f64 * th;
+            [c[0] + rr * a.cos(), c[1] + rr * a.sin()]
+        })
+        .collect()
+}
+
+/// Sides for a disc of radius `r` drawn as a polygon on a grid of `pitch`:
+/// enough that the polygon departs from the circle by under a five-hundredth
+/// of a sample, at most 1024.
+pub fn disc_sides(r: f64, pitch: f64) -> usize {
+    let tol = 2e-3 * pitch;
+    ((PI * (r.abs() / (2.0 * tol)).sqrt()).ceil() as usize).clamp(64, 1024)
+}
+
+/// The transmittance of an aperture on `u`'s grid: each sample's covered
+/// fraction of its cell. `opaque_inside` inverts it (a stop, an obscuration).
+pub fn aperture_mask(u: &Field2, shape: &Shape, opaque_inside: bool) -> Result<Vec<f64>, WaveError> {
+    let mut t = coverage(&u.grid, shape)?;
+    if opaque_inside {
+        for v in &mut t {
+            *v = 1.0 - *v;
+        }
+    }
+    Ok(t)
+}
+
+/// Multiply `u` by the covered fractions `t`, one per sample, and book what
+/// that does. A cell passing a fraction `t` of its area transmits `t·|U|²ΔA`;
+/// the opaque rest, `(1 − t)·|U|²ΔA`, is returned as the first number. The
+/// sample `t·U` carries only `t²·|U|²ΔA`: the edge diffracted the
+/// difference, the second number, beyond the grid's Nyquist band.
+pub fn apply_coverage(u: &mut Field2, t: &[f64]) -> Result<(f64, f64), WaveError> {
+    if t.len() != u.data.len() {
+        return Err(WaveError::Mismatch("mask and field differ in size".into()));
+    }
+    let da = u.grid.cell_area_mm2();
+    let (mut stopped, mut beyond) = (0.0, 0.0);
+    for (z, ti) in u.data.iter_mut().zip(t) {
+        let i = z.norm_sqr() * da;
+        stopped += (1.0 - ti) * i;
+        beyond += (ti - ti * ti) * i;
+        *z *= *ti;
+    }
+    Ok((stopped, beyond))
 }
 
 /// Pass `u` through an aperture. The power the opaque part stops is booked as
@@ -208,18 +356,8 @@ pub fn apply_aperture(
     report: &mut WaveReport,
 ) -> Result<(), WaveError> {
     let t = aperture_mask(u, shape, opaque_inside)?;
-    // A cell passing a fraction t of its area transmits t·|U|²ΔA; the opaque
-    // rest, (1 − t)·|U|²ΔA, is absorbed. The sample t·U carries only t²·|U|²ΔA:
-    // the edge diffracted the difference beyond the grid's Nyquist band.
-    let da = u.grid.cell_area_mm2();
     let before = u.power();
-    let (mut absorbed, mut beyond) = (0.0, 0.0);
-    for (z, ti) in u.data.iter_mut().zip(&t) {
-        let i = z.norm_sqr() * da;
-        absorbed += (1.0 - ti) * i;
-        beyond += (ti - ti * ti) * i;
-        *z *= *ti;
-    }
+    let (absorbed, beyond) = apply_coverage(u, &t)?;
     report.ledger.absorbed_aperture += absorbed;
     report.ledger.beyond_nyquist += beyond;
     close_element(report, before, u.power());
@@ -368,6 +506,50 @@ mod tests {
         }
         let brute = acc * (x1 - x0) * (y1 - y0) / (n * n) as f64;
         assert!((disc_rect_area(r, x0, x1, y0, y1) - brute).abs() < 2e-6);
+    }
+
+    #[test]
+    fn polygon_coverage_is_the_clipped_area_on_every_cell() {
+        // The scanline fill and the band of clipped cells must give, cell by
+        // cell, what clipping the polygon to that cell gives.
+        let g = Grid2::new([41, 30], [0.1, 0.13], [0.2, -0.1]).unwrap();
+        let polys = [
+            // A concave L, wholly inside.
+            vec![[-1.0, -1.0], [1.5, -1.0], [1.5, 0.2], [0.1, 0.2], [0.1, 1.4], [-1.0, 1.4]],
+            // A triangle reaching far outside the window.
+            vec![[-30.0, -0.7], [3.1, -0.2], [0.4, 40.0]],
+            // A square enclosing the window: every cell covered.
+            vec![[-50.0, -50.0], [50.0, -50.0], [50.0, 50.0], [-50.0, 50.0]],
+            // A many-sided disc, clockwise.
+            disc_polygon([0.31, -0.07], 1.13, 300).into_iter().rev().collect(),
+        ];
+        let [dx, dy] = g.pitch_mm;
+        for poly in &polys {
+            let f = polygon_coverage(&g, poly);
+            let mut worst: f64 = 0.0;
+            for j in 0..g.n[1] {
+                for i in 0..g.n[0] {
+                    let (x, y) = g.xy(i, j);
+                    let want = (polygon_rect_area(poly, x - 0.5 * dx, x + 0.5 * dx, y - 0.5 * dy, y + 0.5 * dy) / (dx * dy)).clamp(0.0, 1.0);
+                    worst = worst.max((f[g.idx(i, j)] - want).abs());
+                }
+            }
+            assert!(worst < 1e-12, "{worst} for {poly:?}");
+        }
+    }
+
+    #[test]
+    fn a_disc_polygon_has_the_disc_s_area_and_hugs_its_circle() {
+        let (r, n) = (1.7, 128);
+        let p = disc_polygon([0.4, -0.2], r, n);
+        assert!((shoelace(&p).abs() - PI * r * r).abs() < 1e-12 * PI * r * r);
+        // Its edges depart from the circle by at most about r·(π/n)²/2.
+        let mid = |a: [f64; 2], b: [f64; 2]| (((a[0] + b[0]) / 2.0 - 0.4).hypot((a[1] + b[1]) / 2.0 + 0.2) - r).abs();
+        let worst = (0..n).map(|k| mid(p[k], p[(k + 1) % n])).fold(0.0, f64::max);
+        assert!(worst < r * (PI / n as f64).powi(2) / 2.0, "{worst}");
+        // Enough sides for a five-hundredth of a sample.
+        let sides = disc_sides(0.5, 0.003);
+        assert!(0.5 * (PI / sides as f64).powi(2) / 2.0 <= 2e-3 * 0.003 * (1.0 + 1e-9), "{sides}");
     }
 
     #[test]

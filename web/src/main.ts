@@ -910,7 +910,7 @@ async function main() {
       + (flags ? ` · ${flags} flag${flags > 1 ? "s" : ""}` : "");
     const named = (x: unknown) => (typeof x === "string" ? x : Object.keys(x as object)[0] ?? String(x));
     dockNums.title = [
-      `ledger: detected ${pct(l.detected)}, aperture ${pct(l.absorbed_aperture)}, element ${pct(l.absorbed_element)}, band limit ${pct(l.band_limit_removed)}, beyond Nyquist ${pct(l.beyond_nyquist)}, left the window ${pct(l.left_window)}, other family ${pct(l.other_family)}, numerical ${pct(l.numerical)}`,
+      `ledger: detected ${pct(l.detected)}, aperture ${pct(l.absorbed_aperture)}, element ${pct(l.absorbed_element)}, band limit ${pct(l.band_limit_removed)}, beyond Nyquist ${pct(l.beyond_nyquist)}, left the window ${pct(l.left_window)}, other family ${pct(l.other_family)}, other orders ${pct(l.untracked_orders ?? 0)}, other arm ${pct(l.other_arm ?? 0)}, passed beside ${pct(l.passed_by ?? 0)}, resampling ${pct(l.resampling ?? 0)}, numerical ${pct(l.numerical)}`,
       ...r.report.warnings.map((x) => `warning: ${named(x)}`),
       ...r.report.validity.map((x) => `validity: ${named(x)}`),
       ...r.report.approximated.map((x) => `approximated: ${x}`),

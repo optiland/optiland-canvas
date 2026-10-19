@@ -259,7 +259,8 @@ fn a_dmd_in_the_scene_focuses_its_orders_f_lambda_over_p_apart() {
     }
     let f = 15.0;
     // The lens sits 5 mm along the outgoing ray, small enough (1 mm) that the
-    // incoming chief ray passes beside it; the wave path applies no lens rim.
+    // incoming chief ray passes beside it; its rim clips only the outgoing
+    // beam's far tail.
     let lens_pos = dmd_pos + n_dev * 5.0;
     let lens_tilt = n_dev.y.atan2(n_dev.x).to_degrees();
     s.add_planar_element(lens_pos, 1.0, lens_tilt, lens(f), lens(f));
@@ -511,10 +512,15 @@ fn a_gaussian_through_a_singlet_waists_where_self_predicts() {
     measured("singlet: simulated waist radius vs Self's, relative", (w_min - w2) / w2);
     assert!((dz / s2).abs() < 1e-3, "waist {dz} mm from Self's s'' = {s2}");
     assert!(((w_min - w2) / w2).abs() < 1e-3, "{w_min} vs {w2}");
-    // The ledger closes, the faces' reflection booked.
+    // The faces' reflection booked as light the chain does not follow, not
+    // absorbed; the traced maps' resampling measured, and nothing left over.
     let l = rep.ledger;
-    assert!(l.absorbed_element > 0.07 && l.absorbed_element < 0.10, "two N-BK7 faces reflect about 8%: {l:?}");
-    assert!(l.numerical.abs() < 1e-3 * l.launched, "{l:?}");
+    measured("singlet: power reflected by the faces", l.other_arm);
+    measured("singlet: resampling across the two faces, of the launched power", l.resampling / l.launched);
+    assert!(l.other_arm > 0.07 && l.other_arm < 0.10, "two N-BK7 faces reflect about 8%: {l:?}");
+    assert_eq!(l.absorbed_element, 0.0, "{l:?}");
+    assert!(l.resampling.abs() < 1e-5 * l.launched, "{l:?}");
+    assert!(l.numerical.abs() < 1e-10 * l.launched, "{l:?}");
 }
 
 #[test]
@@ -732,4 +738,242 @@ fn a_tilted_detector_reads_the_beam_on_its_own_plane() {
     measured("tilted detector: power caught against Kogelnik–Li's on the face, relative", (caught - on_face) / on_face);
     assert!(worst / peak < 2e-3, "{}", worst / peak);
     assert!(((caught - on_face) / on_face).abs() < 2e-3, "{caught} vs {on_face}");
+}
+
+#[test]
+fn an_aperture_whose_outer_extent_the_beam_passes_beyond_leaves_it_alone() {
+    // As the tracer has an aperture: light inside the opening passes, light
+    // between the opening and the outer extent is stopped, light beyond the
+    // outer extent passes. A small aperture whose plane the beam crosses 5 mm
+    // from its centre, outside its 2 mm outer extent, must leave the field
+    // exactly as free space does.
+    // The reference is an opening the beam passes through at the same plane,
+    // so that both take the same propagation steps.
+    let run = |beyond: bool| {
+        let mut s = Scene3::new();
+        let src = source(&mut s);
+        if beyond {
+            s.add_aperture(Vec3::new(50.0, 0.0, 5.0), 0.2, 0.0);
+            s.apertures.last_mut().unwrap().shape.outer_extent = Some(oc_core::scene3::PlanarShape2::Disc { radius_mm: 2.0 });
+        } else {
+            s.add_aperture(Vec3::new(50.0, 0.0, 0.0), 10.0, 0.0);
+        }
+        let det = s.add_area_detector(Vec3::new(100.0, 0.0, 0.0), -Vec3::X, 1.0, 1.0, [32, 32]);
+        s.validate().unwrap();
+        wave_path(&s, &spec(src, det, 0.2, 256, 2.048), 1).unwrap()
+    };
+    let (free, past) = (run(false), run(true));
+    assert!(past.report.steps.iter().any(|st| st.note.contains("clear of the beam")), "{:?}", past.report.steps);
+    assert_eq!(past.report.ledger.absorbed_aperture, 0.0);
+    assert_eq!(past.power, free.power, "the field is the one through the open aperture, bit for bit");
+}
+
+/// `∫∫` over the ellipse `(y/a)² + (z/b)² ≤ 1` of `f(y, z)`, by the midpoint
+/// rule in elliptic polar coordinates.
+fn over_ellipse(a: f64, b: f64, f: impl Fn(f64, f64) -> f64) -> f64 {
+    let (nr, nt) = (800, 1600);
+    let mut acc = 0.0;
+    for i in 0..nr {
+        let rho = (i as f64 + 0.5) / nr as f64;
+        for k in 0..nt {
+            let t = 2.0 * std::f64::consts::PI * (k as f64 + 0.5) / nt as f64;
+            acc += f(a * rho * t.cos(), b * rho * t.sin()) * rho;
+        }
+    }
+    acc * a * b * 2.0 * std::f64::consts::PI / (nr * nt) as f64
+}
+
+#[test]
+fn a_fold_mirror_smaller_than_the_beam_reflects_only_what_meets_it() {
+    // A 45° mirror, a disc of radius 0.6 mm, in a Gaussian of 1 mm radius
+    // [13]: it reflects the power over its outline seen along the beam, an
+    // ellipse of semi-axes 0.6 cos 45° and 0.6 mm; the rest passes beside it,
+    // off the chain.
+    let (w0, r_m) = (1.0, 0.6);
+    let mut s = Scene3::new();
+    let src = source(&mut s);
+    let m = SurfaceResponse::Mirror { reflectivity: oc_core::scene3::SpectralScalar::Constant(1.0) };
+    s.add_planar_element(Vec3::new(50.0, 0.0, 0.0), r_m, 135.0, m.clone(), m);
+    let det = s.add_area_detector(Vec3::new(50.0, 60.0, 0.0), -Vec3::Y, 3.0, 3.0, [64, 64]);
+    s.validate().unwrap();
+    let r = wave_path(&s, &spec(src, det, w0, 512, 6.0), 1).unwrap();
+    let w = w0 * (1.0 + (50.0 / rayleigh_range_mm(w0, LAM, 1.0)).powi(2)).sqrt();
+    let irr = |y: f64, z: f64| 2.0 / (std::f64::consts::PI * w * w) * (-2.0 * (y * y + z * z) / (w * w)).exp();
+    let on_mirror = over_ellipse(r_m * std::f64::consts::FRAC_1_SQRT_2, r_m, irr);
+    let l = r.report.ledger;
+    measured("small fold mirror: power passed beside it, against the Gaussian off its outline", l.passed_by / l.launched - (1.0 - on_mirror));
+    assert!((l.passed_by / l.launched - (1.0 - on_mirror)).abs() < 1e-4, "{} vs {}: {l:?}", l.passed_by, 1.0 - on_mirror);
+    assert!(l.beyond_nyquist > 0.0 && l.beyond_nyquist < 1e-2 * on_mirror, "{l:?}");
+    assert!(l.numerical.abs() < 1e-10, "{l:?}");
+    assert!(r.report.steps.iter().any(|st| st.note.contains("off the chain")), "{:?}", r.report.steps);
+}
+
+#[test]
+fn a_thin_lens_smaller_than_the_beam_lets_the_rest_pass_beside_it() {
+    // A thin lens, a disc of radius 0.5 mm, in a Gaussian of 1 mm radius:
+    // inside its outline the field takes the lens's phase exp(−ikr²/2f),
+    // outside it passes unchanged and stays on the chain. Just behind the lens
+    // the field must be free space's times the lens's phase inside and times
+    // 1 outside, away from the edge's own diffraction.
+    let (w0, a, f) = (1.0, 0.5, 100.0);
+    let run = |with: bool| {
+        let mut s = Scene3::new();
+        let src = source(&mut s);
+        if with {
+            s.add_planar_element(Vec3::new(50.0, 0.0, 0.0), a, 0.0, lens(f), lens(f));
+        }
+        let det = s.add_area_detector(Vec3::new(50.01, 0.0, 0.0), -Vec3::X, 2.0, 2.0, [32, 32]);
+        s.validate().unwrap();
+        wave_path(&s, &spec(src, det, w0, 512, 4.0), 1).unwrap()
+    };
+    let (free, lensed) = (run(false), run(true));
+    let g = lensed.field.grid;
+    let k = 2.0 * std::f64::consts::PI / (LAM / 1000.0);
+    let (mut worst_in, mut worst_out): (f64, f64) = (0.0, 0.0);
+    for j in 0..g.n[1] {
+        for i in 0..g.n[0] {
+            let (x, y) = g.xy(i, j);
+            let rr = x.hypot(y);
+            let ratio = lensed.field.at(i, j) / free.field.at(i, j);
+            if rr < 0.45 {
+                let want = oc_wave::Cx::expi(-k * rr * rr / (2.0 * f));
+                worst_in = worst_in.max((ratio - want).abs());
+            } else if rr > 0.56 && rr < 1.8 {
+                worst_out = worst_out.max((ratio - oc_wave::Cx::ONE).abs());
+            }
+        }
+    }
+    measured("small thin lens: field inside its outline against the lens's phase, worst", worst_in);
+    measured("small thin lens: field outside its outline against free space, worst", worst_out);
+    assert!(worst_in < 2e-3 && worst_out < 2e-3, "{worst_in} {worst_out}");
+    let l = lensed.report.ledger;
+    assert_eq!(l.passed_by, 0.0, "the light beside a lens stays on the chain: {l:?}");
+    assert!(lensed.report.steps.iter().any(|st| st.note.contains("on the chain")), "{:?}", lensed.report.steps);
+}
+
+#[test]
+fn a_lens_rim_smaller_than_the_beam_stops_and_diffracts_as_an_iris_against_it() {
+    // A singlet whose clear aperture (1 mm radius) is smaller than the beam
+    // (a 2.8 mm top-hat) must act as an iris of the same radius just in front
+    // of a lens too large to clip: the same power stopped, and the same focal
+    // spot. The rim is laid on the field with exact cell coverage. Resolved
+    // only to the ray grid, four samples a ray here, it stops 3.9e-3 more of
+    // the power and moves the spot by 6.8e-2 of its peak (measured).
+    //
+    // The lens is plano-convex, curved side first, so that the beam converges
+    // inside the glass and the light the front rim's edge diffracts outward
+    // stays mostly inside the 1 mm back face; what it still stops there (9e-4
+    // of what reaches it, here 1.1e-4 of the launched power) is real, and the
+    // gate on the power allows for it.
+    use oc_core::build3::SingletGeom;
+    let lam = 0.5876;
+    let image = 46.0;
+    let run = |rim: f64, iris: Option<f64>| {
+        let mut s = Scene3::new();
+        let src = s.add_collimated_beam(Vec3::new(97.9, 0.0, 0.0), 3.0, 3.0, 1, Spectrum::Monochromatic(lam));
+        let g = SingletGeom { r1_mm: 25.0, r2_mm: f64::INFINITY, thickness_mm: 4.0, semi_aperture_mm: rim, conic1: 0.0, conic2: 0.0 };
+        s.add_singlet(Vec3::new(100.0, 0.0, 0.0), g, 1.5168, 64.17);
+        if let Some(a) = iris {
+            s.add_aperture(Vec3::new(97.9985, 0.0, 0.0), a, 0.0);
+            s.apertures.last_mut().unwrap().shape.clear_opening = oc_core::scene3::PlanarShape2::Disc { radius_mm: a };
+        }
+        let det = s.add_area_detector(Vec3::new(102.0 + image, 0.0, 0.0), -Vec3::X, 0.1, 0.1, [64, 64]);
+        s.validate().unwrap();
+        let mut sp = spec(src, det, 0.3, 1024, 6.0);
+        sp.beam = BeamProfile::TopHat { radius_mm: 2.8 };
+        sp.readout = Readout::Diffracted { samples_per_pixel: 1 };
+        wave_path(&s, &sp, 1).unwrap()
+    };
+    let (rim, iris) = (run(1.0, None), run(12.0, Some(1.0)));
+    assert!(rim.report.steps.iter().any(|st| st.note.contains("its rim laid on the field")), "{:?}", rim.report.steps);
+    let (lr, li) = (rim.report.ledger, iris.report.ledger);
+    let stopped = |l: oc_wave::WaveLedger| l.absorbed_aperture / l.launched;
+    measured("lens rim against an iris: power stopped, difference", stopped(lr) - stopped(li));
+    let peak = iris.power.iter().cloned().fold(0.0, f64::max);
+    let worst = rim.power.iter().zip(&iris.power).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+    measured("lens rim against an iris: focal spot, worst difference / peak", worst / peak);
+    assert!((stopped(lr) - stopped(li)).abs() < 3e-4, "{lr:?} vs {li:?}");
+    assert!(worst / peak < 2e-3, "{}", worst / peak);
+    assert!(lr.numerical.abs() < 1e-10 && lr.resampling.abs() < 1e-4, "{lr:?}");
+}
+
+#[test]
+fn an_lcos_on_the_path_sends_half_of_unpolarized_light_into_each_beam() {
+    // [26] Zhang, You & Chu: an LCoS modulates the field along its director.
+    // The wave path carries unpolarized light, so of what the device reflects
+    // half is modulated and half is not; the chain follows the modulated beam,
+    // steered by a 16-pixel blazed grating, and books the other half. A
+    // 16-level staircase puts sinc²(1/16) of the modulated beam into its first
+    // order [31] (Swanson), which the detector catches.
+    use oc_core::modulator::{LcosSpec, ModulatorKind, Pattern, PatternGenerator, PhaseLut, SpatialModulator};
+    let dev = SpatialModulator {
+        pixels: [128, 128],
+        pitch_um: 8.0,
+        kind: ModulatorKind::Lcos(LcosSpec {
+            director_deg: 0.0,
+            lut: PhaseLut::Linear { levels: 256, max_phase_rad: 2.0 * std::f64::consts::PI },
+            design_lambda_um: LAM,
+            pixel_fill: 1.0,
+            gap_amplitude: 0.0,
+            gap_phase_rad: 0.0,
+            fringing_um: 0.0,
+            reflectance: 1.0,
+        }),
+        pattern: Pattern::Generated(PatternGenerator::BlazedGrating { period_px: 16.0, angle_deg: 0.0 }),
+    };
+    let mut s = Scene3::new();
+    let src = source(&mut s);
+    let pos = Vec3::new(100.0, 0.0, 0.0);
+    let id = s.add_modulator(pos, 180.0, dev).unwrap();
+    let t = s.surfaces.iter().find(|x| x.common.id.0 == id).unwrap().common.transform;
+    let tl = LAM / 1000.0 / (16.0 * 0.008);
+    let d_mod = t.rotate(Vec3::new(tl, 0.0, (1.0 - tl * tl).sqrt()));
+    // 400 mm on, the unmodulated beam's centre is 2 mm away, off the face.
+    let det = s.add_area_detector(pos + d_mod * 400.0, -d_mod, 0.9, 0.9, [32, 32]);
+    s.validate().unwrap();
+    let r = wave_path(&s, &spec(src, det, 0.3, 512, 2.56), 1).unwrap();
+    let l = r.report.ledger;
+    // The device, 1.024 mm square, meets erf(√2·0.512/w)² of the beam.
+    let w = 0.3 * (1.0 + (100.0 / rayleigh_range_mm(0.3, LAM, 1.0)).powi(2)).sqrt();
+    let on_dev = common::erf(std::f64::consts::SQRT_2 * 0.512 / w).powi(2);
+    let eta1 = (std::f64::consts::PI / 16.0).sin().powi(2) / (std::f64::consts::PI / 16.0).powi(2);
+    measured("LCoS on the path: unmodulated share against half of what the device meets", l.other_family / l.launched - 0.5 * on_dev);
+    measured("LCoS on the path: detected against half the device's share in the first order", l.detected / l.launched - 0.5 * on_dev * eta1);
+    assert!((l.other_family / l.launched - 0.5 * on_dev).abs() < 2e-3, "{l:?}");
+    assert!((l.detected / l.launched - 0.5 * on_dev * eta1).abs() < 3e-3, "{l:?}");
+    assert!(l.numerical.abs() < 1e-10 * l.launched, "{l:?}");
+}
+
+#[test]
+fn a_glass_plate_delays_the_beam_by_its_optical_path() {
+    // The phase the field carries is the whole phase, a traced face's optical
+    // path included, so that two arms can be added: through a plate of
+    // thickness t and index n the beam's centre must lag free space's by
+    // k₀(n − 1)t, less the Gouy phase its shorter effective length (t/n in
+    // place of t, [13] in ABCD form) does not accumulate. The window holds
+    // the beam to four radii: cut at two, the cut's own diffraction moves the
+    // centre's phase by a few milliradians.
+    use oc_core::build3::SingletGeom;
+    let (w0, t, l) = (0.5, 10.0, 160.0);
+    let run = |plate: bool| {
+        let mut s = Scene3::new();
+        let src = source(&mut s);
+        if plate {
+            let g = SingletGeom { r1_mm: f64::INFINITY, r2_mm: f64::INFINITY, thickness_mm: t, semi_aperture_mm: 12.0, conic1: 0.0, conic2: 0.0 };
+            s.add_singlet(Vec3::new(100.0, 0.0, 0.0), g, 1.5168, 64.17);
+        }
+        let det = s.add_area_detector(Vec3::new(l, 0.0, 0.0), -Vec3::X, 1.0, 1.0, [16, 16]);
+        s.validate().unwrap();
+        (wave_path(&s, &spec(src, det, w0, 512, 4.096), 1).unwrap(), s)
+    };
+    let ((free, _), (thru, s)) = (run(false), run(true));
+    let n = s.bodies[0].material.index_at(LAM, &oc_core::material::GlassCatalog::builtin()).unwrap();
+    let zr = rayleigh_range_mm(w0, LAM, 1.0);
+    let k0 = 2.0 * std::f64::consts::PI / (LAM / 1000.0);
+    let want = k0 * (n - 1.0) * t - (l - t + t / n).atan2(zr) + l.atan2(zr);
+    let c = thru.field.grid.n[0] / 2;
+    let got = (thru.field.at(c, c) / free.field.at(c, c)).arg();
+    let wrap = |x: f64| (x + std::f64::consts::PI).rem_euclid(2.0 * std::f64::consts::PI) - std::f64::consts::PI;
+    measured("plate: phase at the beam's centre against k0(n−1)t less the Gouy change, rad", wrap(got - want));
+    assert!(wrap(got - want).abs() < 1e-4, "{got} vs {want} (mod 2π)");
 }

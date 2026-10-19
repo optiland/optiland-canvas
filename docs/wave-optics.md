@@ -175,6 +175,7 @@ let spec = WavePathSpec {
     power: 1.0,
     grid_n: 512, window_mm: 4.0,      // the field across the beam
     device_samples_per_pixel: 4,      // when the beam is laid onto a DMD or SLM
+    readout: Readout::Projected,      // or Readout::Diffracted { samples_per_pixel }
 };
 let result = wave_path(&scene, &spec, revision)?;   // power per detector pixel, the field, the report
 // or, from the beam the source itself declares:
@@ -195,13 +196,14 @@ incoming ray to the plane across the outgoing one:
 
 | Element | What the field does | Exact? |
 |---|---|---|
-| flat mirror | mirror image, amplitude `√R` | yes, in scalar optics (image theory [1]) |
-| beam-splitter arm (`ExplicitRt`) | `√R` or `√T` on the arm the chain took | as the element's R and T |
-| grating | its order's momentum along the grooves, amplitude `√η` | thin element |
+| flat mirror | mirror image, amplitude `√R`; what it does not reflect is absorbed | yes, in scalar optics (image theory [1]) |
+| beam-splitter arm (`ExplicitRt`) | `√R` or `√T` on the arm the chain took; the other arm's share is booked as `other_arm`, the rest as absorbed | as the element's R and T |
+| grating | its order's momentum along the grooves, amplitude `√η`; the other orders are booked as `untracked_orders` | thin element |
 | ideal thin lens | `exp(−ik\|r − c\|²/2f)` about the lens's centre | thin element |
-| aperture | its opening, exact cell areas when square to the beam, 3 × 3 sub-samples when not | thin element |
-| DMD, LCoS SLM | laid onto the device plane at `device_samples_per_pixel`, reflected by the device model ([DMD](dmd.md), [SLM](slm.md)), taken up across the outgoing ray | thin element |
-| face of a refractive body, curved mirror or other curved surface | traced across the thin slab that holds the surface where the beam meets it (below); between a body's faces the field diffracts inside the glass by the angular spectrum, in the glass's index | the slab is geometric: no diffraction across a surface's sag |
+| a flat element's outline | the element acts inside its own shape, the edge weighted by exact cell coverage; light outside passes it by, on the chain where the chain goes straight on (a transmitted arm, a thin lens), off it as `passed_by` where the chain turns (a mirror, a grating's order) | thin element |
+| aperture | as the tracer has it: light passes inside the opening, is stopped between the opening and the outer extent, and passes beyond the outer extent (an aperture with none is unbounded); each edge weighted by exact cell coverage, of the shape itself square to the beam and of its projection along the beam otherwise | thin element |
+| DMD, LCoS SLM | laid onto the device plane at `device_samples_per_pixel`, reflected by the device model ([DMD](dmd.md), [SLM](slm.md)), taken up across the outgoing ray; at an LCoS, half of what it reflects follows the chain (below) | thin element |
+| face of a refractive body, curved mirror or other curved surface | traced across the thin slab that holds the surface where the beam meets it (below), its rim laid on the field with exact cell coverage; between a body's faces the field diffracts inside the glass by the angular spectrum, in the glass's index | the slab is geometric: no diffraction across a surface's sag |
 | detector, `Readout::Projected` | power per pixel: each field cell's `\|U\|²ΔA` binned into the pixel its projection lands in, in sub-cells of at most an eighth of a pixel | power conserved to round-off |
 | detector, `Readout::Diffracted` | the last free-space step taken straight onto the detector by the zoomed angular spectrum (`asm_zoom`), at `s × s` points a pixel: a focal spot far smaller than the field's own samples is resolved, with no paraxial step | exact scalar propagation; the field repeats a window away when unpadded |
 
@@ -212,7 +214,11 @@ element's plane is not square to the beam, the handover projects the field
 along the rays rather than diffracting it across the plane's depth. That is
 exact for a flat mirror. For a lens, an aperture or a modulator seen
 obliquely, the report carries `TiltProjection` with the depth spanned, once
-that depth exceeds `Δx²/λ`. A tilted detector read with `Readout::Diffracted`
+that depth exceeds `Δx²/λ`. An aperture and an element's outline are laid on
+the field as their projection along the beam, whose edges are covered
+exactly: a disc becomes an ellipse, drawn as a polygon of up to 1024 sides
+with the disc's own area, departing from it by under a five-hundredth of a
+sample. A tilted detector read with `Readout::Diffracted`
 is not projected: the spectrum is rotated onto its own plane (`asm_tilted`
 [6]). Elements on oblique planes still are.
 
@@ -223,8 +229,10 @@ so a 0.2 mm Gaussian transported by rays through a 10 mm plate would leave
 as if the plate were 5.6 mm shorter rather than the 3.4 mm it is to the beam
 (the plate test below holds the difference). Instead each face is a
 transfer across a thin slab, planes a micrometre clear of the surface where
-rays over the beam window meet it (found by probing the face with rays), and
-between faces the field diffracts inside the glass. Across a slab the f64
+rays over the beam window meet it (found by probing the face with rays,
+and along each direction by bisection for the face's edge, so a lens smaller
+than the window is not missed), and between faces the field diffracts
+inside the glass. Across a slab the f64
 tracer carries one ray from each point of a grid, up to 257 × 257, through a
 copy of the scene holding the element alone, along the arriving field's
 wavefront (a sphere and tilt fitted to its phase gradient). Each ray gives
@@ -232,16 +240,34 @@ where it crosses the exit plane, its optical path and its transmittance; the
 field that leaves is
 
 ```text
-U_out(x') = U_in(x) · √(T / |∂x'/∂x|) · exp(ik₀ (OPL(x) − OPL_chief)),
+U_out(x') = U_in(x) · √(T / |∂x'/∂x|) · exp(ik₀ OPL(x)),
 ```
 
 conserving power ray tube by ray tube (F. Wyrowski and M. Kuhn's geometric
-field tracing [17]). Light whose ray misses the face is stopped as by a mount
-and booked as absorbed; the faces' reflection (unpolarized) is booked as
-absorbed by the element. A curved mirror is the same transfer with the exit
+field tracing [17]). Light whose ray misses the face is stopped as by a mount.
+The edge of what passes, the rim, is found by bisection on traced rays along
+720 directions from the chief ray and laid on the arriving field as a polygon
+with exact cell coverage, so it diffracts at the field's own sampling, not the
+ray grid's; the traced map is carried two rays past it. On a 1 mm lens rim in
+a 2.8 mm beam, four field samples a ray, resolving the rim to the ray grid
+instead stopped 3.9e-3 too much of the power and moved the focal spot by
+6.8e-2 of its peak (the rim test below). A rim that is not star-shaped about
+the chief ray is still resolved to the ray grid, and the report says so. The
+faces' reflection (unpolarized) is booked as `other_arm`: light the chain does
+not follow, not absorbed. A curved mirror is the same transfer with the exit
 plane across the reflected ray. The report names the rays traced, how far
 they moved across the beam, and how far the arriving field's rays depart
 from the fitted sphere.
+
+**One phase clock.** The samples carry the whole phase: every propagator
+multiplies them by its full transfer function, `e^{ikz}` included, and a
+traced face by `exp(ik₀·OPL)` with the optical path from its entry plane. The
+field's `opl_ref_mm` records the reference ray's optical path to the frame
+origin, for comparing a field with a trace; it is never applied again. So a
+plate of thickness `t` delays the beam's centre by `k₀(n − 1)t` against free
+space, less the Gouy phase its shorter effective length does not accumulate
+(the plate-phase test below, within 2.6e-6 rad), and two fields that left one
+source by different paths can be added as they are.
 
 **Reading a field between its samples.** The transfer reads the arriving
 field at the points its rays start from, which fall between samples; so do
@@ -254,11 +280,16 @@ most of a radian a sample at its edge, which lost 3.7% of the power at the
 singlet's second face and dimmed its pupil edge. So the field's fitted sphere
 and tilt are taken out of the samples first and put back exactly at the
 point read; only the slowly varying rest is interpolated. The singlet's
-unexplained remainder fell from 3.7% to 0.04% of the launched power.
+unexplained remainder fell from 3.7% to 0.04% of the launched power. What
+interpolation still costs is booked at each step as `resampling`.
 
 **What the path follows at a modulator.** The chief ray, and so the beam,
 leaves a DMD along the reflection off the facet it hits, and an SLM along the
-phase gradient there (or specularly, for the unmodulated arm). The field keeps
+phase gradient there (or specularly, for the unmodulated arm). The beam is
+unpolarized (the path refuses polarizers), so of what an LCoS reflects, half
+lies along its director and is modulated and half is not [26]; the two never
+interfere, and the half the chain does not follow is booked as
+`other_family`. The field keeps
 every diffraction order that falls inside its window; orders outside are
 booked as `beyond_nyquist` or `left_window`. It does not steer onto a chosen
 order: an iris on a Lee hologram's −1 order, off the chief ray, would block
@@ -315,14 +346,20 @@ These are acceptance case C53, in `crates/oc-wave/tests/path.rs`.
 | `an_aperture_on_the_path_is_found_although_the_trace_logs_no_event` | a Gaussian through a disc passes `1 − exp(−2a²/w²)` [13] | 1e-4 | 3.2e-5 |
 | `a_4f_system_images_at_minus_f2_over_f1_and_its_iris_cuts_the_spectrum` | the image waist `w₀f₂/f₁` [1]; a Fourier-plane iris passes `1 − exp(−2r²/w_F²)`, `w_F = λf₁/(πw₀)` [13]; the ledger | 1e-4; 2e-3; 1e-6 | within 1e-4; 1.6e-3; 4.7e-14 |
 | `wave_and_ray_agree_on_where_the_beam_lands` | the chief ray's landing point on a tilted fold | 0.05 pixel | 3.2e-4 mm (0.003 pixel) |
-| `wave_power_agrees_with_rays_when_the_fresnel_number_is_large` | the f64 ray trace of the same scene, a uniform beam through a disc at `N_F` = 1264 | 1% | 0.11% |
-| `a_dmd_in_the_scene_focuses_its_orders_f_lambda_over_p_apart` | orders `λ/p` apart in direction cosine [10], so `fλ/p` apart at a lens's focus | 1% | 1.000; ledger closes to 8.0e-6 |
+| `wave_power_agrees_with_rays_when_the_fresnel_number_is_large` | the f64 ray trace of the same scene, a uniform beam through a disc at `N_F` = 1264 | 1% | 0.12% |
+| `a_dmd_in_the_scene_focuses_its_orders_f_lambda_over_p_apart` | orders `λ/p` apart in direction cosine [10], so `fλ/p` apart at a lens's focus | 1% | 1.000; resampling 7.7e-6, `numerical` 2.8e-13 |
 | `slicing_a_wave_job_changes_no_bit` | the same path run in one step | bit-identical | identical |
 | `a_glass_plate_shifts_a_gaussian_as_free_space_of_t_over_n` | a plate of thickness `t`, index `n` is free space `t/n` to a Gaussian [13] | 1e-5 | 2.4e-6 (implied index within 2.3e-4) |
 | `a_gaussian_through_a_singlet_waists_where_self_predicts` | Self [14] with the singlet's focal length and principal planes traced by the f64 tracer (an N-BK7 equiconvex lens, R ±50 mm, 4 mm) | 1e-3 | waist position 2.5e-4 of its Rayleigh range (2.9 µm); radius 5.1e-5 |
 | `a_tilted_plate_displaces_the_beam_where_the_rays_say` | the chief ray's landing point behind a plate at 30° | 0.05 pixel | 5.2e-5 mm |
 | `a_singlet_psf_matches_optiland_huygens_psf` | Optiland's `HuygensPSF` of the same singlet at f/10, at its paraxial focus (oracle, below) | Strehl ±0.01; rms 1e-2 of the ideal peak | Strehl 0.8653 against 0.8642; rms 1.2e-4 |
 | `a_tilted_detector_reads_the_beam_on_its_own_plane` | Kogelnik–Li [13] at each point of a face tilted 30°, times the obliquity | 2e-3 of the peak; power on the face 2e-3 | 8.5e-4; −1.9e-3 |
+| `an_aperture_whose_outer_extent_the_beam_passes_beyond_leaves_it_alone` | the tracer's aperture: light beyond the outer extent passes; against an open aperture at the same plane | bit-identical | identical |
+| `a_fold_mirror_smaller_than_the_beam_reflects_only_what_meets_it` | a 0.6 mm disc at 45° in a 1 mm Gaussian [13]: the power off its projected ellipse, by quadrature, passes beside it | 1e-4 | 1.5e-5 |
+| `a_thin_lens_smaller_than_the_beam_lets_the_rest_pass_beside_it` | 10 µm behind a 0.5 mm thin lens: the lens's phase inside, free space's field outside, away from the edge | 2e-3 | 1.0e-3 inside; 3.0e-5 outside |
+| `a_lens_rim_smaller_than_the_beam_stops_and_diffracts_as_an_iris_against_it` | a 1 mm iris 1.5 µm before a lens too large to clip; the lens rim itself, with exact cover | power 3e-4; spot 2e-3 of peak | 1.1e-4 (the back face's rim stops 9e-4 of what reaches it, which is real); 3.5e-4 |
+| `an_lcos_on_the_path_sends_half_of_unpolarized_light_into_each_beam` | half of what the device meets in the unmodulated beam [26]; `sinc²(1/16)` of the modulated half in the first order [31] | 2e-3; 3e-3 | 5.9e-7; −2.0e-3 |
+| `a_glass_plate_delays_the_beam_by_its_optical_path` | `k₀(n − 1)t` less the Gouy change of the effective length [13] | 1e-4 rad | 2.6e-6 rad |
 
 The propagation tests of W8 (acceptance case C57, `crates/oc-wave/tests/propagate.rs`):
 
@@ -335,8 +372,9 @@ The propagation tests of W8 (acceptance case C57, `crates/oc-wave/tests/propagat
 The DMD case shows what the ledger is for. Of the launched power, 66.8%
 reaches the detector, 11.7% falls in the dead space between mirrors
 (`absorbed_element`), 19.4% goes into orders beyond the beam grid's Nyquist
-angle (`beyond_nyquist`), and 2.1% misses the detector (`left_window`); the
-remainder, 8e-6, is the resampling between grids (`numerical`).
+angle (`beyond_nyquist`), and 2.1% misses the detector (`left_window`);
+7.7e-6 is lost resampling between grids (`resampling`), and 2.8e-13 is left
+unaccounted (`numerical`).
 
 ## From Python
 
@@ -362,13 +400,22 @@ Every call returns a `WaveReport`:
   `Undersampled`, and on a wave path `TiltProjection`;
 - `validity` flags;
 - named approximations;
-- a `WaveLedger` that closes to `1e-12` of what was launched:
+- a `WaveLedger`, where every step books what it changed to a cause:
 
 ```text
 launched = detected + absorbed_aperture + absorbed_element + band_limit_removed
          + beyond_nyquist + evanescent + left_window + other_family
-         + untracked_orders + numerical
+         + untracked_orders + other_arm + passed_by + resampling + numerical
 ```
+
+That it sums to what was launched is bookkeeping, not a check: `numerical`
+is defined as what no step accounted for. The entries are the evidence.
+`other_arm`, `passed_by`, `other_family` and `untracked_orders` are light on
+paths the computation does not follow, never absorption; `resampling` is
+what carrying a field onto another grid or plane cost (4.2e-4 of the power
+through the f/10 singlet, 1.2e-3 on and off the LCoS of its test); and
+`numerical`, round-off, is at most 7e-12 of the launched power on every path
+the tests run.
 
 ## Validation
 

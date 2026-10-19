@@ -3,8 +3,12 @@
 //! The ray tracer's `CapabilityReport` and `EnergyLedger` are the model: every
 //! method choice is recorded, every approximation is named, and power that
 //! leaves the computation is booked to a cause rather than renormalized away.
-//! A report that cannot account for its power to `1e-12` of what was launched
-//! is a bug, and the tests say so.
+//!
+//! Each step books what it changed to a named cause, so the ledger sums to
+//! what was launched by construction: that it does is bookkeeping, not
+//! evidence. The evidence is in the entries themselves, above all
+//! `resampling` (what reading a field between its samples cost) and
+//! `numerical` (what no step accounted for, which should be round-off).
 
 use serde::{Deserialize, Serialize};
 
@@ -101,6 +105,18 @@ pub struct WaveLedger {
     pub other_family: f64,
     /// Diffraction orders not followed.
     pub untracked_orders: f64,
+    /// Sent by a splitter into its other arm, or reflected by a refracting
+    /// face, on a path this computation does not follow. Not absorbed.
+    #[serde(default)]
+    pub other_arm: f64,
+    /// Passed beside an element's outline, along a direction this
+    /// computation does not follow (beside a fold mirror, a grating).
+    #[serde(default)]
+    pub passed_by: f64,
+    /// Gained (negative) or lost carrying a field onto another grid or plane:
+    /// interpolation between samples, a traced map's fit, a window's edge.
+    #[serde(default)]
+    pub resampling: f64,
     /// Round-off: whatever is left after every cause above.
     pub numerical: f64,
 }
@@ -117,6 +133,9 @@ impl WaveLedger {
             + self.left_window
             + self.other_family
             + self.untracked_orders
+            + self.other_arm
+            + self.passed_by
+            + self.resampling
             + self.numerical
     }
 

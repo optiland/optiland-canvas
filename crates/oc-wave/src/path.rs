@@ -17,10 +17,19 @@
 //!   or `√η`.
 //! - **Ideal thin lens.** `exp(−ik|r − c|²/2f)` in the lens plane, about the
 //!   lens's centre.
-//! - **Aperture.** Its clear opening, sampled 3 × 3 per sample on the
-//!   aperture's own plane. The tracer logs no event when a ray passes an
-//!   opening, so the path finds every aperture by intersecting the chief ray
-//!   with each aperture's plane.
+//! - **An element's outline.** A flat element's own shape clips the field,
+//!   its edge weighted by exact cell coverage. Light outside it passes the
+//!   element by: still on the chain where the chain goes straight on, off it
+//!   where the chain turns.
+//! - **Aperture.** Its opening and outer extent, as the tracer has them: light
+//!   passes inside the opening, is stopped between it and the outer extent,
+//!   and passes beyond. Each edge is weighted by exact cell coverage, of the
+//!   shape itself square to the beam and of its projection along the beam
+//!   otherwise. The tracer logs no event when a ray passes an opening, so the
+//!   path finds every aperture by intersecting the chief ray with each
+//!   aperture's plane.
+//! - **Refractive body or curved surface.** Traced through face by face
+//!   ([`crate::transfer`]), its rim laid on the field the same way.
 //! - **DMD or LCoS SLM.** The field is laid onto the device plane at a few
 //!   samples per pixel, reflected by [`crate::modulator`], and taken up across
 //!   the outgoing ray, which the tracer has already pointed along the hit
@@ -34,9 +43,9 @@
 //! replaces with the tilted-plane angular spectrum (Matsushima, Schimmel &
 //! Wyrowski, *J. Opt. Soc. Am. A* 20, 1755 (2003)).
 //!
-//! Refused, by name: refractive bodies and curved mirrors (W6), polarizing
-//! elements (the field is scalar), and anything else the field has no model
-//! for. Nothing is skipped silently.
+//! Refused, by name: polarizing elements (the field is scalar), flat
+//! refracting, coated and tabulated surfaces, and anything else the field
+//! has no model for. Nothing is skipped silently.
 
 use crate::beams::GaussianBeam;
 use crate::modulator::{dmd_reflect, lcos_reflect};
@@ -243,26 +252,70 @@ fn obliquity(d_in: Vec3, d_out: Vec3, n_e: Vec3) -> f64 {
     }
 }
 
-fn shape_contains(s: &PlanarShape2, x: f64, y: f64) -> bool {
-    match s {
-        PlanarShape2::Rectangle { half_width_mm, half_height_mm } => x.abs() <= *half_width_mm && y.abs() <= *half_height_mm,
-        PlanarShape2::Disc { radius_mm } => x * x + y * y <= radius_mm * radius_mm,
-        PlanarShape2::Annulus { inner_mm, outer_mm } => {
-            let r2 = x * x + y * y;
-            r2 >= inner_mm * inner_mm && r2 <= outer_mm * outer_mm
+/// The covered fraction of each of `grid`'s cells by `shape`, a shape in an
+/// element's plane, seen across the beam: `to_beam` takes a point of that
+/// plane (its local mm) along the beam to the beam's plane. Square to the
+/// beam, a disc or an annulus stays one and is covered by its closed form;
+/// otherwise every shape is a polygon there (a disc one of
+/// [`crate::elements::disc_sides`] sides with the disc's own area), covered
+/// exactly. Either way the edge is resolved to the field's own sample.
+fn shape_coverage(grid: &Grid2, shape: &PlanarShape2, square: bool, to_beam: &dyn Fn(f64, f64) -> [f64; 2]) -> Result<Vec<f64>, WaveError> {
+    use crate::elements::{coverage, disc_polygon, disc_sides, Shape};
+    let pitch = grid.pitch_mm[0].min(grid.pitch_mm[1]);
+    let ring = |r: f64| -> Vec<[f64; 2]> { disc_polygon([0.0, 0.0], r, disc_sides(r, pitch)).iter().map(|p| to_beam(p[0], p[1])).collect() };
+    let c = to_beam(0.0, 0.0);
+    match shape {
+        PlanarShape2::Disc { radius_mm } if square => coverage(grid, &Shape::Disc { c, r: *radius_mm }),
+        PlanarShape2::Annulus { inner_mm, outer_mm } if square => {
+            coverage(grid, &Shape::Annulus { c, r_in: *inner_mm, r_out: *outer_mm })
         }
-        PlanarShape2::Polygon { vertices } => {
-            let mut inside = false;
-            let n = vertices.len();
-            for i in 0..n {
-                let (a, b) = (vertices[i], vertices[(i + 1) % n]);
-                if (a.y > y) != (b.y > y) && x < a.x + (y - a.y) * (b.x - a.x) / (b.y - a.y) {
-                    inside = !inside;
-                }
-            }
-            inside
+        PlanarShape2::Disc { radius_mm } => coverage(grid, &Shape::Polygon(ring(*radius_mm))),
+        PlanarShape2::Annulus { inner_mm, outer_mm } => {
+            let outer = coverage(grid, &Shape::Polygon(ring(*outer_mm)))?;
+            let inner = if *inner_mm > 0.0 { coverage(grid, &Shape::Polygon(ring(*inner_mm)))? } else { vec![0.0; outer.len()] };
+            Ok(outer.iter().zip(&inner).map(|(o, i)| (o - i).clamp(0.0, 1.0)).collect())
+        }
+        PlanarShape2::Rectangle { half_width_mm, half_height_mm } => {
+            let (w, h) = (*half_width_mm, *half_height_mm);
+            coverage(grid, &Shape::Polygon(vec![to_beam(-w, -h), to_beam(w, -h), to_beam(w, h), to_beam(-w, h)]))
+        }
+        PlanarShape2::Polygon { vertices } => coverage(grid, &Shape::Polygon(vertices.iter().map(|v| to_beam(v.x, v.y)).collect())),
+    }
+}
+
+/// Points around the edge of `shape`, in its plane: what must lie inside an
+/// aperture's outer extent for the opening to be within it.
+fn shape_rim(shape: &PlanarShape2) -> Vec<oc_core::Vec2> {
+    use oc_core::Vec2;
+    let circle = |r: f64| {
+        (0..256).map(move |k| {
+            let a = 2.0 * std::f64::consts::PI * k as f64 / 256.0;
+            Vec2::new(r * a.cos(), r * a.sin())
+        })
+    };
+    match shape {
+        PlanarShape2::Disc { radius_mm } => circle(*radius_mm).collect(),
+        PlanarShape2::Annulus { outer_mm, .. } => circle(*outer_mm).collect(),
+        PlanarShape2::Rectangle { half_width_mm: w, half_height_mm: h } => {
+            vec![Vec2::new(-w, -h), Vec2::new(*w, -h), Vec2::new(*w, *h), Vec2::new(-w, *h)]
+        }
+        PlanarShape2::Polygon { vertices } => vertices.clone(),
+    }
+}
+
+/// The plane of an element seen across `beam`: where the line along the beam
+/// through each corner of the window meets it, the largest depth from the
+/// beam's plane, mm.
+fn plane_depth(beam: &Beam, grid: &Grid2, o: Vec3, n: Vec3) -> f64 {
+    let (hx, hy) = (0.5 * grid.width_mm(0), 0.5 * grid.width_mm(1));
+    let mut depth: f64 = 0.0;
+    for (a, b) in [(-hx, -hy), (hx, -hy), (-hx, hy), (hx, hy)] {
+        let r = beam.point(a + grid.center_mm[0], b + grid.center_mm[1]);
+        if let Some(q) = onto_plane(r, beam.d, o, n) {
+            depth = depth.max((q - r).length());
         }
     }
+    depth
 }
 
 fn merge(total: &mut WaveReport, step: WaveReport) {
@@ -276,6 +329,9 @@ fn merge(total: &mut WaveReport, step: WaveReport) {
     t.left_window += l.left_window;
     t.other_family += l.other_family;
     t.untracked_orders += l.untracked_orders;
+    t.other_arm += l.other_arm;
+    t.passed_by += l.passed_by;
+    t.resampling += l.resampling;
     t.numerical += l.numerical;
     total.steps.extend(step.steps);
     for w in step.warnings {
@@ -325,20 +381,47 @@ fn slab(probe: &Scene3, from: Vec3, d_in: Vec3, hit: Vec3, d_out: Vec3, half: f6
     let y = d_in.cross(x);
     let (mut s_min, mut s_max) = (0.0f64, 0.0f64);
     let r_max = half * std::f64::consts::SQRT_2;
-    for ring in 1..=4 {
-        let r = r_max * ring as f64 / 4.0;
-        for k in 0..24 {
-            let t = 2.0 * std::f64::consts::PI * k as f64 / 24.0;
-            let o = from + x * (r * t.cos()) + y * (r * t.sin());
-            let Ok(ray) = oc_core::vec3::Ray3::new(o, d_in) else { continue };
-            let res = trace3(probe, &[LaunchRay3 { ray, lambda_um: lam, flux: 1.0, source: None, pol: None }], &cfg);
-            let Some(root) = res.segments.iter().find(|s| s.parent_path_id.is_none()) else { continue };
-            // A root with a child met the element at its end.
-            if !res.segments.iter().any(|s| s.parent_path_id == Some(root.path_id)) {
+    // Where the ray from `from`, `r` off the chief ray at azimuth `t`, first
+    // meets the element: before the hit along `d_in`, after it along `d_out`.
+    let meet = |r: f64, t: f64| -> Option<(f64, f64)> {
+        let o = from + x * (r * t.cos()) + y * (r * t.sin());
+        let ray = oc_core::vec3::Ray3::new(o, d_in).ok()?;
+        let res = trace3(probe, &[LaunchRay3 { ray, lambda_um: lam, flux: 1.0, source: None, pol: None }], &cfg);
+        let root = res.segments.iter().find(|s| s.parent_path_id.is_none())?;
+        // A root with a child met the element at its end.
+        res.segments.iter().any(|s| s.parent_path_id == Some(root.path_id)).then(|| ((root.b - hit).dot(d_in), (root.b - hit).dot(d_out)))
+    };
+    // Rings out to the window's corners, and along each azimuth the edge of
+    // the element where a ring first misses it, found by bisection: an
+    // element smaller than the window reaches its greatest depth at its rim,
+    // which no ring need meet.
+    for k in 0..24 {
+        let t = 2.0 * std::f64::consts::PI * k as f64 / 24.0;
+        let mut last = 0.0;
+        for ring in 1..=8 {
+            let r = r_max * ring as f64 / 8.0;
+            if let Some((a, b)) = meet(r, t) {
+                s_min = s_min.min(a);
+                s_max = s_max.max(b);
+                last = r;
                 continue;
             }
-            s_min = s_min.min((root.b - hit).dot(d_in));
-            s_max = s_max.max((root.b - hit).dot(d_out));
+            if r - last > r_max / 8.0 + 1e-12 {
+                continue;
+            }
+            let (mut lo, mut hi) = (last, r);
+            for _ in 0..40 {
+                let mid = 0.5 * (lo + hi);
+                if meet(mid, t).is_some() {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            if let Some((a, b)) = meet(lo, t) {
+                s_min = s_min.min(a);
+                s_max = s_max.max(b);
+            }
         }
     }
     (s_min, s_max)
@@ -404,7 +487,7 @@ impl WaveJob {
             return Err(WaveError::OutOfRange("a wave path needs power, a window and at least 8 samples".into()));
         }
         let seq = oc_trace::extract_sequence3(scene, spec.source, spec.detector, revision)
-            .map_err(|e| WaveError::OutOfRange(format!("no chain from the source to the detector: {e:?}")))?;
+            .map_err(|e| WaveError::OutOfRange(format!("no chain from the source to the detector: {e}")))?;
         let src = scene
             .sources
             .iter()
@@ -443,16 +526,29 @@ impl WaveJob {
                     .sample(grid, -waist_offset_mm)?
             }
             BeamProfile::TopHat { radius_mm } => {
+                // The disc's edge weighted by exact cell coverage, as an
+                // aperture's is.
                 let a = (spec.power / (std::f64::consts::PI * radius_mm * radius_mm)).sqrt();
-                Field2::from_fn(grid, lam, |x, y| if x * x + y * y <= radius_mm * radius_mm { Cx::real(a) } else { Cx::ZERO })?
-                    .in_medium(n0)?
+                let cover = crate::elements::coverage(&grid, &crate::elements::Shape::Disc { c: [0.0, 0.0], r: radius_mm })?;
+                let mut u = Field2::zeros(grid, lam)?.in_medium(n0)?;
+                for (z, c) in u.data.iter_mut().zip(&cover) {
+                    *z = Cx::real(a * c);
+                }
+                u
             }
         };
         u.frame = beam.iso();
-        let report = WaveReport {
-            ledger: WaveLedger { launched: u.power(), ..Default::default() },
-            ..Default::default()
-        };
+        // The source launches its power; what the samples do not hold is the
+        // Gaussian's tail beyond the window, or the top-hat's edge diffracted
+        // beyond the grid's band.
+        let mut ledger = WaveLedger { launched: spec.power, ..Default::default() };
+        let short = spec.power - u.power();
+        match spec.beam {
+            BeamProfile::TopHat { .. } => ledger.beyond_nyquist += short,
+            BeamProfile::Gaussian { .. } if short >= 0.0 => ledger.left_window += short,
+            BeamProfile::Gaussian { .. } => ledger.resampling += short,
+        }
+        let report = WaveReport { ledger, ..Default::default() };
 
         // The chain's events. Each face of a body, and each curved surface, is
         // a transfer across the thin slab that holds the surface where the
@@ -593,9 +689,205 @@ impl WaveJob {
         }
     }
 
+    /// A flat standalone surface on the chain: a mirror, a splitter's arm, a
+    /// grating's order or a thin lens, met at `p` (the field's plane is across
+    /// the beam there) and left along `out`.
+    ///
+    /// The surface's outline clips the field, its edge weighted by exact cell
+    /// coverage of its projection along the beam. Light outside it passes the
+    /// element by: where the chain goes on through (a transmitted arm, a thin
+    /// lens) it is still on the chain, carried unchanged beside the element;
+    /// where the chain turns (a reflection, a diffracted order) it leaves it,
+    /// booked as `passed_by`. What the element itself does not pass on is
+    /// booked by cause: a mirror's absorption, a splitter's other arm
+    /// (`other_arm`) and what it absorbs, a grating's other orders
+    /// (`untracked_orders`).
+    fn flat_element(
+        &mut self,
+        s: &oc_core::scene3::SurfaceObject3,
+        response: &SurfaceResponse,
+        h: &oc_core::seq3::SeqHit3,
+        p: Vec3,
+        n_s: Vec3,
+        out: &Beam,
+    ) -> Result<(), WaveError> {
+        let lam = self.lam;
+        let beam = self.beam;
+        #[derive(Clone, Copy)]
+        enum Loss {
+            Absorbed,
+            /// The other arm's power fraction; the rest of the loss is absorbed.
+            Arm(f64),
+            Orders,
+        }
+        let refuse = |kind: &str| {
+            WaveError::OutOfRange(format!(
+                "{kind} at #{} ({}): no wave model for this response on the path (the field is scalar)",
+                h.object.0, h.label
+            ))
+        };
+        let kind = oc_core::build3::response_kind(response);
+        let unit = |v: Option<f64>| v.map(|x| x.clamp(0.0, 1.0));
+        // The amplitude inside the outline, a thin lens's focal length and
+        // centre, and where the rest goes.
+        let (amp, lens, loss): (f64, Option<(f64, Vec3)>, Loss) = match (response, h.action) {
+            (SurfaceResponse::Mirror { reflectivity }, SeqAction::Reflect) => {
+                (unit(reflectivity.sample(lam)).ok_or_else(|| refuse(kind))?.sqrt(), None, Loss::Absorbed)
+            }
+            (SurfaceResponse::ExplicitRt { reflectance, transmittance, .. }, SeqAction::Reflect | SeqAction::Transmit) => {
+                let r = unit(reflectance.sample(lam)).ok_or_else(|| refuse(kind))?;
+                let t = unit(transmittance.sample(lam)).ok_or_else(|| refuse(kind))?;
+                if h.action == SeqAction::Reflect {
+                    (r.sqrt(), None, Loss::Arm(t.min(1.0 - r)))
+                } else {
+                    (t.sqrt(), None, Loss::Arm(r.min(1.0 - t)))
+                }
+            }
+            (SurfaceResponse::Grating { efficiency, .. }, SeqAction::Diffract) => {
+                (unit(efficiency.sample(lam)).ok_or_else(|| refuse(kind))?.sqrt(), None, Loss::Orders)
+            }
+            (SurfaceResponse::Grating { zero_order, .. }, _) => {
+                (unit(zero_order.sample(lam)).ok_or_else(|| refuse(kind))?.sqrt(), None, Loss::Orders)
+            }
+            (SurfaceResponse::ThinLens { focal_length_mm }, _) => (1.0, Some((*focal_length_mm, s.common.transform.pos)), Loss::Absorbed),
+            _ => {
+                let e = refuse(kind);
+                self.report.rejected.push(e.to_string());
+                return Err(e);
+            }
+        };
+        let k = self.u.k_mm();
+        let fin = move |r: Vec3| -> Cx {
+            match lens {
+                // Distance from the lens's centre within its plane.
+                Some((f, c)) => {
+                    let v = r - c;
+                    let v = v - n_s * v.dot(n_s);
+                    Cx::expi(-k * v.length_squared() / (2.0 * f))
+                }
+                None => Cx::real(amp),
+            }
+        };
+        let pass_by = matches!(h.action, SeqAction::Transmit | SeqAction::ThinLens);
+        let pb = if pass_by { 1.0 } else { 0.0 };
+
+        // The outline across the beam.
+        let g = self.u.grid;
+        let square = n_s.dot(beam.d).abs() > 1.0 - 1e-12;
+        let tf = s.common.transform;
+        let to_beam = |x: f64, y: f64| {
+            let w = tf.transform_point(Vec3::new(x, y, 0.0));
+            let (a, b) = beam.coords(w - beam.d * (w - beam.origin).dot(beam.d));
+            [a, b]
+        };
+        let cov = match &s.geometry {
+            SurfaceGeometry3::Plane { shape } => shape_coverage(&g, shape, square, &to_beam)?,
+            SurfaceGeometry3::SurfaceOfRevolution { .. } => vec![1.0; g.len()],
+        };
+
+        // Each sample's share: inside, where the element's factor acts; outside,
+        // passed by. Physically a cell sends on f·|t|² + (1 − f)·pb of its
+        // power; the sample (f·t + (1 − f)·pb)·U carries less where an edge
+        // crosses it, and the difference is diffracted beyond the grid's band.
+        let da = g.cell_area_mm2();
+        let (mut inside, mut lost_in, mut beside, mut beyond, mut sent, mut total) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        let mut clipped = false;
+        for j in 0..g.n[1] {
+            for i in 0..g.n[0] {
+                let ix = g.idx(i, j);
+                let pw = self.u.data[ix].norm_sqr() * da;
+                if pw == 0.0 {
+                    continue;
+                }
+                let f = cov[ix];
+                clipped |= f < 1.0;
+                let (a, b) = g.xy(i, j);
+                let r_b = beam.point(a, b);
+                let t = fin(onto_plane(r_b, beam.d, p, n_s).unwrap_or(r_b));
+                let carried = (t * f + Cx::real((1.0 - f) * pb)).norm_sqr();
+                inside += f * pw;
+                lost_in += f * pw * (1.0 - t.norm_sqr());
+                beside += (1.0 - f) * (1.0 - pb) * pw;
+                beyond += (f * t.norm_sqr() + (1.0 - f) * pb - carried) * pw;
+                sent += carried * pw;
+                total += pw;
+            }
+        }
+        let (v, depth) = if !clipped {
+            hand_over(&self.u, &beam, n_s, out, &fin)
+        } else {
+            let mut u_in = self.u.clone();
+            for (z, f) in u_in.data.iter_mut().zip(&cov) {
+                *z *= *f;
+            }
+            let (mut v, depth) = hand_over(&u_in, &beam, n_s, out, &fin);
+            if pass_by {
+                let mut u_by = self.u.clone();
+                for (z, f) in u_by.data.iter_mut().zip(&cov) {
+                    *z *= 1.0 - *f;
+                }
+                let (v_by, _) = hand_over(&u_by, &beam, n_s, out, &|_| Cx::ONE);
+                for (a, b) in v.data.iter_mut().zip(&v_by.data) {
+                    *a += *b;
+                }
+                // The light beside the element keeps its direction, which the
+                // outgoing plane holds as a phase ramp across its samples.
+                let ramp = k * (beam.d - out.d).length() * g.pitch_mm[0].max(g.pitch_mm[1]);
+                if ramp > std::f64::consts::PI {
+                    self.report.warn(SamplingWarning::Undersampled {
+                        what: format!("the light passing beside #{}", h.object.0),
+                        max_phase_step_rad: ramp,
+                    });
+                }
+            }
+            (v, depth)
+        };
+        let l = &mut self.report.ledger;
+        match loss {
+            Loss::Absorbed => l.absorbed_element += lost_in,
+            Loss::Arm(other) => {
+                l.other_arm += inside * other;
+                l.absorbed_element += (lost_in - inside * other).max(0.0);
+            }
+            Loss::Orders => l.untracked_orders += lost_in,
+        }
+        l.passed_by += beside;
+        l.beyond_nyquist += beyond;
+        l.resampling += sent - v.power();
+        // A flat mirror's handover is image theory, exact at any tilt;
+        // anything else seen obliquely is a projection.
+        let exact = matches!(response, SurfaceResponse::Mirror { .. }) && h.action == SeqAction::Reflect;
+        if !exact {
+            self.tilt_warn(depth);
+        }
+        let mut note = match lens {
+            Some((f, _)) => format!("thin lens #{} ({}), f = {f} mm", h.object.0, h.label),
+            None => format!("{:?} at #{} ({}), amplitude {amp:.6}", h.action, h.object.0, h.label),
+        };
+        if clipped {
+            note += &format!(
+                "; its outline clips the beam, edges weighted by exact cell coverage, {:.3e} of the power inside it{}",
+                inside / f64::max(total, f64::MIN_POSITIVE),
+                if pass_by { ", the rest passing beside it on the chain" } else { ", the rest passing beside it off the chain" }
+            );
+        }
+        self.report.steps.push(element_step(0.0, note));
+        if let Some((f, _)) = lens {
+            let dx = g.pitch_mm[0];
+            let edge = 0.5 * g.width_mm(0) * 2f64.sqrt();
+            if k * edge * dx / f.abs() > std::f64::consts::PI {
+                self.report.warn(SamplingWarning::Undersampled {
+                    what: format!("thin lens #{} f = {f} mm", h.object.0),
+                    max_phase_step_rad: k * edge * dx / f.abs(),
+                });
+            }
+        }
+        self.u = v;
+        Ok(())
+    }
+
     fn event(&mut self, idx: usize) -> Result<(), WaveError> {
         let (p, _, ev) = self.points[idx].clone();
-        let lam = self.lam;
         // A diffracted readout takes the last step itself, onto the detector.
         if matches!(ev, Ev::End) && matches!(self.spec.readout, Readout::Diffracted { .. }) {
             return Ok(());
@@ -621,13 +913,26 @@ impl WaveJob {
                 let before = self.u.power();
                 let rays = self.spec.grid_n.clamp(65, 257);
                 let (v, st) = crate::transfer::transfer(&probe, &self.u, &beam, &out, last.n_after, rays)?;
-                self.report.ledger.absorbed_element += st.stopped + st.reflected;
-                self.report.ledger.left_window += st.left_window;
+                let l = &mut self.report.ledger;
+                // The rim and the mount stop light; the faces reflect it into
+                // a path the chain does not follow.
+                l.absorbed_aperture += st.rim_stopped + st.stopped;
+                l.beyond_nyquist += st.rim_beyond;
+                l.other_arm += st.reflected;
+                l.left_window += st.left_window;
+                l.resampling += st.carried - st.stopped - st.reflected - st.left_window - v.power();
                 let what = if first.kind == SeqHitKind::Body { "face of body" } else { "curved surface" };
+                let rim = if st.rim_resolved {
+                    format!("its rim laid on the field with exact cell coverage, {:.3e} of the power stopped there", st.rim_stopped / before.max(f64::MIN_POSITIVE))
+                } else if st.stopped > 1e-12 * before {
+                    "its rim resolved only to the ray grid".to_string()
+                } else {
+                    "no rim within the window".to_string()
+                };
                 self.report.steps.push(element_step(
                     0.0,
                     format!(
-                        "{what} #{} ({}): field traced through it along {} rays ({} passed), chief path {:.6} mm; rays move up to {:.4} mm across the beam; {:.3e} of the power stopped outside the traced aperture, {:.3e} reflected by the faces",
+                        "{what} #{} ({}): field traced through it along {} rays ({} passed), chief path {:.6} mm; rays move up to {:.4} mm across the beam; {rim}; {:.3e} of the power stopped elsewhere, {:.3e} reflected by the faces",
                         first.object.0,
                         first.label,
                         st.rays,
@@ -638,6 +943,12 @@ impl WaveJob {
                         st.reflected / before.max(f64::MIN_POSITIVE),
                     ),
                 ));
+                if !st.rim_resolved && st.stopped > 1e-12 * before {
+                    self.report.approx(format!(
+                        "{what} #{}: the edge of what passes is not star-shaped about the chief ray, so it is resolved only to the ray grid",
+                        first.object.0
+                    ));
+                }
                 self.report.approx(format!(
                     "{what} #{}: geometric field tracing (no diffraction inside the element; rays traced along the arriving wavefront's fitted sphere, curvature {:.4e} /mm, which its rays depart from by up to {:.3} mrad; unpolarized transmittance of the faces)",
                     first.object.0,
@@ -659,56 +970,56 @@ impl WaveJob {
                 let t = &a.common.transform;
                 let plane = &a.shape.plane_local;
                 let n_e = t.rotate(plane.normal);
-                // Square to the beam, the opening is a shape in the beam's own
-                // plane: exact cell areas, as for any aperture (elements.rs).
-                if n_e.dot(beam.d).abs() > 1.0 - 1e-12 {
-                    let to_beam = |pu: f64, pv: f64| {
-                        let w = t.transform_point(plane.origin + plane.u * pu + plane.v * pv);
-                        let (x, y) = beam.coords(w);
-                        [x, y]
-                    };
-                    let c = to_beam(0.0, 0.0);
-                    let shape = match &a.shape.clear_opening {
-                        PlanarShape2::Disc { radius_mm } => crate::elements::Shape::Disc { c, r: *radius_mm },
-                        PlanarShape2::Annulus { inner_mm, outer_mm } => {
-                            crate::elements::Shape::Annulus { c, r_in: *inner_mm, r_out: *outer_mm }
-                        }
-                        PlanarShape2::Rectangle { half_width_mm, half_height_mm } => {
-                            let (w, h) = (*half_width_mm, *half_height_mm);
-                            crate::elements::Shape::Polygon(vec![to_beam(-w, -h), to_beam(w, -h), to_beam(w, h), to_beam(-w, h)])
-                        }
-                        PlanarShape2::Polygon { vertices } => {
-                            crate::elements::Shape::Polygon(vertices.iter().map(|v| to_beam(v.x, v.y)).collect())
-                        }
-                    };
-                    let mut step = WaveReport::default();
-                    crate::elements::apply_aperture(&mut self.u, &shape, false, &mut step)?;
-                    merge(&mut self.report, step);
-                    return Ok(());
-                }
-                let before = self.u.power();
-                let dx = self.u.grid.pitch_mm[0];
-                let factor = |r: Vec3| -> Cx {
-                    // 3 × 3 sub-samples across the sample cell, in the beam plane.
-                    let mut inside = 0.0;
-                    for sj in [-1.0, 0.0, 1.0] {
-                        for si in [-1.0, 0.0, 1.0] {
-                            let q = r + beam.x * (si * dx / 3.0) + beam.y * (sj * dx / 3.0);
-                            let local = t.inverse_transform_point(q) - plane.origin;
-                            let (pu, pv) = (local.dot(plane.u), local.dot(plane.v));
-                            if shape_contains(&a.shape.clear_opening, pu, pv) {
-                                inside += 1.0;
-                            }
-                        }
-                    }
-                    Cx::real(inside / 9.0)
+                let o_e = t.transform_point(plane.origin);
+                let square = n_e.dot(beam.d).abs() > 1.0 - 1e-12;
+                // A point of the aperture's plane, along the beam onto the
+                // plane across it here.
+                let to_beam = |pu: f64, pv: f64| {
+                    let w = t.transform_point(plane.origin + plane.u * pu + plane.v * pv);
+                    let (x, y) = beam.coords(w - beam.d * (w - beam.origin).dot(beam.d));
+                    [x, y]
                 };
-                let (v, depth) = hand_over(&self.u, &beam, n_e, &beam, &factor);
-                let note = element_step(0.0, format!("aperture #{} at its plane", a.common.id.0));
-                self.tilt_warn(depth);
-                self.report.ledger.absorbed_aperture += (before - v.power()).max(0.0);
-                self.report.steps.push(note);
-                self.u = v;
+                // As the tracer has it: light passes inside the opening, is
+                // stopped outside it within the outer extent, and passes
+                // beyond the outer extent; with none, the mask is unbounded.
+                let g = self.u.grid;
+                let open = shape_coverage(&g, &a.shape.clear_opening, square, &to_beam)?;
+                let pass: Vec<f64> = match &a.shape.outer_extent {
+                    None => open,
+                    Some(ext) => {
+                        let outer = shape_coverage(&g, ext, square, &to_beam)?;
+                        let inside = shape_rim(&a.shape.clear_opening)
+                            .into_iter()
+                            .all(|p| oc_core::geom3::primitives::planar_shape_contains(ext, p));
+                        if !inside {
+                            self.report.approx(format!(
+                                "aperture #{}: its opening reaches past its outer extent, where the two covers are combined as if it did not",
+                                a.common.id.0
+                            ));
+                        }
+                        outer.iter().zip(&open).map(|(o, c)| (1.0 - o + c).clamp(0.0, 1.0)).collect()
+                    }
+                };
+                let (stopped, beyond) = crate::elements::apply_coverage(&mut self.u, &pass)?;
+                self.report.ledger.absorbed_aperture += stopped;
+                self.report.ledger.beyond_nyquist += beyond;
+                let id = a.common.id.0;
+                if !square {
+                    // Not square to the beam, the opening is its projection
+                    // along the beam: an approximation by the depth it spans.
+                    self.tilt_warn(plane_depth(&beam, &g, o_e, n_e));
+                }
+                let note = if stopped > 0.0 {
+                    format!(
+                        "aperture #{} at its plane, edges weighted by exact cell coverage{}: {:.3e} of the power stopped",
+                        id,
+                        if square { "" } else { " of their projection along the beam" },
+                        stopped / (stopped + self.u.power() + beyond).max(f64::MIN_POSITIVE)
+                    )
+                } else {
+                    format!("aperture #{id} at its plane, clear of the beam")
+                };
+                self.report.steps.push(element_step(0.0, note));
             }
             Ev::Hit(h) => {
                 let si = self
@@ -723,78 +1034,11 @@ impl WaveJob {
                 let response = if from_front { &s.response_front } else { &s.response_back };
                 let d2 = self.next_dir(idx, p, beam.d);
                 let out = beam.turned(p, d2);
-                let before = self.u.power();
-                let amp: Option<f64> = match (response, h.action) {
-                    (SurfaceResponse::Mirror { reflectivity }, SeqAction::Reflect) => {
-                        reflectivity.sample(lam).map(|r| r.clamp(0.0, 1.0).sqrt())
-                    }
-                    (SurfaceResponse::ExplicitRt { reflectance, .. }, SeqAction::Reflect) => {
-                        reflectance.sample(lam).map(|r| r.clamp(0.0, 1.0).sqrt())
-                    }
-                    (SurfaceResponse::ExplicitRt { transmittance, .. }, SeqAction::Transmit) => {
-                        transmittance.sample(lam).map(|t| t.clamp(0.0, 1.0).sqrt())
-                    }
-                    (SurfaceResponse::Grating { efficiency, .. }, SeqAction::Diffract) => {
-                        efficiency.sample(lam).map(|e| e.clamp(0.0, 1.0).sqrt())
-                    }
-                    (SurfaceResponse::Grating { zero_order, .. }, _) => {
-                        zero_order.sample(lam).map(|e| e.clamp(0.0, 1.0).sqrt())
-                    }
-                    _ => None,
-                };
-                if let Some(a) = amp {
-                    let (v, depth) = hand_over(&self.u, &beam, n_s, &out, &|_| Cx::real(a));
-                    // A flat mirror's handover is image theory, exact at any
-                    // tilt; anything else seen obliquely is a projection.
-                    let exact = matches!(response, SurfaceResponse::Mirror { .. }) && h.action == SeqAction::Reflect;
-                    let note = element_step(0.0, format!("{:?} at #{} ({}), amplitude {a:.6}", h.action, h.object.0, h.label));
-                    if !exact {
-                        self.tilt_warn(depth);
-                    }
-                    self.report.ledger.absorbed_element += before * (1.0 - a * a);
-                    self.report.steps.push(note);
-                    self.u = v;
+                if let SurfaceResponse::Modulator { device, .. } = response {
+                    self.u = modulator_step(&self.u, &beam, &out, s, device, &h, &self.spec, &mut self.report)?;
                 } else {
-                    match response {
-                        SurfaceResponse::ThinLens { focal_length_mm } => {
-                            let f = *focal_length_mm;
-                            let c = s.common.transform.pos;
-                            let k = self.u.k_mm();
-                            let lens = move |r: Vec3| {
-                                // Distance from the lens's centre within its plane.
-                                let v = r - c;
-                                let v = v - n_s * v.dot(n_s);
-                                Cx::expi(-k * v.length_squared() / (2.0 * f))
-                            };
-                            let (v, depth) = hand_over(&self.u, &beam, n_s, &out, &lens);
-                            self.tilt_warn(depth);
-                            let dx = self.u.grid.pitch_mm[0];
-                            let edge = 0.5 * self.u.grid.width_mm(0) * 2f64.sqrt();
-                            if k * edge * dx / f.abs() > std::f64::consts::PI {
-                                self.report.warn(SamplingWarning::Undersampled {
-                                    what: format!("thin lens #{} f = {f} mm", h.object.0),
-                                    max_phase_step_rad: k * edge * dx / f.abs(),
-                                });
-                            }
-                            self.report
-                                .steps
-                                .push(element_step(0.0, format!("thin lens #{} ({}), f = {f} mm", h.object.0, h.label)));
-                            self.u = v;
-                        }
-                        SurfaceResponse::Modulator { device, .. } => {
-                            self.u = modulator_step(&self.u, &beam, &out, s, device, &h, &self.spec, &mut self.report)?;
-                        }
-                        other => {
-                            let msg = format!(
-                                "{} at #{} ({}): no wave model for this response on the path (the field is scalar)",
-                                oc_core::build3::response_kind(other),
-                                h.object.0,
-                                h.label
-                            );
-                            self.report.rejected.push(msg.clone());
-                            return Err(WaveError::OutOfRange(msg));
-                        }
-                    }
+                    let (s, response) = (s.clone(), response.clone());
+                    self.flat_element(&s, &response, &h, p, n_s, &out)?;
                 }
                 self.beam = out;
                 self.u.frame = out.iso();
@@ -1106,6 +1350,8 @@ fn modulator_step(
         }
     }
     let before = u.power();
+    let dev_in = on_dev.power();
+    let mut split_off = 0.0;
     let (reflected, rep) = match &device.kind {
         ModulatorKind::Dmd(_) => {
             // The chain followed the family of the pixel the chief ray hit.
@@ -1117,8 +1363,20 @@ fn modulator_step(
         }
         ModulatorKind::Lcos(_) => {
             let beam_kind = if h.action == SeqAction::Diffract { LcosBeam::Modulated } else { LcosBeam::Unmodulated };
-            report.approx("LCoS on the wave path: the beam's polarization split is not applied (the field is scalar); the chosen arm takes the full amplitude");
-            lcos_reflect(&on_dev, device, beam_kind)?
+            report.approx("LCoS on the wave path: the beam is unpolarized, so each polarization beam carries half the reflected power; the two never interfere, and the one not followed is booked as another family");
+            // Unpolarized light, which is all a wave path carries (it refuses
+            // polarizers): of what the device reflects, half lies along its
+            // director and is modulated, half across it and is not (Zhang, You
+            // & Chu 2014). The chain follows one; the other is the family not
+            // followed. What the device absorbs or misses is the same for both.
+            let (mut v, mut rep) = lcos_reflect(&on_dev, device, beam_kind)?;
+            for z in &mut v.data {
+                *z *= std::f64::consts::FRAC_1_SQRT_2;
+            }
+            split_off = 0.5 * (rep.ledger.detected + rep.ledger.beyond_nyquist);
+            rep.ledger.detected *= 0.5;
+            rep.ledger.beyond_nyquist *= 0.5;
+            (v, rep)
         }
     };
     // Take the reflected field up across the outgoing ray. Its samples are
@@ -1152,11 +1410,16 @@ fn modulator_step(
     if depth > gb.pitch_mm[0] * gb.pitch_mm[0] / u.wavelength_in_medium_mm() {
         report.warn(SamplingWarning::TiltProjection { depth_mm: depth });
     }
-    // The device's own ledger, scaled to this beam; resampling closes the rest.
-    let scale = if rep.ledger.launched > 0.0 { before / rep.ledger.launched } else { 0.0 };
+    // The device's own ledger, in this beam's units: the device plane sees the
+    // beam's power spread over its oblique footprint, so its samples sum to
+    // more than the beam's, by the scale below. What the take-up across the
+    // outgoing ray does not carry is resampling.
+    let scale = if dev_in > 0.0 { before / dev_in } else { 0.0 };
     report.ledger.absorbed_element += rep.ledger.absorbed_element * scale;
-    report.ledger.other_family += rep.ledger.other_family * scale;
+    report.ledger.other_family += (rep.ledger.other_family + split_off) * scale;
     report.ledger.beyond_nyquist += rep.ledger.beyond_nyquist * scale;
+    report.ledger.numerical += rep.ledger.numerical * scale;
+    report.ledger.resampling += rep.ledger.detected * scale - v.power();
     for f in rep.validity {
         report.flag(f);
     }

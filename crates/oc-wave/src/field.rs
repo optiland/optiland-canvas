@@ -29,9 +29,15 @@ pub struct Field2 {
     pub carrier: [f64; 2],
     /// The plane in the world.
     pub frame: Isometry3,
-    /// Optical path length at the frame origin, mm. It ties the field's phase
-    /// to the optical path a ray reports, so a field and a trace can be
-    /// compared on the same clock.
+    /// The optical path of the reference ray, the beam's axis, from where the
+    /// field was launched to the frame origin, mm: what a ray reports there,
+    /// for comparing a field with a trace.
+    ///
+    /// It is a record, never applied again: the samples carry the whole
+    /// phase. Every propagator multiplies them by its full transfer function,
+    /// `e^{ikz}` included, and a traced element by `exp(ik₀·OPL)` along its
+    /// rays, so two fields that left one source by different paths and meet
+    /// on one plane add as they are.
     pub opl_ref_mm: f64,
 }
 

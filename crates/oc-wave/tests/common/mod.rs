@@ -37,3 +37,15 @@ pub fn second_moment_radius_x(u: &Field2) -> f64 {
 pub fn measured(what: &str, value: f64) {
     eprintln!("measured: {what} = {value:.3e}");
 }
+
+/// `erf(x)` by its Maclaurin series (DLMF 7.6.1), summed to round-off; for
+/// the test references here, `|x| <= 4`.
+pub fn erf(x: f64) -> f64 {
+    let (mut term, mut sum, mut n) = (x, x, 0.0);
+    while term.abs() > 1e-17 * sum.abs() {
+        n += 1.0;
+        term *= -x * x / n;
+        sum += term / (2.0 * n + 1.0);
+    }
+    2.0 / std::f64::consts::PI.sqrt() * sum
+}

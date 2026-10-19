@@ -136,7 +136,7 @@ pub fn asm_tilted(
     v.data = data;
     v.carrier = [0.0, 0.0];
     v.frame = target;
-    v.opl_ref_mm = u.opl_ref_mm;
+    v.opl_ref_mm = u.opl_ref_mm + u.n_medium * d.z;
     // |U|² over a tilted plane is not power: the power crossing it is the
     // irradiance times the obliquity, taken here as the carrier direction's.
     let obliquity = (ct.z * lam).abs().min(1.0);

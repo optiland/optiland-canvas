@@ -94,9 +94,10 @@ alone.
 
 **On the wave path** the field follows the arm the chief ray took: the
 modulated one where it was steered, the unmodulated one where it reflected
-([wave path](wave-optics.md#the-wave-path)). The scalar field does not carry
-the polarization split, so the arm takes the full amplitude; the report names
-that approximation.
+([wave path](wave-optics.md#the-wave-path)). The path carries unpolarized
+light, so the arm takes half of what the device reflects and the other half
+is booked as the family not followed; the two never interfere. The report
+names that approximation.
 
 **In a file** the device is part of the version 3 document. Written as version
 2 it becomes an absorber of the same footprint, and the loss is named

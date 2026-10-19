@@ -608,7 +608,9 @@ def fig3(D: Data, outdir: Path) -> dict:
 
     files = save(fig, outdir, "F3_fresnel_square")
     r201, r101 = runs[201], runs[101]
-    n_wrap = sum(1 for w_ in m["warnings"] if "WrapAround" in w_["warning"])
+    # The reports carry a Paraxial warning beside each WrapAround (I4).
+    wraps = [w_ for w_ in m["warnings"] if "WrapAround" in w_["warning"]]
+    n_wrap = len(wraps)
     caption = (
         f"Fresnel diffraction of a square aperture, w = {w} mm, λ = {p['lambda_um']} µm, z = {p['z_mm']:g} mm (N_F = (w/2)²/(λz) = {p['fresnel_number_half_width']:g}). "
         f"Simulation: unit plane wave through the area-weighted aperture, 201 samples across (Δx = w/201, n = {r201['n']}, window {r201['window_mm']:.2f} mm, "
@@ -619,7 +621,7 @@ def fig3(D: Data, outdir: Path) -> dict:
         f"{sci(r201['worst_complex_err_rel_peak_2d'])} over the plane, reached at the window edge, where the convolution sum's phase step per cell is largest. "
         f"With 101 samples across, z_c = {r101['critical_distance_mm']:.1f} mm lies beyond z, so the transfer function is the in-regime method; it gives "
         f"{sci(r101['worst_complex_err_rel_peak_2d'])}, a ratio of {e['error_ratio_101_to_201_2d']:.2f} on halving Δx (second order). Both reports carry WrapAround "
-        f"(edge fractions {sci(m['warnings'][0]['warning']['WrapAround']['edge_fraction'])} and {sci(m['warnings'][1]['warning']['WrapAround']['edge_fraction'])}); "
+        f"(edge fractions {sci(wraps[0]['warning']['WrapAround']['edge_fraction'])} and {sci(wraps[1]['warning']['WrapAround']['edge_fraction'])}); "
         f"the sharp edge diffracts up to the grid's Nyquist angle. Sources: [Goodman], [Voelz 2009], [DLMF]."
     )
     return {

@@ -385,7 +385,14 @@ narrow beam, on a window finer than a few samples a pixel, is laid on a
 device grid at least twice as fine as the beam's own (up to 32 samples a
 pixel): read between device samples it did not have, the DMD's take-up onto a
 0.1 mm beam's window resampled 7.5% of the power at four samples a pixel, and
-1.4% at 32.
+1.0% at 32. A device grid finer than the window the field leaves on holds
+directions that window cannot, as a coarser window does: the plane waves
+beyond the outgoing window's band, about the reflected family's carrier, are
+taken out of the device's field before the take-up and booked as
+`beyond_nyquist`. Read between device samples with them still in, a DMD's
+facets folded 17% of the power back into the band in the DMD-and-lens test
+below (booked as `resampling`) and weighted its orders wrongly; taken out
+first, the resampling there is 1.3e-4.
 
 **What the path follows at a modulator.** The chief ray, and so the beam,
 leaves a DMD along the reflection off the facet it hits, and an SLM along the
@@ -552,7 +559,7 @@ These are acceptance case C53, in `crates/oc-wave/tests/path.rs`.
 | `a_4f_system_images_at_minus_f2_over_f1_and_its_iris_cuts_the_spectrum` | the image waist `w₀f₂/f₁` [1]; a Fourier-plane iris passes `1 − exp(−2r²/w_F²)`, `w_F = λf₁/(πw₀)` [13]; the ledger | 1e-4; 2e-3; 1e-6 | within 1e-4; 1.8e-5 (1.6e-3 before the window was fitted to the focus); 8.7e-14 |
 | `wave_and_ray_agree_on_where_the_beam_lands` | the chief ray's landing point on a tilted fold | 0.05 pixel | 3.2e-4 mm (0.003 pixel) |
 | `wave_power_agrees_with_rays_when_the_fresnel_number_is_large` | the f64 ray trace of the same scene, a uniform beam through a disc at `N_F` = 1264 | 1% | 0.12% |
-| `a_dmd_in_the_scene_focuses_its_orders_f_lambda_over_p_apart` | orders `λ/p` apart in direction cosine [10], so `fλ/p` apart at a lens's focus | 1% | 1.000; resampling 7.7e-6, `numerical` 2.8e-13 |
+| `a_dmd_in_the_scene_focuses_its_orders_f_lambda_over_p_apart` | orders `λ/p` apart in direction cosine [10], so `fλ/p` apart at a lens's focus | 1% | 1.000; resampling 1.3e-4, `numerical` 3.6e-13 |
 | `slicing_a_wave_job_changes_no_bit` | the same path run in one step | bit-identical | identical |
 | `a_glass_plate_shifts_a_gaussian_as_free_space_of_t_over_n` | a plate of thickness `t`, index `n` is free space `t/n` to a Gaussian [13]; faces anti-reflected, one closed-form step | 1e-5 | 1.9e-7 (implied index within 1.8e-5; face by face it was 2.4e-6 and 2.3e-4) |
 | `a_gaussian_through_a_singlet_waists_where_self_predicts` | Self [14] with the singlet's focal length and principal planes traced by the f64 tracer (an N-BK7 equiconvex lens, R ±50 mm, 4 mm) | 1e-3 | waist position 2.5e-4 of its Rayleigh range (2.9 µm); radius 5.1e-5 |
@@ -580,7 +587,7 @@ These are acceptance case C53, in `crates/oc-wave/tests/path.rs`.
 | `a_retarder_between_crossed_polarizers_passes_half_sin2_2phi_sin2_half_delta` | `sin²2φ·sin²(δ/2)/2` [26], [27] at five (φ, δ); circular light from a quarter-wave plate at 45°, `1/4` through any analyzer | 1e-9 | 9.6e-15; 4.8e-15 |
 | `tilted_crossed_polarizers_leak_as_the_ray_tracer_says` | crossed at ±45° to the plane of incidence, met at 40°: the f64 tracer's polarized trace of the chief ray, bare and in glass of 1.5 (one model, two implementations); bare, `(sin²θ/(1 + cos²θ))²/2` from the axes' projection | 1e-6; 1e-9 | 1.8e-14 and 3.5e-14; 1.9e-14 |
 | `a_half_wave_plate_in_one_arm_of_a_mach_zehnder_takes_its_fringes_away_and_a_polarizer_brings_them_back` | Fresnel–Arago [27]: half the launched in the X port at every Δφ; behind an analyzer at β, `1/4 − cos Δφ·cos 2(θ − β)/4` [26], θ = 20°, β = 20°, 50°, 65° | 1e-6 | 4.9e-8 |
-| `a_dmd_s_orders_cross_a_singlet_each_about_its_own_direction` | the orders of a DMD whose blaze lies between two of them, through an N-BK7 singlet (R ±8 mm): each crosses each face about its own direction [10], [17]; the chief ray lies 27 mrad from the nearest | rms departure 2.7 mrad; `numerical` 1e-6 | 0.36 mrad; 5.6e-9 (resampling 1.4e-2 at the DMD's take-up) |
+| `a_dmd_s_orders_cross_a_singlet_each_about_its_own_direction` | the orders of a DMD whose blaze lies between two of them, through an N-BK7 singlet (R ±8 mm): each crosses each face about its own direction [10], [17]; the chief ray lies 27 mrad from the nearest | rms departure 2.7 mrad; `numerical` 1e-6 | 0.36 mrad; 5.9e-9 (resampling 9.9e-3 at the DMD's take-up) |
 | `crossed_polarizers_before_a_lens_leave_it_a_dark_field_to_carry` | the chain is geometry: behind crossed polarizers a singlet carries an all-zero field, the ledger closed | 1e-12 | detected 1.7e-33 |
 | `a_pinhole_at_a_lens_s_focus_passes_what_the_focused_gaussian_puts_through_it` | a waist on a lens of focal length f has radius λf/(πw₀) at the focal plane (bundle M30, [13]): a pinhole of that radius stops `exp(−2)` | 1e-5 | 5.7e-7 |
 | `a_ten_times_beam_expander_widens_the_beam_as_the_abcd_law_says` | the radius at the second lens by the Gaussian ABCD law [13], through a 50 µm focus | 1e-5 | 3.9e-7 |
@@ -615,11 +622,11 @@ The propagation tests of W8 (acceptance case C57, `crates/oc-wave/tests/propagat
 | `an_off_axis_window_holds_the_field_the_large_window_does` | a beam walked 0.6 mm sideways, against the FFT angular spectrum on a window four times as wide [7] | 1e-6 | 1.9e-12 of peak |
 | `a_tilted_plane_holds_the_field_its_plane_waves_sum_to` | a plane tilted 20°, 2 mm along, against the plane waves of the same spectrum summed at its points [6]; with no tilt, against `asm_zoom` | 2e-3; 1e-10 | 5.9e-4 (the bilinear reading of the spectrum, padded 4×); 8.3e-14 |
 
-The DMD case shows what the ledger is for. Of the launched power, 66.8%
+The DMD case shows what the ledger is for. Of the launched power, 72.1%
 reaches the detector, 11.7% falls in the dead space between mirrors
-(`absorbed_element`), 19.4% goes into orders beyond the beam grid's Nyquist
-angle (`beyond_nyquist`), and 2.1% misses the detector (`left_window`);
-7.7e-6 is lost resampling between grids (`resampling`), and 2.8e-13 is left
+(`absorbed_element`), 9.9% goes into orders beyond the beam grid's Nyquist
+angle (`beyond_nyquist`), and 6.2% misses the detector (`left_window`);
+1.3e-4 is lost resampling between grids (`resampling`), and 3.6e-13 is left
 unaccounted (`numerical`).
 
 ## From Python

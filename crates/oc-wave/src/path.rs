@@ -3462,6 +3462,17 @@ fn modulator_step(
             lcos_reflect(&on_dev, device, beam_kind)?
         }
     };
+    // The device grid, finer than the outgoing window, holds plane waves that
+    // window cannot: read between device samples, they would fold back in at
+    // directions they do not have, and weight the orders wrongly. Take them
+    // out first, about the reflected family's carrier, as a re-grid does,
+    // and book them. The window's samples, `p` apart across the outgoing
+    // ray, are `p/√(1 − (e·d)²)` apart along a device axis `e` on its plane.
+    let scale = if dev_in > 0.0 { before / dev_in } else { 0.0 };
+    let pb = u.grid.pitch_mm[0].max(u.grid.pitch_mm[1]);
+    let along = |e: Vec3| pb / (1.0 - e.dot(out.d).powi(2)).max(1e-12).sqrt();
+    let band = Grid2::new(reflected.grid.n, [along(t.rotate(Vec3::X)), along(t.rotate(Vec3::Y))], [0.0, 0.0])?;
+    let (reflected, cut) = band_to(&reflected, &band, &mut Fft2::new());
     // Take the reflected field up across the outgoing ray. Its samples are
     // the incident ones times a piston per pixel, so the incident field's
     // sphere is the one to take out of them.
@@ -3497,12 +3508,11 @@ fn modulator_step(
     // beam's power spread over its oblique footprint, so its samples sum to
     // more than the beam's, by the scale below. What the take-up across the
     // outgoing ray does not carry is resampling.
-    let scale = if dev_in > 0.0 { before / dev_in } else { 0.0 };
     report.ledger.absorbed_element += rep.ledger.absorbed_element * scale;
     report.ledger.other_family += rep.ledger.other_family * scale;
-    report.ledger.beyond_nyquist += rep.ledger.beyond_nyquist * scale;
+    report.ledger.beyond_nyquist += (rep.ledger.beyond_nyquist + cut) * scale;
     report.ledger.numerical += rep.ledger.numerical * scale;
-    report.ledger.resampling += rep.ledger.detected * scale - v.power();
+    report.ledger.resampling += (rep.ledger.detected - cut) * scale - v.power();
     for f in rep.validity {
         report.flag(f);
     }
@@ -3511,7 +3521,16 @@ fn modulator_step(
     }
     report.steps.push(element_step(
         0.0,
-        format!("{} #{} ({}): laid on {}×{} device samples, {} per pixel", oc_core::build3::response_kind(&s.response_front), h.object.0, h.label, n[0], n[1], per),
+        format!(
+            "{} #{} ({}): laid on {}×{} device samples, {} per pixel; {:.3e} of the power, beyond the outgoing window's band, taken out before the take-up",
+            oc_core::build3::response_kind(&s.response_front),
+            h.object.0,
+            h.label,
+            n[0],
+            n[1],
+            per,
+            cut * scale / before.max(f64::MIN_POSITIVE)
+        ),
     ));
     Ok(v)
 }

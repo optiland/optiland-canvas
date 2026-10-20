@@ -18,13 +18,34 @@
 //! distance between the planes and any sideways shift: an off-axis window is
 //! the same sum (K. Matsushima, "Shifted angular spectrum method for off-axis
 //! numerical propagation," *Opt. Express* 18(17), 18453–18463 (2010),
-//! doi:10.1364/OE.18.018453, resolved 2026-10-19). The source spectrum is read between its FFT
-//! samples by bilinear interpolation, which is the method's approximation:
-//! padding the source (`pad`) samples the spectrum finer and makes it
-//! smaller. The target field is then evaluated on the output grid by chirp-z,
-//! as [`super::asm::asm_zoom`] does, so a small tilted window is not wrapped.
+//! doi:10.1364/OE.18.018453, resolved 2026-10-19).
+//!
+//! The source spectrum is wanted between its FFT samples, at the rotated
+//! frequencies. It is read there by gridding, the interpolation step of the
+//! non-uniform FFT: the field is divided by the kernel's Fourier dual, its
+//! spectrum taken on a grid at least twice finer than the window's (the
+//! source zero-padded `pad ≥ 2` times), and each rotated frequency read as
+//! the kernel-weighted sum of the [`GRID_KERNEL_WIDTH`] nearest samples per
+//! axis (J. I. Jackson, C. H. Meyer, D. G. Nishimura, A. Macovski,
+//! "Selection of a convolution function for Fourier inversion using
+//! gridding," *IEEE Trans. Med. Imaging* 10(3), 473–478 (1991),
+//! doi:10.1109/42.97598; L. Greengard, J.-Y. Lee, "Accelerating the
+//! nonuniform fast Fourier transform," *SIAM Rev.* 46(3), 443–454 (2004),
+//! doi:10.1137/S003614450343200X). The kernel is the Kaiser–Bessel window,
+//! `I₀(β√(1 − (2z/w)²))`, whose Fourier dual is closed-form,
+//! `w·sinh(√(β² − a²))/√(β² − a²)`, with `β` chosen for the width and the
+//! oversampling after P. J. Beatty, D. G. Nishimura, J. M. Pauly, "Rapid
+//! gridding reconstruction with a minimal oversampling ratio," *IEEE Trans.
+//! Med. Imaging* 24(6), 799–808 (2005), doi:10.1109/TMI.2005.848376, Eq. (5).
+//! The reading's error is the kernel's aliasing, about `e^{−β}`: with ten
+//! samples a side and the source padded twice, below 1e-8 of the field (the
+//! tilted-plane test prints it against a direct plane-wave sum). The target
+//! field is then evaluated on the output grid by chirp-z, as
+//! [`super::asm::asm_zoom`] does, so a small tilted window is not wrapped.
 //! A plane wave travelling back across the source plane (`w ≤ 0`) is not part
-//! of the forward field and is left out.
+//! of the forward field and is left out. The output carries the source
+//! carrier's direction, seen in the target frame, as its own analytic
+//! carrier; its samples are the envelope about it.
 
 use super::embed;
 use crate::fft::{fftshift2, ifftshift2, next_fast_len};
@@ -33,9 +54,71 @@ use crate::{Cx, Fft2, Field2, Grid2, WaveError, WaveReport};
 use oc_core::{Isometry3, Vec3};
 use std::f64::consts::PI;
 
+/// The width of the gridding kernel, in spectral samples per axis.
+pub const GRID_KERNEL_WIDTH: usize = 10;
+
+/// The modified Bessel function `I₀(x)` by its power series, every term
+/// positive; held to round-off.
+fn bessel_i0(x: f64) -> f64 {
+    let q = 0.25 * x * x;
+    let mut term = 1.0;
+    let mut sum = 1.0;
+    for k in 1..400u32 {
+        term *= q / ((k * k) as f64);
+        sum += term;
+        if term < 1e-17 * sum {
+            break;
+        }
+    }
+    sum
+}
+
+/// The Kaiser–Bessel kernel's shape parameter for a width of `w` samples and
+/// an oversampling `p` (Beatty, Nishimura & Pauly 2005, Eq. (5)).
+fn kaiser_beta(w: usize, p: f64) -> f64 {
+    let w = w as f64;
+    PI * ((w / p).powi(2) * (p - 0.5).powi(2) - 0.8).max(0.0).sqrt()
+}
+
+/// The kernel's Fourier dual (without its factor `w`),
+/// `sinh(√(β² − a²))/√(β² − a²)`, at `a = πw·x/L` for a sample `x` from the
+/// window's centre and the padded period `L`.
+fn kernel_dual(beta: f64, a: f64) -> f64 {
+    let s2 = beta * beta - a * a;
+    if s2 > 0.0 {
+        let s = s2.sqrt();
+        s.sinh() / s
+    } else if s2 < 0.0 {
+        let s = (-s2).sqrt();
+        s.sin() / s
+    } else {
+        1.0
+    }
+}
+
+/// The kernel's weights for a read at the fractional sample `g`, over the
+/// samples `i0..i0 + n` that fall within the kernel's width and the grid.
+fn kernel_weights(beta: f64, w: usize, g: f64, len: usize, out: &mut Vec<f64>) -> usize {
+    out.clear();
+    let half = 0.5 * w as f64;
+    let i0 = ((g - half).ceil().max(0.0)) as usize;
+    let i1 = ((g + half).floor().min((len - 1) as f64)) as isize;
+    if i1 < i0 as isize {
+        return i0;
+    }
+    for i in i0..=(i1 as usize) {
+        let z = (i as f64 - g) / half;
+        let t = 1.0 - z * z;
+        out.push(if t > 0.0 { bessel_i0(beta * t.sqrt()) } else { 0.0 });
+    }
+    i0
+}
+
 /// The field `u` on the plane `target` (a frame in world coordinates; its
 /// local `XY` the plane), sampled on `out` in that frame, with the source
-/// zero-padded `pad` times. The output field carries no carrier.
+/// zero-padded `pad` times (at least twice, for the gridding kernel). The
+/// output's analytic carrier is the source carrier's direction in the
+/// target frame; its samples are the envelope about it.
 pub fn asm_tilted(
     u: &Field2,
     target: Isometry3,
@@ -47,9 +130,28 @@ pub fn asm_tilted(
     let mut report = WaveReport::default();
     report.ledger.launched = u.power();
     let n = u.grid.n;
-    let p = if pad <= 1 { n } else { [next_fast_len(pad * n[0]), next_fast_len(pad * n[1])] };
+    let pad = pad.max(2);
+    let p = [next_fast_len(pad * n[0]), next_fast_len(pad * n[1])];
     let gp = Grid2::new(p, u.grid.pitch_mm, u.grid.center_mm)?;
-    let mut buf = if pad <= 1 { u.data.clone() } else { embed(u, p) };
+    let w = GRID_KERNEL_WIDTH;
+    // The kernel for each axis's oversampling, and the field divided by its
+    // dual (the samples' offsets from the window's centre, in the padded
+    // period, as `embed` places them).
+    let over = [p[0] as f64 / n[0] as f64, p[1] as f64 / n[1] as f64];
+    let beta = [kaiser_beta(w, over[0]), kaiser_beta(w, over[1])];
+    let dual = |axis: usize, i: usize| {
+        let x = i as f64 - (n[axis] / 2) as f64;
+        kernel_dual(beta[axis], PI * w as f64 * x / p[axis] as f64)
+    };
+    let dual_x: Vec<f64> = (0..n[0]).map(|i| dual(0, i)).collect();
+    let dual_y: Vec<f64> = (0..n[1]).map(|j| dual(1, j)).collect();
+    let mut pre = u.clone();
+    for (j, dy) in dual_y.iter().enumerate() {
+        for (i, dx) in dual_x.iter().enumerate() {
+            pre.data[j * n[0] + i] *= 1.0 / (dx * dy);
+        }
+    }
+    let mut buf = embed(&pre, p);
     ifftshift2(&mut buf, p);
     fft.forward(&mut buf, p, gp.cell_area_mm2());
     fftshift2(&mut buf, p);
@@ -57,6 +159,20 @@ pub fn asm_tilted(
     let inv_l2 = 1.0 / (lam * lam);
     let (du, dv) = (gp.freq_pitch(0), gp.freq_pitch(1));
     let (u0, v0) = (u.carrier[0] / lam, u.carrier[1] / lam);
+    // Where the source spectrum is: reads beyond it (and the kernel's reach)
+    // are skipped.
+    let peak = buf.iter().map(|z| z.norm_sqr()).fold(0.0, f64::max);
+    let (mut lo, mut hi) = ([usize::MAX; 2], [0usize; 2]);
+    for ky in 0..p[1] {
+        for kx in 0..p[0] {
+            if buf[ky * p[0] + kx].norm_sqr() > 1e-20 * peak {
+                lo = [lo[0].min(kx), lo[1].min(ky)];
+                hi = [hi[0].max(kx), hi[1].max(ky)];
+            }
+        }
+    }
+    let half = 0.5 * w as f64;
+    let reach = [(lo[0] as f64 - half, hi[0] as f64 + half), (lo[1] as f64 - half, hi[1] as f64 + half)];
 
     // The target frame's axes and origin in the source frame.
     let src = u.frame;
@@ -71,17 +187,6 @@ pub fn asm_tilted(
     let at_c = Cx::expi(2.0 * PI * (u0 * c_win.x + v0 * c_win.y));
     // A source-frame frequency from a target-frame one: k = u′ tx + v′ ty + w′ tz.
     let to_src = |up: f64, vp: f64, wp: f64| tx * up + ty * vp + tz * wp;
-    // The bilinear spectrum, at absolute source frequency (fx, fy).
-    let read = |fx: f64, fy: f64| -> Cx {
-        let (gx, gy) = ((fx - u0) / du + (p[0] / 2) as f64, (fy - v0) / dv + (p[1] / 2) as f64);
-        if !(gx >= 0.0 && gy >= 0.0 && gx <= (p[0] - 1) as f64 && gy <= (p[1] - 1) as f64) {
-            return Cx::ZERO;
-        }
-        let (i0, j0) = ((gx.floor() as usize).min(p[0] - 2), (gy.floor() as usize).min(p[1] - 2));
-        let (s, t) = (gx - i0 as f64, gy - j0 as f64);
-        let at = |i: usize, j: usize| buf[j * p[0] + i];
-        at(i0, j0) * ((1.0 - s) * (1.0 - t)) + at(i0 + 1, j0) * (s * (1.0 - t)) + at(i0, j0 + 1) * ((1.0 - s) * t) + at(i0 + 1, j0 + 1) * (s * t)
-    };
     // The target spectrum on a grid as fine as the source's, over the band
     // the source holds, about the source's carrier seen in the target frame.
     let c = Vec3::new(u0, v0, (inv_l2 - u0 * u0 - v0 * v0).max(0.0).sqrt());
@@ -92,7 +197,9 @@ pub fn asm_tilted(
     let sgn = if tz.z >= 0.0 { 1.0 } else { -1.0 };
     let (mx, my) = (p[0], p[1]);
     let f_at = |k: usize, axis: usize| (k as f64 - (if axis == 0 { mx } else { my } / 2) as f64) * if axis == 0 { du } else { dv };
+    let norm = 1.0 / (w * w) as f64;
     let mut spec = vec![Cx::ZERO; mx * my];
+    let (mut wx, mut wy) = (Vec::with_capacity(w + 1), Vec::with_capacity(w + 1));
     for ky in 0..my {
         let vp = vp0 + f_at(ky, 1);
         for kx in 0..mx {
@@ -106,16 +213,35 @@ pub fn asm_tilted(
             if k.z <= 0.0 {
                 continue;
             }
+            // The read, at the source's fractional samples.
+            let (gx, gy) = ((k.x - u0) / du + (p[0] / 2) as f64, (k.y - v0) / dv + (p[1] / 2) as f64);
+            if gx < reach[0].0 || gx > reach[0].1 || gy < reach[1].0 || gy > reach[1].1 {
+                continue;
+            }
+            let i0 = kernel_weights(beta[0], w, gx, p[0], &mut wx);
+            let j0 = kernel_weights(beta[1], w, gy, p[1], &mut wy);
+            if wx.is_empty() || wy.is_empty() {
+                continue;
+            }
+            let mut a = Cx::ZERO;
+            for (dj, cy) in wy.iter().enumerate() {
+                let row = (j0 + dj) * p[0] + i0;
+                let mut line = Cx::ZERO;
+                for (di, cx) in wx.iter().enumerate() {
+                    line += buf[row + di] * *cx;
+                }
+                a += line * *cy;
+            }
             // ∂(u, v)/∂(u′, v′) with w′ = √(1/λ² − u′² − v′²).
             let (dux, duy) = (tx.x - tz.x * up / wp, ty.x - tz.x * vp / wp);
             let (dvx, dvy) = (tx.y - tz.y * up / wp, ty.y - tz.y * vp / wp);
             let jac = (dux * dvy - duy * dvx).abs();
             let phase = 2.0 * PI * (k.x * d.x + k.y * d.y + k.z * d.z);
-            spec[ky * mx + kx] = read(k.x, k.y) * at_c * Cx::expi(phase) * jac;
+            spec[ky * mx + kx] = a * norm * at_c * Cx::expi(phase) * jac;
         }
     }
-    // Evaluate on the output points by chirp-z, one axis at a time. The
-    // target carrier `(u′₀, v′₀)` is put back into the samples.
+    // Evaluate on the output points by chirp-z, one axis at a time: the
+    // envelope about the target carrier `(u′₀, v′₀)`.
     let (ox, oy) = (out.n[0], out.n[1]);
     let (x0, y0) = (out.coord(0, 0), out.coord(1, 0));
     let (dx, dy) = (out.pitch_mm[0], out.pitch_mm[1]);
@@ -133,14 +259,13 @@ pub fn asm_tilted(
         }
         let cz = crate::czt::czt_line(&col, f_at(0, 1), dv, -y0, -dy, oy, fft);
         for (m, v) in cz.into_iter().enumerate() {
-            let (x, y) = out.xy(i, m);
-            data[m * ox + i] = v * Cx::expi(2.0 * PI * (up0 * x + vp0 * y));
+            data[m * ox + i] = v;
         }
     }
     let mut v = u.clone();
     v.grid = out;
     v.data = data;
-    v.carrier = [0.0, 0.0];
+    v.carrier = [up0 * lam, vp0 * lam];
     v.frame = target;
     v.opl_ref_mm = u.opl_ref_mm + u.n_medium * d.z;
     // |U|² over a tilted plane is not power: the power crossing it is the
@@ -153,10 +278,51 @@ pub fn asm_tilted(
         z_mm: d.z,
         sampling: None,
         note: format!(
-            "angular spectrum of a {}×{} field (padded to {}×{}) onto a plane tilted {:.3}° and {:.4} mm along, by spectrum rotation (Matsushima, Schimmel & Wyrowski 2003) and chirp-z onto {}×{} points; power through the window projected by the carrier's obliquity",
+            "angular spectrum of a {}×{} field (padded to {}×{}) onto a plane tilted {:.3}° and {:.4} mm along, by spectrum rotation (Matsushima, Schimmel & Wyrowski 2003), the spectrum read between its samples by a Kaiser–Bessel kernel {w} samples wide, and chirp-z onto {}×{} points; power through the window projected by the carrier's obliquity",
             n[0], n[1], p[0], p[1], tz.z.abs().min(1.0).acos().to_degrees(), d.z, ox, oy
         ),
     });
     report.ledger.close();
     Ok((v, report))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_bessel_series_matches_tabulated_values() {
+        // Abramowitz & Stegun, Table 9.8: I₀(1) = 1.2660658778, I₀(2) =
+        // 2.2795853023, I₀(5) = 27.239871823.
+        assert!((bessel_i0(0.0) - 1.0).abs() < 1e-15);
+        assert!((bessel_i0(1.0) - 1.266_065_877_8).abs() < 1e-9);
+        assert!((bessel_i0(2.0) - 2.279_585_302_3).abs() < 1e-9);
+        assert!((bessel_i0(5.0) - 27.239_871_823).abs() < 1e-7);
+    }
+
+    #[test]
+    fn the_kernel_sums_to_its_dual_at_the_origin() {
+        // Poisson: Σ_m ψ(m) over the integers equals w·S(0) up to the
+        // kernel's aliasing, which is the reading's error.
+        for p in [2.0, 4.0] {
+            let w = GRID_KERNEL_WIDTH;
+            let beta = kaiser_beta(w, p);
+            let half = 0.5 * w as f64;
+            let sum: f64 = (-(w as i64)..=(w as i64))
+                .map(|m| {
+                    let z = m as f64 / half;
+                    let t = 1.0 - z * z;
+                    if t > 0.0 {
+                        bessel_i0(beta * t.sqrt())
+                    } else {
+                        0.0
+                    }
+                })
+                .sum();
+            let want = w as f64 * kernel_dual(beta, 0.0);
+            let err = ((sum - want) / want).abs();
+            eprintln!("measured: Kaiser–Bessel kernel of width {w} at oversampling {p}: Σψ(m) against w·S(0), relative = {err:.3e}");
+            assert!(err < 1e-8, "{err}");
+        }
+    }
 }

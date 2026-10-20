@@ -65,6 +65,7 @@ fn main() -> R<()> {
         window_mm: 6.0,
         device_samples_per_pixel: 4,
         readout: Readout::Diffracted { samples_per_pixel: 1 },
+        detector_model: oc_wave::path::DetectorModel::NormalFlux,
     };
     let r = wave_path(&s, &spec, 1)?;
 

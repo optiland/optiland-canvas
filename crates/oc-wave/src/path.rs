@@ -81,19 +81,55 @@ use std::sync::Arc;
 /// source carries as its `coherence` and the document saves.
 pub use oc_core::scene3::CoherentBeam as BeamProfile;
 
-/// How the detector is read.
+/// How finely the detector is read. Every field that reaches the detector,
+/// one chain's or an interferometer's arms', is carried onto the
+/// detector's own sub-pixel grid, with enough points a pixel to resolve the
+/// fields' band and the fringes between the arms ([`READOUT_PER_PERIOD`]
+/// points per period of the intensity), and each pixel sums its points'
+/// irradiance times their area.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum Readout {
-    /// The field carried to the detector's centre on its own grid, each
-    /// cell's power binned into the pixel its projection lands in.
+    /// The points a pixel chosen from the fields alone.
     #[default]
     Projected,
-    /// The last free-space step taken straight onto the detector by the
-    /// zoomed angular spectrum ([`crate::asm_zoom`]), on `samples_per_pixel`²
-    /// points a pixel and then binned: a focal spot far smaller than the
-    /// field's own samples is resolved, with no paraxial approximation.
+    /// At least `samples_per_pixel` points a pixel, and more where the
+    /// fields need them.
     Diffracted { samples_per_pixel: usize },
 }
+
+/// How the detector forms power from the fields that reach its face.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum DetectorModel {
+    /// The scalar flux through the face: `Σ_c cos θ_c |U_c|²` for the arms
+    /// `c` at obliquity `θ_c`, and the cross terms with the mean obliquity,
+    /// `Re Σ_{c≠c′} U_c U_c′* (cos θ_c + cos θ_c′)/2`; exact for coplanar
+    /// TE plane waves. The default.
+    #[default]
+    NormalFlux,
+    /// A paraxial area detector: `|Σ_c U_c|²` on the face, every obliquity
+    /// taken as 1.
+    ParaxialArea,
+}
+
+/// The points per period of the intensity's highest frequency (the arms'
+/// directions' spread on the face plus twice the envelope's band, the band
+/// holding all but 1e-6 of the envelope's energy) the readout gives each
+/// face axis. The fringe between two arms' carriers is integrated over each
+/// cell exactly; the envelopes' structure by the midpoint rule over the
+/// points, whose error for a component of the intensity at frequency `f` is
+/// `(πfh)²/6` of it, `h` the points' pitch: 2.6% of a component at the
+/// band's edge, 0.64% at half of it.
+pub const READOUT_PER_PERIOD: f64 = 8.0;
+
+/// The points per period the readout gives the intensity's whole band, the
+/// envelope's taken down to 1e-8 of its peak amplitude: above two, so that
+/// the sum over the points is the band-limited interpolant's power exactly
+/// (its aliases vanish), whatever the field's window cut off. A field that
+/// ends at its window's edge has spectral tails to its grid's Nyquist
+/// frequency, whose beat with the main lobe is of first order in the edge's
+/// amplitude: read at points that do not resolve them, the Michelson of the
+/// tests gained 1e-4 of an arm's power.
+pub const READOUT_PER_PERIOD_TAILS: f64 = 2.5;
 
 /// What to compute.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -109,6 +145,8 @@ pub struct WavePathSpec {
     /// Samples per pixel when the field is laid onto a DMD or SLM.
     pub device_samples_per_pixel: usize,
     pub readout: Readout,
+    /// How the detector forms power from the fields on its face.
+    pub detector_model: DetectorModel,
 }
 
 impl WavePathSpec {
@@ -140,6 +178,7 @@ impl WavePathSpec {
             window_mm,
             device_samples_per_pixel: 4,
             readout: Readout::Projected,
+            detector_model: DetectorModel::NormalFlux,
         })
     }
 }
@@ -885,8 +924,6 @@ struct ChainJob {
     /// The field is laid out only when the chain first runs, so a job of
     /// many chains holds one full field at a time.
     launched: bool,
-    /// Read out onto the detector's own grid, to be added to other arms.
-    face: bool,
     /// The polarization the field (or, while an element runs on one of two
     /// components, that component) stands for.
     pol: Pol,
@@ -1037,7 +1074,7 @@ fn launch_field(spec: &WavePathSpec, grid: Grid2, lam: f64, n0: f64, power: f64,
 impl ChainJob {
     /// Plan the events along `seq` and frame the beam at the source; the
     /// field is launched when the chain first steps.
-    fn new(scene: &Arc<Scene3>, spec: &WavePathSpec, seq: oc_core::seq3::SequencePrescription3, power: f64, face: bool, jones: Option<[f64; 2]>) -> Result<Self, WaveError> {
+    fn new(scene: &Arc<Scene3>, spec: &WavePathSpec, seq: oc_core::seq3::SequencePrescription3, power: f64, jones: Option<[f64; 2]>) -> Result<Self, WaveError> {
         let src = scene
             .sources
             .iter()
@@ -1182,7 +1219,6 @@ impl ChainJob {
             power,
             n0,
             launched: false,
-            face,
             pol: Pol::Unpolarized,
             uy: None,
             polarized: jones.is_some(),
@@ -1711,40 +1747,6 @@ impl ChainJob {
         Ok((gx, gy))
     }
 
-    /// The chain's twin for its second component: the same chain, done, with
-    /// `u` as its field and a report of its own.
-    fn twin(&self, u: Field2) -> ChainJob {
-        let launched = u.power();
-        ChainJob {
-            scene: Arc::clone(&self.scene),
-            spec: self.spec,
-            lam: self.lam,
-            power: 0.0,
-            n0: self.n0,
-            launched: true,
-            face: self.face,
-            pol: Pol::Unpolarized,
-            uy: None,
-            polarized: false,
-            jones: [1.0, 0.0],
-            points: self.points.clone(),
-            keys: Vec::new(),
-            launch: WaveLedger::default(),
-            history: Vec::new(),
-            junction: None,
-            next: self.next,
-            beam: self.beam,
-            u,
-            q: self.q,
-            at: self.at,
-            cache: None,
-            departures: None,
-            rest: Vec::new(),
-            report: WaveReport { ledger: WaveLedger { launched, ..Default::default() }, ..Default::default() },
-            fft: Fft2::new(),
-        }
-    }
-
     fn tilt_warn(&mut self, depth: f64) {
         let dx = self.u.grid.pitch_mm[0];
         if depth > dx * dx / self.u.wavelength_in_medium_mm() {
@@ -2053,12 +2055,6 @@ impl ChainJob {
 
     fn event(&mut self, idx: usize) -> Result<(), WaveError> {
         let (p, _, ev) = self.points[idx].clone();
-        // A diffracted readout takes the last step itself, onto the detector,
-        // and so does an arm read out to be added to others.
-        if matches!(ev, Ev::End) && (self.face || matches!(self.spec.readout, Readout::Diffracted { .. })) {
-            self.merge_lobes();
-            return Ok(());
-        }
         // Free space up to this event, onto a window fitted to the beam there
         // when the one it has would no longer suit it; both components, and
         // every order carried apart, onto the same one.
@@ -2597,335 +2593,214 @@ impl ChainJob {
         Ok(())
     }
 
-    /// Read the detector: each pixel's power, from the field projected onto
-    /// its face. Refused before the chain is done.
-    fn finish(mut self, revision: u64) -> Result<WavePathResult, WaveError> {
-        if let Some(uy) = self.uy.take() {
-            // The two components are read alike and add in power.
-            let twin = self.twin(uy);
-            let mut rx = self.finish(revision)?;
-            let ry = twin.finish(revision)?;
-            for (a, b) in rx.power.iter_mut().zip(&ry.power) {
-                *a += *b;
-            }
-            rx.arriving += ry.arriving;
-            let l = &mut rx.report.ledger;
-            l.detected += ry.report.ledger.detected;
-            let mut extra = ry.report.ledger;
-            extra.numerical = 0.0;
-            add_losses(l, &extra);
-            l.numerical = 0.0;
-            l.close();
-            rx.report.inconsistencies.clear();
-            rx.report.check_ledger();
-            for w in ry.report.warnings {
-                rx.report.warn(w);
-            }
-            rx.field_y = Some(ry.field);
-            return Ok(rx);
+}
+
+/// The band of a field on each axis of its frame, cycles/mm, carrier
+/// included: the frequency beyond which the field holds less than a
+/// millionth of its power.
+/// A field's band on each of its axes, cycles/mm, its carrier included:
+/// `main`, holding all but 1e-6 of its energy, and `full`, down to 1e-8 of
+/// its peak amplitude (the tails a window's edge leaves).
+#[derive(Clone, Copy, Debug, Default)]
+struct Band {
+    main: [f64; 2],
+    full: [f64; 2],
+}
+
+impl Band {
+    fn max(self, other: Band) -> Band {
+        Band {
+            main: [self.main[0].max(other.main[0]), self.main[1].max(other.main[1])],
+            full: [self.full[0].max(other.full[0]), self.full[1].max(other.full[1])],
         }
-        if self.next < self.points.len() {
-            return Err(WaveError::OutOfRange(format!(
-                "the wave job has {} of {} events still to run",
-                self.points.len() - self.next,
-                self.points.len()
-            )));
-        }
-        let spec = self.spec;
-        let beam = self.beam;
-        let det = self
-            .scene
-            .detectors
-            .iter()
-            .find(|d| d.common.id.0 == spec.detector.0)
-            .ok_or_else(|| WaveError::OutOfRange("no such detector".into()))?;
-        let (hw, hh) = match det.geometry {
-            DetectorGeometry3::Rectangle { half_width_mm, half_height_mm } => (half_width_mm, half_height_mm),
-            _ => return Err(WaveError::OutOfRange("the wave readout needs a rectangular detector".into())),
-        };
-        let [nu, nv] = det.bins;
-        let t = &det.common.transform;
-        let n_det = t.rotate(Vec3::Z);
-        let cos = beam.d.dot(n_det).abs();
-        let (du, dv) = (2.0 * hw / nu as f64, 2.0 * hh / nv as f64);
-        if let Readout::Diffracted { samples_per_pixel } = spec.readout {
-            return self.finish_diffracted(samples_per_pixel, (hw, hh), [nu, nv], (du, dv), revision);
-        }
-        // A detector integrates power, so the readout bins it: each field
-        // cell's power |U|²ΔA goes to the pixel its projection along the beam
-        // lands in, as `s × s` sub-cells so that each, stretched by 1/cos on
-        // a tilted face, spans at most an eighth of a pixel (a cell snapped
-        // whole to a pixel would move the light by up to half a cell). Power
-        // is conserved to round-off; what misses the face left the window.
-        let g = self.u.grid;
-        let o = t.pos;
-        let cell = g.pitch_mm[0].max(g.pitch_mm[1]) / cos.max(1e-6);
-        let s = ((8.0 * cell / du.min(dv)).ceil() as usize).clamp(1, 16);
-        let share = g.cell_area_mm2() / (s * s) as f64;
-        let mut power = vec![0.0; nu * nv];
-        for j in 0..g.n[1] {
-            for i in 0..g.n[0] {
-                let p = self.u.data[g.idx(i, j)].norm_sqr() * share;
-                if p == 0.0 {
-                    continue;
-                }
-                let (x, y) = g.xy(i, j);
-                for sj in 0..s {
-                    for si in 0..s {
-                        let a = x + ((si as f64 + 0.5) / s as f64 - 0.5) * g.pitch_mm[0];
-                        let b = y + ((sj as f64 + 0.5) / s as f64 - 0.5) * g.pitch_mm[1];
-                        let Some(r) = onto_plane(beam.point(a, b), beam.d, o, n_det) else {
-                            continue;
-                        };
-                        let l = t.inverse_transform_point(r);
-                        if l.x.abs() > hw || l.y.abs() > hh {
-                            continue;
-                        }
-                        let iu = (((l.x + hw) / du) as usize).min(nu - 1);
-                        let iv = (((l.y + hh) / dv) as usize).min(nv - 1);
-                        power[iv * nu + iu] += p;
-                    }
-                }
-            }
-        }
-        let bins = det.bins;
-        let on_detector: f64 = power.iter().sum();
-        let in_face = on_detector;
-        let arriving = self.u.power();
-        self.report.ledger.left_window += (arriving - in_face).max(0.0);
-        let arriving_power = arriving;
-        self.report.ledger.detected = on_detector;
-        self.report.close_checked();
-        Ok(WavePathResult {
-            revision,
-            detector: spec.detector,
-            bins,
-            power,
-            field: self.u,
-            field_y: None,
-            arriving: arriving_power,
-            report: self.report,
-        })
     }
 }
 
-impl ChainJob {
-    /// The diffracted readout: the field carried from where it is straight
-    /// onto a window of the plane across the beam at the detector's centre,
-    /// at `s × s` points a pixel, then binned into the pixels.
-    fn finish_diffracted(
-        mut self,
-        s: usize,
-        (hw, hh): (f64, f64),
-        [nu, nv]: [usize; 2],
-        (du, dv): (f64, f64),
-        revision: u64,
-    ) -> Result<WavePathResult, WaveError> {
-        let spec = self.spec;
-        let beam = self.beam;
-        let det = self
-            .scene
-            .detectors
-            .iter()
-            .find(|d| d.common.id.0 == spec.detector.0)
-            .ok_or_else(|| WaveError::OutOfRange("no such detector".into()))?;
-        let t = &det.common.transform;
-        let n_det = t.rotate(Vec3::Z);
-        let z = (t.pos - beam.origin).dot(beam.d);
-        if z <= 0.0 {
-            return Err(WaveError::OutOfRange("the detector is behind the field's last plane".into()));
-        }
-        // Padded so that no periodic copy of the field lands on the face.
-        let n_max = self.u.grid.n[0].max(self.u.grid.n[1]);
-        let width = self.u.grid.width_mm(0).max(self.u.grid.width_mm(1));
-        let reach = face_reach(&beam, t, hw, hh, beam.origin + beam.d * z);
-        let padding = |at_least: usize, report: &mut WaveReport| {
-            let (pad, period) = readout_pad(n_max, width, reach, at_least);
-            if period < reach + 0.5 * width {
-                report.warn(SamplingWarning::Periodic { period_mm: period, span_mm: reach + 0.5 * width });
-            }
-            pad
-        };
-        // A face that is not square to the beam: the spectrum rotated onto the
-        // face's own plane (Matsushima, Schimmel & Wyrowski 2003), on its own
-        // subpixel grid; each pixel its mean irradiance over its area.
-        if n_det.dot(beam.d).abs() <= 1.0 - 1e-12 {
-            let s = s.max(1);
-            let grid = centred(Grid2::new([nu * s, nv * s], [du / s as f64, dv / s as f64], [0.0, 0.0])?);
-            // The rotation reads the spectrum between its samples: pad finer
-            // where the field is small enough to afford it.
-            let pad = padding(if n_max <= 512 { 4 } else if n_max <= 1024 { 2 } else { 1 }, &mut self.report);
-            let arriving = self.u.power();
-            let (zf, mut rep) = crate::asm_tilted(&self.u, *t, grid, pad, &mut self.fft)?;
-            let cos = n_det.dot(beam.d).abs();
-            let mut power = vec![0.0; nu * nv];
-            for j in 0..nv * s {
-                for i in 0..nu * s {
-                    power[(j / s) * nu + i / s] += zf.data[grid.idx(i, j)].norm_sqr();
-                }
-            }
-            for v in &mut power {
-                *v *= du * dv * cos / (s * s) as f64;
-            }
-            let on_detector: f64 = power.iter().sum();
-            rep.ledger.left_window = (arriving - on_detector).max(0.0);
-            rep.ledger.detected = on_detector;
-            merge(&mut self.report, rep);
-            self.report.ledger.detected = on_detector;
-            self.report.close_checked();
-            self.u = zf;
-            return Ok(WavePathResult { revision, detector: spec.detector, bins: [nu, nv], power, field: self.u, field_y: None, arriving, report: self.report });
-        }
-        // The face's corners, projected along the beam onto the plane across
-        // it at the detector's centre, give the window.
-        let plane = beam.origin + beam.d * z;
-        let (mut lo, mut hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
-        let mut depth: f64 = 0.0;
-        for (u, v) in [(-hw, -hh), (hw, -hh), (-hw, hh), (hw, hh)] {
-            let r = t.transform_point(Vec3::new(u, v, 0.0));
-            depth = depth.max((r - plane).dot(beam.d).abs());
-            let (a, b) = beam.coords(r - beam.d * (r - plane).dot(beam.d));
-            lo = [lo[0].min(a), lo[1].min(b)];
-            hi = [hi[0].max(a), hi[1].max(b)];
-        }
-        // A face square to the beam with its axes along the beam's is read
-        // on its own subpixel grid, `s × s` points at the centres of equal
-        // parts of each pixel (one point: the pixel's centre). Any other face
-        // is read on a grid along the beam's axes, each pixel taking the mean
-        // of the points that fall in it.
-        let s = s.max(1);
-        let (eu, ev) = (t.rotate(Vec3::X), t.rotate(Vec3::Y));
-        let square = n_det.dot(beam.d).abs() > 1.0 - 1e-12;
-        let along = |a: Vec3, b: Vec3| a.dot(b).abs() > 1.0 - 1e-12;
-        // The face's axes along the beam's, either way round.
-        let aligned = if square && along(eu, beam.x) && along(ev, beam.y) {
-            Some(([nu * s, nv * s], [du / s as f64, dv / s as f64]))
-        } else if square && along(eu, beam.y) && along(ev, beam.x) {
-            Some(([nv * s, nu * s], [dv / s as f64, du / s as f64]))
-        } else {
-            None
-        };
-        let (out, pitch_a, pitch_b) = if let Some((n, pitch)) = aligned {
-            let c = beam.coords(t.pos - beam.d * (t.pos - plane).dot(beam.d));
-            (centred(Grid2::new(n, pitch, [c.0, c.1])?), pitch[0], pitch[1])
-        } else {
-            let pitch = du.min(dv) / s as f64;
-            let m = [
-                (((hi[0] - lo[0]) / pitch).ceil() as usize).clamp(1, 4096),
-                (((hi[1] - lo[1]) / pitch).ceil() as usize).clamp(1, 4096),
-            ];
-            (Grid2::new(m, [pitch, pitch], [0.5 * (lo[0] + hi[0]), 0.5 * (lo[1] + hi[1])])?, pitch, pitch)
-        };
-        let pitch = pitch_a.min(pitch_b);
-        let m = out.n;
-        // The field repeats a padded window away: padded so that no copy
-        // reaches the face.
-        let pad = padding(2, &mut self.report);
-        let arriving = self.u.power();
-        let (zf, mut rep) = crate::asm_zoom(&self.u, z, out, pad, &mut self.fft)?;
-        if depth > pitch * pitch / zf.wavelength_in_medium_mm() {
-            self.report.warn(SamplingWarning::TiltProjection { depth_mm: depth });
-        }
-        // Each pixel: the mean irradiance of its points, over its area seen
-        // across the beam.
-        let mut sum = vec![0.0; nu * nv];
-        let mut count = vec![0usize; nu * nv];
-        for j in 0..m[1] {
-            for i in 0..m[0] {
-                let (a, b) = out.xy(i, j);
-                let r = plane + beam.x * a + beam.y * b;
-                let Some(q) = onto_plane(r, beam.d, t.pos, n_det) else { continue };
-                let l = t.inverse_transform_point(q);
-                if l.x.abs() > hw || l.y.abs() > hh {
-                    continue;
-                }
-                let iu = (((l.x + hw) / du) as usize).min(nu - 1);
-                let iv = (((l.y + hh) / dv) as usize).min(nv - 1);
-                sum[iv * nu + iu] += zf.data[out.idx(i, j)].norm_sqr();
-                count[iv * nu + iu] += 1;
+fn field_band(u: &Field2, fft: &mut Fft2) -> Band {
+    let g = u.grid;
+    let n = g.n;
+    let mut b = u.data.clone();
+    crate::fft::ifftshift2(&mut b, n);
+    fft.forward(&mut b, n, g.cell_area_mm2());
+    let lam = u.wavelength_in_medium_mm();
+    let mut out = Band::default();
+    for axis in 0..2 {
+        let m = n[axis];
+        let mut marginal = vec![0.0; m];
+        for ky in 0..n[1] {
+            for kx in 0..n[0] {
+                let k = if axis == 0 { kx } else { ky };
+                marginal[k] += b[ky * n[0] + kx].norm_sqr();
             }
         }
-        let cos = n_det.dot(beam.d).abs();
-        if count.contains(&0) {
-            self.report.warn(SamplingWarning::Undersampled {
-                what: format!("the diffracted readout of detector #{}: a pixel got no sample", spec.detector.0),
-                max_phase_step_rad: 0.0,
-            });
+        let total: f64 = marginal.iter().sum();
+        if total <= 0.0 {
+            continue;
         }
-        let power: Vec<f64> =
-            sum.iter().zip(&count).map(|(s, &c)| if c > 0 { s / c as f64 * du * dv * cos } else { 0.0 }).collect();
-        let on_detector: f64 = power.iter().sum();
-        // What the window held but the face did not left the window too.
-        rep.ledger.left_window += (zf.power() - on_detector).max(0.0);
-        merge(&mut self.report, rep);
-        self.report.ledger.detected = on_detector;
-        self.report.close_checked();
-        self.u = zf;
-        self.u.frame = beam.turned(plane, beam.d).iso();
-        Ok(WavePathResult {
-            revision,
-            detector: spec.detector,
-            bins: [nu, nv],
-            power,
-            field: self.u,
-            field_y: None,
-            arriving,
-            report: self.report,
-        })
+        let peak = marginal.iter().cloned().fold(0.0, f64::max);
+        let mut pairs: Vec<(f64, f64)> = (0..m).map(|k| (g.fft_freq(axis, k).abs(), marginal[k])).collect();
+        pairs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        let mut tail = 0.0;
+        let (mut main, mut full) = (0.0, 0.0);
+        for (f, p) in pairs {
+            if full == 0.0 && p > 1e-16 * peak {
+                full = f;
+            }
+            tail += p;
+            if tail > 1e-6 * total {
+                main = f;
+                break;
+            }
+        }
+        let carrier = u.carrier[axis].abs() / lam;
+        out.main[axis] = main + carrier;
+        out.full[axis] = full.max(main) + carrier;
     }
+    out
 }
 
 /// One arm read out onto its detector's own grid, ready to be added to the
 /// other arms.
 struct FaceField {
-    /// The detector's sub-pixel grid, in its own frame, and the arm's whole
-    /// field there (carrier and phase included).
+    /// The detector's sub-pixel grid, in its own frame, and the arm's field
+    /// there, its components along the face's own axes: the envelope about
+    /// the arm's carrier, `carrier` the direction cosines of that carrier on
+    /// the face's axes (the whole field at `(x, y)` is
+    /// `data · exp(ik(c_u x + c_v y))`, `k` the arm's wavenumber in its
+    /// medium, the phase referred to the face's origin).
     grid: Grid2,
     data: Vec<Cx>,
-    /// The obliquity of the arm's beam on the face, and its direction.
+    /// The second component's field on the same points, if the arm has one.
+    data_y: Option<Vec<Cx>>,
+    carrier: [f64; 2],
+    /// The obliquity of the arm's beam on the face.
     cos: f64,
-    dir: Vec3,
     frame: Isometry3,
     lambda_um: f64,
     n_medium: f64,
     /// The power the arm brought to the detector's plane.
     arriving: f64,
-    /// The second component's field on the same points, if the arm has one.
-    data_y: Option<Vec<Cx>>,
+    /// The arm's field as it arrived, across its chief ray, when kept.
+    arrived: Option<(Field2, Option<Field2>)>,
     report: WaveReport,
-    /// The launch's ledger and the arm's history, for the network's ledger.
+    /// The launch's ledger, the arm's history and the histories of the arms
+    /// that joined it, for the network's ledger.
     launch: WaveLedger,
-    history: Vec<HistoryEntry>,
-    /// What reading the arm onto the detector's grid took (evanescent waves,
-    /// what missed the face): in `report` and in `history` already.
-    readout: WaveLedger,
+    histories: Vec<Vec<HistoryEntry>>,
     events: usize,
 }
 
+/// How a face is read from a beam: square to it with its axes along the
+/// beam's (either way round), or by the rotated spectrum.
+#[derive(Clone, Copy)]
+struct FaceReading {
+    z: f64,
+    plane: Vec3,
+    reach: f64,
+    width: f64,
+    n_max: usize,
+    aligned: Option<([usize; 2], [f64; 2])>,
+}
+
+/// One component of an arm's field read onto the face's sub-pixel grid: its
+/// envelope on the points, its carrier's direction cosines on the face's
+/// axes (the phase referred to the face's origin), the reading's report and
+/// its `Periodic` warning if any.
+type FaceRead = (Vec<Cx>, [f64; 2], WaveReport, Option<SamplingWarning>);
+
+/// One component of an arm's field onto the face's sub-pixel grid `fg`.
+#[allow(clippy::too_many_arguments)]
+fn read_onto_face(
+    u: &Field2,
+    beam: &Beam,
+    t: &Isometry3,
+    fg: Grid2,
+    (hw, hh): (f64, f64),
+    r: &FaceReading,
+    fft: &mut Fft2,
+) -> Result<FaceRead, WaveError> {
+    let mut data = vec![Cx::ZERO; fg.len()];
+    let mut periodic = None;
+    let (eu, ev) = (t.rotate(Vec3::X), t.rotate(Vec3::Y));
+    let (rep, carrier) = if let Some((n, pitch)) = r.aligned {
+        let c = beam.coords(t.pos - beam.d * (t.pos - r.plane).dot(beam.d));
+        let out = centred(Grid2::new(n, pitch, [c.0, c.1])?);
+        let (pad, period) = readout_pad(r.n_max, r.width, r.reach, 2);
+        if period < r.reach + 0.5 * r.width {
+            periodic = Some(SamplingWarning::Periodic { period_mm: period, span_mm: r.reach + 0.5 * r.width });
+        }
+        let (zf, rep) = crate::asm_zoom(u, r.z.max(0.0), out, pad, fft)?;
+        // The carrier, a direction across the beam, on the face's axes (the
+        // beam's, here); its phase is referred to the field's origin on the
+        // chief ray, and the face's to the face's own.
+        let c3 = beam.x * zf.carrier[0] + beam.y * zf.carrier[1];
+        let shift = Cx::expi(zf.k_mm() * c3.dot(t.pos - r.plane));
+        let [nu_s, nv_s] = fg.n;
+        let (ps, qs) = (fg.pitch_mm[0], fg.pitch_mm[1]);
+        for j in 0..out.n[1] {
+            for i in 0..out.n[0] {
+                let (a, b) = out.xy(i, j);
+                let l = t.inverse_transform_point(r.plane + beam.x * a + beam.y * b);
+                let (iu, iv) = (((l.x + hw) / ps).floor(), ((l.y + hh) / qs).floor());
+                if iu < 0.0 || iv < 0.0 || iu >= nu_s as f64 || iv >= nv_s as f64 {
+                    continue;
+                }
+                data[fg.idx(iu as usize, iv as usize)] = zf.data[out.idx(i, j)] * shift;
+            }
+        }
+        (rep, [c3.dot(eu), c3.dot(ev)])
+    } else {
+        let (pad, period) = readout_pad(r.n_max, r.width, r.reach, 2);
+        if period < r.reach + 0.5 * r.width {
+            periodic = Some(SamplingWarning::Periodic { period_mm: period, span_mm: r.reach + 0.5 * r.width });
+        }
+        let (zt, rep) = crate::asm_tilted(u, *t, fg, pad, fft)?;
+        data = zt.data;
+        (rep, zt.carrier)
+    };
+    // What the band-limited interpolation onto the face's points gained
+    // or lost is resampling, not round-off: the propagator booked it as
+    // the remainder of its own ledger.
+    let mut rep = rep;
+    rep.ledger.resampling += rep.ledger.numerical;
+    rep.ledger.numerical = 0.0;
+    Ok((data, carrier, rep, periodic))
+}
+
 impl ChainJob {
-    /// The arm's field on the detector's own sub-pixel grid, `s × s` points a
-    /// pixel at the centres of equal parts of it: the zoomed angular
-    /// spectrum onto the face when it is square to the beam with its axes
-    /// along the beam's, the spectrum rotated onto it otherwise
-    /// ([`crate::asm_tilted`]). Every arm is read on the same points, so the
-    /// fields can be added.
-    fn face(mut self, s: usize) -> Result<FaceField, WaveError> {
+    /// The band of the chain's field on its frame's axes, cycles/mm, over
+    /// both components.
+    fn band(&mut self) -> Band {
+        let mut b = field_band(&self.u, &mut self.fft);
+        if let Some(uy) = &self.uy {
+            b = b.max(field_band(uy, &mut self.fft));
+        }
+        b
+    }
+
+    /// The direction the chain reaches the detector along.
+    fn final_dir(&self) -> Vec3 {
+        let n = self.points.len();
+        if n >= 2 {
+            (self.points[n - 1].0 - self.points[n - 2].1).normalize()
+        } else {
+            self.beam.d
+        }
+    }
+
+    /// The arm's field on the detector's own sub-pixel grid, `s` points a
+    /// pixel along each face axis at the centres of equal parts of each
+    /// pixel: the field, already carried to the detector's plane across its
+    /// chief ray, interpolated onto the face by the zoomed angular spectrum
+    /// when the face is square to the beam with its axes along the beam's,
+    /// and the spectrum rotated onto the face otherwise
+    /// ([`crate::asm_tilted`]); its carrier kept analytic. Every arm is read
+    /// on the same points, its two components turned onto the face's own
+    /// axes, so that the arms can be added. `keep` holds on to the arriving
+    /// field.
+    fn face(mut self, s: [usize; 2], keep: bool) -> Result<FaceField, WaveError> {
         if self.next < self.points.len() {
             return Err(WaveError::OutOfRange("an arm read out before its chain is done".into()));
-        }
-        if let Some(uy) = self.uy.take() {
-            let twin = self.twin(uy);
-            let mut fx = self.face(s)?;
-            let fy = twin.face(s)?;
-            fx.arriving += fy.arriving;
-            fx.data_y = Some(fy.data);
-            // The second component's readout took its own share.
-            add_losses(&mut fx.report.ledger, &fy.readout);
-            add_losses(&mut fx.readout, &fy.readout);
-            if let Some(last) = fx.history.last_mut() {
-                add_losses(&mut last.delta, &fy.readout);
-            }
-            return Ok(fx);
         }
         let beam = self.beam;
         let det = self
@@ -2942,16 +2817,15 @@ impl ChainJob {
         let t = det.common.transform;
         let n_det = t.rotate(Vec3::Z);
         let (du, dv) = (2.0 * hw / nu as f64, 2.0 * hh / nv as f64);
-        let z = (t.pos - beam.origin).dot(beam.d);
-        if z <= 0.0 {
-            return Err(WaveError::OutOfRange("the detector is behind the field's last plane".into()));
-        }
-        let s = s.max(1);
-        let (ps, qs) = (du / s as f64, dv / s as f64);
-        let fg = centred(Grid2::new([nu * s, nv * s], [ps, qs], [0.0, 0.0])?);
-        let arriving = self.u.power();
+        let s = [s[0].max(1), s[1].max(1)];
+        let (ps, qs) = (du / s[0] as f64, dv / s[1] as f64);
+        let fg = centred(Grid2::new([nu * s[0], nv * s[1]], [ps, qs], [0.0, 0.0])?);
+        let arriving = self.u.power() + self.uy.as_ref().map_or(0.0, |f| f.power());
         let n_max = self.u.grid.n[0].max(self.u.grid.n[1]);
-        // Padded so that no periodic copy of the field lands on the face.
+        // The field sits on the plane across its chief ray through the
+        // chief ray's point on the face; the detector's centre lies on that
+        // plane for a face square to the beam.
+        let z = (t.pos - beam.origin).dot(beam.d);
         let plane = beam.origin + beam.d * z;
         let reach = face_reach(&beam, &t, hw, hh, plane);
         let width = self.u.grid.width_mm(0).max(self.u.grid.width_mm(1));
@@ -2959,68 +2833,101 @@ impl ChainJob {
         let (eu, ev) = (t.rotate(Vec3::X), t.rotate(Vec3::Y));
         let along = |a: Vec3, b: Vec3| a.dot(b).abs() > 1.0 - 1e-12;
         let aligned = if square && along(eu, beam.x) && along(ev, beam.y) {
-            Some(([nu * s, nv * s], [ps, qs]))
+            Some(([nu * s[0], nv * s[1]], [ps, qs]))
         } else if square && along(eu, beam.y) && along(ev, beam.x) {
-            Some(([nv * s, nu * s], [qs, ps]))
+            Some(([nv * s[1], nu * s[0]], [qs, ps]))
         } else {
             None
         };
-        let mut data = vec![Cx::ZERO; fg.len()];
-        let rep = if let Some((n, pitch)) = aligned {
-            let c = beam.coords(t.pos - beam.d * (t.pos - plane).dot(beam.d));
-            let out = centred(Grid2::new(n, pitch, [c.0, c.1])?);
-            let (pad, period) = readout_pad(n_max, width, reach, 2);
-            if period < reach + 0.5 * width {
-                self.report.warn(SamplingWarning::Periodic { period_mm: period, span_mm: reach + 0.5 * width });
-            }
-            let (zf, rep) = crate::asm_zoom(&self.u, z, out, pad, &mut self.fft)?;
-            let k = zf.k_mm();
-            for j in 0..out.n[1] {
-                for i in 0..out.n[0] {
-                    let (a, b) = out.xy(i, j);
-                    let l = t.inverse_transform_point(plane + beam.x * a + beam.y * b);
-                    let (iu, iv) = (((l.x + hw) / ps).floor(), ((l.y + hh) / qs).floor());
-                    if iu < 0.0 || iv < 0.0 || iu >= (nu * s) as f64 || iv >= (nv * s) as f64 {
-                        continue;
-                    }
-                    data[fg.idx(iu as usize, iv as usize)] = zf.data[out.idx(i, j)] * Cx::expi(k * (zf.carrier[0] * a + zf.carrier[1] * b));
-                }
-            }
-            rep
-        } else {
-            // The rotation reads the spectrum between its samples: padded
-            // finer where the field is small enough to afford it.
-            let interp = if n_max <= 512 { 4 } else if n_max <= 1024 { 2 } else { 1 };
-            let (pad, period) = readout_pad(n_max, width, reach, interp);
-            if period < reach + 0.5 * width {
-                self.report.warn(SamplingWarning::Periodic { period_mm: period, span_mm: reach + 0.5 * width });
-            }
-            let (zt, rep) = crate::asm_tilted(&self.u, t, fg, pad, &mut self.fft)?;
-            data = zt.data;
-            rep
+        if n_det.dot(beam.d).abs() < 1e-9 {
+            return Err(WaveError::OutOfRange(format!("an arm runs along the face of detector #{}: it cannot be read there", self.spec.detector.0)));
+        }
+        let reading = FaceReading { z, plane, reach, width, n_max, aligned };
+        // The envelope's whole band against what the face's points can hold
+        // (the carrier is analytic).
+        let band = self.band();
+        let highest = band.full[0].max(band.full[1]);
+        if highest > 0.5 / ps.max(qs) {
+            self.report.warn(SamplingWarning::Undersampled {
+                what: format!("the envelope of an arm on detector #{}'s grid, {ps:.3e} mm apart: its band reaches {highest:.3e} /mm", self.spec.detector.0),
+                max_phase_step_rad: 2.0 * std::f64::consts::PI * highest * ps.max(qs),
+            });
+        }
+        let (dx, carrier, rep_x, periodic) = read_onto_face(&self.u, &beam, &t, fg, (hw, hh), &reading, &mut self.fft)?;
+        let dy = match &self.uy {
+            Some(uy) => Some(read_onto_face(uy, &beam, &t, fg, (hw, hh), &reading, &mut self.fft)?),
+            None => None,
         };
+        if let Some(w) = periodic {
+            self.report.warn(w);
+        }
         // The readout's own losses (evanescent waves, what missed the face)
-        // are the arm's, booked in its history as one more event.
-        let mut report = self.report;
-        let before = report.ledger;
-        merge(&mut report, rep);
-        let readout = losses_between(&report.ledger, &before);
-        let mut history = self.history;
-        history.push(HistoryEntry { key: "readout".to_string(), junction: None, delta: readout });
+        // are the arm's, booked in its history as one more event; what its
+        // interpolation onto the face's points gained or lost beyond them is
+        // `resampling`, so that the arm's power on the face (through it, by
+        // its obliquity) and its bookings add up to what arrived.
+        let cos_face = n_det.dot(beam.d).abs();
+        let on_face = ps * qs * (dx.iter().map(|z| z.norm_sqr()).sum::<f64>() + dy.as_ref().map_or(0.0, |(d, _, _, _)| d.iter().map(|z| z.norm_sqr()).sum::<f64>()));
+        let before = self.report.ledger;
+        merge(&mut self.report, rep_x);
+        let data_y = match dy {
+            Some((dy, _, rep_y, _)) => {
+                let mut rep_y = rep_y;
+                rep_y.steps.clear();
+                merge(&mut self.report, rep_y);
+                Some(dy)
+            }
+            None => None,
+        };
+        let booked = losses_between(&self.report.ledger, &before);
+        self.report.ledger.resampling += arriving - on_face * cos_face - booked.accounted();
+        let readout = losses_between(&self.report.ledger, &before);
+        self.history.push(HistoryEntry { key: "readout".to_string(), junction: None, delta: readout });
+        // The two components onto the face's own axes. For an arm oblique
+        // to the face, its transverse axes are turned onto the face by the
+        // rotation that takes its direction onto the face's normal (about
+        // their common perpendicular): the component across the plane of
+        // incidence stays, the one in it lands along the face's own in-plane
+        // direction, and each arm keeps its power. A projection would lose
+        // the part of the field along the face's normal. The report names
+        // the turn.
+        let (data, data_y) = match data_y {
+            Some(dy) => {
+                let nf = if n_det.dot(beam.d) > 0.0 { n_det } else { -n_det };
+                let q = glam::DQuat::from_rotation_arc(beam.d, nf);
+                let (bx, by) = (q * beam.x, q * beam.y);
+                let (xu, xv, yu, yv) = (bx.dot(eu), bx.dot(ev), by.dot(eu), by.dot(ev));
+                let mut du_ = vec![Cx::ZERO; fg.len()];
+                let mut dv_ = vec![Cx::ZERO; fg.len()];
+                for k in 0..fg.len() {
+                    du_[k] = dx[k] * xu + dy[k] * yu;
+                    dv_[k] = dx[k] * xv + dy[k] * yv;
+                }
+                if !square {
+                    self.report.approx(format!(
+                        "detector #{}: an arm's two components, oblique to the face, turned onto the face's axes by the rotation of its direction onto the normal (s and p kept; the vector cross terms between arms of different directions are not modelled)",
+                        self.spec.detector.0
+                    ));
+                }
+                (du_, Some(dv_))
+            }
+            None => (dx, None),
+        };
+        let arrived = keep.then(|| (self.u.clone(), self.uy.clone()));
         Ok(FaceField {
             grid: fg,
             data,
+            data_y,
+            carrier,
             cos: n_det.dot(beam.d).abs(),
-            dir: beam.d,
             frame: t,
             lambda_um: self.lam,
             n_medium: self.u.n_medium,
             arriving,
-            data_y: None,
-            report,
+            arrived,
+            report: self.report,
             launch: self.launch,
-            history,
-            readout,
+            histories: vec![self.history],
             events: self.points.len(),
         })
     }
@@ -3153,20 +3060,30 @@ fn book_history(l: &mut WaveLedger, arms: &[&[HistoryEntry]]) {
     }
 }
 
-/// Several arms of one coherent mode, added on the detector's grid.
+/// The arms of one coherent mode (one or several), added on the detector's
+/// grid and read into its pixels.
 ///
-/// The power a pixel catches is `Σ |Σ_c U_c √cos θ_c|² ΔA` over its points:
-/// each arm's field weighted by the root of its obliquity on the face, so
-/// that one arm alone reads as it would by itself. Two arms crossing at an
-/// angle make fringes of period `λ/|t₁ − t₂|`, `t` the directions' components
-/// along the face; a period under two of the readout's points is flagged.
+/// The arms are read on the same points of the face, their components along
+/// the face's own axes, each an envelope about its own analytic carrier, and
+/// added as fields. Each point's irradiance follows the detector model
+/// ([`DetectorModel`]): the scalar flux through the face,
+/// `Re Σ_{c,c′} U_c U_c′* (cos θ_c + cos θ_c′)/2` (each arm's own power times
+/// its obliquity, the cross terms with the mean obliquity), or `|Σ_c U_c|²`
+/// for a paraxial area detector. A pixel's power is the sum over its cells
+/// (one about each point) of the cell's integral: for each pair of arms the
+/// fringe between their carriers, `exp(i(κ_c − κ_c′)·r)`, is integrated over
+/// the cell exactly, `sinc(Δκ_u h_u/2)·sinc(Δκ_v h_v/2)` times its value at
+/// the centre (R13 of the expert review: two plane waves give the
+/// rectangular pixel's sinc factors to round-off), and the envelopes by the
+/// midpoint rule, which the points resolve at `READOUT_PER_PERIOD` a period
+/// of the intensity's band unless the sample cap stopped that, which the job
+/// says.
 ///
 /// The ledger counts each arm's losses, an event the arms share once (they
-/// carry the same field up to where they part). What a splitter sends into
-/// another arm is not lost, so a splitter met by several arms books no
-/// `other_arm`; the light that leaves by the ports no arm reads (a
-/// recombining splitter's other output, what misses the detector once the
-/// arms meet) is then the remainder, `other_ports`.
+/// carry one field up to where they part), and the shares no arm carries on
+/// once (`book_history`); the light that leaves by the ports no arm reads
+/// (a recombining splitter's other output, what misses the detector once
+/// the arms meet) is the remainder, `other_ports`.
 fn combine_arms(scene: &Scene3, spec: &WavePathSpec, faces: Vec<FaceField>, revision: u64) -> Result<WavePathResult, WaveError> {
     let det = scene
         .detectors
@@ -3175,35 +3092,75 @@ fn combine_arms(scene: &Scene3, spec: &WavePathSpec, faces: Vec<FaceField>, revi
         .ok_or_else(|| WaveError::OutOfRange("no such detector".into()))?;
     let [nu, nv] = det.bins;
     let g = faces[0].grid;
-    let s = g.n[0] / nu;
+    let (su, sv) = (g.n[0] / nu, g.n[1] / nv);
     let (ps, qs) = (g.pitch_mm[0], g.pitch_mm[1]);
-    let mut data = vec![Cx::ZERO; g.len()];
     let two = faces.iter().any(|f| f.data_y.is_some());
-    let mut data_y = vec![Cx::ZERO; if two { g.len() } else { 0 }];
-    for f in &faces {
-        let w = f.cos.sqrt();
-        for (a, b) in data.iter_mut().zip(&f.data) {
-            *a += *b * w;
-        }
-        if let Some(dy) = &f.data_y {
-            for (a, b) in data_y.iter_mut().zip(dy) {
-                *a += *b * w;
-            }
+    let paraxial = spec.detector_model == DetectorModel::ParaxialArea;
+    // Each arm's carrier as a wavevector along the face, κ = k·c, and its
+    // weight in the flux; for each pair, the mean weight times the exact
+    // integral of their fringe over a cell, relative to its centre.
+    let kappa: Vec<[f64; 2]> = faces
+        .iter()
+        .map(|f| {
+            let k = 2.0 * std::f64::consts::PI * f.n_medium / (f.lambda_um / 1000.0);
+            [k * f.carrier[0], k * f.carrier[1]]
+        })
+        .collect();
+    let weight: Vec<f64> = faces.iter().map(|f| if paraxial { 1.0 } else { f.cos }).collect();
+    let sinc = |x: f64| if x.abs() < 1e-6 { 1.0 - x * x / 6.0 } else { x.sin() / x };
+    let mut pairs: Vec<(usize, usize, f64, [f64; 2])> = Vec::new();
+    for a in 0..faces.len() {
+        for b in a + 1..faces.len() {
+            let dk = [kappa[a][0] - kappa[b][0], kappa[a][1] - kappa[b][1]];
+            let cell = sinc(0.5 * dk[0] * ps) * sinc(0.5 * dk[1] * qs);
+            pairs.push((a, b, 0.5 * (weight[a] + weight[b]) * cell, dk));
         }
     }
     let mut power = vec![0.0; nu * nv];
     for j in 0..g.n[1] {
         for i in 0..g.n[0] {
             let k = g.idx(i, j);
-            let y = if two { data_y[k].norm_sqr() } else { 0.0 };
-            power[(j / s) * nu + i / s] += (data[k].norm_sqr() + y) * ps * qs;
+            let (x, y) = g.xy(i, j);
+            let mut irr = 0.0;
+            for (a, f) in faces.iter().enumerate() {
+                irr += weight[a] * (f.data[k].norm_sqr() + f.data_y.as_ref().map_or(0.0, |d| d[k].norm_sqr()));
+            }
+            for &(a, b, wf, dk) in &pairs {
+                let mut cross = faces[a].data[k] * faces[b].data[k].conj();
+                if let (Some(da), Some(db)) = (&faces[a].data_y, &faces[b].data_y) {
+                    cross += da[k] * db[k].conj();
+                }
+                irr += 2.0 * wf * (cross * Cx::expi(dk[0] * x + dk[1] * y)).re;
+            }
+            power[(j / sv) * nu + i / su] += irr * ps * qs;
+        }
+    }
+    // The arms' sum on the face, about the first arm's carrier, for the
+    // field shown.
+    let mut s_x = vec![Cx::ZERO; g.len()];
+    let mut s_y = vec![Cx::ZERO; if two { g.len() } else { 0 }];
+    for (a, f) in faces.iter().enumerate() {
+        let dk = [kappa[a][0] - kappa[0][0], kappa[a][1] - kappa[0][1]];
+        for j in 0..g.n[1] {
+            for i in 0..g.n[0] {
+                let k = g.idx(i, j);
+                let (x, y) = g.xy(i, j);
+                let ph = Cx::expi(dk[0] * x + dk[1] * y);
+                s_x[k] += f.data[k] * ph;
+                if let Some(dy) = &f.data_y {
+                    s_y[k] += dy[k] * ph;
+                }
+            }
         }
     }
     let mut report = WaveReport::default();
+    let arms = faces.len();
     for (c, f) in faces.iter().enumerate() {
         for st in &f.report.steps {
             let mut st = st.clone();
-            st.note = format!("arm {}: {}", c + 1, st.note);
+            if arms > 1 {
+                st.note = format!("arm {}: {}", c + 1, st.note);
+            }
             report.steps.push(st);
         }
         for w in &f.report.warnings {
@@ -3221,62 +3178,79 @@ fn combine_arms(scene: &Scene3, spec: &WavePathSpec, faces: Vec<FaceField>, revi
             }
         }
     }
-    // The fringes between each pair of arms, against the readout's points.
-    let n_det = det.common.transform.rotate(Vec3::Z);
-    let lam_mm = faces[0].lambda_um / 1000.0 / faces[0].n_medium;
-    for a in 0..faces.len() {
-        for b in a + 1..faces.len() {
-            let (da, db) = (faces[a].dir, faces[b].dir);
-            let ta = da - n_det * da.dot(n_det);
-            let tb = db - n_det * db.dot(n_det);
-            let gap = (ta - tb).length();
-            if gap > 0.0 {
-                let period = lam_mm / gap;
-                let h = ps.min(qs);
-                if period < 2.0 * h {
-                    report.warn(SamplingWarning::Undersampled {
-                        what: format!(
-                            "the fringes of arms {} and {} on detector #{}, {period:.4e} mm apart, against readout points {h:.4e} mm apart",
-                            a + 1,
-                            b + 1,
-                            spec.detector.0
-                        ),
-                        max_phase_step_rad: 2.0 * std::f64::consts::PI * h / period,
-                    });
-                }
+    // The fringes between each pair of arms, against the readout's points:
+    // their carriers' fringe is integrated exactly, but the envelopes' part
+    // of the cross term is not resolved once the fringe falls under two
+    // points a period.
+    for &(a, b, _, dk) in &pairs {
+        let gap = (dk[0] * dk[0] + dk[1] * dk[1]).sqrt();
+        if gap > 0.0 {
+            let period = 2.0 * std::f64::consts::PI / gap;
+            let h = ps.min(qs);
+            if period < 2.0 * h {
+                report.warn(SamplingWarning::Undersampled {
+                    what: format!(
+                        "the fringes of arms {} and {} on detector #{}, {period:.4e} mm apart, against readout points {h:.4e} mm apart",
+                        a + 1,
+                        b + 1,
+                        spec.detector.0
+                    ),
+                    max_phase_step_rad: 2.0 * std::f64::consts::PI * h / period,
+                });
             }
         }
     }
-    // The network's ledger: the launch once, then every arm's history.
+    // The network's ledger: the launch once, then every arm's history, and
+    // those of the arms that joined it on the way.
     let mut l = WaveLedger { launched: faces[0].launch.launched, ..Default::default() };
     add_losses(&mut l, &faces[0].launch);
-    let histories: Vec<&[HistoryEntry]> = faces.iter().map(|f| f.history.as_slice()).collect();
+    let histories: Vec<&[HistoryEntry]> = faces.iter().flat_map(|f| f.histories.iter().map(Vec::as_slice)).collect();
     book_history(&mut l, &histories);
     l.detected = power.iter().sum();
-    l.other_ports = l.launched - l.accounted();
+    if arms == 1 {
+        // One arm reads every port it has: the remainder is round-off.
+        l.close();
+    } else {
+        l.other_ports = l.launched - l.accounted();
+    }
     let lam = faces[0].lambda_um;
     let n = faces[0].n_medium;
-    let arms = faces.len();
+    let model = match spec.detector_model {
+        DetectorModel::NormalFlux => "the scalar flux through the face (each arm's power times its obliquity, the cross terms with the mean obliquity)",
+        DetectorModel::ParaxialArea => "a paraxial area detector (|ΣU|², every obliquity 1)",
+    };
     report.steps.push(element_step(
         0.0,
         format!(
-            "{arms} arms added as fields on detector #{}'s own grid, {s}×{s} points a pixel, each weighted by the root of its obliquity on the face",
+            "{arms} arm{} read on detector #{}'s own grid, {su}×{sv} points a pixel, each pixel the sum of its points' irradiance times their area, the irradiance {model}",
+            if arms == 1 { "" } else { "s added as fields" },
             spec.detector.0
         ),
     ));
-    if !two {
+    if arms > 1 && !two {
         report.approx("arms added in a scalar field: their polarizations taken as the same, so the fringes' visibility is an upper bound");
     }
     report.ledger = l;
     report.check_ledger();
-    let mut field = Field2::zeros(g, lam)?.in_medium(n)?;
-    field.frame = faces[0].frame;
-    let field_y = two.then(|| {
-        let mut f = field.clone();
-        f.data = data_y;
-        f
-    });
-    field.data = data;
+    let arriving = faces.iter().map(|f| f.arriving).sum();
+    // One arm that kept its field: the field across its chief ray; several
+    // arms: their sum on the face.
+    let (field, field_y) = match faces.into_iter().next().map(|f| (f.arrived, f.frame, f.carrier)) {
+        Some((Some((u, uy)), _, _)) if arms == 1 => (u, uy),
+        Some((_, frame, carrier)) => {
+            let mut field = Field2::zeros(g, lam)?.in_medium(n)?;
+            field.frame = frame;
+            field.carrier = carrier;
+            let field_y = two.then(|| {
+                let mut f = field.clone();
+                f.data = s_y;
+                f
+            });
+            field.data = s_x;
+            (field, field_y)
+        }
+        None => unreachable!("at least one arm"),
+    };
     Ok(WavePathResult {
         revision,
         detector: spec.detector,
@@ -3284,7 +3258,7 @@ fn combine_arms(scene: &Scene3, spec: &WavePathSpec, faces: Vec<FaceField>, revi
         power,
         field,
         field_y,
-        arriving: faces.iter().map(|f| f.arriving).sum(),
+        arriving,
         report,
     })
 }
@@ -3324,6 +3298,14 @@ pub struct WaveJob {
     revision: u64,
     /// One per line, strongest first.
     modes: Vec<Mode>,
+    /// The readout's points a pixel along each face axis, fixed by the first
+    /// arm read (`readout_samples`), and whether the sample cap held them
+    /// below what the fields need.
+    samples: Option<[usize; 2]>,
+    capped: bool,
+    /// The direction each chain reaches the detector along, for the
+    /// fringes between the arms.
+    dirs: Vec<Vec3>,
 }
 
 struct Mode {
@@ -3367,6 +3349,9 @@ fn polarization_matters(scene: &Scene3, seqs: &[oc_core::seq3::SequencePrescript
 
 enum Chain {
     Running(Box<ChainJob>),
+    /// A chain done, waiting for a lit arm to fix the readout's points a
+    /// pixel before it is read (a dark arm cannot fix them).
+    Finished(Box<ChainJob>),
     /// An arm done and read out onto the detector's grid.
     Face(Box<FaceField>),
     /// A lone chain of one line among several, finished.
@@ -3376,7 +3361,7 @@ enum Chain {
 impl Chain {
     fn events(&self) -> usize {
         match self {
-            Chain::Running(j) => j.points.len(),
+            Chain::Running(j) | Chain::Finished(j) => j.points.len(),
             Chain::Face(f) => f.events,
             Chain::Done(_, n) => *n,
         }
@@ -3384,6 +3369,7 @@ impl Chain {
     fn done(&self) -> usize {
         match self {
             Chain::Running(j) => j.next,
+            Chain::Finished(j) => j.points.len(),
             Chain::Face(f) => f.events,
             Chain::Done(_, n) => *n,
         }
@@ -3438,10 +3424,10 @@ impl WaveJob {
         let total: f64 = lines.iter().map(|l| l.1).sum();
         let shared = Arc::new(scene.clone());
         let mut modes = Vec::with_capacity(lines.len());
+        let mut dirs: Vec<Vec3> = Vec::new();
         for (lam, w) in lines {
             let seqs = oc_trace::extract_sequences3(scene, spec.source, spec.detector, Some(lam), revision)
                 .map_err(|e| WaveError::OutOfRange(format!("no chain from the source to the detector: {e}")))?;
-            let face = seqs.len() > 1;
             let pols: Vec<Option<[f64; 2]>> =
                 if polarization_matters(scene, &seqs, 0.5 * spec.window_mm, lam) { vec![Some([1.0, 0.0]), Some([0.0, 1.0])] } else { vec![None] };
             let share = 1.0 / pols.len() as f64;
@@ -3449,7 +3435,12 @@ impl WaveJob {
                 let chains = seqs
                     .iter()
                     .cloned()
-                    .map(|seq| ChainJob::new(&shared, spec, seq, spec.power * w / total * share, face, jones).map(|j| Chain::Running(Box::new(j))))
+                    .map(|seq| {
+                        ChainJob::new(&shared, spec, seq, spec.power * w / total * share, jones).map(|j| {
+                            dirs.push(j.final_dir());
+                            Chain::Running(Box::new(j))
+                        })
+                    })
                     .collect::<Result<Vec<_>, _>>()?;
                 let label = match jones {
                     None => format!("λ {lam} µm"),
@@ -3458,7 +3449,7 @@ impl WaveJob {
                 modes.push(Mode { lambda_um: lam, label, chains });
             }
         }
-        Ok(WaveJob { scene: shared, spec: *spec, revision, modes })
+        Ok(WaveJob { scene: shared, spec: *spec, revision, modes, samples: None, capped: false, dirs })
     }
 
     /// The scene revision the job answers for.
@@ -3490,6 +3481,119 @@ impl WaveJob {
         self.modes.len()
     }
 
+    /// The points a pixel the readout gives each face axis, from the band
+    /// `band` (cycles/mm on the field's axes; the first arm read stands for
+    /// every arm) and the directions the arms reach the detector along: the
+    /// intensity's band on the face (the spread of the arms' directions,
+    /// the fringes between them, plus twice the envelope's band, its beat
+    /// with itself) held at [`READOUT_PER_PERIOD`] points a period for the
+    /// band that holds the envelope's energy and at
+    /// [`READOUT_PER_PERIOD_TAILS`] for its whole band; the carriers
+    /// themselves are analytic and need no points. At least two and the
+    /// spec's floor; within the sample cap, which `capped` records.
+    fn readout_samples(&mut self, band: Band) -> Result<[usize; 2], WaveError> {
+        let det = self
+            .scene
+            .detectors
+            .iter()
+            .find(|d| d.common.id.0 == self.spec.detector.0)
+            .ok_or_else(|| WaveError::OutOfRange("no such detector".into()))?;
+        let (hw, hh) = match det.geometry {
+            DetectorGeometry3::Rectangle { half_width_mm, half_height_mm } => (half_width_mm, half_height_mm),
+            _ => return Err(WaveError::OutOfRange("the wave readout needs a rectangular detector".into())),
+        };
+        let [nu, nv] = det.bins;
+        let (du, dv) = (2.0 * hw / nu as f64, 2.0 * hh / nv as f64);
+        let t = det.common.transform;
+        let (eu, ev) = (t.rotate(Vec3::X), t.rotate(Vec3::Y));
+        let lam = self.modes.first().map_or(0.5, |m| m.lambda_um) / 1000.0;
+        let (b_main, b_full) = (band.main[0].max(band.main[1]), band.full[0].max(band.full[1]));
+        let floor = match self.spec.readout {
+            Readout::Diffracted { samples_per_pixel } => samples_per_pixel.max(1),
+            Readout::Projected => 1,
+        };
+        let mut s = [2usize; 2];
+        for (axis, e) in [eu, ev].into_iter().enumerate() {
+            let (lo, hi) = self
+                .dirs
+                .iter()
+                .map(|d| d.dot(e) / lam)
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), t| (lo.min(t), hi.max(t)));
+            let (lo, hi) = if lo.is_finite() { (lo, hi) } else { (0.0, 0.0) };
+            let pitch = if axis == 0 { du } else { dv };
+            let main = READOUT_PER_PERIOD * ((hi - lo) + 2.0 * b_main);
+            let full = READOUT_PER_PERIOD_TAILS * ((hi - lo) + 2.0 * b_full);
+            let want = (pitch * main.max(full)).ceil();
+            s[axis] = (want.max(2.0) as usize).max(floor);
+        }
+        let total = nu * s[0] * nv * s[1];
+        if total > crate::MAX_WAVE_SAMPLES {
+            let scale = (crate::MAX_WAVE_SAMPLES as f64 / total as f64).sqrt();
+            s = [((s[0] as f64 * scale).floor() as usize).max(1), ((s[1] as f64 * scale).floor() as usize).max(1)];
+            self.capped = true;
+        }
+        Ok(s)
+    }
+
+    /// The readout's points a pixel, fixed by the first lit arm done: a dark
+    /// arm (no power left, behind crossed polarizers say) cannot fix them,
+    /// and waits. `None` while they are not fixed.
+    fn try_fix_samples(&mut self, job: &mut ChainJob) -> Result<Option<[usize; 2]>, WaveError> {
+        if let Some(s) = self.samples {
+            return Ok(Some(s));
+        }
+        let power = job.u.power() + job.uy.as_ref().map_or(0.0, |f| f.power());
+        if power <= 1e-12 * job.launch.launched.max(f64::MIN_POSITIVE) {
+            return Ok(None);
+        }
+        let band = job.band();
+        let s = self.readout_samples(band)?;
+        self.samples = Some(s);
+        Ok(Some(s))
+    }
+
+    /// The points a pixel when no lit arm fixed them: two, and the spec's
+    /// floor.
+    fn default_samples(&mut self) -> Result<[usize; 2], WaveError> {
+        if let Some(s) = self.samples {
+            return Ok(s);
+        }
+        let s = self.readout_samples(Band::default())?;
+        self.samples = Some(s);
+        Ok(s)
+    }
+
+    /// Read the chains that finished before the readout's points were fixed.
+    fn read_waiting(&mut self) -> Result<(), WaveError> {
+        let Some(s) = self.samples else { return Ok(()) };
+        for mi in 0..self.modes.len() {
+            let several = self.modes[mi].chains.len() > 1;
+            for ci in 0..self.modes[mi].chains.len() {
+                if !matches!(self.modes[mi].chains[ci], Chain::Finished(_)) {
+                    continue;
+                }
+                let placeholder = Chain::Done(Box::new(placeholder_result(self.revision, self.spec.detector)?), 0);
+                let Chain::Finished(job) = std::mem::replace(&mut self.modes[mi].chains[ci], placeholder) else {
+                    unreachable!()
+                };
+                let n = job.points.len();
+                self.modes[mi].chains[ci] = if several {
+                    Chain::Face(Box::new(job.face(s, false)?))
+                } else {
+                    Chain::Done(Box::new(combine_arms(&self.scene, &self.spec, vec![job.face(s, true)?], self.revision)?), n)
+                };
+            }
+        }
+        Ok(())
+    }
+
+    /// The sub-pixel grid the readout chose, for the cap's warning.
+    fn face_grid_n(&self) -> Option<[usize; 2]> {
+        let det = self.scene.detectors.iter().find(|d| d.common.id.0 == self.spec.detector.0)?;
+        let s = self.samples?;
+        Some([det.bins[0] * s[0], det.bins[1] * s[1]])
+    }
+
     /// Carry the fields through up to `events` more events, chain after
     /// chain. `Ok(true)` once every chain is done; an element a field has no
     /// model for is an error naming it, and the job is not resumable after
@@ -3497,15 +3601,11 @@ impl WaveJob {
     /// job holds one full field at a time.
     pub fn step(&mut self, events: usize) -> Result<bool, WaveError> {
         let lone = self.modes.len() == 1 && self.modes[0].chains.len() == 1;
-        let s = match self.spec.readout {
-            Readout::Diffracted { samples_per_pixel } => samples_per_pixel.max(1),
-            Readout::Projected => 2,
-        };
         let mut left = events;
-        for m in &mut self.modes {
-            let several = m.chains.len() > 1;
-            for c in &mut m.chains {
-                let Chain::Running(job) = c else { continue };
+        for mi in 0..self.modes.len() {
+            let several = self.modes[mi].chains.len() > 1;
+            for ci in 0..self.modes[mi].chains.len() {
+                let Chain::Running(job) = &mut self.modes[mi].chains[ci] else { continue };
                 if left == 0 {
                     return Ok(false);
                 }
@@ -3513,15 +3613,17 @@ impl WaveJob {
                 let finished = job.step(k)?;
                 left -= k;
                 if finished && !lone {
-                    let Chain::Running(job) = std::mem::replace(c, Chain::Done(Box::new(placeholder_result(self.revision, self.spec.detector)?), 0)) else {
+                    let placeholder = Chain::Done(Box::new(placeholder_result(self.revision, self.spec.detector)?), 0);
+                    let Chain::Running(mut job) = std::mem::replace(&mut self.modes[mi].chains[ci], placeholder) else {
                         unreachable!()
                     };
                     let n = job.points.len();
-                    *c = if several {
-                        Chain::Face(Box::new(job.face(s)?))
-                    } else {
-                        Chain::Done(Box::new(job.finish(self.revision)?), n)
+                    self.modes[mi].chains[ci] = match self.try_fix_samples(&mut job)? {
+                        Some(s) if several => Chain::Face(Box::new(job.face(s, false)?)),
+                        Some(s) => Chain::Done(Box::new(combine_arms(&self.scene, &self.spec, vec![job.face(s, true)?], self.revision)?), n),
+                        None => Chain::Finished(job),
                     };
+                    self.read_waiting()?;
                 }
             }
         }
@@ -3530,7 +3632,7 @@ impl WaveJob {
 
     /// Read the detector: each pixel's power. Refused before every chain is
     /// done.
-    pub fn finish(self) -> Result<WavePathResult, WaveError> {
+    pub fn finish(mut self) -> Result<WavePathResult, WaveError> {
         if self.done() < self.events() {
             return Err(WaveError::OutOfRange(format!(
                 "the wave job has {} of {} events still to run",
@@ -3538,13 +3640,29 @@ impl WaveJob {
                 self.events()
             )));
         }
-        let WaveJob { scene, spec, revision, mut modes } = self;
-        if modes.len() == 1 && modes[0].chains.len() == 1 {
-            if let Some(Chain::Running(job)) = modes[0].chains.pop() {
-                return job.finish(revision);
+        if self.modes.len() == 1 && self.modes[0].chains.len() == 1 {
+            let Some(Chain::Running(mut job)) = self.modes[0].chains.pop() else {
+                unreachable!("a lone chain stays running until it is finished")
+            };
+            let s = match self.try_fix_samples(&mut job)? {
+                Some(s) => s,
+                None => self.default_samples()?,
+            };
+            let mut r = combine_arms(&self.scene, &self.spec, vec![job.face(s, true)?], self.revision)?;
+            if self.capped {
+                if let Some(n) = self.face_grid_n() {
+                    r.report.warn(SamplingWarning::CoarsePreview { n });
+                }
             }
-            unreachable!("a lone chain stays running until it is finished");
+            return Ok(r);
         }
+        // Arms that waited for the readout's points: every arm dark, then.
+        if self.modes.iter().flat_map(|m| &m.chains).any(|c| matches!(c, Chain::Finished(_))) {
+            self.default_samples()?;
+            self.read_waiting()?;
+        }
+        let capped_n = if self.capped { self.face_grid_n() } else { None };
+        let WaveJob { scene, spec, revision, modes, .. } = self;
         let count = modes.len();
         let mut lines: Vec<f64> = modes.iter().map(|m| m.lambda_um).collect();
         lines.dedup();
@@ -3571,7 +3689,11 @@ impl WaveJob {
             results.push((lam, r));
         }
         if results.len() == 1 {
-            return Ok(results.pop().expect("one").1);
+            let mut r = results.pop().expect("one").1;
+            if let Some(n) = capped_n {
+                r.report.warn(SamplingWarning::CoarsePreview { n });
+            }
+            return Ok(r);
         }
         // Lines add in power: mutually incoherent modes.
         let mut iter = results.into_iter();
@@ -3618,6 +3740,9 @@ impl WaveJob {
             total.report.approx(format!(
                 "unpolarized light as two mutually incoherent modes, launched along the beam frame's x and y, each a field of two polarization components, added in power; the field shown is the first mode's, {lam0}"
             ));
+        }
+        if let Some(n) = capped_n {
+            total.report.warn(SamplingWarning::CoarsePreview { n });
         }
         Ok(total)
     }
@@ -3801,4 +3926,106 @@ fn modulator_step(
         ),
     ));
     Ok(v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oc_core::id::SourceId;
+
+    /// A face field of one plane wave at frequency `f` cycles/mm along the
+    /// face's `u`, of unit amplitude, met at obliquity `cos`, on `fg`:
+    /// `in_carrier` of the frequency carried analytically, the rest in the
+    /// envelope's samples.
+    fn plane_wave_face(fg: Grid2, f: f64, in_carrier: f64, cos: f64, frame: Isometry3) -> FaceField {
+        let lam = 0.6328e-3;
+        let mut data = vec![Cx::ZERO; fg.len()];
+        for j in 0..fg.n[1] {
+            for i in 0..fg.n[0] {
+                let (x, _) = fg.xy(i, j);
+                data[fg.idx(i, j)] = Cx::expi(2.0 * std::f64::consts::PI * (f - in_carrier) * x);
+            }
+        }
+        FaceField {
+            grid: fg,
+            data,
+            data_y: None,
+            carrier: [in_carrier * lam, 0.0],
+            cos,
+            frame,
+            lambda_um: 0.6328,
+            n_medium: 1.0,
+            arriving: 0.0,
+            arrived: None,
+            report: WaveReport::default(),
+            launch: WaveLedger { launched: 1.0, ..Default::default() },
+            histories: vec![Vec::new()],
+            events: 0,
+        }
+    }
+
+    /// R13 of the expert review: two plane waves crossing on a detector make
+    /// pixel powers with the exact rectangular-pixel sinc factors,
+    /// `A[cos₁ + cos₂ + (cos₁ + cos₂) cos(2πΔf x_c) sinc(Δf·d)]` for the
+    /// scalar flux through the face, and with the cosines 1 for a paraxial
+    /// area detector. With the waves as the arms' carriers the readout
+    /// integrates their fringe over each cell exactly and must hold the
+    /// closed form to round-off; with the fringe in the envelopes' samples
+    /// instead, at `READOUT_PER_PERIOD` points a period, it is the midpoint
+    /// rule's `(πΔf h)²/6` short of it.
+    #[test]
+    fn two_plane_waves_integrate_over_the_pixels_with_the_sinc_factors() {
+        let mut scene = Scene3::new();
+        let src = scene.add_collimated_beam(Vec3::ZERO, 1.0, 1.0, 1, oc_core::scene::Spectrum::Monochromatic(0.6328));
+        let det = scene.add_area_detector(Vec3::new(0.0, 0.0, 100.0), -Vec3::Z, 1.0, 1.0, [20, 20]);
+        let frame = scene.detectors[0].common.transform;
+        let (nu, nv) = (20, 20);
+        let d = 2.0 / nu as f64;
+        let (f1, f2) = (3.7f64, -2.1f64);
+        let delta = f1 - f2;
+        // Points a pixel: READOUT_PER_PERIOD per period of the fringe.
+        let s = ((d * READOUT_PER_PERIOD * delta.abs()).ceil() as usize).max(2);
+        let h = d / s as f64;
+        let fg = centred(Grid2::new([nu * s, nv * s], [h, h], [0.0, 0.0]).unwrap());
+        // The midpoint rule's factor on a fringe of frequency Δf across cells
+        // of pitch h is x/sin x, x = πΔf·h; the cross term it acts on is
+        // (w₁ + w₂)·sinc(Δf·d) of the pixel's mean.
+        let x = std::f64::consts::PI * delta * h;
+        let midpoint = (x / x.sin() - 1.0) * ((std::f64::consts::PI * delta * d).sin() / (std::f64::consts::PI * delta * d)).abs();
+        for (model, c1, c2) in [(DetectorModel::NormalFlux, 0.9, 0.7), (DetectorModel::ParaxialArea, 0.9, 0.7), (DetectorModel::NormalFlux, 1.0, 1.0)] {
+            let spec = WavePathSpec {
+                source: SourceId(src.0),
+                detector: det,
+                beam: BeamProfile::Gaussian { waist_radius_mm: 1.0, waist_offset_mm: 0.0 },
+                power: 1.0,
+                grid_n: 64,
+                window_mm: 4.0,
+                device_samples_per_pixel: 4,
+                readout: Readout::Projected,
+                detector_model: model,
+            };
+            let (w1, w2) = match model {
+                DetectorModel::NormalFlux => (c1, c2),
+                DetectorModel::ParaxialArea => (1.0, 1.0),
+            };
+            for (how, in_carrier) in [("carriers", 1.0), ("envelopes", 0.0)] {
+                let faces = vec![plane_wave_face(fg, f1, in_carrier * f1, c1, frame), plane_wave_face(fg, f2, in_carrier * f2, c2, frame)];
+                let r = combine_arms(&scene, &spec, faces, 1).unwrap();
+                let mut worst: f64 = 0.0;
+                for j in 0..nv {
+                    for i in 0..nu {
+                        let xc = -1.0 + (i as f64 + 0.5) * d;
+                        let sinc = (std::f64::consts::PI * delta * d).sin() / (std::f64::consts::PI * delta * d);
+                        let want = d * d * (w1 + w2 + (w1 + w2) * (2.0 * std::f64::consts::PI * delta * xc).cos() * sinc);
+                        worst = worst.max((r.power[j * nu + i] - want).abs() / (d * d * (w1 + w2)));
+                    }
+                }
+                eprintln!("measured: two plane waves as the arms' {how}, {model:?}, cos {c1}, {c2}: pixel power against the sinc closed form, worst / (w1 + w2)ΔA = {worst:.3e}");
+                match how {
+                    "carriers" => assert!(worst < 1e-12, "{model:?}: {worst}"),
+                    _ => assert!(worst < 1.05 * midpoint && worst > 0.9 * midpoint, "{model:?}: {worst} against the midpoint rule's {midpoint}"),
+                }
+            }
+        }
+    }
 }

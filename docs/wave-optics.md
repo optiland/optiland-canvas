@@ -60,7 +60,7 @@ grid:
 | Function | What it computes | Valid where | Source |
 |---|---|---|---|
 | `asm_zoom(field, z, out, pad)` | the plane waves advanced `z` exactly and summed on any output window and pitch by chirp-z, so a focal spot is sampled far finer than the field and a window may sit off the axis | the padded window covers the output's offset (a field repeats a padded window away) | [1], [7], [9] |
-| `asm_tilted(field, plane, out, pad)` | the field on any plane: tilted, shifted and distant at once, each plane wave read in the target frame, `(u, v, w) = Rᵀ(u′, v′, w′)`, with the Jacobian `\|∂(u, v)/∂(u′, v′)\|` and the phase to the plane's origin | the source spectrum is read between its samples (bilinear): padding samples it finer | [6], [7] |
+| `asm_tilted(field, plane, out, pad)` | the field on any plane: tilted, shifted and distant at once, each plane wave read in the target frame, `(u, v, w) = Rᵀ(u′, v′, w′)`, with the Jacobian `\|∂(u, v)/∂(u′, v′)\|` and the phase to the plane's origin | the source spectrum is read between its samples by gridding, a Kaiser–Bessel kernel ten samples wide on the spectrum of the field padded at least twice [30], [31]: the kernel's aliasing, 4e-10 in its test | [6], [7], [30], [31] |
 
 **The critical distance** `z_c = LΔx/λ`, for a window `L` wide after padding,
 divides the two Fresnel methods [3]. Up to `z_c` the angular spectrum's
@@ -199,7 +199,8 @@ let spec = WavePathSpec {
     power: 1.0,
     grid_n: 512, window_mm: 4.0,      // the field across the beam
     device_samples_per_pixel: 4,      // when the beam is laid onto a DMD or SLM
-    readout: Readout::Projected,      // or Readout::Diffracted { samples_per_pixel }
+    readout: Readout::Projected,      // or Readout::Diffracted { samples_per_pixel }, a floor on the points a pixel
+    detector_model: DetectorModel::NormalFlux,   // or ParaxialArea
 };
 let result = wave_path(&scene, &spec, revision)?;   // power per detector pixel, the field, the report
 // or, from the beam the source itself declares:
@@ -232,8 +233,7 @@ incoming ray to the plane across the outgoing one:
 | face of a refractive body, curved mirror or other curved surface | traced across the thin slab that holds the surface where the beam meets it (below), its rim laid on the field with exact cell coverage; between a body's faces the field diffracts inside the glass by the angular spectrum, in the glass's index | the slab is geometric: no diffraction across a surface's sag |
 | plane-parallel plate (a body entered and left by two flat, parallel faces, bare or with a residual AR) | one step: the closed-form slab, round trips included, on each plane wave of the field, then the angular spectrum across the planes (below) | exact for a plate of infinite extent, s or p; its rim laid on the field |
 | flat coated surface (`Coating`: a coated splitter, a dichroic) | each plane wave times the coating's complex `r` or `t` at its own angle, from the transfer matrix, then handed over like any flat element; a plate-backed coating's plate in series, without round trips, as the coating declares it incoherent | exact for the stack, s or p |
-| detector, `Readout::Projected` | power per pixel: each field cell's `\|U\|²ΔA` binned into the pixel its projection lands in, in up to 16 × 16 sub-cells a field cell (an eighth of a pixel while a cell spans at most two pixels) | power conserved to round-off |
-| detector, `Readout::Diffracted` | the last free-space step taken straight onto the detector by the zoomed angular spectrum (`asm_zoom`), at `s × s` points a pixel: a focal spot far smaller than the field's own samples is resolved, with no paraxial step | exact scalar propagation; padded so that the field's periodic copies, a padded window apart, stay clear of the face (`Periodic` warns where 4096 samples a side cannot) |
+| detector (`Readout::Projected` or `Readout::Diffracted { samples_per_pixel }`) | one readout for every arm: the field, carried to the detector's plane across its chief ray, is interpolated onto the detector's own sub-pixel grid, `s × s` points a pixel at the centres of equal parts of each pixel, by the zoomed angular spectrum (`asm_zoom`) where the face is square to the beam with its axes along the beam's and by the spectrum rotated onto the face (`asm_tilted`) otherwise, its carrier kept analytic; `s` holds the intensity's band on the face (the arms' directions' spread plus twice the envelope's band) at `READOUT_PER_PERIOD` (8) points a period for the band that holds all but 1e-6 of the envelope's energy and at `READOUT_PER_PERIOD_TAILS` (2.5) for its whole band, down to 1e-8 of its peak amplitude (a field cut by its window has spectral tails to its grid's Nyquist frequency, whose beat with the main lobe is of first order in the edge's amplitude: read at points that do not resolve them, a Michelson's arm gained 1e-4 of its power; resolved above two points a period, the sum over the points is the interpolant's power exactly), two at least, and `Diffracted` sets a floor of its `samples_per_pixel`; a pixel's power is the sum of its cells' integrals, the fringe between two arms' carriers integrated over each cell exactly (the rectangular pixel's sinc factors) and the envelopes by the midpoint rule, the irradiance by the `DetectorModel` (below) | exact scalar propagation; the midpoint rule on the envelopes, `(πfh)²/6` of an intensity component at frequency `f` for points `h` apart (2.6% at the band's edge, 0.64% at half of it); padded so that the field's periodic copies, a padded window apart, stay clear of the face (`Periodic` warns where 4096 samples a side cannot); the sample cap (`CoarsePreview` says what the points fell short of) |
 
 When the beam leaves an element at another angle than it came, its
 cross-section changes by `cos θ_out / cos θ_in`; the handover's amplitude
@@ -246,9 +246,8 @@ that depth exceeds `Δx²/λ`. An aperture and an element's outline are laid on
 the field as their projection along the beam, whose edges are covered
 exactly: a disc becomes an ellipse, drawn as a polygon of up to 1024 sides
 with the disc's own area, departing from it by under a five-hundredth of a
-sample. A tilted detector read with `Readout::Diffracted`
-is not projected: the spectrum is rotated onto its own plane (`asm_tilted`
-[6]). Elements on oblique planes still are.
+sample. A tilted detector is not projected: the spectrum is rotated onto
+its own plane (`asm_tilted` [6]). Elements on oblique planes still are.
 
 **Through a lens: one face at a time.** A refractive body is not carried
 through whole by its rays. Inside its Rayleigh range a beam's curvature does
@@ -473,10 +472,11 @@ light.
 **Interferometers: arms that meet.** Where splitter arms recombine on the
 detector, the axial ray reaches it by several chains. Each carries the same
 launched field along its own arm, and the arms' fields are added on the
-detector's own grid, `s × s` points a pixel (two for `Readout::Projected`),
-before the power is formed; each arm is carried onto the face by a spectrum
-padded so that the field's periodic copies stay clear of it. That is the
-coherent sum of paths the
+detector's own grid, `s × s` points a pixel, before the power is formed: the
+one readout every arm gets (above), so a second arm that carries almost
+nothing changes the first's pixels by their cross term alone, of order the
+root of its power, and nothing at all once it carries nothing (R12). That is
+the coherent sum of paths the
 scattering-network formulation asks for (`T = C(I − SP)⁻¹SB`, here a network
 without feedback, so a finite sum of paths). It needs three things the single
 chain did not:
@@ -507,17 +507,33 @@ chain did not:
   and never a check; the ledger's own checks (below) report it when it comes
   out negative.
 
-Each arm's field is weighted on the face by the root of its obliquity, so that
-one arm alone reads as it would by itself. Two arms crossing at an angle make
-fringes of period `λ/|t₁ − t₂|`, `t` the directions' components along the face;
-a period under two of the readout's points is flagged `Undersampled`. Arms of
-two components are added component by component, so orthogonally polarized
-arms do not interfere [27]: a half-wave plate in one arm of a Mach–Zehnder
-takes its fringes away, and an analyzer behind it brings them back. Where the
-chains carry one field, the arms' polarizations are taken as the same and the
-fringes' visibility is an upper bound (named in the report). An arm read out
-at a tilt goes through the tilted-plane spectrum, whose reading between
-spectral samples is its approximation (5.9e-4 in its own test).
+The irradiance at a point of the face follows the spec's `DetectorModel`.
+`NormalFlux`, the default, is the scalar flux through the face,
+`Σ_c |U_c|² cos θ_c + Re Σ_{c≠c′} U_c U_c′* (cos θ_c + cos θ_c′)/2`: each
+arm's own power times its obliquity, so that one arm alone reads as it would
+by itself, and the cross terms with the mean obliquity, exact for coplanar
+TE plane waves. `ParaxialArea` is `|Σ_c U_c|²`, every obliquity 1. Two arms
+crossing at an angle make fringes of period `λ/|t₁ − t₂|`, `t` the
+directions' components along the face; their carriers' fringe is integrated
+over each readout cell exactly, so two plane waves give the rectangular
+pixel's sinc factors to round-off (R13), and a period under two of the
+readout's points, where the envelopes' part of the cross term is no longer
+resolved, is flagged `Undersampled`. Arms of two components are added
+component by component on the face's own axes (R14): an arm oblique to the
+face has its transverse axes turned onto the face by the rotation that takes
+its direction onto the face's normal, so the component across the plane of
+incidence stays, the one in it lands along the face's in-plane direction and
+each arm keeps its power (a projection would drop the part of the field along
+the normal); the vector cross terms between arms of different directions are
+not modelled, which the report names. So orthogonally polarized arms do not
+interfere [27]: a half-wave plate in one arm of a Mach–Zehnder takes its
+fringes away, and an analyzer behind it brings them back, on a detector
+rolled about its normal or tilted about its own axis as on one square to the
+beam. Where the chains carry one field, the arms' polarizations are taken as
+the same and the fringes' visibility is an upper bound (named in the report).
+An arm read out at a tilt goes through the tilted-plane spectrum, whose
+reading between spectral samples (gridding, [30], [31]) is accurate to about
+1e-9 of the field.
 
 **Several lines.** A source of spectral lines is a set of mutually incoherent
 modes [22]: each line runs coherently through every chain at its own
@@ -583,16 +599,16 @@ These are acceptance case C53, in `crates/oc-wave/tests/path.rs`.
 | `a_gaussian_through_a_singlet_waists_where_self_predicts` | Self [14] with the singlet's focal length and principal planes traced by the f64 tracer (an N-BK7 equiconvex lens, R ±50 mm, 4 mm) | 1e-3 | waist position 2.5e-4 of its Rayleigh range (2.9 µm); radius 5.1e-5 |
 | `a_tilted_plate_displaces_the_beam_where_the_rays_say` | the chief ray's landing point behind a plate at 30° | 0.05 pixel | 5.2e-5 mm |
 | `a_singlet_psf_matches_optiland_huygens_psf` | Optiland's `HuygensPSF` of the same singlet at f/10, at its paraxial focus (oracle, below) | Strehl ±0.01; rms 1e-2 of the ideal peak | Strehl 0.8653 against 0.8642; rms 1.2e-4 |
-| `a_tilted_detector_reads_the_beam_on_its_own_plane` | Kogelnik–Li [13] at each point of a face tilted 30°, times the obliquity | 2e-3 of the peak; power on the face 2e-3 | 8.5e-4; −1.9e-3 |
+| `a_tilted_detector_reads_the_beam_on_its_own_plane` | Kogelnik–Li [13] on a face tilted 30°, times the obliquity: each pixel's power against the 8 × 8 sub-pixel mean of the law, and the power caught | 2e-3 of the peak; power on the face 3e-3 | 8.4e-4; 1.8e-8 (−1.9e-3 under the bilinear spectrum reading before E3) |
 | `an_aperture_whose_outer_extent_the_beam_passes_beyond_leaves_it_alone` | the tracer's aperture: light beyond the outer extent passes; against an open aperture at the same plane | bit-identical | identical |
 | `a_fold_mirror_smaller_than_the_beam_reflects_only_what_meets_it` | a 0.6 mm disc at 45° in a 1 mm Gaussian [13]: the power off its projected ellipse, by quadrature, passes beside it | 1e-4 | 1.5e-5 |
 | `a_thin_lens_smaller_than_the_beam_lets_the_rest_pass_beside_it` | 10 µm behind a 0.5 mm thin lens: the lens's phase inside, free space's field outside, away from the edge | 2e-3 | 1.0e-3 inside; 3.0e-5 outside |
 | `a_lens_rim_smaller_than_the_beam_stops_and_diffracts_as_an_iris_against_it` | a 1 mm iris 1.5 µm before a lens too large to clip; the lens rim itself, with exact cover | power 3e-4; spot 2e-3 of peak | 1.1e-4 (the back face's rim stops 9e-4 of what reaches it, which is real); 3.7e-4 |
 | `an_lcos_on_the_path_sends_half_of_unpolarized_light_into_each_beam` | half of what the device meets in the unmodulated beam [20]; `sinc²(1/16)` of the modulated half in the first order [21] | 2e-3; 3e-3 | −5.9e-7; −2.0e-3 |
 | `a_glass_plate_delays_the_beam_by_its_optical_path` | `k₀(n − 1)t` less the Gouy change of the effective length [13] | 1e-4 rad | 8.9e-9 rad (face by face, 2.6e-6) |
-| `a_mach_zehnder_sends_all_the_power_out_of_its_two_ports_whatever_the_path_difference` | a lossless network is unitary: the two ports carry the input between them, `(1 ∓ cos Δφ)/2` each, at Δφ = 0, π/2, π, 3π/2 [23], [24] | sum 1e-3; share 2e-3 | sum 1.000; share within 1.1e-7 |
+| `a_mach_zehnder_sends_all_the_power_out_of_its_two_ports_whatever_the_path_difference` | a lossless network is unitary: the two ports carry the input between them, `(1 ∓ cos Δφ)/2` each, at Δφ = 0, π/2, π, 3π/2 [23], [24] | sum 1e-3; share 2e-3 | sum 1.000; share within 1.0e-7; the network ledger's remainder 2.2e-14 |
 | `a_michelson_with_a_tilted_mirror_makes_fringes_of_period_lambda_over_sin_2_alpha` | two arms crossing at 2α make fringes `λ/sin 2α` apart [1]; read from the power's spectrum across the face | 2e-3 | −7.1e-5 (the beams' curvature accounts for −3.5e-5) |
-| `moving_a_michelson_mirror_by_d_shifts_its_fringes_by_two_k_d` | four steps of λ/8 are four of π/2: `P₀ + P₂ = P₁ + P₃`; visibility 1; equal arms dark [1] | 1e-3; 0.995 | 2.8e-7; 1.000 |
+| `moving_a_michelson_mirror_by_d_shifts_its_fringes_by_two_k_d` | four steps of λ/8 are four of π/2: `P₀ + P₂ = P₁ + P₃`; visibility 1; equal arms dark [1] | 1e-3; 0.995 | −3.1e-8; 1.000 |
 | `two_lines_wash_a_michelson_s_fringes_out_where_their_beats_cancel` | two incoherent lines [22]: visibility `\|cos(2πΔ(1/λ₁ − 1/λ₂))\|`, 1 at equal arms, 0 where the beats cancel | 0.99; 2e-2 | 0.9996; 1.6e-3 |
 | `a_continuous_source_is_refused_and_lines_add_in_power` | the lines' own runs, weighted; a continuum refused by name | 1e-12 | 1.8e-15 |
 | `an_lcos_whose_two_polarization_beams_both_reach_the_detector_adds_them_in_power` | the two beams are orthogonally polarized [20] and add in power [27]: the detector reads the same whatever uniform phase the device puts on one; the device meets `erf(√2a/w)²` [13] | 1e-9; 1e-3 | 0 (identical); −2.7e-4 |
@@ -612,7 +628,11 @@ These are acceptance case C53, in `crates/oc-wave/tests/path.rs`.
 | `a_grating_order_leaves_with_its_momentum_and_its_phase` | the grating equation [1] (R01 of the expert review): a 20 l/mm grating met at 10°, η = 0.65; the order's field stays centred on the chief ray turned to the order, lands where the traced chief ray does, and takes the phase `e^{−i2πΔ/d}` when the grating moves Δ across its grooves | centroid 1e-4 mm; landing 6e-3 mm; phase 1e-8 | 2.3e-14 mm; 5.2e-4 mm; 1.2e-12 |
 | `both_orders_of_a_grating_book_what_neither_carries_once` | the order and the zero order on one detector (R02): `untracked_orders = 1 − η − η₀` once, nothing left to the remainder | 1e-6; 2e-3 | 0.250; detected 0.750, remainder −1.1e-7 |
 | `a_window_fitted_off_the_chief_ray_carries_the_field_where_it_is` | a half-blocked 0.1 mm beam whose fitted window lies 55 µm off the chief ray (R03): in free space its centroid on the detector against a fixed window's and against the second-moment law [25]; through a singlet, the power and centroid against a fixed window's | 2e-4 mm; 1e-2 mm (the detector holds 96.7% of the light); 2e-3 mm; 2e-2 (the windows hold different shares of the edge's light) | 9.9e-5 mm; 4.9e-3 mm; 3.1e-4 mm; 9.9e-3 |
-| `a_rigidly_moved_scene_reads_the_same_detector` | gauge (R06): a folded path, a Mach–Zehnder and two Michelsons rotated 0.7 rad about (1, 2, 3) and moved, against themselves | 1e-9; 1e-5 of the launched (k·OPL round-off, 1e-7 rad) | 2.3e-12; 2.2e-10, 1.0e-7, 1.2e-6 |
+| `a_rigidly_moved_scene_reads_the_same_detector` | gauge (R06): a folded path, a Mach–Zehnder and two Michelsons rotated 0.7 rad about (1, 2, 3) and moved, against themselves | 1e-9; 1e-5 of the launched (k·OPL round-off, 1e-7 rad) | 2.3e-12; 9.5e-11, 1.8e-8, 1.4e-7 |
+| `a_vanishing_second_arm_changes_the_bright_arm_continuously` | R12 of the expert review: one readout for one arm or several, so a second arm carrying ε of the power changes the bright arm's pixels by their cross term alone, of order `√ε`, and the detected power as much; at ε = 0 one chain runs | 3√ε of the peak; 3√ε | 1.86√ε (1.9e-1, 1.9e-2, 1.9e-4 at ε = 1e-2, 1e-4, 1e-8); detected −9.3e-2, −9.3e-3, −9.3e-5 |
+| `a_rolled_detector_reads_the_same_polarized_fringes` | R14: the half-wave-plate Mach–Zehnder on a detector rolled 30° about its normal, and on one tilted 30° about its own axis, against the square detector and the Fresnel–Arago law [26], [27] at Δφ = 0, π/2 (analyzer 50°), π (analyzer 20°) | 1e-6 | square against the law 5.0e-8; rolled 1.1e-11; tilted 7.9e-9 |
+| `a_noncoplanar_mach_zehnder_conserves_power_across_its_ports` | R14: arms folded out of the plane reach the second splitter with frames turned about the beam; added on the detector's own axes, both ports carry the launched power, and a rigid roll of the whole scene leaves the Z port's pixels | 2e-3; 1e-5 of the launched | 1.000; 6.2e-7 |
+| `two_plane_waves_integrate_over_the_pixels_with_the_sinc_factors` (a unit test of `path.rs`) | R13: two plane waves on a 20 × 20 detector, as the arms' carriers and as their envelopes, against the rectangular pixel's closed form `A(w₁ + w₂)[1 + cos(2πΔf x_c)·sinc(Δf d)]`, for the scalar flux (cos 0.9, 0.7; 1, 1) and the paraxial area | 1e-12; the midpoint rule's `(x/sin x − 1)·sinc(Δf d)`, `x = πΔf h`, within 10% | 2.4e-15; 1.19e-2 (the rule's 1.20e-2) |
 
 The transfer's own tests (acceptance case C62, `crates/oc-wave/src/transfer.rs`):
 
@@ -642,7 +662,7 @@ The propagation tests of W8 (acceptance case C57, `crates/oc-wave/tests/propagat
 |---|---|---|---|
 | `the_zoomed_angular_spectrum_lands_on_the_angular_spectrum_on_its_own_grid` | the FFT angular spectrum on the same points [1] | 1e-10 | 2.7e-14 of peak |
 | `an_off_axis_window_holds_the_field_the_large_window_does` | a beam walked 0.6 mm sideways, against the FFT angular spectrum on a window four times as wide [7] | 1e-6 | 1.9e-12 of peak |
-| `a_tilted_plane_holds_the_field_its_plane_waves_sum_to` | a plane tilted 20°, 2 mm along, against the plane waves of the same spectrum summed at its points [6]; with no tilt, against `asm_zoom` | 2e-3; 1e-10 | 5.9e-4 (the bilinear reading of the spectrum, padded 4×); 8.3e-14 |
+| `a_tilted_plane_holds_the_field_its_plane_waves_sum_to` | a plane tilted 20°, 2 mm along, against the plane waves of the same spectrum summed at its points [6], [30], [31]; with no tilt, against `asm_zoom`; rolled about its normal, against the field itself | 1e-7; 1e-10; 1e-9 | 4.1e-10 (the gridding kernel's aliasing, padded 2×); 2.5e-11; rolled 30° about its normal, against the Gaussian at the rolled points, 2.5e-11 |
 | `an_off_centre_input_window_propagates_where_its_field_is` | a window centred 0.2 mm off the frame origin, with and without a carrier (R03 of the expert review): the zoomed spectrum against the FFT angular spectrum on a wide centred window [1], onto windows centred anywhere; the rotation onto a shifted parallel plane against the zoom | 1e-6; 1e-9 | 2.0e-12; 8.3e-13 |
 | `a_translated_frame_and_a_translated_grid_hold_the_same_field` | gauge: one field encoded as a grid at `c` or as a frame moved to `c`, by the zoom and by the rotation onto one plane | 1e-12 | 3.2e-15; 5.2e-16 |
 | `the_zoomed_fresnel_and_fraunhofer_transforms_take_the_grid_where_it_is` | the chirp-z Fresnel transform of an off-centre window against the zoomed angular spectrum (padded 8×, for its periodic copies); a shifted field's far field against the centred one's times the shift phase `e^{−i2πf·c}` [1] | 1e-4; 1e-10 | 4.2e-6; 8.3e-16 |
@@ -712,13 +732,14 @@ power on most tested paths, 5.9e-9 on the DMD-and-singlet path; the tests
 print it.
 
 What *is* checked, on every result (`WaveLedger::check`): no physical bucket
-is negative, and no more is detected than was launched, beyond 1e-9 of the
-launched power. Anything else is named in `inconsistencies`, which every
-path test asserts empty. The one exception the tests allow, by name, is the
-readout of several arms: added on the detector's grid at two points a pixel,
-samples rather than integrals, the arms can read slightly more than was
-launched (1.7e-9 in the Mach–Zehnder test, 1.6e-5 in the Michelson's), a
-known limit of that point-sampled readout.
+is negative, and no more is detected than was launched, beyond 1e-7 of the
+launched power (`LEDGER_TOLERANCE`: a readout's band-limited interpolation
+onto the face can gain a few 1e-9). Anything else is named in
+`inconsistencies`, which every path test asserts empty, interferometers
+included: an arm's readout is an interpolation accurate to about 1e-9 (the
+chirp-z sum, or the gridded spectrum rotation on a tilted face), so the
+Michelson that read 1.6e-5 more than was launched under the earlier
+point-sampled readout now closes.
 
 ## Validation
 
@@ -827,8 +848,8 @@ The coating fixtures keep their own pin, `optiland==0.6.1`
   14 wavelengths [11].
 - **Oblique elements by projection.** A lens, an aperture or a modulator seen
   obliquely is handed over by projecting the field along the rays
-  (`TiltProjection`, reported); only the detector's diffracted readout uses
-  the tilted-plane spectrum.
+  (`TiltProjection`, reported); only the detector's readout uses the
+  tilted-plane spectrum.
 - **Lenses face by face.** A face is traced across its sag in the geometric
   limit; diffraction is taken between faces, not inside a face's slab. Its
   rays follow the beam's paraxial wavefront, not the field's own: a field that
@@ -902,5 +923,8 @@ entry says so.
 27. E. Hecht, *Optics*, 5th ed., Pearson (2017), ch. 8 (polarization): Malus's law; a retarder between crossed polarizers; the Fresnel–Arago laws. (Section numbers to confirm against the edition.)
 28. A. E. Siegman, *Lasers*, University Science Books (1986), ch. 15 and 20: ray matrices in reduced form across media of different index, and the ABCD law for a Gaussian beam's `q`. (Chapters to confirm.)
 29. Wave-optics specification bundle v1.0.0 (`wave_optics_agent_bundle_v1.zip`, supplied by the project, 2026-10-19): `01_MODEL.md` M14, M34, M35; `03_BENCHMARKS.md` B02, B10; `config/benchmark_cases.json`, frozen fixtures. (A specification, not a published source; its own references are in `04_REFERENCES.md`.)
+30. J. I. Jackson, C. H. Meyer, D. G. Nishimura, A. Macovski, "Selection of a convolution function for Fourier inversion using gridding," *IEEE Trans. Med. Imaging* 10(3), 473–478 (1991), doi:10.1109/42.97598. (Gridding: a spectrum read between its samples by a kernel on an oversampled grid, the field divided by the kernel's Fourier dual; the Kaiser–Bessel kernel.)
+31. P. J. Beatty, D. G. Nishimura, J. M. Pauly, "Rapid gridding reconstruction with a minimal oversampling ratio," *IEEE Trans. Med. Imaging* 24(6), 799–808 (2005), doi:10.1109/TMI.2005.848376. (The kernel's shape parameter for a width and an oversampling, Eq. (5).)
+32. L. Greengard, J.-Y. Lee, "Accelerating the nonuniform fast Fourier transform," *SIAM Rev.* 46(3), 443–454 (2004), doi:10.1137/S003614450343200X. (The same step as the interpolation of a type-2 non-uniform FFT.)
 
 The FFT is `rustfft` 6.4.1 (MIT OR Apache-2.0).

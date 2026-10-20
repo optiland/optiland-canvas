@@ -156,9 +156,11 @@ pub struct WaveLedger {
 }
 
 /// The relative tolerance [`WaveLedger::check`] allows a physical bucket
-/// below zero, or `detected` above `launched`: round-off of a long chain,
+/// below zero, or `detected` above `launched`: the round-off of a long
+/// chain and of the readout's band-limited interpolation onto the
+/// detector's grid, whose sum can exceed the launched power by a few 1e-9;
 /// never a model's error.
-pub const LEDGER_TOLERANCE: f64 = 1e-9;
+pub const LEDGER_TOLERANCE: f64 = 1e-7;
 
 impl WaveLedger {
     /// The physical buckets together: where the model sends the power.

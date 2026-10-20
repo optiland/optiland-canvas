@@ -184,8 +184,10 @@ pub fn asm_zoom(
     pad: usize,
     fft: &mut Fft2,
 ) -> Result<(Field2, WaveReport), WaveError> {
-    if !(z.is_finite() && z > 0.0) {
-        return Err(WaveError::OutOfRange("a zoomed angular spectrum goes forward, a positive distance".into()));
+    // At `z = 0` it is the band-limited interpolation of the field onto
+    // `out`, by the same sum.
+    if !(z.is_finite() && z >= 0.0) {
+        return Err(WaveError::OutOfRange("a zoomed angular spectrum goes forward, a positive distance or none".into()));
     }
     out.validate()?;
     let mut report = WaveReport::default();

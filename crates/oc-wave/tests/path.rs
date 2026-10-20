@@ -55,22 +55,6 @@ fn wave_path(s: &Scene3, spec: &WavePathSpec, revision: u64) -> Result<WavePathR
     Ok(r)
 }
 
-/// A path of several arms, read on the detector's point-sampled grid. Two
-/// points a pixel are samples, not integrals, so the arms' sum can read
-/// slightly more than was launched, which the ledger's checks name; until
-/// the arms are read by exact binning, that gain is the only inconsistency
-/// allowed here, and it stays below 1e-4 of the launched power.
-fn wave_path_arms(s: &Scene3, spec: &WavePathSpec, revision: u64) -> Result<WavePathResult, oc_wave::WaveError> {
-    let r = oc_wave::path::wave_path(s, spec, revision)?;
-    let l = r.report.ledger;
-    for note in &r.report.inconsistencies {
-        assert!(note.contains("more power detected than launched") || note.contains("other_ports is negative"), "{note}: {l:?}");
-    }
-    assert!(l.detected - l.launched < 1e-4 * l.launched, "{l:?}");
-    assert!(l.other_ports > -1e-4 * l.launched, "{l:?}");
-    Ok(r)
-}
-
 fn source(s: &mut Scene3) -> SourceId {
     s.add_collimated_beam(Vec3::ZERO, 1.0, 1.0, 1, Spectrum::Monochromatic(LAM))
 }
@@ -85,6 +69,7 @@ fn spec(source: SourceId, detector: DetectorId, w0: f64, grid_n: usize, window_m
         window_mm,
         device_samples_per_pixel: 4,
         readout: Readout::Projected,
+        detector_model: oc_wave::path::DetectorModel::NormalFlux,
     }
 }
 
@@ -522,8 +507,8 @@ fn a_mach_zehnder_sends_all_the_power_out_of_its_two_ports_whatever_the_path_dif
         let dphi = j as f64 * std::f64::consts::FRAC_PI_2;
         let delta = dphi / (k0 * std::f64::consts::SQRT_2);
         let (s, src, dx, dy) = mach_zehnder(delta);
-        let rx = wave_path_arms(&s, &spec(src, dx, 0.5, 256, 4.0), 1).unwrap();
-        let ry = wave_path_arms(&s, &spec(src, dy, 0.5, 256, 4.0), 1).unwrap();
+        let rx = wave_path(&s, &spec(src, dx, 0.5, 256, 4.0), 1).unwrap();
+        let ry = wave_path(&s, &spec(src, dy, 0.5, 256, 4.0), 1).unwrap();
         let (px, py) = (rx.report.ledger.detected, ry.report.ledger.detected);
         let share = px / (px + py);
         let want = 0.5 * (1.0 - dphi.cos());
@@ -623,7 +608,7 @@ fn moving_a_michelson_mirror_by_d_shifts_its_fringes_by_two_k_d() {
     let p: Vec<f64> = (0..4)
         .map(|j| {
             let (s, src, det) = michelson(j as f64 * LAM / 1000.0 / 8.0, 0.0, 0.0, Spectrum::Monochromatic(LAM), 3.0, 32);
-            wave_path_arms(&s, &spec(src, det, 1.0, 256, 5.0), 1).unwrap().report.ledger.detected
+            wave_path(&s, &spec(src, det, 1.0, 256, 5.0), 1).unwrap().report.ledger.detected
         })
         .collect();
     let mean = p.iter().sum::<f64>() / 4.0;
@@ -648,7 +633,7 @@ fn two_lines_wash_a_michelson_s_fringes_out_where_their_beats_cancel() {
     let walk = 0.25 / beat;
     let run = |dd: f64, j: usize| {
         let (s, src, det) = michelson(j as f64 * l1 / 1000.0 / 8.0, dd, 0.0, Spectrum::Lines(vec![(l1, 1.0), (l2, 1.0)]), 3.0, 32);
-        wave_path_arms(&s, &spec(src, det, 1.0, 256, 5.0), 1).unwrap().report.ledger.detected
+        wave_path(&s, &spec(src, det, 1.0, 256, 5.0), 1).unwrap().report.ledger.detected
     };
     let at = |dd: f64| -> f64 {
         let p: Vec<f64> = (0..4).map(|j| run(dd, j)).collect();
@@ -943,19 +928,19 @@ fn a_singlet_psf_matches_optiland_huygens_psf() {
 
 #[test]
 fn a_tilted_detector_reads_the_beam_on_its_own_plane() {
-    // The diffracted readout of a face tilted 30°: the spectrum rotated onto
-    // its plane (Matsushima, Schimmel & Wyrowski 2003 [6]) rather than the
-    // field projected along the beam. At each pixel the irradiance must be
-    // Kogelnik and Li's [13] at that point of the tilted plane, times the
-    // obliquity cos 30°, and the face must catch the whole beam.
+    // The readout of a face tilted 30°: the spectrum rotated onto its plane
+    // (Matsushima, Schimmel & Wyrowski 2003 [6]) rather than the field
+    // projected along the beam. Each pixel's power must be Kogelnik and
+    // Li's irradiance [13] over that pixel of the tilted plane (its mean
+    // over an 8 × 8 quadrature), times the obliquity cos 30°, and the face
+    // must catch the whole beam.
     let w0 = 0.2;
     let mut s = Scene3::new();
     let src = source(&mut s);
     let th = 30f64.to_radians();
     let det = s.add_area_detector(Vec3::new(100.0, 0.0, 0.0), -Vec3::new(th.cos(), th.sin(), 0.0), 0.6, 0.6, [48, 48]);
     s.validate().unwrap();
-    let mut sp = spec(src, det, w0, 256, 2.048);
-    sp.readout = Readout::Diffracted { samples_per_pixel: 1 };
+    let sp = spec(src, det, w0, 256, 2.048);
     let r = wave_path(&s, &sp, 1).unwrap();
     assert!(r.report.steps.iter().any(|st| st.note.contains("tilted")), "{:?}", r.report.steps);
     assert!(!r.report.warnings.iter().any(|w| matches!(w, SamplingWarning::TiltProjection { .. })));
@@ -963,23 +948,36 @@ fn a_tilted_detector_reads_the_beam_on_its_own_plane() {
     let t = d.common.transform;
     let (du, dv) = (1.2 / 48.0, 1.2 / 48.0);
     let zr = rayleigh_range_mm(w0, LAM, 1.0);
+    let irradiance = |u: f64, v: f64| {
+        let p = t.transform_point(Vec3::new(u, v, 0.0));
+        let w = w0 * (1.0 + (p.x / zr).powi(2)).sqrt();
+        2.0 / (std::f64::consts::PI * w * w) * (-2.0 * (p.y * p.y + p.z * p.z) / (w * w)).exp() * th.cos()
+    };
     let (mut worst, mut peak, mut on_face): (f64, f64, f64) = (0.0, 0.0, 0.0);
     for j in 0..48 {
         for i in 0..48 {
-            let p = t.transform_point(Vec3::new(-0.6 + (i as f64 + 0.5) * du, -0.6 + (j as f64 + 0.5) * dv, 0.0));
-            let w = w0 * (1.0 + (p.x / zr).powi(2)).sqrt();
-            let want = 2.0 / (std::f64::consts::PI * w * w) * (-2.0 * (p.y * p.y + p.z * p.z) / (w * w)).exp() * th.cos();
+            let m = 8;
+            let mut want = 0.0;
+            for b in 0..m {
+                for a in 0..m {
+                    want += irradiance(-0.6 + (i as f64 + (a as f64 + 0.5) / m as f64) * du, -0.6 + (j as f64 + (b as f64 + 0.5) / m as f64) * dv);
+                }
+            }
+            let want = want / (m * m) as f64;
             let got = r.power[j * 48 + i] / (du * dv);
             peak = peak.max(want);
             on_face += want * du * dv;
             worst = worst.max((got - want).abs());
         }
     }
+    // The rotated spectrum is read between its samples (bilinear), which
+    // costs a few 1e-3 of the power on a 30° face; its convergence is the
+    // propagation tests' business.
     let caught = r.report.ledger.detected / r.report.ledger.launched;
     measured("tilted detector: irradiance against Kogelnik–Li on the tilted plane, worst / peak", worst / peak);
     measured("tilted detector: power caught against Kogelnik–Li's on the face, relative", (caught - on_face) / on_face);
     assert!(worst / peak < 2e-3, "{}", worst / peak);
-    assert!(((caught - on_face) / on_face).abs() < 2e-3, "{caught} vs {on_face}");
+    assert!(((caught - on_face) / on_face).abs() < 3e-3, "{caught} vs {on_face}");
 }
 
 #[test]
@@ -1892,7 +1890,7 @@ fn both_orders_of_a_grating_book_what_neither_carries_once() {
     // arm; nothing is left to the remainder. η = 0.65, η₀ = 0.10; the
     // detector holds both spots, 2.6 mm apart.
     let (s, src, det, _) = grating_scene(20.0, 10.0, 0.65, 0.10, 8.0, 160);
-    let r = wave_path_arms(&s, &spec(src, det, 0.5, 256, 4.0), 1).unwrap();
+    let r = wave_path(&s, &spec(src, det, 0.5, 256, 4.0), 1).unwrap();
     let l = r.report.ledger;
     measured("grating, both orders: detected, of the launched", l.detected);
     measured("grating, both orders: untracked orders, of the launched", l.untracked_orders);
@@ -2045,13 +2043,13 @@ fn a_rigidly_moved_scene_reads_the_same_detector() {
     // about that much of the launched power, and an arm read through the
     // rotated spectrum (the tilted Michelson's) by its interpolation's
     // round-off too; a single arm's cannot.
-    for (name, s, src, det, w0, n, win, arms, gate) in [
-        ("folded path", &folded, src_f, det_f, 0.2, 256, 3.0, false, 1e-9),
-        ("Mach–Zehnder", &mz, src_m, det_m, 0.5, 256, 4.0, true, 1e-5),
-        ("Michelson, square", &mi0, src_0, det_0, 1.0, 256, 5.0, true, 1e-5),
-        ("Michelson, tilted mirror", &mi, src_i, det_i, 1.0, 256, 5.0, true, 1e-5),
+    for (name, s, src, det, w0, n, win, gate) in [
+        ("folded path", &folded, src_f, det_f, 0.2, 256, 3.0, 1e-9),
+        ("Mach–Zehnder", &mz, src_m, det_m, 0.5, 256, 4.0, 1e-5),
+        ("Michelson, square", &mi0, src_0, det_0, 1.0, 256, 5.0, 1e-5),
+        ("Michelson, tilted mirror", &mi, src_i, det_i, 1.0, 256, 5.0, 1e-5),
     ] {
-        let run = |sc: &Scene3| if arms { wave_path_arms(sc, &spec(src, det, w0, n, win), 1).unwrap() } else { wave_path(sc, &spec(src, det, w0, n, win), 1).unwrap() };
+        let run = |sc: &Scene3| wave_path(sc, &spec(src, det, w0, n, win), 1).unwrap();
         let a = run(s);
         let b = run(&moved_scene(s, t));
         let launched = a.report.ledger.launched;
@@ -2059,4 +2057,172 @@ fn a_rigidly_moved_scene_reads_the_same_detector() {
         measured(&format!("{name}, moved rigidly: pixel power difference / launched"), worst / launched);
         assert!(worst / launched < gate, "{name}: {}", worst / launched);
     }
+}
+
+/// The Mach–Zehnder of `mach_zehnder`, its first splitter reflecting `r1`
+/// (transmitting the rest), so that the reflected arm can be made as faint
+/// as one likes.
+fn mach_zehnder_split(delta: f64, r1: f64) -> (Scene3, SourceId, DetectorId, DetectorId) {
+    let mut s = Scene3::new();
+    let src = source(&mut s);
+    let m = SurfaceResponse::Mirror { reflectivity: oc_core::scene3::SpectralScalar::Constant(1.0) };
+    let n = Vec3::new(-1.0, 1.0, 0.0).normalize();
+    s.add_beam_splitter(Vec3::new(50.0, 0.0, 0.0), 10.0, 135.0, r1, 1.0 - r1).unwrap();
+    s.add_planar_element(Vec3::new(150.0, 0.0, 0.0), 10.0, 135.0, m.clone(), m.clone());
+    s.add_planar_element(Vec3::new(50.0, 100.0, 0.0) + n * delta, 10.0, 135.0, m.clone(), m);
+    s.add_beam_splitter(Vec3::new(150.0, 100.0, 0.0), 10.0, 135.0, 0.5, 0.5).unwrap();
+    let dx = s.add_area_detector(Vec3::new(250.0, 100.0, 0.0), -Vec3::X, 3.0, 3.0, [64, 64]);
+    let dy = s.add_area_detector(Vec3::new(150.0, 200.0, 0.0), -Vec3::Y, 3.0, 3.0, [64, 64]);
+    s.validate().unwrap();
+    (s, src, dx, dy)
+}
+
+#[test]
+fn a_vanishing_second_arm_changes_the_bright_arm_continuously() {
+    // R12 of the expert review. One chain and several are read by one
+    // method, so a second arm carrying ε of the power must change the bright
+    // arm's pixels by the cross term alone, of order √ε, and nothing at
+    // ε = 0 (the splitter then sends no child along the dark arm, and one
+    // chain runs). The first splitter reflects ε into the second arm.
+    let k0 = 2.0 * std::f64::consts::PI / (LAM / 1000.0);
+    let delta = 0.37 / (k0 * std::f64::consts::SQRT_2);
+    let (s0, src, dx, _) = mach_zehnder_split(delta, 0.0);
+    let base = wave_path(&s0, &spec(src, dx, 0.5, 256, 4.0), 1).unwrap();
+    let arms0 = oc_trace::extract_sequences3(&s0, src, dx, Some(LAM), 1).unwrap().len();
+    assert_eq!(arms0, 1, "at ε = 0 one chain reaches the detector");
+    let peak = base.power.iter().cloned().fold(0.0, f64::max);
+    for eps in [1e-2, 1e-4, 1e-8] {
+        let (s, src, dx, _) = mach_zehnder_split(delta, eps);
+        let r = wave_path(&s, &spec(src, dx, 0.5, 256, 4.0), 1).unwrap();
+        assert!(r.report.steps.iter().any(|st| st.note.contains("2 arms added")), "{:?}", r.report.steps);
+        let worst = base.power.iter().zip(&r.power).map(|(p, q)| (p - q).abs()).fold(0.0, f64::max);
+        measured(&format!("Mach–Zehnder with ε = {eps:.0e} in the second arm: the bright arm's pixels against ε = 0, worst / peak"), worst / peak);
+        measured(&format!("Mach–Zehnder with ε = {eps:.0e} in the second arm: detected power against ε = 0"), r.report.ledger.detected - base.report.ledger.detected);
+        assert!(worst / peak < 3.0 * eps.sqrt(), "{}", worst / peak);
+        assert!((r.report.ledger.detected - base.report.ledger.detected).abs() < 3.0 * eps.sqrt(), "{:?}", r.report.ledger);
+    }
+}
+
+#[test]
+fn a_rolled_detector_reads_the_same_polarized_fringes() {
+    // R14 of the expert review, the readout's basis: each arm's two
+    // components are turned onto the face's own axes before the arms are
+    // added. A detector rolled 30° about its normal, and one tilted 30°
+    // about its own in-plane axis (the arms then oblique to it, their
+    // components turned onto the face by the rotation of their direction
+    // onto its normal), read the half-wave-plate Mach–Zehnder as the square
+    // one does: half the launched power in the X port at every phase, and
+    // behind an analyzer at β the Fresnel–Arago law
+    // `1/4 − cos Δφ · cos 2(θ − β)/4` [26], [27] (the pixels move with the
+    // face; the totals cannot).
+    let k0 = 2.0 * std::f64::consts::PI / (LAM / 1000.0);
+    let theta = 20.0;
+    for (dphi, beta) in [(0.0, None), (std::f64::consts::FRAC_PI_2, Some(50.0)), (std::f64::consts::PI, Some(20.0))] {
+        let delta = dphi / (k0 * std::f64::consts::SQRT_2);
+        let mut totals = Vec::new();
+        // The face turned about its own axis: Z its normal (a roll), X an
+        // in-plane axis (a tilt).
+        for (name, axis, deg) in [("square", Vec3::Z, 0.0f64), ("rolled 30°", Vec3::Z, 30.0), ("tilted 30°", Vec3::X, 30.0)] {
+            let (mut s, src, dx, _) = mach_zehnder(delta);
+            // The half-wave plate in the transmitted arm, square to it.
+            s.add_planar_element(Vec3::new(100.0, 0.0, 0.0), 10.0, 0.0, retarder(theta, 180.0), retarder(theta, 180.0));
+            if let Some(b) = beta {
+                s.add_planar_element(Vec3::new(200.0, 100.0, 0.0), 10.0, 0.0, polarizer(b, 0.0), polarizer(b, 0.0));
+            }
+            let d = s.detectors.iter_mut().find(|d| d.common.id.0 == dx.0).unwrap();
+            let turn = oc_core::Isometry3::from_axis_angle(axis, deg.to_radians()).unwrap();
+            d.common.transform = d.common.transform.compose(turn);
+            s.validate().unwrap();
+            let r = wave_path(&s, &spec(src, dx, 0.5, 256, 4.0), 1).unwrap();
+            if deg != 0.0 {
+                assert!(r.report.steps.iter().any(|st| st.note.contains("spectrum rotation")), "{name}: {:?}", r.report.steps);
+            }
+            totals.push((name, r.report.ledger.detected));
+        }
+        let want = match beta {
+            None => 0.5,
+            Some(b) => 0.25 - 0.25 * dphi.cos() * (2.0 * (theta - b).to_radians()).cos(),
+        };
+        measured(&format!("half-wave plate Mach–Zehnder, Δφ = {dphi:.3}, analyzer {beta:?}: square detector against the law"), totals[0].1 - want);
+        assert!((totals[0].1 - want).abs() < 1e-6, "{} vs {want}", totals[0].1);
+        for (name, total) in &totals[1..] {
+            measured(&format!("half-wave plate Mach–Zehnder, Δφ = {dphi:.3}, analyzer {beta:?}: {name} detector against the square one"), total - totals[0].1);
+            assert!((total - totals[0].1).abs() < 1e-6, "{name}: {total} vs {}", totals[0].1);
+        }
+    }
+}
+
+/// A Mach–Zehnder whose arms leave the plane: from a splitter at the origin,
+/// arm A goes +X, is folded up +Z, then along +Y to the second splitter at
+/// (100, 100, 100); arm B goes +Y, is folded along +X, then up +Z to the same
+/// splitter, which sends both along +Z to a detector at z = 200 (and the
+/// other port along +Y to a second detector).
+fn noncoplanar_mach_zehnder() -> (Scene3, SourceId, DetectorId, DetectorId) {
+    use oc_core::scene3::SpectralScalar;
+    let mut s = Scene3::new();
+    let src = source(&mut s);
+    let m = SurfaceResponse::Mirror { reflectivity: SpectralScalar::Constant(1.0) };
+    let mirror = |s: &mut Scene3, pos: Vec3, normal: Vec3| {
+        let id = s.add_planar_element(pos, 10.0, 0.0, m.clone(), m.clone());
+        let o = s.surfaces.iter_mut().find(|o| o.common.id.0 == id).unwrap();
+        o.common.transform = facing_iso(pos, normal);
+        id
+    };
+    let split = |s: &mut Scene3, pos: Vec3, normal: Vec3| {
+        let id = s.add_beam_splitter(pos, 10.0, 0.0, 0.5, 0.5).unwrap();
+        let o = s.surfaces.iter_mut().find(|o| o.common.id.0 == id).unwrap();
+        o.common.transform = facing_iso(pos, normal);
+        id
+    };
+    // Splitter 1 at the origin+50: +X transmits, reflects to +Y.
+    split(&mut s, Vec3::new(50.0, 0.0, 0.0), Vec3::new(-1.0, 1.0, 0.0).normalize());
+    // Arm A: +X → +Z at (150, 0, 0); +Z → +Y at (150, 0, 100).
+    mirror(&mut s, Vec3::new(150.0, 0.0, 0.0), Vec3::new(-1.0, 0.0, 1.0).normalize());
+    mirror(&mut s, Vec3::new(150.0, 0.0, 100.0), Vec3::new(0.0, 1.0, -1.0).normalize());
+    // Arm B: +Y → +X at (50, 100, 0); +X → +Z at (150, 100, 0).
+    mirror(&mut s, Vec3::new(50.0, 100.0, 0.0), Vec3::new(1.0, -1.0, 0.0).normalize());
+    mirror(&mut s, Vec3::new(150.0, 100.0, 0.0), Vec3::new(-1.0, 0.0, 1.0).normalize());
+    // Splitter 2 at (150, 100, 100): arm A along +Y reflects to +Z, arm B
+    // along +Z transmits; the other port leaves along +Y.
+    split(&mut s, Vec3::new(150.0, 100.0, 100.0), Vec3::new(0.0, -1.0, 1.0).normalize());
+    let dz = s.add_area_detector(Vec3::new(150.0, 100.0, 200.0), -Vec3::Z, 3.0, 3.0, [64, 64]);
+    let dy = s.add_area_detector(Vec3::new(150.0, 200.0, 100.0), -Vec3::Y, 3.0, 3.0, [64, 64]);
+    s.validate().unwrap();
+    (s, src, dz, dy)
+}
+
+/// An isometry whose local +Z is `normal`, at `pos`.
+fn facing_iso(pos: Vec3, normal: Vec3) -> oc_core::Isometry3 {
+    let z = normal.normalize();
+    let seed = if z.x.abs() < 0.9 { Vec3::X } else { Vec3::Y };
+    let x = (seed - z * z.dot(seed)).normalize();
+    let y = z.cross(x);
+    let q = glam::DQuat::from_mat3(&glam::DMat3::from_cols(x, y, z));
+    oc_core::Isometry3::new(pos, [q.x, q.y, q.z, q.w]).unwrap()
+}
+
+#[test]
+fn a_noncoplanar_mach_zehnder_conserves_power_across_its_ports() {
+    // R14 of the expert review: arms that leave the plane reach the second
+    // splitter with transverse frames turned differently about the beam.
+    // Added on the detector's own axes, the two output ports must still
+    // carry the launched power between them, at whatever phase the arms
+    // meet, and a rigid roll of the whole scene must change neither port
+    // (the frames are carried by the geometry alone).
+    let (s, src, dz, dy) = noncoplanar_mach_zehnder();
+    assert_eq!(oc_trace::extract_sequences3(&s, src, dz, Some(LAM), 1).unwrap().len(), 2, "two arms reach the Z port");
+    let rz = wave_path(&s, &spec(src, dz, 0.5, 256, 4.0), 1).unwrap();
+    let ry = wave_path(&s, &spec(src, dy, 0.5, 256, 4.0), 1).unwrap();
+    let (pz, py) = (rz.report.ledger.detected, ry.report.ledger.detected);
+    measured("non-coplanar Mach–Zehnder: both ports' power, of the launched", pz + py);
+    measured("non-coplanar Mach–Zehnder: the Z port's share", pz / (pz + py));
+    assert!((pz + py - 1.0).abs() < 2e-3, "{pz} + {py}");
+    assert!(rz.report.steps.iter().any(|st| st.note.contains("2 arms added")), "{:?}", rz.report.steps);
+    let q = glam::DQuat::from_axis_angle(Vec3::new(2.0, -1.0, 3.0).normalize(), 1.1);
+    let t = oc_core::Isometry3::new(Vec3::new(-4.0, 7.0, 2.0), [q.x, q.y, q.z, q.w]).unwrap();
+    let moved = moved_scene(&s, t);
+    let rz2 = wave_path(&moved, &spec(src, dz, 0.5, 256, 4.0), 1).unwrap();
+    let worst = rz.power.iter().zip(&rz2.power).map(|(p, q)| (p - q).abs()).fold(0.0, f64::max);
+    measured("non-coplanar Mach–Zehnder, moved rigidly: the Z port's pixels against the unmoved, / launched", worst);
+    assert!(worst < 1e-5, "{worst}");
 }

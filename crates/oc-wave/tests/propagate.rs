@@ -13,6 +13,15 @@
 //!   Fresnel propagator each side of it favours.
 //! - [4] F. Shen, A. Wang, *Appl. Opt.* 45(6), 1102–1110 (2006),
 //!   doi:10.1364/AO.45.001102: direct Rayleigh–Sommerfeld integration.
+//! - [6] K. Matsushima, H. Schimmel, F. Wyrowski, *J. Opt. Soc. Am. A* 20(9),
+//!   1755–1762 (2003), doi:10.1364/JOSAA.20.001755: the spectrum rotated
+//!   onto a tilted plane; [7] K. Matsushima, *Opt. Express* 18(17),
+//!   18453–18463 (2010), doi:10.1364/OE.18.018453: the shifted window.
+//! - [30] J. I. Jackson et al., *IEEE Trans. Med. Imaging* 10(3), 473–478
+//!   (1991), doi:10.1109/42.97598, and [31] P. J. Beatty, D. G. Nishimura,
+//!   J. M. Pauly, *IEEE Trans. Med. Imaging* 24(6), 799–808 (2005),
+//!   doi:10.1109/TMI.2005.848376: gridding with the Kaiser–Bessel kernel,
+//!   which reads the rotated spectrum between its samples.
 //!
 //! All retrieved 2026-10-19.
 
@@ -268,9 +277,12 @@ fn a_tilted_plane_holds_the_field_its_plane_waves_sum_to() {
     // Matsushima, Schimmel & Wyrowski 2003 [6]: the spectrum rotated onto a
     // plane tilted 20°, 2 mm along, against the plane waves of the same
     // spectrum summed directly at that plane's points. The method reads the
-    // source spectrum between its samples (bilinear), which is all that
-    // separates the two; with no tilt it reads them on their samples and must
-    // agree with the zoomed angular spectrum to round-off.
+    // source spectrum between its samples (by gridding, a Kaiser–Bessel
+    // kernel ten samples wide on the spectrum of the field padded twice or
+    // more [30], [31]), which is all that separates the two; with no tilt it
+    // must agree with the zoomed angular spectrum to the kernel's own
+    // accuracy; rolled about its normal, it reads the field's samples at the
+    // rolled points, against the Gaussian itself there.
     use oc_core::{Isometry3, Vec3};
     use oc_wave::beams::GaussianBeam;
     use oc_wave::{asm_tilted, asm_zoom, Cx, Fft2, Grid2};
@@ -292,7 +304,8 @@ fn a_tilted_plane_holds_the_field_its_plane_waves_sum_to() {
     let th = 20f64.to_radians();
     let q = glam::DQuat::from_rotation_y(th);
     let tilted = Isometry3::new(Vec3::new(0.0, 0.0, 2.0), [q.x, q.y, q.z, q.w]).unwrap();
-    let (t1, _) = asm_tilted(&u, tilted, out, 4, &mut fft).unwrap();
+    let (t1, _) = asm_tilted(&u, tilted, out, 2, &mut fft).unwrap();
+    let k1 = t1.k_mm();
     // The direct sum over the same padded spectrum.
     let p = 512usize;
     let mut buf = vec![Cx::ZERO; p * p];
@@ -330,11 +343,35 @@ fn a_tilted_plane_holds_the_field_its_plane_waves_sum_to() {
             }
             let s = s * (df * df);
             peak = peak.max(s.abs());
-            worst = worst.max((t1.at(i, j) - s).abs());
+            // The rotation keeps its carrier analytic: put it back.
+            let full = t1.at(i, j) * Cx::expi(k1 * (t1.carrier[0] * x + t1.carrier[1] * y));
+            worst = worst.max((full - s).abs());
         }
     }
     eprintln!("measured: tilted plane (20°), spectrum rotation against the direct plane-wave sum, worst / peak = {:.3e}", worst / peak);
-    assert!(worst / peak < 2e-3, "{}", worst / peak);
+    assert!(worst / peak < 1e-7, "{}", worst / peak);
+    // Rolled 30° about its normal, on the source plane: the field at the
+    // rolled points, which for the sampled Gaussian is the Gaussian itself
+    // (its band well inside the grid's, its tails 1e-11 at the window's
+    // edge).
+    let qz = glam::DQuat::from_rotation_z(30f64.to_radians());
+    let rolled = Isometry3::new(Vec3::ZERO, [qz.x, qz.y, qz.z, qz.w]).unwrap();
+    let (t2, rep2) = asm_tilted(&u, rolled, out, 2, &mut fft).unwrap();
+    let (mut worst2, mut peak2): (f64, f64) = (0.0, 0.0);
+    for j in 0..40 {
+        for i in 0..40 {
+            let (x, y) = out.xy(i, j);
+            let r = rolled.transform_point(Vec3::new(x, y, 0.0));
+            let want = u.at(64, 64).abs() * (-(r.x * r.x + r.y * r.y) / (0.1f64 * 0.1)).exp();
+            peak2 = peak2.max(want);
+            worst2 = worst2.max((t2.at(i, j).abs() - want).abs());
+        }
+    }
+    eprintln!("measured: plane rolled 30° about the normal, spectrum rotation against the Gaussian at the rolled points, worst / peak = {:.3e}", worst2 / peak2);
+    assert!(worst2 / peak2 < 1e-9, "{}", worst2 / peak2);
+    // The window holds all but the Gaussian's tails (1.3e-4 beyond 0.2 mm),
+    // booked as left; the rest closes.
+    assert!(t2.carrier == [0.0, 0.0] && rep2.ledger.detected > 0.9998 && rep2.ledger.numerical.abs() < 1e-12, "{:?}", rep2.ledger);
 }
 
 #[test]
@@ -390,15 +427,18 @@ fn an_off_centre_input_window_propagates_where_its_field_is() {
         let (t0, _) = asm_tilted(&a, shifted, out, 4, &mut fft).unwrap();
         let win = Grid2::new([40, 40], [0.01, 0.01], land).unwrap();
         let (z0, _) = asm_zoom(&a, z, win, 4, &mut fft).unwrap();
-        // asm_tilted leaves no carrier; put the zoom's back on its samples.
+        // Both keep their carriers analytic, each about its own origin: put
+        // them back on the samples.
         let k = z0.k_mm();
         let (mut worst0, mut peak0): (f64, f64) = (0.0, 0.0);
         for j in 0..40 {
             for i in 0..40 {
                 let (x, y) = win.xy(i, j);
                 let full = z0.at(i, j) * Cx::expi(k * (z0.carrier[0] * x + z0.carrier[1] * y));
+                let (xt, yt) = out.xy(i, j);
+                let full_t = t0.at(i, j) * Cx::expi(k * (t0.carrier[0] * xt + t0.carrier[1] * yt));
                 peak0 = peak0.max(full.abs());
-                worst0 = worst0.max((t0.at(i, j) - full).abs());
+                worst0 = worst0.max((full_t - full).abs());
             }
         }
         measured(&format!("off-centre input window, carrier {carrier:?}: shifted parallel plane by spectrum rotation against the zoomed angular spectrum, worst / peak"), worst0 / peak0);

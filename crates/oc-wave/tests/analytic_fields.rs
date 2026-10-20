@@ -140,10 +140,10 @@ fn a_circular_aperture_makes_the_airy_pattern() {
     assert!(worst < 2e-3, "{worst}");
     // Encircled energy inside the first dark ring, as a fraction of the power
     // the aperture transmits, πD²/4 for a unit field. (Not of the sampled
-    // field's power: the aperture's edge also diffracts into angles beyond
-    // the grid's band, which the ledger books as `beyond_nyquist`.)
+    // field's power: the sample at the aperture's edge carries less than the
+    // cell transmits, which the ledger books as `subcell_projection`.)
     let total = area;
-    assert!(r.ledger.beyond_nyquist > 0.0);
+    assert!(r.ledger.subcell_projection > 0.0);
     let mut inside = 0.0;
     for j in 0..v.grid.n[1] {
         for i in 0..v.grid.n[0] {

@@ -178,7 +178,7 @@ pub fn dmd_reflect(
     report.ledger.launched = u.power();
     report.ledger.absorbed_element = absorbed;
     report.ledger.other_family = other;
-    report.ledger.beyond_nyquist = beyond.max(0.0);
+    report.ledger.subcell_projection = beyond.max(0.0);
     report.ledger.detected = out.power();
     report.ledger.close();
     validity_flags(&mut report, p, u.lambda_um);
@@ -322,8 +322,8 @@ pub fn lcos_reflect(u: &Field2, device: &SpatialModulator, beam: LcosBeam) -> Re
     report.ledger.launched = u.power();
     report.ledger.absorbed_element = absorbed;
     // A sample spanning several phases carries less than the cell reflects:
-    // the difference went into angles beyond the grid's band.
-    report.ledger.beyond_nyquist = beyond.max(0.0);
+    // the difference is the sub-cell projection error of the pixel edges.
+    report.ledger.subcell_projection = beyond.max(0.0);
     report.ledger.detected = out.power();
     report.ledger.close();
     validity_flags(&mut report, p, lam);

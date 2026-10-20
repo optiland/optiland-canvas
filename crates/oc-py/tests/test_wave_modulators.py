@@ -6,7 +6,7 @@ behind passing Rust tests:
 
 - an N-level blazed phase grating puts sinc²(1/N) in its first order (G. J.
   Swanson, MIT Lincoln Laboratory TR-854 (1989));
-- a 7.56 µm, 12° DMD at matched f/2.4 cones is within 3 percentage points of
+- a 7.56 µm, 12° DMD at matched f/2.4 cones is within 8 percentage points of
   Texas Instruments DLPA083B Table 6-1's 84% photopic diffraction efficiency,
   a vendor simulation, here at 550 nm only as a smoke check (the photopic
   average is the Rust test's).

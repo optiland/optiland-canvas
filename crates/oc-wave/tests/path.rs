@@ -41,10 +41,35 @@ use oc_core::scene::Spectrum;
 use oc_core::scene3::{Scene3, SurfaceResponse};
 use oc_core::vec3::Vec3;
 use oc_wave::beams::{rayleigh_range_mm, GaussianBeam};
-use oc_wave::path::{wave_path, BeamProfile, Readout, WavePathResult, WavePathSpec};
+use oc_wave::path::{BeamProfile, Readout, WavePathResult, WavePathSpec};
 use oc_wave::SamplingWarning;
 
 const LAM: f64 = 0.6328;
+
+/// The path, with the ledger's own checks asserted on every result: a
+/// passive model books no negative physical bucket and detects no more than
+/// it launched (`WaveLedger::check`).
+fn wave_path(s: &Scene3, spec: &WavePathSpec, revision: u64) -> Result<WavePathResult, oc_wave::WaveError> {
+    let r = oc_wave::path::wave_path(s, spec, revision)?;
+    assert!(r.report.inconsistencies.is_empty(), "ledger inconsistencies: {:?}\n{:?}", r.report.inconsistencies, r.report.ledger);
+    Ok(r)
+}
+
+/// A path of several arms, read on the detector's point-sampled grid. Two
+/// points a pixel are samples, not integrals, so the arms' sum can read
+/// slightly more than was launched, which the ledger's checks name; until
+/// the arms are read by exact binning, that gain is the only inconsistency
+/// allowed here, and it stays below 1e-4 of the launched power.
+fn wave_path_arms(s: &Scene3, spec: &WavePathSpec, revision: u64) -> Result<WavePathResult, oc_wave::WaveError> {
+    let r = oc_wave::path::wave_path(s, spec, revision)?;
+    let l = r.report.ledger;
+    for note in &r.report.inconsistencies {
+        assert!(note.contains("more power detected than launched") || note.contains("other_ports is negative"), "{note}: {l:?}");
+    }
+    assert!(l.detected - l.launched < 1e-4 * l.launched, "{l:?}");
+    assert!(l.other_ports > -1e-4 * l.launched, "{l:?}");
+    Ok(r)
+}
 
 fn source(s: &mut Scene3) -> SourceId {
     s.add_collimated_beam(Vec3::ZERO, 1.0, 1.0, 1, Spectrum::Monochromatic(LAM))
@@ -497,8 +522,8 @@ fn a_mach_zehnder_sends_all_the_power_out_of_its_two_ports_whatever_the_path_dif
         let dphi = j as f64 * std::f64::consts::FRAC_PI_2;
         let delta = dphi / (k0 * std::f64::consts::SQRT_2);
         let (s, src, dx, dy) = mach_zehnder(delta);
-        let rx = wave_path(&s, &spec(src, dx, 0.5, 256, 4.0), 1).unwrap();
-        let ry = wave_path(&s, &spec(src, dy, 0.5, 256, 4.0), 1).unwrap();
+        let rx = wave_path_arms(&s, &spec(src, dx, 0.5, 256, 4.0), 1).unwrap();
+        let ry = wave_path_arms(&s, &spec(src, dy, 0.5, 256, 4.0), 1).unwrap();
         let (px, py) = (rx.report.ledger.detected, ry.report.ledger.detected);
         let share = px / (px + py);
         let want = 0.5 * (1.0 - dphi.cos());
@@ -507,7 +532,11 @@ fn a_mach_zehnder_sends_all_the_power_out_of_its_two_ports_whatever_the_path_dif
         assert!((px + py - 1.0).abs() < 1e-3, "{px} + {py}");
         assert!((share - want).abs() < 2e-3, "{share} vs {want}");
         assert!(rx.report.steps.iter().any(|st| st.note.contains("2 arms added")), "{:?}", rx.report.steps);
-        assert!(rx.report.ledger.numerical.abs() < 1e-10, "{:?}", rx.report.ledger);
+        // The arms' readout onto the detector's grid books what it takes (or
+        // gains, reading the spectrum between its samples) in the arm's own
+        // ledger, so the network's remainder is the readouts': small, named.
+        measured(&format!("Mach–Zehnder at Δφ = {j}·π/2: the network ledger's remainder, of the launched"), rx.report.ledger.numerical);
+        assert!(rx.report.ledger.numerical.abs() < 1e-8, "{:?}", rx.report.ledger);
     }
 }
 
@@ -594,7 +623,7 @@ fn moving_a_michelson_mirror_by_d_shifts_its_fringes_by_two_k_d() {
     let p: Vec<f64> = (0..4)
         .map(|j| {
             let (s, src, det) = michelson(j as f64 * LAM / 1000.0 / 8.0, 0.0, 0.0, Spectrum::Monochromatic(LAM), 3.0, 32);
-            wave_path(&s, &spec(src, det, 1.0, 256, 5.0), 1).unwrap().report.ledger.detected
+            wave_path_arms(&s, &spec(src, det, 1.0, 256, 5.0), 1).unwrap().report.ledger.detected
         })
         .collect();
     let mean = p.iter().sum::<f64>() / 4.0;
@@ -619,7 +648,7 @@ fn two_lines_wash_a_michelson_s_fringes_out_where_their_beats_cancel() {
     let walk = 0.25 / beat;
     let run = |dd: f64, j: usize| {
         let (s, src, det) = michelson(j as f64 * l1 / 1000.0 / 8.0, dd, 0.0, Spectrum::Lines(vec![(l1, 1.0), (l2, 1.0)]), 3.0, 32);
-        wave_path(&s, &spec(src, det, 1.0, 256, 5.0), 1).unwrap().report.ledger.detected
+        wave_path_arms(&s, &spec(src, det, 1.0, 256, 5.0), 1).unwrap().report.ledger.detected
     };
     let at = |dd: f64| -> f64 {
         let p: Vec<f64> = (0..4).map(|j| run(dd, j)).collect();
@@ -717,7 +746,8 @@ fn a_gaussian_through_a_singlet_waists_where_self_predicts() {
     let (c0, c1, c2) = (col(0), col(1), col(2));
     let dz = -c1 / (2.0 * c2);
     let w_min = (c0 - c1 * c1 / (4.0 * c2)).sqrt();
-    measured("singlet: simulated waist offset from Self's, / Rayleigh range", dz / zr2);
+    measured("singlet: simulated waist offset from Self's, / Rayleigh range (the gate is on its ratio to s'')", dz / zr2);
+    measured("singlet: simulated waist offset from Self's, / s''", dz / s2);
     measured("singlet: simulated waist radius vs Self's, relative", (w_min - w2) / w2);
     assert!((dz / s2).abs() < 1e-3, "waist {dz} mm from Self's s'' = {s2}");
     assert!(((w_min - w2) / w2).abs() < 1e-3, "{w_min} vs {w2}");
@@ -1015,7 +1045,7 @@ fn a_fold_mirror_smaller_than_the_beam_reflects_only_what_meets_it() {
     let l = r.report.ledger;
     measured("small fold mirror: power passed beside it, against the Gaussian off its outline", l.passed_by / l.launched - (1.0 - on_mirror));
     assert!((l.passed_by / l.launched - (1.0 - on_mirror)).abs() < 1e-4, "{} vs {}: {l:?}", l.passed_by, 1.0 - on_mirror);
-    assert!(l.beyond_nyquist > 0.0 && l.beyond_nyquist < 1e-2 * on_mirror, "{l:?}");
+    assert!(l.subcell_projection > 0.0 && l.subcell_projection < 1e-2 * on_mirror, "{l:?}");
     assert!(l.numerical.abs() < 1e-10, "{l:?}");
     assert!(r.report.steps.iter().any(|st| st.note.contains("off the chain")), "{:?}", r.report.steps);
 }

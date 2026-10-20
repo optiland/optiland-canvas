@@ -67,10 +67,22 @@ is where the field lives, and what it may touch.
    a second, unmodulated beam and reported, never dropped. Jones fields are
    later work.
 
+   *Amended 2026-10-19 (the wave-optics review, I5).* A chain that meets an
+   element telling polarizations apart carries two components, a Jones
+   vector at every sample; other chains carry one scalar field standing for
+   unpolarized light (`docs/wave-optics.md`, "Two polarization components").
+
 6. **Fidelity is reported the same way as in the tracer.** Every step records
    its method; sampling problems, band limits and model limits are warnings
    or validity flags; power leaving the computation is booked to a cause in a
    `WaveLedger` that must close to `1e-12` of what was launched.
+
+   *Amended 2026-10-20 (the expert review, E1).* The ledger closes by
+   construction, so its closure is not the check. Its buckets are in two
+   groups, physical and numerical; what is checked on every result is that
+   no physical bucket is negative and nothing is detected beyond what was
+   launched (`WaveLedger::check`, named in the report's `inconsistencies`),
+   and the numerical buckets are reported term by term.
 
 ## Consequences
 

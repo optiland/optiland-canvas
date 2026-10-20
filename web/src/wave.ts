@@ -29,6 +29,8 @@ export type WaveResult = {
     validity: unknown[];
     approximated: string[];
     rejected: string[];
+    /** What the ledger booked that a passive model cannot; empty for a sound result. */
+    inconsistencies?: string[];
     steps: { method: unknown; z_mm: number; note: string }[];
     ledger: Record<string, number>;
   };

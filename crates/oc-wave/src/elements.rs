@@ -330,8 +330,11 @@ pub fn aperture_mask(u: &Field2, shape: &Shape, opaque_inside: bool) -> Result<V
 /// Multiply `u` by the covered fractions `t`, one per sample, and book what
 /// that does. A cell passing a fraction `t` of its area transmits `t·|U|²ΔA`;
 /// the opaque rest, `(1 − t)·|U|²ΔA`, is returned as the first number. The
-/// sample `t·U` carries only `t²·|U|²ΔA`: the edge diffracted the
-/// difference, the second number, beyond the grid's Nyquist band.
+/// sample `t·U` carries only `t²·|U|²ΔA`: the difference, the second number,
+/// is the sub-cell projection error of the edge (`subcell_projection`), the
+/// norm the cell-average projection discards. That is not the same claim as
+/// "beyond the grid's band"; what the band cannot hold is a separate
+/// measurement.
 pub fn apply_coverage(u: &mut Field2, t: &[f64]) -> Result<(f64, f64), WaveError> {
     if t.len() != u.data.len() {
         return Err(WaveError::Mismatch("mask and field differ in size".into()));
@@ -359,7 +362,7 @@ pub fn apply_aperture(
     let before = u.power();
     let (absorbed, beyond) = apply_coverage(u, &t)?;
     report.ledger.absorbed_aperture += absorbed;
-    report.ledger.beyond_nyquist += beyond;
+    report.ledger.subcell_projection += beyond;
     close_element(report, before, u.power());
     report.steps.push(StepReport {
         method: Method::Element,

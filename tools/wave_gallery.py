@@ -418,7 +418,7 @@ def fig1(D: Data, outdir: Path) -> dict:
         f"(c) Encircled energy, the simulated |U|²ΔA summed inside r (cells cut by the circle weighted by their exact covered area) "
         f"divided by the aperture area πD²/4, against 1 − J₀²(v) − J₁²(v): {e['ee_first_ring_sim']:.5f} vs {e['ee_first_ring_analytic']:.5f} at the first "
         f"dark ring (|Δ| = {sci(e['ee_first_ring_abs_err'])}), worst {sci(e['ee_worst_abs_err_0_to_4r1'])} out to v = 15.3. The sampled field carries "
-        f"{100*nyq:.2f}% less power than πD²/4; that is edge diffraction beyond the grid's Nyquist band, which the aperture's ledger books as beyond_nyquist. "
+        f"{100*nyq:.2f}% less power than πD²/4; that is the sub-cell projection error of the sampled edge, which the aperture's ledger books as subcell_projection. "
         f"Sources: [Goodman], [Born & Wolf], [DLMF] (ch. 10)."
     )
     return {

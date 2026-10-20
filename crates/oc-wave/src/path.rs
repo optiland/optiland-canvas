@@ -345,7 +345,8 @@ fn merge(total: &mut WaveReport, step: WaveReport) {
     t.absorbed_aperture += l.absorbed_aperture;
     t.absorbed_element += l.absorbed_element;
     t.band_limit_removed += l.band_limit_removed;
-    t.beyond_nyquist += l.beyond_nyquist;
+    t.spectral_projection += l.spectral_projection;
+    t.subcell_projection += l.subcell_projection;
     t.evanescent += l.evanescent;
     t.left_window += l.left_window;
     t.other_family += l.other_family;
@@ -366,6 +367,11 @@ fn merge(total: &mut WaveReport, step: WaveReport) {
         total.approx(a);
     }
     total.rejected.extend(step.rejected);
+    for s in step.inconsistencies {
+        if !total.inconsistencies.contains(&s) {
+            total.inconsistencies.push(s);
+        }
+    }
 }
 
 /// The grid's samples moved onto the centres of the cells it divides its
@@ -495,22 +501,60 @@ impl Moments {
     }
 }
 
-/// Where a chain's arm parts from others: the element, whether the arms meet
-/// it with one field (a splitter) or each with its own share of it (an
-/// LCoS's two polarizations), and what the chain booked there for the other
-/// arm's share, which that arm books itself when it too reaches the detector.
+/// Where a chain's arm parts from others: the element, how the arms share
+/// it, what met it on this arm and the fraction this arm carries on, and
+/// what the chain booked there for the other arms' shares, which those arms
+/// book themselves when they too reach the detector.
 #[derive(Clone, Copy, Debug)]
-struct Arm {
+struct Junction {
     object: u64,
-    shared: bool,
+    kind: JunctionKind,
+    /// The bucket this arm books the shares it does not carry to.
+    bucket: Bucket,
+    /// The power that met the element on this arm.
+    input: f64,
+    /// The fraction of `input` this arm carries on (a splitter's R or T, a
+    /// grating's η, a coating's R or T averaged over the field).
+    share: f64,
+    /// What this arm booked at the element for the other arms' shares
+    /// (`PerBeam`).
     foreign_absorbed: f64,
     foreign_family: f64,
 }
 
-impl Arm {
-    fn splitter(object: u64) -> Self {
-        Arm { object, shared: true, foreign_absorbed: 0.0, foreign_family: 0.0 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JunctionKind {
+    /// The arms meet the element with one field and part there: a
+    /// splitter's two ports, a grating's orders.
+    Split,
+    /// Each arm meets the element with its own share of the field: an
+    /// LCoS's two polarization beams.
+    PerBeam,
+}
+
+/// The ledger bucket a junction's unfollowed shares go to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Bucket {
+    OtherArm,
+    UntrackedOrders,
+    OtherFamily,
+}
+
+fn bucket_mut(l: &mut WaveLedger, b: Bucket) -> &mut f64 {
+    match b {
+        Bucket::OtherArm => &mut l.other_arm,
+        Bucket::UntrackedOrders => &mut l.untracked_orders,
+        Bucket::OtherFamily => &mut l.other_family,
     }
+}
+
+/// One event of a chain's history: its identity, the junction met there,
+/// and what the event booked (losses only).
+#[derive(Clone, Debug)]
+struct HistoryEntry {
+    key: String,
+    junction: Option<Junction>,
+    delta: WaveLedger,
 }
 
 /// `u` with the plane waves a window `out` cannot hold taken out, those
@@ -825,11 +869,12 @@ struct ChainJob {
     points: Vec<(Vec3, Vec3, Ev)>,
     /// An identity per event, for finding the events chains share.
     keys: Vec<String>,
-    /// The splitter met at an event, if a splitter (`ExplicitRt`) it was.
-    /// Per event, the element where the chain's arm parts from others.
-    arms: Vec<Option<Arm>>,
-    /// The ledger at the launch and after each event.
-    ledgers: Vec<WaveLedger>,
+    /// The launch's ledger, and each event run so far: its key, the
+    /// junction met there and what it booked, for the network's ledger.
+    launch: WaveLedger,
+    history: Vec<HistoryEntry>,
+    /// The junction the event now running met, taken into its history entry.
+    junction: Option<Junction>,
     next: usize,
     beam: Beam,
     u: Field2,
@@ -947,7 +992,7 @@ fn launch_field(spec: &WavePathSpec, grid: Grid2, lam: f64, n0: f64, power: f64,
     let mut ledger = WaveLedger { launched: power, ..Default::default() };
     let short = power - u.power();
     match spec.beam {
-        BeamProfile::TopHat { .. } => ledger.beyond_nyquist += short,
+        BeamProfile::TopHat { .. } => ledger.subcell_projection += short,
         BeamProfile::Gaussian { .. } if short >= 0.0 => ledger.left_window += short,
         BeamProfile::Gaussian { .. } => ledger.resampling += short,
     }
@@ -1095,7 +1140,6 @@ impl ChainJob {
                 }
             })
             .collect();
-        let arms = vec![None; points.len()];
         Ok(ChainJob {
             scene: Arc::clone(scene),
             spec: *spec,
@@ -1110,8 +1154,9 @@ impl ChainJob {
             jones: jones.unwrap_or([1.0, 0.0]),
             points,
             keys,
-            arms,
-            ledgers: Vec::new(),
+            launch: WaveLedger::default(),
+            history: Vec::new(),
+            junction: None,
             next: 0,
             beam,
             u,
@@ -1146,16 +1191,42 @@ impl ChainJob {
                 self.u = u;
             }
             self.report.ledger = ledger;
-            self.ledgers = vec![ledger];
+            self.launch = ledger;
+            self.history.clear();
             self.launched = true;
         }
         let end = self.next.saturating_add(events).min(self.points.len());
         while self.next < end {
+            let before = self.report.ledger;
+            self.junction = None;
             self.event(self.next)?;
-            self.ledgers.push(self.report.ledger);
+            self.history.push(HistoryEntry {
+                key: self.keys[self.next].clone(),
+                junction: self.junction.take(),
+                delta: losses_between(&self.report.ledger, &before),
+            });
             self.next += 1;
         }
         Ok(self.next == self.points.len())
+    }
+
+    /// The junction the running event met. A second pass at the same element
+    /// (the field's other component, another of its orders) adds its input,
+    /// the share power-weighted, so the junction speaks for the whole field.
+    fn note_junction(&mut self, j: Junction) {
+        self.junction = Some(match self.junction {
+            Some(prev) if prev.object == j.object && prev.kind == j.kind => {
+                let input = prev.input + j.input;
+                Junction {
+                    input,
+                    share: if input > 0.0 { (prev.input * prev.share + j.input * j.share) / input } else { 0.0 },
+                    foreign_absorbed: prev.foreign_absorbed + j.foreign_absorbed,
+                    foreign_family: prev.foreign_family + j.foreign_family,
+                    ..j
+                }
+            }
+            _ => j,
+        });
     }
 
     fn next_dir(&self, i: usize, here: Vec3, current: Vec3) -> Vec3 {
@@ -1200,7 +1271,7 @@ impl ChainJob {
             let cov = crate::elements::polygon_coverage(&self.u.grid, &poly);
             let (stopped, beyond) = crate::elements::apply_coverage(&mut self.u, &cov)?;
             self.report.ledger.absorbed_aperture += stopped;
-            self.report.ledger.beyond_nyquist += beyond;
+            self.report.ledger.subcell_projection += beyond;
             format!("its rim laid on the field with exact cell coverage, {:.3e} of the power stopped there", stopped / before.max(f64::MIN_POSITIVE))
         };
         let out = beam.turned(exit, beam.d);
@@ -1257,10 +1328,11 @@ impl ChainJob {
     /// centroid, keeps its sample count, and never grows past the one the
     /// spec declares. `None` to stay on the window the field has.
     ///
-    /// Narrowing, the zoomed angular spectrum carries it, exactly, padded
-    /// enough that the plane waves' walk over `z` stays inside; widening from
-    /// a narrow window past its critical distance, the zoomed Fresnel
-    /// transform, whose paraxial error on the field is reported.
+    /// The zoomed angular spectrum carries it, exactly, padded enough that
+    /// the plane waves' walk over `z` stays inside; where that walk exceeds
+    /// the window and `z` is past the window's critical distance (a narrow
+    /// window widening again, typically), the zoomed Fresnel transform, whose
+    /// paraxial error on the field is reported.
     fn regrid_plan(&mut self, z: f64) -> Result<Option<Regrid>, WaveError> {
         let mut fields: Vec<&Field2> = vec![&self.u];
         fields.extend(self.uy.as_ref());
@@ -1311,7 +1383,7 @@ impl ChainJob {
 
     /// Carry `u` `z` on onto the window a plan chose. A coarser window holds
     /// fewer directions: the plane waves beyond its band are taken out first
-    /// and booked (`beyond_nyquist`), since free space keeps every plane wave
+    /// and booked (`spectral_projection`), since free space keeps every plane wave
     /// and the new samples, read at their points, would fold them back in at
     /// directions they do not have.
     fn regrid_apply(&mut self, u: &Field2, z: f64, pl: &Regrid) -> Result<(Field2, WaveReport), WaveError> {
@@ -1330,7 +1402,7 @@ impl ChainJob {
             }
         };
         let n = pl.out.n[0];
-        r.ledger.beyond_nyquist += beyond;
+        r.ledger.spectral_projection += beyond;
         let cut = if beyond > 0.0 { format!("; {:.3e} of its power in directions beyond the new window's band taken out first", beyond / (beyond + u.power()).max(f64::MIN_POSITIVE)) } else { String::new() };
         r.steps.push(element_step(
             z,
@@ -1423,7 +1495,15 @@ impl ChainJob {
             }
             self.report.ledger.absorbed_element += dropped * rho;
             self.report.ledger.other_family += dropped * (1.0 - rho);
-            self.arms[idx] = Some(Arm { object: h_id, shared: false, foreign_absorbed: dropped * rho, foreign_family: dropped * (1.0 - rho) });
+            self.note_junction(Junction {
+                object: h_id,
+                kind: JunctionKind::PerBeam,
+                bucket: Bucket::OtherFamily,
+                input: total,
+                share: if total > 0.0 { ran / total } else { 0.0 },
+                foreign_absorbed: dropped * rho,
+                foreign_family: dropped * (1.0 - rho),
+            });
             // The component leaves along the device's image of its direction:
             // its part along the surface kept, as the tangential chart has it.
             let out = self.beam;
@@ -1610,8 +1690,9 @@ impl ChainJob {
             jones: [1.0, 0.0],
             points: self.points.clone(),
             keys: Vec::new(),
-            arms: Vec::new(),
-            ledgers: Vec::new(),
+            launch: WaveLedger::default(),
+            history: Vec::new(),
+            junction: None,
             next: self.next,
             beam: self.beam,
             u,
@@ -1673,6 +1754,8 @@ impl ChainJob {
         };
         let kind = oc_core::build3::response_kind(response);
         let unit = |v: Option<f64>| v.map(|x| x.clamp(0.0, 1.0));
+        // A coating's junction: what met it and the share it carries on.
+        let mut coat: Option<(f64, f64)> = None;
         // The amplitude inside the outline, a thin lens's focal length and
         // centre, and where the rest goes.
         //
@@ -1732,7 +1815,9 @@ impl ChainJob {
                     let (a, b) = (table[i], table[i + 1]);
                     (a.0 * (1.0 - f) + b.0 * f, a.1 * (1.0 - f) + b.1 * f, a.2 * (1.0 - f) + b.2 * f)
                 };
+                let input = self.u.power();
                 let (v, other, absorbed, left) = crate::planar::surface_filter(&self.u, &beam, n_s, &read, &mut self.fft)?;
+                coat = Some((input, if input > 0.0 { 1.0 - (other + absorbed) / input } else { 0.0 }));
                 let l = &mut self.report.ledger;
                 l.other_arm += other;
                 l.absorbed_element += absorbed;
@@ -1858,8 +1943,19 @@ impl ChainJob {
             Loss::Orders => l.untracked_orders += lost_in,
         }
         l.passed_by += beside;
-        l.beyond_nyquist += beyond;
+        l.subcell_projection += beyond;
         l.resampling += sent - v.power();
+        // Where arms part: the element, what met it, and what this arm
+        // carries on of it, for the network's ledger (`book_history`).
+        let junction = match response {
+            SurfaceResponse::ExplicitRt { .. } => Some((Bucket::OtherArm, inside, amp * amp)),
+            SurfaceResponse::Grating { .. } => Some((Bucket::UntrackedOrders, inside, amp * amp)),
+            SurfaceResponse::Coating { .. } => coat.map(|(input, share)| (Bucket::OtherArm, input, share)),
+            _ => None,
+        };
+        if let Some((bucket, input, share)) = junction {
+            self.note_junction(Junction { object: h.object.0, kind: JunctionKind::Split, bucket, input, share, foreign_absorbed: 0.0, foreign_family: 0.0 });
+        }
         // A flat mirror's handover is image theory, exact at any tilt;
         // anything else seen obliquely is a projection.
         let exact = matches!(response, SurfaceResponse::Mirror { .. }) && h.action == SeqAction::Reflect;
@@ -2283,7 +2379,7 @@ impl ChainJob {
                 // The rim and the mount stop light; the faces reflect it into
                 // a path the chain does not follow.
                 l.absorbed_aperture += st.rim_stopped + st.stopped;
-                l.beyond_nyquist += st.rim_beyond;
+                l.subcell_projection += st.rim_beyond;
                 l.other_arm += st.reflected;
                 l.left_window += st.left_window;
                 l.resampling += st.carried - st.stopped - st.reflected - st.left_window - v.power();
@@ -2370,7 +2466,7 @@ impl ChainJob {
                 };
                 let (stopped, beyond) = crate::elements::apply_coverage(&mut self.u, &pass)?;
                 self.report.ledger.absorbed_aperture += stopped;
-                self.report.ledger.beyond_nyquist += beyond;
+                self.report.ledger.subcell_projection += beyond;
                 let id = a.common.id.0;
                 if !square {
                     // Not square to the beam, the opening is its projection
@@ -2406,9 +2502,6 @@ impl ChainJob {
                     self.u = modulator_step(&self.u, &beam, &out, s, device, &h, &self.spec, self.pol, &mut self.report)?;
                 } else {
                     let (s, response) = (s.clone(), response.clone());
-                    if matches!(response, SurfaceResponse::ExplicitRt { .. } | SurfaceResponse::Coating { .. }) {
-                        self.arms[idx] = Some(Arm::splitter(h.object.0));
-                    }
                     self.flat_element(&s, &response, &h, p, n_s, &out, from_front)?;
                 }
                 self.beam = out;
@@ -2438,6 +2531,8 @@ impl ChainJob {
             add_losses(l, &extra);
             l.numerical = 0.0;
             l.close();
+            rx.report.inconsistencies.clear();
+            rx.report.check_ledger();
             for w in ry.report.warnings {
                 rx.report.warn(w);
             }
@@ -2515,7 +2610,7 @@ impl ChainJob {
         self.report.ledger.left_window += (arriving - in_face).max(0.0);
         let arriving_power = arriving;
         self.report.ledger.detected = on_detector;
-        self.report.ledger.close();
+        self.report.close_checked();
         Ok(WavePathResult {
             revision,
             detector: spec.detector,
@@ -2582,7 +2677,7 @@ impl ChainJob {
             rep.ledger.detected = on_detector;
             merge(&mut self.report, rep);
             self.report.ledger.detected = on_detector;
-            self.report.ledger.close();
+            self.report.close_checked();
             self.u = zf;
             return Ok(WavePathResult { revision, detector: spec.detector, bins: [nu, nv], power, field: self.u, field_y: None, arriving, report: self.report });
         }
@@ -2669,7 +2764,7 @@ impl ChainJob {
         rep.ledger.left_window += (zf.power() - on_detector).max(0.0);
         merge(&mut self.report, rep);
         self.report.ledger.detected = on_detector;
-        self.report.ledger.close();
+        self.report.close_checked();
         self.u = zf;
         self.u.frame = beam.turned(plane, beam.d).iso();
         Ok(WavePathResult {
@@ -2703,10 +2798,12 @@ struct FaceField {
     /// The second component's field on the same points, if the arm has one.
     data_y: Option<Vec<Cx>>,
     report: WaveReport,
-    keys: Vec<String>,
-    /// Per event, the element where the chain's arm parts from others.
-    arms: Vec<Option<Arm>>,
-    ledgers: Vec<WaveLedger>,
+    /// The launch's ledger and the arm's history, for the network's ledger.
+    launch: WaveLedger,
+    history: Vec<HistoryEntry>,
+    /// What reading the arm onto the detector's grid took (evanescent waves,
+    /// what missed the face): in `report` and in `history` already.
+    readout: WaveLedger,
     events: usize,
 }
 
@@ -2727,6 +2824,12 @@ impl ChainJob {
             let fy = twin.face(s)?;
             fx.arriving += fy.arriving;
             fx.data_y = Some(fy.data);
+            // The second component's readout took its own share.
+            add_losses(&mut fx.report.ledger, &fy.readout);
+            add_losses(&mut fx.readout, &fy.readout);
+            if let Some(last) = fx.history.last_mut() {
+                add_losses(&mut last.delta, &fy.readout);
+            }
             return Ok(fx);
         }
         let beam = self.beam;
@@ -2789,11 +2892,14 @@ impl ChainJob {
             data = zt.data;
             rep
         };
+        // The readout's own losses (evanescent waves, what missed the face)
+        // are the arm's, booked in its history as one more event.
         let mut report = self.report;
-        report.steps.extend(rep.steps);
-        for w in rep.warnings {
-            report.warn(w);
-        }
+        let before = report.ledger;
+        merge(&mut report, rep);
+        let readout = losses_between(&report.ledger, &before);
+        let mut history = self.history;
+        history.push(HistoryEntry { key: "readout".to_string(), junction: None, delta: readout });
         Ok(FaceField {
             grid: fg,
             data,
@@ -2805,9 +2911,9 @@ impl ChainJob {
             arriving,
             data_y: None,
             report,
-            keys: self.keys,
-            arms: self.arms,
-            ledgers: self.ledgers,
+            launch: self.launch,
+            history,
+            readout,
             events: self.points.len(),
         })
     }
@@ -2818,7 +2924,8 @@ fn add_losses(l: &mut WaveLedger, d: &WaveLedger) {
     l.absorbed_aperture += d.absorbed_aperture;
     l.absorbed_element += d.absorbed_element;
     l.band_limit_removed += d.band_limit_removed;
-    l.beyond_nyquist += d.beyond_nyquist;
+    l.spectral_projection += d.spectral_projection;
+    l.subcell_projection += d.subcell_projection;
     l.evanescent += d.evanescent;
     l.left_window += d.left_window;
     l.other_family += d.other_family;
@@ -2838,7 +2945,8 @@ fn losses_between(after: &WaveLedger, before: &WaveLedger) -> WaveLedger {
         absorbed_aperture: after.absorbed_aperture - before.absorbed_aperture,
         absorbed_element: after.absorbed_element - before.absorbed_element,
         band_limit_removed: after.band_limit_removed - before.band_limit_removed,
-        beyond_nyquist: after.beyond_nyquist - before.beyond_nyquist,
+        spectral_projection: after.spectral_projection - before.spectral_projection,
+        subcell_projection: after.subcell_projection - before.subcell_projection,
         evanescent: after.evanescent - before.evanescent,
         left_window: after.left_window - before.left_window,
         other_family: after.other_family - before.other_family,
@@ -2848,6 +2956,93 @@ fn losses_between(after: &WaveLedger, before: &WaveLedger) -> WaveLedger {
         resampling: after.resampling - before.resampling,
         other_ports: after.other_ports - before.other_ports,
         numerical: after.numerical - before.numerical,
+    }
+}
+
+/// The network's ledger from its arms' histories. Each event is booked once
+/// per distinct history (arms carry one field up to where they part). At a
+/// junction where several arms part with one field (`Split`), the element's
+/// absorption and what passes beside it are booked with the first arm, each
+/// arm's own resampling with that arm, and the shares no arm carries on,
+/// `input·(1 − Σ shares)` less the absorption, once, to the junction's
+/// bucket: with both orders of a grating followed, its untracked orders are
+/// `1 − η − η₀` of what met it, not `(1 − η) + (1 − η₀)`. An element met
+/// again by arms of other histories (arms recombining) books no other port
+/// there: that light reached the detector by the other arm, and what the
+/// element sends by ports no arm reads is the remainder, `other_ports`. At a
+/// `PerBeam` junction each arm books its own share of the device's loss and
+/// takes back what it booked for the other arm's.
+fn book_history(l: &mut WaveLedger, arms: &[&[HistoryEntry]]) {
+    use std::collections::{HashMap, HashSet};
+    let mut met: HashMap<u64, usize> = HashMap::new();
+    for a in arms {
+        let mut objs: Vec<u64> = a.iter().filter_map(|e| e.junction.map(|j| j.object)).collect();
+        objs.sort_unstable();
+        objs.dedup();
+        for o in objs {
+            *met.entry(o).or_default() += 1;
+        }
+    }
+    // The shares carried on by the arms parting at one event: by the history
+    // before it and the element, each distinct event once.
+    let mut shares: HashMap<String, f64> = HashMap::new();
+    let mut counted: HashSet<String> = HashSet::new();
+    for a in arms {
+        let mut history = String::new();
+        for e in *a {
+            let before = history.clone();
+            history.push_str(&e.key);
+            history.push('|');
+            if let Some(j) = e.junction {
+                if j.kind == JunctionKind::Split && counted.insert(history.clone()) {
+                    *shares.entry(format!("{before}#{}", j.object)).or_default() += j.share;
+                }
+            }
+        }
+    }
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut parted: HashSet<String> = HashSet::new();
+    for a in arms {
+        let mut history = String::new();
+        for e in *a {
+            let before = history.clone();
+            history.push_str(&e.key);
+            history.push('|');
+            if !seen.insert(history.clone()) {
+                continue;
+            }
+            let mut d = e.delta;
+            if let Some(j) = e.junction {
+                let n_met = met.get(&j.object).copied().unwrap_or(0);
+                match j.kind {
+                    JunctionKind::Split => {
+                        let tag = format!("{before}#{}", j.object);
+                        let taken = shares.get(&tag).copied().unwrap_or(j.share);
+                        if parted.insert(tag) {
+                            if taken > j.share * (1.0 + 1e-12) {
+                                // Other arms part here and carry their shares on.
+                                *bucket_mut(&mut d, j.bucket) = j.input * (1.0 - taken) - d.absorbed_element;
+                            } else if n_met >= 2 {
+                                // Arms of other histories meet the element: what
+                                // went by its other port reached the detector.
+                                *bucket_mut(&mut d, j.bucket) = 0.0;
+                            }
+                        } else {
+                            // The arms met the element with one field: what it
+                            // absorbs or passes by was booked with the first.
+                            d = WaveLedger { resampling: d.resampling, numerical: d.numerical, ..Default::default() };
+                        }
+                    }
+                    JunctionKind::PerBeam => {
+                        if n_met >= 2 {
+                            d.absorbed_element -= j.foreign_absorbed;
+                            d.other_family -= j.foreign_family;
+                        }
+                    }
+                }
+            }
+            add_losses(l, &d);
+        }
     }
 }
 
@@ -2913,6 +3108,11 @@ fn combine_arms(scene: &Scene3, spec: &WavePathSpec, faces: Vec<FaceField>, revi
         for a in &f.report.approximated {
             report.approx(a.clone());
         }
+        for s in &f.report.inconsistencies {
+            if !report.inconsistencies.contains(s) {
+                report.inconsistencies.push(s.clone());
+            }
+        }
     }
     // The fringes between each pair of arms, against the readout's points.
     let n_det = det.common.transform.rotate(Vec3::Z);
@@ -2940,53 +3140,11 @@ fn combine_arms(scene: &Scene3, spec: &WavePathSpec, faces: Vec<FaceField>, revi
             }
         }
     }
-    // The network's ledger.
-    let mut l = WaveLedger { launched: faces[0].ledgers[0].launched, ..Default::default() };
-    add_losses(&mut l, &faces[0].ledgers[0]);
-    let mut met: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
-    for f in &faces {
-        let mut objs: Vec<u64> = f.arms.iter().flatten().map(|a| a.object).collect();
-        objs.sort_unstable();
-        objs.dedup();
-        for o in objs {
-            *met.entry(o).or_default() += 1;
-        }
-    }
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut parted: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for f in &faces {
-        let mut history = String::new();
-        for i in 0..f.keys.len() {
-            let before = history.clone();
-            history.push_str(&f.keys[i]);
-            history.push('|');
-            if !seen.insert(history.clone()) {
-                continue;
-            }
-            let mut d = losses_between(&f.ledgers[i + 1], &f.ledgers[i]);
-            if let Some(arm) = f.arms[i] {
-                let (o, shared) = (arm.object, arm.shared);
-                if met.get(&o).copied().unwrap_or(0) >= 2 {
-                    // What went into the other arm reached the detector, and
-                    // that arm books its own share.
-                    if shared {
-                        d.other_arm = 0.0;
-                    } else {
-                        d.absorbed_element -= arm.foreign_absorbed;
-                        d.other_family -= arm.foreign_family;
-                    }
-                }
-                // Where arms part at a splitter, they meet it with one field:
-                // what it absorbs or passes by is counted once. At an LCoS
-                // each beam meets the device with its own polarization, and
-                // what the device takes of each is its own.
-                if shared && !parted.insert(format!("{before}#{o}")) {
-                    d = WaveLedger { resampling: d.resampling, numerical: d.numerical, ..Default::default() };
-                }
-            }
-            add_losses(&mut l, &d);
-        }
-    }
+    // The network's ledger: the launch once, then every arm's history.
+    let mut l = WaveLedger { launched: faces[0].launch.launched, ..Default::default() };
+    add_losses(&mut l, &faces[0].launch);
+    let histories: Vec<&[HistoryEntry]> = faces.iter().map(|f| f.history.as_slice()).collect();
+    book_history(&mut l, &histories);
     l.detected = power.iter().sum();
     l.other_ports = l.launched - l.accounted();
     let lam = faces[0].lambda_um;
@@ -3003,6 +3161,7 @@ fn combine_arms(scene: &Scene3, spec: &WavePathSpec, faces: Vec<FaceField>, revi
         report.approx("arms added in a scalar field: their polarizations taken as the same, so the fringes' visibility is an upper bound");
     }
     report.ledger = l;
+    report.check_ledger();
     let mut field = Field2::zeros(g, lam)?.in_medium(n)?;
     field.frame = faces[0].frame;
     let field_y = two.then(|| {
@@ -3067,12 +3226,6 @@ struct Mode {
     chains: Vec<Chain>,
 }
 
-/// The polarization modes a set of chains needs: one standing for
-/// unpolarized light, unless an element on a chain tells s from p obliquely
-/// (a plane-parallel plate, a flat coating), when an unpolarized source is
-/// two mutually incoherent modes, s and p of the plane of incidence those
-/// elements share, half its power each. Elements whose planes of incidence
-/// differ mix s and p, which a scalar field cannot carry: refused by name.
 /// Whether the chains' light must be carried as two polarization components:
 /// when one of them meets a polarizer, a retarder or an LCoS, or a flat
 /// coating or a plate obliquely, where s and p differ.
@@ -3345,6 +3498,11 @@ impl WaveJob {
             for a in r.report.approximated {
                 total.report.approx(a);
             }
+            for s in r.report.inconsistencies {
+                if !total.report.inconsistencies.contains(&s) {
+                    total.report.inconsistencies.push(s);
+                }
+            }
         }
         if lines > 1 {
             total.report.approx(format!("{lines} spectral lines added in power, as mutually incoherent modes; the field shown is the first mode's, {lam0}"));
@@ -3510,7 +3668,8 @@ fn modulator_step(
     // outgoing ray does not carry is resampling.
     report.ledger.absorbed_element += rep.ledger.absorbed_element * scale;
     report.ledger.other_family += rep.ledger.other_family * scale;
-    report.ledger.beyond_nyquist += (rep.ledger.beyond_nyquist + cut) * scale;
+    report.ledger.subcell_projection += rep.ledger.subcell_projection * scale;
+    report.ledger.spectral_projection += cut * scale;
     report.ledger.numerical += rep.ledger.numerical * scale;
     report.ledger.resampling += (rep.ledger.detected - cut) * scale - v.power();
     for f in rep.validity {

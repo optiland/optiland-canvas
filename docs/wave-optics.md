@@ -160,9 +160,12 @@ transmits that cell's covered fraction `f`, computed exactly:
 
 The edge error then falls as `Δx²`, which the Heurtley test below measures.
 Physically the cell transmits `f·|U|²ΔA`, but the sample `f·U` carries only
-`f²·|U|²ΔA`. The difference is edge diffraction into angles beyond the grid's
-Nyquist band. It is booked as `beyond_nyquist`, separately from the
-`absorbed_aperture` of the opaque part.
+`f²·|U|²ΔA`. The difference, `(f − f²)|U|²ΔA`, is the sub-cell projection
+error of the sampled edge: the norm the cell average discards. It is booked
+as `subcell_projection`, separately from the `absorbed_aperture` of the
+opaque part. It is not the same claim as "beyond the grid's band": a cell
+average is not a band projector, and the norm the band cannot hold is a
+separate measurement, not made here.
 
 The thin lens warns `Undersampled` when its chirp changes by more than π
 between neighbouring samples at the window edge.
@@ -229,7 +232,7 @@ incoming ray to the plane across the outgoing one:
 | face of a refractive body, curved mirror or other curved surface | traced across the thin slab that holds the surface where the beam meets it (below), its rim laid on the field with exact cell coverage; between a body's faces the field diffracts inside the glass by the angular spectrum, in the glass's index | the slab is geometric: no diffraction across a surface's sag |
 | plane-parallel plate (a body entered and left by two flat, parallel faces, bare or with a residual AR) | one step: the closed-form slab, round trips included, on each plane wave of the field, then the angular spectrum across the planes (below) | exact for a plate of infinite extent, s or p; its rim laid on the field |
 | flat coated surface (`Coating`: a coated splitter, a dichroic) | each plane wave times the coating's complex `r` or `t` at its own angle, from the transfer matrix, then handed over like any flat element; a plate-backed coating's plate in series, without round trips, as the coating declares it incoherent | exact for the stack, s or p |
-| detector, `Readout::Projected` | power per pixel: each field cell's `\|U\|²ΔA` binned into the pixel its projection lands in, in sub-cells of at most an eighth of a pixel | power conserved to round-off |
+| detector, `Readout::Projected` | power per pixel: each field cell's `\|U\|²ΔA` binned into the pixel its projection lands in, in up to 16 × 16 sub-cells a field cell (an eighth of a pixel while a cell spans at most two pixels) | power conserved to round-off |
 | detector, `Readout::Diffracted` | the last free-space step taken straight onto the detector by the zoomed angular spectrum (`asm_zoom`), at `s × s` points a pixel: a focal spot far smaller than the field's own samples is resolved, with no paraxial step | exact scalar propagation; the field repeats a window away when unpadded |
 
 When the beam leaves an element at another angle than it came, its
@@ -366,17 +369,19 @@ variance `σ_θ²` and their cross moment `C = ⟨(x − x̄)θ⟩` (the local d
 `θ` from the phase gradient, the fitted sphere taken out first so that a
 steep wavefront is not understated): under paraxial propagation
 `σ²(z) = σ² + 2zC + z²σ_θ²` exactly, whatever the beam's shape (the
-second-moment law; A. E. Siegman [25]). When the beam, six rms radii across,
-would fill less than a quarter of the window, or on a window already
-narrowed more than four fifths of it, the field is carried onto a window
-fitted to it, centred on its predicted centroid, with the same sample count
-and never wider than the declared window. Narrowing, the zoomed angular
-spectrum carries it, exactly, padded enough that its plane waves' walk over
-the step stays inside; widening from a narrow window past its critical
-distance, the zoomed Fresnel transform, the Fresnel integral as one chirp-z
-transform onto the new grid, its paraxial error reported. A coarser window
-holds fewer directions: the plane waves beyond its band are taken out of the
-field first, and booked as `beyond_nyquist`, for free space keeps every plane
+second-moment law; A. E. Siegman [25]). When the beam, taken as six rms
+radii to either side of its centroid, would fill less than a quarter of the
+window, or on a window already narrowed more than four fifths of it, the
+field is carried onto a window fitted to it, centred on its predicted
+centroid, with the same sample count and never wider than the declared
+window. The zoomed angular spectrum carries it, exactly, padded enough that
+its plane waves' walk over the step stays inside; where that walk exceeds the
+window and the step is longer than the window's critical distance (a narrow
+window widening again, typically), the zoomed Fresnel transform, the Fresnel
+integral as one chirp-z transform onto the new grid, its paraxial error
+reported. A coarser window holds fewer directions: the plane waves beyond its
+band are taken out of the field first, and booked as `spectral_projection`,
+for free space keeps every plane
 wave and the new samples, read at their points, would fold them back in at
 directions they do not have. A pinhole at a focus is then laid on the focus
 at the focus's own sampling, and a 10× beam expander keeps its beam resolved
@@ -389,7 +394,7 @@ pixel): read between device samples it did not have, the DMD's take-up onto a
 directions that window cannot, as a coarser window does: the plane waves
 beyond the outgoing window's band, about the reflected family's carrier, are
 taken out of the device's field before the take-up and booked as
-`beyond_nyquist`. Read between device samples with them still in, a DMD's
+`spectral_projection`. Read between device samples with them still in, a DMD's
 facets folded 17% of the power back into the band in the DMD-and-lens test
 below (booked as `resampling`) and weighted its orders wrongly; taken out
 first, the resampling there is 1.3e-4.
@@ -406,7 +411,7 @@ reach the detector, each is a chain of its own; they meet orthogonally
 polarized and add in power, and the ledger books each beam's share once. The
 field keeps
 every diffraction order that falls inside its window; orders outside are
-booked as `beyond_nyquist` or `left_window`. It does not steer onto a chosen
+booked as `spectral_projection` or `left_window`. It does not steer onto a chosen
 order: an iris on a Lee hologram's −1 order, off the chief ray, would block
 the chief ray itself. The wave path does not follow an order yet; the ray
 tracer's orders model (`RayModel::Orders`) traces them as rays.
@@ -483,11 +488,17 @@ chain did not:
   fringes, never the power. The Mach–Zehnder test holds the sum to 1 at every
   phase.
 - **A ledger for a network.** Each arm's own losses are counted, an event the
-  arms share once (they carry one field until they part). What a splitter
-  sends into another arm is not lost, so a splitter several arms meet books
-  no `other_arm`; the light that leaves by the ports no arm reads (a
-  recombining splitter's other output, what misses the detector once the arms
-  meet) is then the remainder, `other_ports`, named and never a check.
+  arms share once (they carry one field until they part), each arm's readout
+  onto the face with it. Where arms part at one element with one field (a
+  splitter's two ports, a grating's two orders), the element's absorption is
+  booked once and the shares no arm carries on once, `input·(1 − Σ shares)`
+  less that absorption: a splitter whose two ports both reach the detector
+  books no `other_arm`, and a grating whose two orders do books `1 − η − η₀`
+  of what met it, not `(1 − η) + (1 − η₀)`. The light that leaves by the
+  ports no arm reads (a recombining splitter's other output, what misses the
+  detector once the arms meet) is then the remainder, `other_ports`, named
+  and never a check; the ledger's own checks (below) report it when it comes
+  out negative.
 
 Each arm's field is weighted on the face by the root of its obliquity, so that
 one arm alone reads as it would by itself. Two arms crossing at an angle make
@@ -553,10 +564,10 @@ These are acceptance case C53, in `crates/oc-wave/tests/path.rs`.
 | Test | Held against | Gate | Measured |
 |---|---|---|---|
 | `a_gaussian_through_empty_space_spreads_as_kogelnik_and_li_say` | Kogelnik–Li after 300 mm of scene [13] | 1e-5 | radius 3.5e-7; field 2.3e-7 of peak |
-| `a_thin_lens_in_the_scene_focuses_like_self` | Self's waist [14] | 1e-4 | 8.1e-10 |
-| `a_fold_mirror_hands_on_the_mirror_image_exactly` | image theory [1]: folded path = straight path | 1e-9 | 2.0e-11 of peak |
+| `a_thin_lens_in_the_scene_focuses_like_self` | Self's waist [14] | 1e-4 | 3.6e-8 |
+| `a_fold_mirror_hands_on_the_mirror_image_exactly` | image theory [1]: folded path = straight path | 1e-9 | 6.1e-11 of peak |
 | `an_aperture_on_the_path_is_found_although_the_trace_logs_no_event` | a Gaussian through a disc passes `1 − exp(−2a²/w²)` [13] | 1e-4 | 3.2e-5 |
-| `a_4f_system_images_at_minus_f2_over_f1_and_its_iris_cuts_the_spectrum` | the image waist `w₀f₂/f₁` [1]; a Fourier-plane iris passes `1 − exp(−2r²/w_F²)`, `w_F = λf₁/(πw₀)` [13]; the ledger | 1e-4; 2e-3; 1e-6 | within 1e-4; 1.8e-5 (1.6e-3 before the window was fitted to the focus); 8.7e-14 |
+| `a_4f_system_images_at_minus_f2_over_f1_and_its_iris_cuts_the_spectrum` | the image waist `w₀f₂/f₁` [1]; a Fourier-plane iris passes `1 − exp(−2r²/w_F²)`, `w_F = λf₁/(πw₀)` [13]; the ledger | 1e-4; 2e-3; 1e-6 | within 1e-4; 1.7e-5 (1.6e-3 before the window was fitted to the focus); 1.1e-13 |
 | `wave_and_ray_agree_on_where_the_beam_lands` | the chief ray's landing point on a tilted fold | 0.05 pixel | 3.2e-4 mm (0.003 pixel) |
 | `wave_power_agrees_with_rays_when_the_fresnel_number_is_large` | the f64 ray trace of the same scene, a uniform beam through a disc at `N_F` = 1264 | 1% | 0.12% |
 | `a_dmd_in_the_scene_focuses_its_orders_f_lambda_over_p_apart` | orders `λ/p` apart in direction cosine [10], so `fλ/p` apart at a lens's focus | 1% | 1.000; resampling 1.3e-4, `numerical` 3.6e-13 |
@@ -569,10 +580,10 @@ These are acceptance case C53, in `crates/oc-wave/tests/path.rs`.
 | `an_aperture_whose_outer_extent_the_beam_passes_beyond_leaves_it_alone` | the tracer's aperture: light beyond the outer extent passes; against an open aperture at the same plane | bit-identical | identical |
 | `a_fold_mirror_smaller_than_the_beam_reflects_only_what_meets_it` | a 0.6 mm disc at 45° in a 1 mm Gaussian [13]: the power off its projected ellipse, by quadrature, passes beside it | 1e-4 | 1.5e-5 |
 | `a_thin_lens_smaller_than_the_beam_lets_the_rest_pass_beside_it` | 10 µm behind a 0.5 mm thin lens: the lens's phase inside, free space's field outside, away from the edge | 2e-3 | 1.0e-3 inside; 3.0e-5 outside |
-| `a_lens_rim_smaller_than_the_beam_stops_and_diffracts_as_an_iris_against_it` | a 1 mm iris 1.5 µm before a lens too large to clip; the lens rim itself, with exact cover | power 3e-4; spot 2e-3 of peak | 1.1e-4 (the back face's rim stops 9e-4 of what reaches it, which is real); 3.5e-4 |
+| `a_lens_rim_smaller_than_the_beam_stops_and_diffracts_as_an_iris_against_it` | a 1 mm iris 1.5 µm before a lens too large to clip; the lens rim itself, with exact cover | power 3e-4; spot 2e-3 of peak | 1.1e-4 (the back face's rim stops 9e-4 of what reaches it, which is real); 3.7e-4 |
 | `an_lcos_on_the_path_sends_half_of_unpolarized_light_into_each_beam` | half of what the device meets in the unmodulated beam [20]; `sinc²(1/16)` of the modulated half in the first order [21] | 2e-3; 3e-3 | −5.9e-7; −2.0e-3 |
 | `a_glass_plate_delays_the_beam_by_its_optical_path` | `k₀(n − 1)t` less the Gouy change of the effective length [13] | 1e-4 rad | 8.9e-9 rad (face by face, 2.6e-6) |
-| `a_mach_zehnder_sends_all_the_power_out_of_its_two_ports_whatever_the_path_difference` | a lossless network is unitary: the two ports carry the input between them, `(1 ∓ cos Δφ)/2` each, at Δφ = 0, π/2, π, 3π/2 [23], [24] | sum 1e-3; share 2e-3 | sum 1.000; share within 1e-7 |
+| `a_mach_zehnder_sends_all_the_power_out_of_its_two_ports_whatever_the_path_difference` | a lossless network is unitary: the two ports carry the input between them, `(1 ∓ cos Δφ)/2` each, at Δφ = 0, π/2, π, 3π/2 [23], [24] | sum 1e-3; share 2e-3 | sum 1.000; share within 1.1e-7 |
 | `a_michelson_with_a_tilted_mirror_makes_fringes_of_period_lambda_over_sin_2_alpha` | two arms crossing at 2α make fringes `λ/sin 2α` apart [1]; read from the power's spectrum across the face | 2e-3 | −7.1e-5 (the beams' curvature accounts for −3.5e-5) |
 | `moving_a_michelson_mirror_by_d_shifts_its_fringes_by_two_k_d` | four steps of λ/8 are four of π/2: `P₀ + P₂ = P₁ + P₃`; visibility 1; equal arms dark [1] | 1e-3; 0.995 | 2.8e-7; 1.000 |
 | `two_lines_wash_a_michelson_s_fringes_out_where_their_beats_cancel` | two incoherent lines [22]: visibility `\|cos(2πΔ(1/λ₁ − 1/λ₂))\|`, 1 at equal arms, 0 where the beats cancel | 0.99; 2e-2 | 0.9996; 1.6e-3 |
@@ -590,7 +601,7 @@ These are acceptance case C53, in `crates/oc-wave/tests/path.rs`.
 | `a_dmd_s_orders_cross_a_singlet_each_about_its_own_direction` | the orders of a DMD whose blaze lies between two of them, through an N-BK7 singlet (R ±8 mm): each crosses each face about its own direction [10], [17]; the chief ray lies 27 mrad from the nearest | rms departure 2.7 mrad; `numerical` 1e-6 | 0.36 mrad; 5.9e-9 (resampling 9.9e-3 at the DMD's take-up) |
 | `crossed_polarizers_before_a_lens_leave_it_a_dark_field_to_carry` | the chain is geometry: behind crossed polarizers a singlet carries an all-zero field, the ledger closed | 1e-12 | detected 1.7e-33 |
 | `a_pinhole_at_a_lens_s_focus_passes_what_the_focused_gaussian_puts_through_it` | a waist on a lens of focal length f has radius λf/(πw₀) at the focal plane (bundle M30, [13]): a pinhole of that radius stops `exp(−2)` | 1e-5 | 5.7e-7 |
-| `a_ten_times_beam_expander_widens_the_beam_as_the_abcd_law_says` | the radius at the second lens by the Gaussian ABCD law [13], through a 50 µm focus | 1e-5 | 3.9e-7 |
+| `a_ten_times_beam_expander_widens_the_beam_as_the_abcd_law_says` | the radius at the second lens by the Gaussian ABCD law [13], through a 50 µm focus | 1e-5 | 4.2e-7 |
 
 The transfer's own tests (acceptance case C62, `crates/oc-wave/src/transfer.rs`):
 
@@ -623,11 +634,13 @@ The propagation tests of W8 (acceptance case C57, `crates/oc-wave/tests/propagat
 | `a_tilted_plane_holds_the_field_its_plane_waves_sum_to` | a plane tilted 20°, 2 mm along, against the plane waves of the same spectrum summed at its points [6]; with no tilt, against `asm_zoom` | 2e-3; 1e-10 | 5.9e-4 (the bilinear reading of the spectrum, padded 4×); 8.3e-14 |
 
 The DMD case shows what the ledger is for. Of the launched power, 72.1%
-reaches the detector, 11.7% falls in the dead space between mirrors
-(`absorbed_element`), 9.9% goes into orders beyond the beam grid's Nyquist
-angle (`beyond_nyquist`), and 6.2% misses the detector (`left_window`);
-1.3e-4 is lost resampling between grids (`resampling`), and 3.6e-13 is left
-unaccounted (`numerical`).
+reaches the detector and 11.7% falls in the dead space between mirrors
+(`absorbed_element`): the physical buckets. The numerical ones: 7.7% is the
+sub-cell projection error of the mirror edges on the device grid
+(`subcell_projection`), 2.3% is the band cut before the take-up, orders the
+beam grid cannot hold (`spectral_projection`), 6.2% misses the detector
+(`left_window`), 1.3e-4 is lost resampling between grids (`resampling`), and
+3.6e-13 is left unaccounted (`numerical`).
 
 ## From Python
 
@@ -653,23 +666,43 @@ Every call returns a `WaveReport`:
   `Undersampled`, and on a wave path `TiltProjection`;
 - `validity` flags;
 - named approximations;
-- a `WaveLedger`, where every step books what it changed to a cause:
+- a `WaveLedger`, where every step books what it changed to a cause, in two
+  groups;
+- `inconsistencies`: what the ledger booked that a passive model cannot
+  (below); empty for a sound result.
 
 ```text
-launched = detected + absorbed_aperture + absorbed_element + band_limit_removed
-         + beyond_nyquist + evanescent + left_window + other_family
-         + untracked_orders + other_arm + passed_by + resampling
-         + other_ports + numerical
+launched = physical + numerical
+
+physical  = detected + absorbed_aperture + absorbed_element + evanescent
+          + other_family + untracked_orders + other_arm + passed_by
+          + other_ports
+numerical = left_window + band_limit_removed + spectral_projection
+          + subcell_projection + resampling + numerical
 ```
 
 That it sums to what was launched is bookkeeping, not a check: `numerical`
-is defined as what no step accounted for. The entries are the evidence.
-`other_arm`, `passed_by`, `other_family` and `untracked_orders` are light on
-paths the computation does not follow, never absorption; `resampling` is
-what carrying a field onto another grid or plane cost (4.2e-4 of the power
-through the f/10 singlet, 1.2e-3 on and off the LCoS of its test); and
-`numerical`, round-off, is at most 7e-12 of the launched power on every path
-the tests run.
+is defined as what no step accounted for. The entries are the evidence. The
+**physical** buckets say where the model sends the power: `other_arm`,
+`passed_by`, `other_family` and `untracked_orders` are light on paths the
+computation does not follow, never absorption. The **numerical** buckets say
+what the computation took: a window's crop (`left_window`), a propagator's
+band limit, a band cut before a coarser window or a modulator's take-up
+(`spectral_projection`), the sub-cell projection error of a sampled edge
+(`subcell_projection`), interpolation (`resampling`: 4.2e-4 of the power
+through the f/10 singlet, 1.2e-3 on and off the LCoS of its test), and the
+remainder `numerical`, which should be round-off: below 1e-10 of the launched
+power on most tested paths, 5.9e-9 on the DMD-and-singlet path; the tests
+print it.
+
+What *is* checked, on every result (`WaveLedger::check`): no physical bucket
+is negative, and no more is detected than was launched, beyond 1e-9 of the
+launched power. Anything else is named in `inconsistencies`, which every
+path test asserts empty. The one exception the tests allow, by name, is the
+readout of several arms: added on the detector's grid at two points a pixel,
+samples rather than integrals, the arms can read slightly more than was
+launched (1.7e-9 in the Mach–Zehnder test, 1.6e-5 in the Michelson's), a
+known limit of that point-sampled readout.
 
 ## Validation
 

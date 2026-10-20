@@ -260,8 +260,8 @@ fn b10_a_gaussian_through_a_circular_hole_passes_one_minus_e_to_the_minus_half()
     // quadrature of the continuum; a mask on a grid has its own boundary
     // error. The canvas's exact cell coverage `c` stops `1 − c` of each
     // cell's power, the area outside the hole, and of what it lets through,
-    // `c − c²` goes into directions beyond the grid's band, where the edge
-    // diffracts it (`beyond_nyquist`): what the mask does not stop is the
+    // `c − c²` is the sub-cell projection error of the sampled edge
+    // (`subcell_projection`): what the mask does not stop is the
     // continuum's throughput, less the boundary quadrature of a sampled
     // field, the Gaussian read at the centres of the cells its edge crosses:
     // 4.4e-5 at 2 µm samples, a quarter of it at 1 µm (second order).
@@ -276,7 +276,7 @@ fn b10_a_gaussian_through_a_circular_hole_passes_one_minus_e_to_the_minus_half()
         let (stopped, beyond) = oc_wave::elements::apply_coverage(&mut u, &cover).unwrap();
         let got = 1.0 - stopped / p0;
         measured(&format!("B10: Gaussian through a circular hole, exact cell coverage at {} µm, against 1 − e^(−1/2)", 1e3 * dx), got - want);
-        measured(&format!("B10: of it, diffracted beyond the grid's band at the edge, at {} µm", 1e3 * dx), beyond / p0);
+        measured(&format!("B10: of it, the sub-cell projection error at the edge, at {} µm", 1e3 * dx), beyond / p0);
         assert!((u.power() + beyond + stopped - p0).abs() < 1e-11 * p0, "the ledger closes: {}", (u.power() + beyond + stopped - p0) / p0);
         errs.push((got - want).abs());
     }

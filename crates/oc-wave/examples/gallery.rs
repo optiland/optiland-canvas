@@ -1170,7 +1170,7 @@ fn f7_regimes_ledger(dir: &Path, fft: &mut Fft2) -> R<Value> {
         left.push(l.left_window / l.launched);
         evan.push(l.evanescent / l.launched);
         num.push(l.numerical / l.launched);
-        let other = l.absorbed_aperture + l.absorbed_element + l.beyond_nyquist + l.other_family + l.untracked_orders;
+        let other = l.absorbed_aperture + l.absorbed_element + l.subcell_projection + l.spectral_projection + l.other_family + l.untracked_orders;
         if other != 0.0 {
             return Err(format!("unexpected ledger entries at z = {z}: {l:?}").into());
         }

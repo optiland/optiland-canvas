@@ -905,12 +905,14 @@ async function main() {
     }
     const l = r.report.ledger;
     const pct = (x: number) => `${(100 * x / Math.max(l.launched, 1e-300)).toFixed(1)}%`;
-    const flags = r.report.warnings.length + r.report.validity.length;
+    const inconsistencies: string[] = r.report.inconsistencies ?? [];
+    const flags = r.report.warnings.length + r.report.validity.length + inconsistencies.length;
     dockNums.textContent = `#${det.id} · ${formatFlux(l.detected)} detected (${pct(l.detected)}) · ${r.field.n[0]}² over ${windowMm} mm · λ ${(r.field.lambdaUm * 1000).toFixed(1)} nm`
       + (flags ? ` · ${flags} flag${flags > 1 ? "s" : ""}` : "");
     const named = (x: unknown) => (typeof x === "string" ? x : Object.keys(x as object)[0] ?? String(x));
     dockNums.title = [
-      `ledger: detected ${pct(l.detected)}, aperture ${pct(l.absorbed_aperture)}, element ${pct(l.absorbed_element)}, band limit ${pct(l.band_limit_removed)}, beyond Nyquist ${pct(l.beyond_nyquist)}, left the window ${pct(l.left_window)}, other family ${pct(l.other_family)}, other orders ${pct(l.untracked_orders ?? 0)}, other arm ${pct(l.other_arm ?? 0)}, passed beside ${pct(l.passed_by ?? 0)}, resampling ${pct(l.resampling ?? 0)}, numerical ${pct(l.numerical)}`,
+      `ledger, physical: detected ${pct(l.detected)}, aperture ${pct(l.absorbed_aperture)}, element ${pct(l.absorbed_element)}, evanescent ${pct(l.evanescent ?? 0)}, other family ${pct(l.other_family)}, other orders ${pct(l.untracked_orders ?? 0)}, other arm ${pct(l.other_arm ?? 0)}, passed beside ${pct(l.passed_by ?? 0)}, other ports ${pct(l.other_ports ?? 0)}; numerical: left the window ${pct(l.left_window)}, band limit ${pct(l.band_limit_removed)}, band cut ${pct(l.spectral_projection ?? 0)}, sub-cell edges ${pct(l.subcell_projection ?? l.beyond_nyquist ?? 0)}, resampling ${pct(l.resampling ?? 0)}, remainder ${pct(l.numerical)}`,
+      ...inconsistencies.map((x) => `inconsistent: ${x}`),
       ...r.report.warnings.map((x) => `warning: ${named(x)}`),
       ...r.report.validity.map((x) => `validity: ${named(x)}`),
       ...r.report.approximated.map((x) => `approximated: ${x}`),

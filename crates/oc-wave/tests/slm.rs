@@ -175,7 +175,7 @@ fn the_sampled_lcos_lands_on_the_closed_form_orders() {
     let g = Grid2::new([ns, ns], [dx, dx], [0.5 * dx, 0.5 * dx]).unwrap();
     let u = Field2::from_fn(g, 0.633, |_, _| Cx::ONE).unwrap();
     let (v, r) = lcos_reflect(&u, &d, LcosBeam::Modulated).unwrap();
-    assert!(r.ledger.beyond_nyquist.abs() < 1e-12 * r.ledger.launched, "aligned edges lose nothing");
+    assert!(r.ledger.subcell_projection.abs() < 1e-12 * r.ledger.launched, "aligned edges lose nothing");
     let t = unit_cell_orders(&d, &UnitCell { period: [nlev as usize, 1], values: (0..nlev).collect() }, 0.633, NORMAL, OrderModel::Tea, LcosBeam::Modulated).unwrap();
     let area = (np as f64 * p).powi(2);
     let lm = 0.633 / 1000.0;

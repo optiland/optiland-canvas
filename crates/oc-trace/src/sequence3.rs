@@ -16,6 +16,9 @@
 //! ([`SequenceError::NotReached`] carries every branch's actual fate), or it
 //! reached it more than one way ([`SequenceError::Ambiguous`] names the
 //! chains, and the caller disambiguates by declaring a tighter intent).
+//! A coherent consumer wants every way, not one: [`extract_sequences3`]
+//! returns one prescription per branch lineage that reaches the detector,
+//! which the wave path adds as the arms of an interferometer.
 //!
 //! Extraction traces **one** launch ray with ghosts off: Fresnel
 //! back-reflections are not part of a designed sequence, while deterministic

@@ -22,8 +22,9 @@
 //!   those two scales Parseval's theorem holds exactly between the sampled
 //!   field and its sampled spectrum, so power is comparable on both sides.
 //! - Lengths are millimetres, wavelengths micrometres, as everywhere in the
-//!   kernel. The factor of 1000 between them appears once, in
-//!   [`Field2::wavelength_mm`].
+//!   kernel. A field converts between them through [`Field2::wavelength_mm`];
+//!   the beams and the path do the same `λ_um / 1000` where no field is at
+//!   hand yet.
 //! - `|U|²` is flux per mm², so `Σ|U|²ΔA` is the flux the field carries. It is
 //!   relative unless the source that launched it was calibrated, exactly like
 //!   a ray's flux.

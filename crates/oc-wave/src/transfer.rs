@@ -644,9 +644,11 @@ pub(crate) fn trace_map(probe: &Scene3, grid: Grid2, lam: f64, inc: &Beam, out: 
         .ok_or_else(|| WaveError::OutOfRange("the chief ray does not cross the surface to its exit plane".into()))?;
     let opl_axis = if r.dir(0.0, 0.0) == [0.0, 0.0] { chief.opl } else { trace_with(probe, &cfg, lam, inc, out, 0.0, 0.0, [0.0, 0.0]).map_or(chief.opl, |x| x.opl) };
 
-    // The ray grid: odd, so the chief ray is its centre, spanning the window.
+    // The ray grid: odd, so the chief ray is its centre, spanning the window
+    // wherever its centre lies (a window fitted to the beam need not be
+    // centred on the chief ray).
     let g = (rays.max(9) | 1).min(1025);
-    let w = grid.width_mm(0).max(grid.width_mm(1));
+    let w = 2.0 * (0..2).map(|a| grid.center_mm[a].abs() + 0.5 * grid.width_mm(a)).fold(0.0, f64::max);
     let h = w / (g - 1) as f64;
     let half = (g - 1) as f64 / 2.0;
     let mut rays_out: Vec<Option<RayOut>> = Vec::with_capacity(g * g);

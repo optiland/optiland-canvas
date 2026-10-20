@@ -1788,3 +1788,275 @@ fn a_dmd_s_orders_cross_a_singlet_each_about_its_own_direction() {
     measured("DMD orders through a singlet: resampling, of the launched", l.resampling / l.launched);
     assert!(l.numerical.abs() < 1e-6 && l.resampling.abs() < 2e-2, "{l:?}");
 }
+
+/// A transmission grating 50 mm from the source, met at `incidence_deg` in
+/// the XY plane, `lines_per_mm` grooves along Z, with the given order and
+/// zero-order fractions, and a detector 200 mm behind it facing back along
+/// the beam, `half` mm wide on `bins` pixels a side. Returns the grating's id.
+fn grating_scene(lines_per_mm: f64, incidence_deg: f64, eta: f64, zero: f64, half: f64, bins: usize) -> (Scene3, SourceId, DetectorId, u64) {
+    let mut s = Scene3::new();
+    let src = source(&mut s);
+    let g = s.add_grating(Vec3::new(50.0, 0.0, 0.0), 10.0, 10.0, 180.0 + incidence_deg, lines_per_mm, true);
+    assert!(s.set_grating(g, lines_per_mm, 1, true, Some(eta), Some(zero)));
+    let det = s.add_area_detector(Vec3::new(250.0, 0.0, 0.0), -Vec3::X, half, half, [bins, bins]);
+    s.validate().unwrap();
+    (s, src, det, g)
+}
+
+#[test]
+fn a_grating_order_leaves_with_its_momentum_and_its_phase() {
+    // R01 of the expert review. A grating's order carries the grating's own
+    // phase, exp(i m K·(r − r_g)) with K = 2π/d across the grooves: its
+    // tangential wavevector is the incident one plus mK (the grating
+    // equation [1]), so in a frame turned to the order's direction the field
+    // stays centred on the chief ray instead of drifting off at the angle
+    // the frame turned through; and moving the grating by Δ across its
+    // grooves moves the order's phase by −mKΔ (by 2π for Δ = d: the same
+    // field). 20 l/mm (d = 50 µm) met at 10°, the zero order set to 0 so that
+    // one chain runs, η = 0.65.
+    let bins = 320;
+    let (s, src, det, g) = grating_scene(20.0, 10.0, 0.65, 0.0, 8.0, bins);
+    let r = wave_path(&s, &spec(src, det, 0.5, 256, 4.0), 1).unwrap();
+    let l = r.report.ledger;
+    measured("grating order: detected, of the launched", l.detected);
+    measured("grating order: untracked orders, of the launched", l.untracked_orders);
+    assert!((l.detected - 0.65).abs() < 1e-6, "{l:?}");
+    assert!((l.untracked_orders - 0.35).abs() < 1e-6, "{l:?}");
+    // The field's centroid in the beam frame, which follows the chief ray.
+    let f = &r.field;
+    let (mut p, mut mx, mut my) = (0.0, 0.0, 0.0);
+    for j in 0..f.grid.n[1] {
+        for i in 0..f.grid.n[0] {
+            let w = f.at(i, j).norm_sqr();
+            let (x, y) = f.grid.xy(i, j);
+            p += w;
+            mx += w * x;
+            my += w * y;
+        }
+    }
+    let (mx, my) = (mx / p, my / p);
+    measured("grating order: the field's centroid off the chief ray, mm", mx.hypot(my));
+    assert!(mx.hypot(my) < 1e-4, "({mx}, {my}): the order drifted off its chief ray");
+    // The order lands on the detector where the traced chief ray does, off
+    // the axis.
+    let seqs = oc_trace::extract_sequences3(&s, src, det, Some(LAM), 1).unwrap();
+    assert_eq!(seqs.len(), 1, "one chain: the zero order carries nothing");
+    let dt = s.detectors.iter().find(|d| d.common.id.0 == det.0).unwrap().common.transform;
+    let land = dt.inverse_transform_point(seqs[0].terminal.point);
+    let du = 16.0 / bins as f64;
+    let (mut pw, mut cu, mut cv) = (0.0, 0.0, 0.0);
+    for j in 0..bins {
+        for i in 0..bins {
+            let w = r.power[j * bins + i];
+            pw += w;
+            cu += w * (-8.0 + (i as f64 + 0.5) * du);
+            cv += w * (-8.0 + (j as f64 + 0.5) * du);
+        }
+    }
+    let (cu, cv) = (cu / pw, cv / pw);
+    // The projected readout bins each field cell's power into the pixel its
+    // sub-cells land in, so a centroid is known to a sub-cell (a third of a
+    // 15.6 µm field cell here).
+    measured("grating order: power centroid on the face against the chief ray's landing point, mm", (cu - land.x).hypot(cv - land.y));
+    assert!((cu - land.x).hypot(cv - land.y) < 6e-3, "({cu}, {cv}) vs ({}, {})", land.x, land.y);
+    assert!(land.x.abs() + land.y.abs() > 1.0, "the order must land off the axis: {land:?}");
+    // The grating moved Δ along its own X: the same field times e^{−i2πΔ/d}.
+    let gt = s.surfaces.iter().find(|o| o.common.id.0 == g).unwrap().common.transform;
+    let gx = gt.rotate(Vec3::X);
+    let d_mm = 1.0 / 20.0;
+    let peak = r.field.data.iter().map(|z| z.abs()).fold(0.0, f64::max);
+    for (frac, note) in [(0.3, "0.3 d"), (1.0, "d")] {
+        let mut moved = s.clone();
+        let o = moved.surfaces.iter_mut().find(|o| o.common.id.0 == g).unwrap();
+        o.common.transform = oc_core::Isometry3::from_pos(gx * (frac * d_mm)).compose(o.common.transform);
+        let r2 = wave_path(&moved, &spec(src, det, 0.5, 256, 4.0), 1).unwrap();
+        let want = oc_wave::Cx::expi(-2.0 * std::f64::consts::PI * frac);
+        let worst = r
+            .field
+            .data
+            .iter()
+            .zip(&r2.field.data)
+            .filter(|(a, _)| a.abs() > 1e-3 * peak)
+            .map(|(a, b)| (*b - *a * want).abs() / a.abs())
+            .fold(0.0, f64::max);
+        measured(&format!("grating moved {note} across its grooves: the order's field against the same field times e^(−i2πΔ/d), worst relative"), worst);
+        assert!(worst < 1e-8, "{worst}");
+    }
+}
+
+#[test]
+fn both_orders_of_a_grating_book_what_neither_carries_once() {
+    // R02 of the expert review. With the zero order and the first order both
+    // followed to one detector, the grating's untracked orders are
+    // 1 − η − η₀ of what met it, booked once, not (1 − η) + (1 − η₀), one per
+    // arm; nothing is left to the remainder. η = 0.65, η₀ = 0.10; the
+    // detector holds both spots, 2.6 mm apart.
+    let (s, src, det, _) = grating_scene(20.0, 10.0, 0.65, 0.10, 8.0, 160);
+    let r = wave_path_arms(&s, &spec(src, det, 0.5, 256, 4.0), 1).unwrap();
+    let l = r.report.ledger;
+    measured("grating, both orders: detected, of the launched", l.detected);
+    measured("grating, both orders: untracked orders, of the launched", l.untracked_orders);
+    measured("grating, both orders: other ports, of the launched", l.other_ports);
+    assert!((l.untracked_orders - 0.25).abs() < 1e-6, "{l:?}");
+    assert!((l.detected - 0.75).abs() < 2e-3, "{l:?}");
+    assert!(l.other_ports.abs() < 2e-3, "{l:?}");
+    assert!(r.report.steps.iter().any(|st| st.note.contains("2 arms added")), "{:?}", r.report.steps);
+}
+
+/// The power centroid of a detector's pixels, in its own frame, mm.
+fn power_centroid(r: &WavePathResult, half: f64) -> (f64, f64) {
+    let [nu, nv] = r.bins;
+    let (du, dv) = (2.0 * half / nu as f64, 2.0 * half / nv as f64);
+    let (mut p, mut cu, mut cv) = (0.0, 0.0, 0.0);
+    for j in 0..nv {
+        for i in 0..nu {
+            let w = r.power[j * nu + i];
+            p += w;
+            cu += w * (-half + (i as f64 + 0.5) * du);
+            cv += w * (-half + (j as f64 + 0.5) * dv);
+        }
+    }
+    (cu / p, cv / p)
+}
+
+#[test]
+fn a_window_fitted_off_the_chief_ray_carries_the_field_where_it_is() {
+    // R03 of the expert review. A re-grid centres the window on the beam's
+    // predicted centroid, which a half-blocked beam moves off the chief ray;
+    // every step after it (the zoomed propagators, a traced face's ray grid,
+    // the readout) must then take the window where it is. A 0.1 mm Gaussian
+    // has half of it stopped 10 mm on; the fitted run's window is centred
+    // off the chief ray from there on, which its re-grid note records, while
+    // on a 2 mm window the path never re-grids. The observable that an
+    // offset would move: the beam's centroid on a detector 140 mm further.
+    // The two runs must agree on it to a fraction of a sample (the offset
+    // window is 55 µm off the chief ray; carried where the frame origin is,
+    // it would read 55 µm off). The second-moment law gives the centroid of
+    // the whole field exactly ([25]; it walks with the beam's mean direction,
+    // the wavefront's slope at the centroid), ⟨y⟩ = w/√(2π) at the aperture
+    // times 1 + L/R; the detector holds 96.7% of the light, the rest
+    // diffracted by the edge beyond 7 mrad leaves the window, which moves
+    // what it reads by a few µm. With a singlet in the way (its ray grid
+    // must span the offset window) the two runs must still read the same
+    // power and centroid.
+    use oc_core::build3::SingletGeom;
+    use oc_core::scene3::PlanarShape2;
+    use oc_core::Vec2;
+    let w0 = 0.1;
+    let z_ap = 10.0;
+    let build = |singlet: bool| {
+        let mut s = Scene3::new();
+        let src = source(&mut s);
+        let a = s.add_aperture(Vec3::new(z_ap, 0.0, 0.0), 1.0, 180.0);
+        let ap = s.apertures.iter_mut().find(|o| o.common.id.0 == a).unwrap();
+        ap.shape.clear_opening =
+            PlanarShape2::Polygon { vertices: vec![Vec2::new(-1.0, 0.0), Vec2::new(1.0, 0.0), Vec2::new(1.0, 1.0), Vec2::new(-1.0, 1.0)] };
+        ap.shape.outer_extent = None;
+        if singlet {
+            let g = SingletGeom { r1_mm: 50.0, r2_mm: -50.0, thickness_mm: 4.0, semi_aperture_mm: 12.0, conic1: 0.0, conic2: 0.0 };
+            s.add_singlet(Vec3::new(100.0, 0.0, 0.0), g, 1.5168, 64.17);
+        }
+        let det = s.add_area_detector(Vec3::new(150.0, 0.0, 0.0), -Vec3::X, 1.0, 1.0, [100, 100]);
+        s.validate().unwrap();
+        (s, src, det)
+    };
+    // Free space: the centroid against the second-moment law.
+    let (s, src, det) = build(false);
+    let fitted = wave_path(&s, &spec(src, det, w0, 512, 4.0), 1).unwrap();
+    let fixed = wave_path(&s, &spec(src, det, w0, 512, 2.0), 1).unwrap();
+    let off: Vec<&str> = fitted.report.steps.iter().map(|st| st.note.as_str()).filter(|n| n.contains("onto a new window")).collect();
+    assert!(off.iter().any(|n| n.contains("centred (") && !n.contains("centred (+0.0000e0, +0.0000e0)")), "a window off the chief ray: {off:?}");
+    assert!(!fixed.report.steps.iter().any(|st| st.note.contains("onto a new window")), "the reference must not re-grid");
+    let zr = rayleigh_range_mm(w0, LAM, 1.0);
+    let w_ap = w0 * (1.0 + (z_ap / zr).powi(2)).sqrt();
+    let radius = (z_ap * z_ap + zr * zr) / z_ap;
+    let want = w_ap / (2.0 * std::f64::consts::PI).sqrt() * (1.0 + (150.0 - z_ap) / radius);
+    let (fu, fv) = power_centroid(&fitted, 1.0);
+    let (xu, xv) = power_centroid(&fixed, 1.0);
+    measured("window fitted off the chief ray: the beam's centroid on the detector against the second-moment law, mm", fu.hypot(fv) - want);
+    measured("the same on a fixed window, mm", xu.hypot(xv) - want);
+    measured("window fitted off the chief ray against a fixed window: centroid difference, mm", (fu - xu).hypot(fv - xv));
+    assert!((fu.hypot(fv) - want).abs() < 1e-2, "{} vs {want}", fu.hypot(fv));
+    assert!((xu.hypot(xv) - want).abs() < 1e-2, "{} vs {want}", xu.hypot(xv));
+    assert!((fu - xu).hypot(fv - xv) < 2e-4, "{}", (fu - xu).hypot(fv - xv));
+    // Through a singlet: the same power and centroid either way.
+    let (s, src, det) = build(true);
+    let fitted = wave_path(&s, &spec(src, det, w0, 512, 4.0), 1).unwrap();
+    let fixed = wave_path(&s, &spec(src, det, w0, 512, 2.0), 1).unwrap();
+    assert!(fitted.report.steps.iter().any(|st| st.note.contains("onto a new window") && st.note.contains("centred (") && !st.note.contains("centred (+0.0000e0, +0.0000e0)")));
+    let (fu, fv) = power_centroid(&fitted, 1.0);
+    let (xu, xv) = power_centroid(&fixed, 1.0);
+    // The windows differ in what they hold: the fixed 2 mm one loses 1.5% of
+    // the edge's wide-angle light to its edges and 0.8% to the coarser
+    // sampling of the edge, where the fitted one, 4 mm wide at the lens,
+    // loses 0.6% and 0.2% (their ledgers say so).
+    measured("window fitted off the chief ray, through a singlet: detected power against a fixed window", fitted.report.ledger.detected - fixed.report.ledger.detected);
+    measured("window fitted off the chief ray, through a singlet: centroid difference against a fixed window, mm", (fu - xu).hypot(fv - xv));
+    assert!((fitted.report.ledger.detected - fixed.report.ledger.detected).abs() < 2e-2, "{:?} vs {:?}", fitted.report.ledger, fixed.report.ledger);
+    assert!((fu - xu).hypot(fv - xv) < 2e-3);
+}
+
+/// Every object of `s` carried by the rigid motion `t`.
+fn moved_scene(s: &Scene3, t: oc_core::Isometry3) -> Scene3 {
+    let mut m = s.clone();
+    for o in &mut m.surfaces {
+        o.common.transform = t.compose(o.common.transform);
+    }
+    for o in &mut m.bodies {
+        o.common.transform = t.compose(o.common.transform);
+    }
+    for o in &mut m.apertures {
+        o.common.transform = t.compose(o.common.transform);
+    }
+    for o in &mut m.detectors {
+        o.common.transform = t.compose(o.common.transform);
+    }
+    for o in &mut m.sources {
+        o.transform = t.compose(o.transform);
+    }
+    m
+}
+
+#[test]
+fn a_rigidly_moved_scene_reads_the_same_detector() {
+    // R06 of the expert review (gauge): a rotation and a translation of the
+    // whole scene change no observable. A folded path, a Mach–Zehnder and a
+    // Michelson with a tilted mirror (two retro-reflections, whose frames are
+    // carried by a half-turn about the beam's own axis), moved by 0.7 rad
+    // about (1, 2, 3) and by (3, −2, 5) mm, must read the same pixels.
+    let q = glam::DQuat::from_axis_angle(Vec3::new(1.0, 2.0, 3.0).normalize(), 0.7);
+    let t = oc_core::Isometry3::new(Vec3::new(3.0, -2.0, 5.0), [q.x, q.y, q.z, q.w]).unwrap();
+    // The projected readout bins whole field cells: a cell whose centre
+    // falls on a pixel edge goes either way by round-off, so the pixels are
+    // sized not to put edges on cell centres (3 mm over 256 cells, 6 mm over
+    // 30 pixels).
+    let mut folded = Scene3::new();
+    let src_f = source(&mut folded);
+    folded.add_planar_mirror(Vec3::new(97.0, -3.0, 0.0), Vec3::new(103.0, 3.0, 0.0), 1.0).unwrap();
+    let det_f = folded.add_area_detector(Vec3::new(100.0, 200.0, 0.0), -Vec3::Y, 3.0, 3.0, [30, 30]);
+    folded.validate().unwrap();
+    let (mz, src_m, det_m, _) = mach_zehnder(0.3e-3);
+    // Arms 0.1 mm apart, so neither port is dark.
+    let (mi, src_i, det_i) = michelson(0.1, 0.0, 5e-4, Spectrum::Monochromatic(LAM), 3.0, 64);
+    let (mi0, src_0, det_0) = michelson(0.1, 0.0, 0.0, Spectrum::Monochromatic(LAM), 3.0, 64);
+    // An interferometer reads the phase between its arms, k·OPL ≈ 4e6 rad
+    // over these paths: the tracer's hit points, rotated, move by round-off
+    // (1e-13 of 250 mm), which is 1e-7 rad, so its pixels can differ by
+    // about that much of the launched power, and an arm read through the
+    // rotated spectrum (the tilted Michelson's) by its interpolation's
+    // round-off too; a single arm's cannot.
+    for (name, s, src, det, w0, n, win, arms, gate) in [
+        ("folded path", &folded, src_f, det_f, 0.2, 256, 3.0, false, 1e-9),
+        ("Mach–Zehnder", &mz, src_m, det_m, 0.5, 256, 4.0, true, 1e-5),
+        ("Michelson, square", &mi0, src_0, det_0, 1.0, 256, 5.0, true, 1e-5),
+        ("Michelson, tilted mirror", &mi, src_i, det_i, 1.0, 256, 5.0, true, 1e-5),
+    ] {
+        let run = |sc: &Scene3| if arms { wave_path_arms(sc, &spec(src, det, w0, n, win), 1).unwrap() } else { wave_path(sc, &spec(src, det, w0, n, win), 1).unwrap() };
+        let a = run(s);
+        let b = run(&moved_scene(s, t));
+        let launched = a.report.ledger.launched;
+        let worst = a.power.iter().zip(&b.power).map(|(p, q)| (p - q).abs()).fold(0.0, f64::max);
+        measured(&format!("{name}, moved rigidly: pixel power difference / launched"), worst / launched);
+        assert!(worst / launched < gate, "{name}: {}", worst / launched);
+    }
+}

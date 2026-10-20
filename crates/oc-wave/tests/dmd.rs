@@ -1,12 +1,17 @@
 //! The DMD model (acceptance cases C46–C48).
 //!
 //! Sources:
-//! - [D1] S. M. Popoff, R. Gutiérrez-Cuevas, Y. Bromberg, M. W. Matthès, "A
-//!   practical guide to digital micro-mirror devices (DMDs) for wavefront
-//!   shaping," *J. Phys. Photonics* 6, 043001 (2024),
-//!   doi:10.1088/2515-7647/ad6dc0: the DMD as a blazed grating (§2), the
-//!   blazed number (Eq. 2) and its values in Fig. 5; App. A's far field, one
-//!   mirror's envelope times the array's orders.
+//! - [D1] S. M. Popoff, L. Malosse, R. Gutiérrez-Cuevas, Y. Bromberg, J.
+//!   Commère, M. Glanc, R. Galicher, M. W. Matthès, "A practical guide to
+//!   digital micro-mirror devices (DMDs) for wavefront shaping," *J. Phys.
+//!   Photonics* 8, 023002 (2026), doi:10.1088/2515-7647/ae60d5: the DMD as a
+//!   blazed grating (§2), the 2D blazed condition (Eq. 4), the blazed number
+//!   (Eq. 5) and its values in Fig. 6; App. A's far field, one mirror's
+//!   envelope times the array's orders. The 2024 version of this paper
+//!   (*J. Phys. Photonics* 6, 043001, doi:10.1088/2515-7647/ad6dc0) was
+//!   retracted (7, 049701 (2025), doi:10.1088/2515-7647/ae0605): its blazed
+//!   number, Eq. (2), was wrong, and Figs. 4(a) and 5–9 with it. Nothing
+//!   here is held against it any more.
 //! - [D2] Texas Instruments, *DMD Optical Efficiency for Visible
 //!   Wavelengths*, application note DLPA083B (June 2019, rev. April 2023):
 //!   Table 2-1 (pitch, tilt, illumination f-number, on-state fill factor),
@@ -24,14 +29,14 @@
 //!   (arXiv:2311.16685v1, Eqs. (11), (15)): a binary amplitude grating of 50%
 //!   duty puts `(1/π)²` of the light in each first order.
 //!
-//! Retrieved 2026-10-19.
+//! Retrieved 2026-10-19; [D1] and its retraction notice 2026-10-20.
 
 mod common;
 
 use common::measured;
 use oc_core::modulator::{
-    dmd_projector_efficiency, facet_normal, mirror_ft, on_axis_illumination, photopic_average,
-    popoff_blazed_number, reflect, unit_cell_orders, DmdSpec, DmdState, LcosBeam, ModulatorKind,
+    blazed_number, dmd_projector_efficiency, facet_normal, hinge, mirror_ft, on_axis_illumination,
+    photopic_average, reflect, unit_cell_orders, DmdSpec, DmdState, LcosBeam, ModulatorKind,
     OrderModel, Pattern, PatternGenerator, SpatialModulator, TiltAxis, UnitCell,
 };
 use oc_core::Vec3;
@@ -91,13 +96,42 @@ fn dmd_orders_sit_on_the_harvey_vernold_grid() {
 }
 
 #[test]
-fn the_blazed_number_matches_popoff_figure_5() {
-    // [D1] Eq. (2), Fig. 5 at 633 nm, 12° tilt: 0.06 and 0.04 for 7.6 µm at
-    // α′ = 0° and 25°; 0.97 and 1.00 for 10.8 µm.
-    for (d, a, published) in [(7.6, 0.0, 0.06), (7.6, 25.0, 0.04), (10.8, 0.0, 0.97), (10.8, 25.0, 1.00)] {
-        let mu = popoff_blazed_number(d, 0.633, 12.0, a);
-        measured(&format!("blazed number, d = {d} µm, α′ = {a}°"), mu);
+fn the_blazed_number_matches_popoff_figure_6_and_the_facet_kinematics() {
+    // [D1] Eq. (5) at 633 nm, θ_B = −12°, the values in the legend of Fig. 6:
+    // 0.09 and 0.71 for 7.6 µm at α = 0° and 15°; 0.81 and 0.06 for 10.8 µm
+    // at 0° and 15°. (Fig. 6(b)'s legend labels its second angle −15° while
+    // the caption gives θ_B = −12° for both panels; Eq. (5) is even under
+    // (θ_B, α) → (−θ_B, −α), so that value is 0.06 at +15° for the caption's
+    // tilt, as held here, and the symmetry is checked too.)
+    for (d, a, published) in [(7.6, 0.0, 0.09), (7.6, 15.0, 0.71), (10.8, 0.0, 0.81), (10.8, 15.0, 0.06)] {
+        let mu = blazed_number(d, 0.633, -12.0, a);
+        measured(&format!("blazed number, d = {d} µm, θ_B = −12°, α = {a}°"), mu);
         assert!((mu - published).abs() <= 0.01, "{d} µm, {a}°: {mu} vs {published}");
+        assert!((blazed_number(d, 0.633, 12.0, -a) - mu).abs() < 1e-12);
+    }
+    // The same number from the kernel's own facet kinematics: the specular
+    // direction off the ON facet (`facet_normal`, `reflect`) lies
+    // Δ = (r − d_in)·ŵ across the hinge from the incident direction, and the
+    // orders along the hinge's normal (`unit_cell_orders`' lattice,
+    // t_in + λ(m, n)/p with n = −m) are √2λ/p apart: μ = |2Δ/(√2λ/p) mod 2 − 1|.
+    let (_, w) = hinge(TiltAxis::Diagonal);
+    let lam = 0.633;
+    for tilt in [12.0, -12.0] {
+        for pitch in [7.6, 10.8] {
+            let d = dmd(1, pitch, tilt, TiltAxis::Diagonal, 0.95, Pattern::Uniform { value: 1 });
+            let mut worst: f64 = 0.0;
+            for k in 0..=360 {
+                let a = -45.0 + 0.25 * k as f64;
+                let din = across_hinge(a);
+                let r = reflect(din, facet_normal(spec(&d), DmdState::On));
+                let delta = (r - din).dot(w);
+                let p_real = delta / (2f64.sqrt() * lam / pitch);
+                let mu_engine = ((2.0 * p_real).rem_euclid(2.0) - 1.0).abs();
+                worst = worst.max((mu_engine - blazed_number(pitch, lam, tilt, a)).abs());
+            }
+            measured(&format!("blazed number from the facet kinematics against Eq. (5), worst over α, d = {pitch} µm, θ_B = {tilt}°"), worst);
+            assert!(worst < 1e-12, "{worst}");
+        }
     }
 }
 
@@ -114,10 +148,10 @@ fn a_blazed_dmd_concentrates_one_order_and_an_anti_blazed_one_splits_four() {
     };
     let blazed = shares(10.8);
     let anti = shares(7.6);
-    measured("10.8 µm (μ = 0.97): brightest order's share", blazed[0]);
+    measured("10.8 µm (μ = 0.81): brightest order's share", blazed[0]);
     measured("10.8 µm: second order's share", blazed[1]);
     for (k, v) in anti.iter().take(5).enumerate() {
-        measured(&format!("7.6 µm (μ = 0.06): share of order ranked {}", k + 1), *v);
+        measured(&format!("7.6 µm (μ = 0.09): share of order ranked {}", k + 1), *v);
     }
     // Blazed: one order takes most of the light.
     assert!(blazed[0] > 0.6, "{:?}", &blazed[..4]);

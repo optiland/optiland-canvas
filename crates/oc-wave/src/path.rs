@@ -187,6 +187,13 @@ impl Beam {
     /// The same beam going along `d2` from `origin`: its transverse axes
     /// carried by the shortest rotation, which keeps the frame right-handed.
     fn turned(&self, origin: Vec3, d2: Vec3) -> Beam {
+        // Straight back (a retro-reflection): every half-turn about an axis
+        // across the beam is a shortest rotation; the beam's own `y` is the
+        // axis, so the frame depends on the beam alone and a rotated scene
+        // gets a rotated frame.
+        if self.d.dot(d2) < -1.0 + 1e-12 {
+            return Beam { origin, x: -self.x, y: self.y, d: d2 };
+        }
         let q = glam::DQuat::from_rotation_arc(self.d, d2);
         let x = (q * self.x - d2 * d2.dot(q * self.x)).normalize();
         Beam { origin, x, y: d2.cross(x), d: d2 }
@@ -372,6 +379,34 @@ fn merge(total: &mut WaveReport, step: WaveReport) {
             total.inconsistencies.push(s);
         }
     }
+}
+
+/// The padding a zoomed or rotated spectrum needs to read a field of `n`
+/// samples on a window `width` wide onto a face reaching `reach` from the
+/// beam, so that none of the field's periodic copies (a padded window apart)
+/// lands on the face: the padded window must hold the reach and half the
+/// beam's window, and at least `at_least` times the window. Capped so the
+/// padded grid stays within 4096 samples a side. Returns the padding and
+/// the period it gives; a period shorter than `reach + width/2` is reported
+/// by the caller as `Periodic`.
+fn readout_pad(n: usize, width: f64, reach: f64, at_least: usize) -> (usize, f64) {
+    let need = (((reach + 0.5 * width) / width).ceil() as usize).max(at_least).max(1);
+    let cap = (4096 / n.max(1)).max(1);
+    let pad = need.min(cap);
+    (pad, pad as f64 * width)
+}
+
+/// The farthest a face reaches from the beam axis in the beam's plane: its
+/// corners projected along the beam onto the plane through `plane`.
+fn face_reach(beam: &Beam, t: &Isometry3, hw: f64, hh: f64, plane: Vec3) -> f64 {
+    [(-hw, -hh), (hw, -hh), (-hw, hh), (hw, hh)]
+        .iter()
+        .map(|&(u, v)| {
+            let r = t.transform_point(Vec3::new(u, v, 0.0));
+            let (a, b) = beam.coords(r - beam.d * (r - plane).dot(beam.d));
+            a.abs().max(b.abs())
+        })
+        .fold(0.0, f64::max)
 }
 
 /// The grid's samples moved onto the centres of the cells it divides its
@@ -1259,7 +1294,9 @@ impl ChainJob {
             hits == [first.patch, second.patch]
         };
         let g = 65usize;
-        let w = self.u.grid.width_mm(0).max(self.u.grid.width_mm(1));
+        // The probe grid about the chief ray, spanning the window wherever
+        // its centre lies.
+        let w = 2.0 * (0..2).map(|a| self.u.grid.center_mm[a].abs() + 0.5 * self.u.grid.width_mm(a)).fold(0.0, f64::max);
         let h = w / (g - 1) as f64;
         let half = (g - 1) as f64 / 2.0;
         let grid: Vec<bool> = (0..g * g).map(|k| pass(((k % g) as f64 - half) * h, ((k / g) as f64 - half) * h)).collect();
@@ -1407,9 +1444,11 @@ impl ChainJob {
         r.steps.push(element_step(
             z,
             format!(
-                "the field carried {z:.4} mm onto a new window {:.4e} mm across ({n}², pitch {:.4e} mm), where the beam is predicted {:.4e} mm across (six rms radii), by {how}{cut}",
+                "the field carried {z:.4} mm onto a new window {:.4e} mm across ({n}², pitch {:.4e} mm) centred ({:+.4e}, {:+.4e}) mm off the chief ray, where the beam is predicted to reach {:.4e} mm either side of its centroid (six rms radii), by {how}{cut}",
                 2.0 * pl.half,
                 pl.out.pitch_mm[0],
+                pl.out.center_mm[0],
+                pl.out.center_mm[1],
                 pl.needed
             ),
         ));
@@ -1756,6 +1795,9 @@ impl ChainJob {
         let unit = |v: Option<f64>| v.map(|x| x.clamp(0.0, 1.0));
         // A coating's junction: what met it and the share it carries on.
         let mut coat: Option<(f64, f64)> = None;
+        // A grating order's own phase: `m K` (rad/mm, along the surface's
+        // local X) and the surface's origin it is referred to.
+        let mut grating_phase: Option<(Vec3, Vec3)> = None;
         // The amplitude inside the outline, a thin lens's focal length and
         // centre, and where the rest goes.
         //
@@ -1779,7 +1821,18 @@ impl ChainJob {
                     (t.sqrt(), None, Loss::Arm(r.min(1.0 - t)))
                 }
             }
-            (SurfaceResponse::Grating { efficiency, .. }, SeqAction::Diffract) => {
+            (SurfaceResponse::Grating { efficiency, lines_per_mm, order, .. }, SeqAction::Diffract) => {
+                // The order carries the grating's own phase, exp(i m K·(r −
+                // r_g)), K = 2π·lines/mm along local X from the surface's
+                // origin. The chain leaves along the tracer's order direction,
+                // for which k(d′ − d)_t = mK, so this phase and the hand-over's
+                // change of reference combine to the constant
+                // exp(i m K·(p − r_g)): the order's interferometric phase,
+                // which moves with the grating. Without it the samples would
+                // keep the incident tangential direction while the frame
+                // turned to the order's.
+                let kg = s.common.transform.rotate(Vec3::X) * (2.0 * std::f64::consts::PI * lines_per_mm * *order as f64);
+                grating_phase = Some((kg, s.common.transform.pos));
                 (unit(efficiency.sample(lam)).ok_or_else(|| refuse(kind))?.sqrt(), None, Loss::Orders)
             }
             (SurfaceResponse::Grating { zero_order, .. }, _) => {
@@ -1856,7 +1909,10 @@ impl ChainJob {
                     let v = v - n_s * v.dot(n_s);
                     Cx::expi(-k * v.length_squared() / (2.0 * f))
                 }
-                None => Cx::real(amp),
+                None => match grating_phase {
+                    Some((kg, rg)) => Cx::from_polar(amp, kg.dot(r - rg)),
+                    None => Cx::real(amp),
+                },
             }
         };
         let pass_by = matches!(h.action, SeqAction::Transmit | SeqAction::ThinLens);
@@ -1974,9 +2030,16 @@ impl ChainJob {
             );
         }
         self.report.steps.push(element_step(0.0, note));
-        if let Some((f, _)) = lens {
+        if let Some((f, c)) = lens {
             let dx = g.pitch_mm[0];
-            let edge = 0.5 * g.width_mm(0) * 2f64.sqrt();
+            // The window's corner farthest from the lens's centre, in the
+            // beam's plane.
+            let (la, lb) = beam.coords(c - beam.d * (c - beam.origin).dot(beam.d));
+            let (hw, hh) = (0.5 * g.width_mm(0), 0.5 * g.width_mm(1));
+            let edge = [(-hw, -hh), (hw, -hh), (-hw, hh), (hw, hh)]
+                .iter()
+                .map(|(a, b)| ((g.center_mm[0] + a - la).powi(2) + (g.center_mm[1] + b - lb).powi(2)).sqrt())
+                .fold(0.0, f64::max);
             if k * edge * dx / f.abs() > std::f64::consts::PI {
                 self.report.warn(SamplingWarning::Undersampled {
                     what: format!("thin lens #{} f = {f} mm", h.object.0),
@@ -2319,13 +2382,11 @@ impl ChainJob {
             }
             Ev::Hit(h) => {
                 let s = self.scene.surfaces.iter().find(|s| s.common.id == h.object);
-                let lens = s.and_then(|s| {
-                    let r = if beam_in.d.dot(s.common.transform.rotate(Vec3::Z)) < 0.0 { &s.response_front } else { &s.response_back };
-                    match r {
-                        SurfaceResponse::ThinLens { focal_length_mm } => Some(*focal_length_mm),
-                        _ => None,
-                    }
-                });
+                let resp = s.map(|s| if beam_in.d.dot(s.common.transform.rotate(Vec3::Z)) < 0.0 { &s.response_front } else { &s.response_back });
+                let lens = match resp {
+                    Some(SurfaceResponse::ThinLens { focal_length_mm }) => Some(*focal_length_mm),
+                    _ => None,
+                };
                 if let Some(f) = lens {
                     for q in &mut self.q {
                         *q = Cx::ONE / (Cx::ONE / *q - Cx::real(1.0 / f));
@@ -2335,6 +2396,30 @@ impl ChainJob {
                     for a in std::iter::once(&mut self.at).chain(self.rest.iter_mut().map(|l| &mut l.at)) {
                         a[2] -= a[0] / f;
                         a[3] -= a[1] / f;
+                    }
+                }
+                // A grating's order: the beam's width across the grooves
+                // scales by A = cos θ_out / cos θ_in (the anamorphic factor,
+                // the paraxial matrix diag(A, 1/A) across the grooves), so
+                // `q` scales by A² on the beam axis nearest the grooves'
+                // normal.
+                if let (Some(s), Some(SurfaceResponse::Grating { .. }), SeqAction::Diffract) = (s, resp, h.action) {
+                    let n_s = s.common.transform.rotate(Vec3::Z);
+                    let (ci, co) = (beam_in.d.dot(n_s).abs(), self.beam.d.dot(n_s).abs());
+                    let across = s.common.transform.rotate(Vec3::X);
+                    let across = across - self.beam.d * self.beam.d.dot(across);
+                    if ci > 1e-12 && co > 1e-12 && across.length() > 1e-9 {
+                        let across = across.normalize();
+                        let (ax, ay) = (across.dot(self.beam.x).abs(), across.dot(self.beam.y).abs());
+                        let axis = if ax >= ay { 0 } else { 1 };
+                        let a = co / ci;
+                        self.q[axis] *= a * a;
+                        if ax.max(ay) < 1.0 - 1e-6 {
+                            self.report.approx(format!(
+                                "grating #{}: its anamorphic factor on the reference wavefront is applied along the beam axis nearest its grooves' normal",
+                                h.object.0
+                            ));
+                        }
                     }
                 }
             }
@@ -2650,6 +2735,17 @@ impl ChainJob {
         if z <= 0.0 {
             return Err(WaveError::OutOfRange("the detector is behind the field's last plane".into()));
         }
+        // Padded so that no periodic copy of the field lands on the face.
+        let n_max = self.u.grid.n[0].max(self.u.grid.n[1]);
+        let width = self.u.grid.width_mm(0).max(self.u.grid.width_mm(1));
+        let reach = face_reach(&beam, t, hw, hh, beam.origin + beam.d * z);
+        let padding = |at_least: usize, report: &mut WaveReport| {
+            let (pad, period) = readout_pad(n_max, width, reach, at_least);
+            if period < reach + 0.5 * width {
+                report.warn(SamplingWarning::Periodic { period_mm: period, span_mm: reach + 0.5 * width });
+            }
+            pad
+        };
         // A face that is not square to the beam: the spectrum rotated onto the
         // face's own plane (Matsushima, Schimmel & Wyrowski 2003), on its own
         // subpixel grid; each pixel its mean irradiance over its area.
@@ -2658,8 +2754,7 @@ impl ChainJob {
             let grid = centred(Grid2::new([nu * s, nv * s], [du / s as f64, dv / s as f64], [0.0, 0.0])?);
             // The rotation reads the spectrum between its samples: pad finer
             // where the field is small enough to afford it.
-            let n_max = self.u.grid.n[0].max(self.u.grid.n[1]);
-            let pad = if n_max <= 512 { 4 } else if n_max <= 1024 { 2 } else { 1 };
+            let pad = padding(if n_max <= 512 { 4 } else if n_max <= 1024 { 2 } else { 1 }, &mut self.report);
             let arriving = self.u.power();
             let (zf, mut rep) = crate::asm_tilted(&self.u, *t, grid, pad, &mut self.fft)?;
             let cos = n_det.dot(beam.d).abs();
@@ -2723,9 +2818,9 @@ impl ChainJob {
         };
         let pitch = pitch_a.min(pitch_b);
         let m = out.n;
-        // Without padding the field repeats a window away, which a beam
-        // converging onto the detector never reaches; small fields are padded.
-        let pad = if self.u.grid.n[0].max(self.u.grid.n[1]) >= 1024 { 1 } else { 2 };
+        // The field repeats a padded window away: padded so that no copy
+        // reaches the face.
+        let pad = padding(2, &mut self.report);
         let arriving = self.u.power();
         let (zf, mut rep) = crate::asm_zoom(&self.u, z, out, pad, &mut self.fft)?;
         if depth > pitch * pitch / zf.wavelength_in_medium_mm() {
@@ -2856,6 +2951,10 @@ impl ChainJob {
         let fg = centred(Grid2::new([nu * s, nv * s], [ps, qs], [0.0, 0.0])?);
         let arriving = self.u.power();
         let n_max = self.u.grid.n[0].max(self.u.grid.n[1]);
+        // Padded so that no periodic copy of the field lands on the face.
+        let plane = beam.origin + beam.d * z;
+        let reach = face_reach(&beam, &t, hw, hh, plane);
+        let width = self.u.grid.width_mm(0).max(self.u.grid.width_mm(1));
         let square = n_det.dot(beam.d).abs() > 1.0 - 1e-12;
         let (eu, ev) = (t.rotate(Vec3::X), t.rotate(Vec3::Y));
         let along = |a: Vec3, b: Vec3| a.dot(b).abs() > 1.0 - 1e-12;
@@ -2868,10 +2967,12 @@ impl ChainJob {
         };
         let mut data = vec![Cx::ZERO; fg.len()];
         let rep = if let Some((n, pitch)) = aligned {
-            let plane = beam.origin + beam.d * z;
             let c = beam.coords(t.pos - beam.d * (t.pos - plane).dot(beam.d));
             let out = centred(Grid2::new(n, pitch, [c.0, c.1])?);
-            let pad = if n_max >= 1024 { 1 } else { 2 };
+            let (pad, period) = readout_pad(n_max, width, reach, 2);
+            if period < reach + 0.5 * width {
+                self.report.warn(SamplingWarning::Periodic { period_mm: period, span_mm: reach + 0.5 * width });
+            }
             let (zf, rep) = crate::asm_zoom(&self.u, z, out, pad, &mut self.fft)?;
             let k = zf.k_mm();
             for j in 0..out.n[1] {
@@ -2887,7 +2988,13 @@ impl ChainJob {
             }
             rep
         } else {
-            let pad = if n_max <= 512 { 4 } else if n_max <= 1024 { 2 } else { 1 };
+            // The rotation reads the spectrum between its samples: padded
+            // finer where the field is small enough to afford it.
+            let interp = if n_max <= 512 { 4 } else if n_max <= 1024 { 2 } else { 1 };
+            let (pad, period) = readout_pad(n_max, width, reach, interp);
+            if period < reach + 0.5 * width {
+                self.report.warn(SamplingWarning::Periodic { period_mm: period, span_mm: reach + 0.5 * width });
+            }
             let (zt, rep) = crate::asm_tilted(&self.u, t, fg, pad, &mut self.fft)?;
             data = zt.data;
             rep
@@ -3561,10 +3668,12 @@ fn modulator_step(
     let p = device.pitch_mm();
     let per = spec.device_samples_per_pixel.max(2).max(((2.0 * p / u.grid.pitch_mm[0].min(u.grid.pitch_mm[1])).ceil() as usize).min(32));
     let dxd = p / per as f64;
-    let half = 0.5 * u.grid.width_mm(0);
+    // The window's corners, wherever its centre lies.
+    let (gw, gh) = (0.5 * u.grid.width_mm(0), 0.5 * u.grid.width_mm(1));
+    let [cx, cy] = u.grid.center_mm;
     let mut lo = [f64::INFINITY; 2];
     let mut hi = [f64::NEG_INFINITY; 2];
-    for (a, b) in [(-half, -half), (half, -half), (-half, half), (half, half)] {
+    for (a, b) in [(cx - gw, cy - gh), (cx + gw, cy - gh), (cx - gw, cy + gh), (cx + gw, cy + gh)] {
         if let Some(r) = onto_plane(beam.point(a, b), beam.d, beam.origin, n_s) {
             let l = t.inverse_transform_point(r);
             lo = [lo[0].min(l.x), lo[1].min(l.y)];

@@ -22,7 +22,7 @@
 //! Appl. Opt. 5, 1550 (1966); Self, Appl. Opt. 22, 658 (1983); Wen, Zhang &
 //! Xiao, Adv. Opt. Photon. 5, 83 (2013); NIST DLMF ch. 7 and 10; Born & Wolf,
 //! *Principles of Optics*, 7th ed. (1999). The modulator figures (F8, F9):
-//! Popoff et al., J. Phys. Photonics 6, 043001 (2024); Texas Instruments
+//! Popoff et al., J. Phys. Photonics 8, 023002 (2026); Texas Instruments
 //! DLPA083B (2019, rev. 2023); Harvey & Vernold, Appl. Opt. 37, 8158 (1998);
 //! Harvey et al., Proc. SPIE 8122, 812205 (2011); Swanson, MIT Lincoln Lab
 //! TR-854 (1989); Zhang, You & Chu, Light Sci. Appl. 3, e213 (2014); Persson
@@ -39,7 +39,7 @@ use oc_wave::{
     WaveReport,
 };
 use oc_core::modulator::{
-    dmd_projector_efficiency, facet_normal, on_axis_illumination, photopic_average, popoff_blazed_number, reflect,
+    blazed_number, dmd_projector_efficiency, facet_normal, on_axis_illumination, photopic_average, reflect,
     sinc as msinc, unit_cell_orders, DmdSpec, DmdState, LcosBeam, LcosSpec, ModulatorKind, OrderModel, Pattern,
     PatternGenerator, PhaseLut, SpatialModulator, TiltAxis, UnitCell,
 };
@@ -1317,12 +1317,13 @@ fn f8_dmd(dir: &Path, _fft: &mut Fft2) -> R<Value> {
     ds.array("b_lambda_nm", &lnm, &[lnm.len()], &["wavelength"], "nm", "wavelengths")?;
     ds.array("b_efficiency", &curves, &[devs.len(), lams.len()], &["device", "wavelength"], "fraction of reflected power", "dmd_projector_efficiency, matched illumination and projection cones, 64 directions, Harvey-renormalized")?;
 
-    // (c) Popoff's blazed number against incidence, and the brightest
-    // order's share of the reflected power from the order model.
+    // (c) Popoff et al.'s blazed number (2026, Eq. (5)) against incidence, and
+    // the brightest order's share of the reflected power from the order
+    // model, both for the device's +12° tilt.
     let lam_c = 0.633;
     let ac = linspace(-45.0, 45.0, 361);
-    let mu76: Vec<f64> = ac.iter().map(|&a| popoff_blazed_number(7.6, lam_c, 12.0, a)).collect();
-    let mu108: Vec<f64> = ac.iter().map(|&a| popoff_blazed_number(10.8, lam_c, 12.0, a)).collect();
+    let mu76: Vec<f64> = ac.iter().map(|&a| blazed_number(7.6, lam_c, 12.0, a)).collect();
+    let mu108: Vec<f64> = ac.iter().map(|&a| blazed_number(10.8, lam_c, 12.0, a)).collect();
     let acoarse = linspace(-45.0, 45.0, 37);
     let mut share = Vec::new();
     for pitch in [7.6, 10.8] {
@@ -1332,14 +1333,16 @@ fn f8_dmd(dir: &Path, _fft: &mut Fft2) -> R<Value> {
             share.push(tt.brightest().map(|o| o.efficiency).unwrap_or(0.0) / tt.total);
         }
     }
-    let published = [(7.6, 0.0, 0.06), (7.6, 25.0, 0.04), (10.8, 0.0, 0.97), (10.8, 25.0, 1.00)];
+    // The legend of Fig. 6 (2026) gives μ at θ_B = −12°; Eq. (5) is even
+    // under (θ_B, α) → (−θ_B, −α), so its α = 0° and 15° are 0° and −15° here.
+    let published = [(7.6, 0.0, 0.09), (7.6, -15.0, 0.71), (10.8, 0.0, 0.81), (10.8, -15.0, 0.06)];
     let pub_cmp: Vec<Value> = published
         .iter()
-        .map(|&(p, a, v)| json!({ "pitch_um": p, "alpha_deg": a, "published": v, "model": popoff_blazed_number(p, lam_c, 12.0, a) }))
+        .map(|&(p, a, v)| json!({ "pitch_um": p, "alpha_deg": a, "published": v, "model": blazed_number(p, lam_c, 12.0, a) }))
         .collect();
-    ds.array("c_alpha_deg", &ac, &[ac.len()], &["angle"], "deg", "incidence angle alpha' in the plane across the hinge")?;
-    ds.array("c_mu_7p6", &mu76, &[ac.len()], &["angle"], "1", "popoff_blazed_number, 7.6 um, 12 deg, 633 nm")?;
-    ds.array("c_mu_10p8", &mu108, &[ac.len()], &["angle"], "1", "popoff_blazed_number, 10.8 um, 12 deg, 633 nm")?;
+    ds.array("c_alpha_deg", &ac, &[ac.len()], &["angle"], "deg", "incidence angle alpha in the plane across the hinge")?;
+    ds.array("c_mu_7p6", &mu76, &[ac.len()], &["angle"], "1", "blazed_number (Popoff et al. 2026 Eq. (5)), 7.6 um, 12 deg, 633 nm")?;
+    ds.array("c_mu_10p8", &mu108, &[ac.len()], &["angle"], "1", "blazed_number (Popoff et al. 2026 Eq. (5)), 10.8 um, 12 deg, 633 nm")?;
     ds.array("c_alpha_coarse_deg", &acoarse, &[acoarse.len()], &["angle"], "deg", "angles of the order-model points")?;
     ds.array("c_brightest_share", &share, &[2, acoarse.len()], &["pitch (7.6, 10.8)", "angle"], "fraction of reflected power", "brightest order's Harvey-renormalized share, all-ON, fill 0.95")?;
 
@@ -1354,7 +1357,7 @@ fn f8_dmd(dir: &Path, _fft: &mut Fft2) -> R<Value> {
         "b_rows": rows,
         "b_5p4um_f2p4": { "ti_photopic": 0.80, "model_photopic": ph54, "delta_pp": 100.0 * (ph54 - 0.80) },
         "c_published_vs_model": pub_cmp,
-        "c_worst_abs_diff_published": fmax(published.iter().map(|&(p, a, v)| (popoff_blazed_number(p, lam_c, 12.0, a) - v).abs())),
+        "c_worst_abs_diff_published": fmax(published.iter().map(|&(p, a, v)| (blazed_number(p, lam_c, 12.0, a) - v).abs())),
     });
     eprintln!("  F8 errors: {errors}");
     let meta = json!({
@@ -1368,9 +1371,9 @@ fn f8_dmd(dir: &Path, _fft: &mut Fft2) -> R<Value> {
         },
         "method": { "orders": "oc_core::modulator::unit_cell_orders (closed-form Fourier series of the unit cell, Harvey-renormalized)",
             "efficiency": "dmd_projector_efficiency (TI DLPA083B 4.2 method), photopic_average (CIE 1931 V(lambda))",
-            "blazed_number": "popoff_blazed_number (Popoff et al. 2024 Eq. 2)" },
-        "reference": "TI DLPA083B Table 6-1 (vendor simulation); Popoff et al. 2024 Fig. 5; Harvey & Vernold 1998 order grid",
-        "sources": ["Popoff 2024", "TI DLPA083B", "Harvey 1998", "Harvey 2011"],
+            "blazed_number": "blazed_number (Popoff et al. 2026 Eq. (5); the 2024 Eq. (2) was retracted)" },
+        "reference": "TI DLPA083B Table 6-1 (vendor simulation); Popoff et al. 2026 Fig. 6; Harvey & Vernold 1998 order grid",
+        "sources": ["Popoff 2026", "TI DLPA083B", "Harvey 1998", "Harvey 2011"],
         "warnings": [],
         "errors": errors,
     });

@@ -219,10 +219,13 @@ pub fn asm_zoom(
             }
         }
     }
-    // The centred output coordinates: the transform is about the frame
-    // origin, and `out`'s samples sit at out.coord(axis, m).
+    // The output coordinates: the transform was taken about the input
+    // window's centre `c` (`ifftshift2` puts it at the origin), so the
+    // plane-wave sum is evaluated at `x − c`; `out`'s samples sit at
+    // out.coord(axis, m) in the frame.
     let (mx, my) = (out.n[0], out.n[1]);
-    let (x0, y0) = (out.coord(0, 0), out.coord(1, 0));
+    let c = u.grid.center_mm;
+    let (x0, y0) = (out.coord(0, 0) - c[0], out.coord(1, 0) - c[1]);
     let (dx, dy) = (out.pitch_mm[0], out.pitch_mm[1]);
     // Along fx: p[1] rows of p[0] frequencies → p[1] × mx.
     let mut rows = vec![Cx::ZERO; p[1] * mx];

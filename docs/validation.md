@@ -302,8 +302,10 @@ two kinds of published numbers, and they are not the same kind of evidence:
   simulation, by the method it describes. Agreeing with it (six of seven rows
   within 2 percentage points, one 4.4 pp off) shows the canvas computes TI's
   model; it is not a measurement of a device.
-- **Popoff et al. (2024)** give a closed-form blazed number and its values; the
-  canvas reproduces the formula's numbers and the order structure it predicts.
+- **Popoff et al. (2026)** give a closed-form blazed number and its values
+  (their 2024 text was retracted for that equation); the canvas reproduces the
+  formula's numbers, derives the same number from its own facet kinematics,
+  and reproduces the order structure it predicts.
 - **Goorden et al. (2014)** report a computed superpixel fidelity, also a
   computation; the superpixel method is not implemented yet.
 

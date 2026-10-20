@@ -14,9 +14,10 @@ put on an optical table every day:
 
 - the **digital micromirror device** (DMD), an array of mirrors a few
   microns across, which acts as a 2D blazed grating, so where its light goes
-  depends on the wavelength (Popoff et al., *J. Phys. Photonics* 6, 043001
-  (2024), doi:10.1088/2515-7647/ad6dc0; Texas Instruments application note
-  DLPA083B);
+  depends on the wavelength (Popoff et al., *J. Phys. Photonics* 8, 023002
+  (2026), doi:10.1088/2515-7647/ae60d5, first published as 6, 043001 (2024)
+  and since retracted for its blazed-number equation; Texas Instruments
+  application note DLPA083B);
 - the **phase-only LCoS spatial light modulator** (SLM), a pixelated phase
   screen whose purpose is diffraction (Zhang, You & Chu, *Light Sci. Appl.* 3,
   e213 (2014), doi:10.1038/lsa.2014.94).

@@ -62,7 +62,13 @@ pub fn asm_tilted(
     let src = u.frame;
     let ax = |v: Vec3| src.quat().inverse() * target.rotate(v);
     let (tx, ty, tz) = (ax(Vec3::X), ax(Vec3::Y), ax(Vec3::Z));
-    let d = src.quat().inverse() * (target.pos - src.pos);
+    // The source spectrum was taken about the source window's centre `c`
+    // (`ifftshift2`), while the carrier is referred to the frame origin: the
+    // plane waves about `c` carry the carrier's phase there, and the target
+    // origin lies `Δo − c` from `c`.
+    let c_win = Vec3::new(u.grid.center_mm[0], u.grid.center_mm[1], 0.0);
+    let d = src.quat().inverse() * (target.pos - src.pos) - c_win;
+    let at_c = Cx::expi(2.0 * PI * (u0 * c_win.x + v0 * c_win.y));
     // A source-frame frequency from a target-frame one: k = u′ tx + v′ ty + w′ tz.
     let to_src = |up: f64, vp: f64, wp: f64| tx * up + ty * vp + tz * wp;
     // The bilinear spectrum, at absolute source frequency (fx, fy).
@@ -105,7 +111,7 @@ pub fn asm_tilted(
             let (dvx, dvy) = (tx.y - tz.y * up / wp, ty.y - tz.y * vp / wp);
             let jac = (dux * dvy - duy * dvx).abs();
             let phase = 2.0 * PI * (k.x * d.x + k.y * d.y + k.z * d.z);
-            spec[ky * mx + kx] = read(k.x, k.y) * Cx::expi(phase) * jac;
+            spec[ky * mx + kx] = read(k.x, k.y) * at_c * Cx::expi(phase) * jac;
         }
     }
     // Evaluate on the output points by chirp-z, one axis at a time. The

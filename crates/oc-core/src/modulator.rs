@@ -20,8 +20,9 @@
 //! doi:10.1364/AO.37.008158), and their strengths follow one mirror's
 //! diffraction envelope, centred on the direction the tilted mirror reflects
 //! specularly (S. M. Popoff et al., "A practical guide to digital
-//! micro-mirror devices (DMDs) for wavefront shaping," *J. Phys. Photonics* 6,
-//! 043001 (2024), doi:10.1088/2515-7647/ad6dc0, §2 and App. A).
+//! micro-mirror devices (DMDs) for wavefront shaping," *J. Phys. Photonics* 8,
+//! 023002 (2026), doi:10.1088/2515-7647/ae60d5, §2 and App. A; the 2024
+//! version, 6, 043001, was retracted for its blazed-number equation).
 //!
 //! In the thin-element approximation used here, a mirror reflects the
 //! incident wave as the tilted plane would, restricted to the mirror's outline
@@ -47,7 +48,7 @@
 //! `A = ââᵀ + cos θ ŵŵᵀ` (`â` the hinge, `ŵ` the in-plane direction across it).
 //!
 //! Not modelled: one mirror shading its neighbour at oblique incidence, the
-//! mirror's edges and hinge, its curvature (Popoff et al. 2024, §3), and
+//! mirror's edges and hinge, its curvature (Popoff et al. 2026, §3), and
 //! anything rigorous electromagnetics would add for a pitch of a few
 //! wavelengths (D. A. Pommet et al., *J. Opt. Soc. Am. A* 11, 1827 (1994):
 //! scalar theory's error exceeds ±5% below about 14λ).
@@ -595,17 +596,29 @@ pub fn sinc(x: f64) -> f64 {
     }
 }
 
-/// Popoff et al.'s blazed number `μ` for a diagonal-tilt DMD lit in the plane
-/// across its hinge (their Eq. (2) and §2.2, *J. Phys. Photonics* 6, 043001
-/// (2024)): with the angles projected onto the pixel axes,
-/// `θ_B = atan(tan θ_DMD / √2)` and `α = atan(tan α′ / √2)`,
-/// `μ = |(4 (d/λ) sin θ_B cos(θ_B − α)) mod 2 − 1|`. One means one diffraction
-/// order collects the light; zero, the worst case, four orders share it.
-pub fn popoff_blazed_number(pitch_um: f64, lambda_um: f64, tilt_deg: f64, incidence_deg: f64) -> f64 {
-    let s2 = 2f64.sqrt();
-    let tb = (tilt_deg.to_radians().tan() / s2).atan();
-    let a = (incidence_deg.to_radians().tan() / s2).atan();
-    let x = 4.0 * pitch_um / lambda_um * tb.sin() * (tb - a).cos();
+/// The blazed number `μ` of a diagonal-hinge DMD lit in the plane across its
+/// hinge (S. M. Popoff et al., *J. Phys. Photonics* 8, 023002 (2026),
+/// doi:10.1088/2515-7647/ae60d5, Eq. (5)): `θ_B` the mirror tilt and `α` the
+/// incidence angle in that plane, both from the array normal, `d` the pitch,
+///
+/// ```text
+/// μ = |(4 d / (√2 λ)) · sin θ_B · cos(θ_B − α)  mod 2  −  1|.
+/// ```
+///
+/// The envelope's peak (the facets' specular direction) lies
+/// `2 sin θ_B cos(θ_B − α)` from the incident direction in direction cosines
+/// (their Eq. (4)), and the orders along the diagonal are `√2 λ/d` apart (the
+/// lattice's period along it is `d/√2`): `μ` is one when the peak sits on an
+/// order, zero when it lies halfway, where four orders share the light. The
+/// 2024 version of this formula (*J. Phys. Photonics* 6, 043001, Eq. (2)),
+/// which projected the angles by `tan/√2` and kept the pitch `d`, was
+/// retracted (*J. Phys. Photonics* 7, 049701 (2025),
+/// doi:10.1088/2515-7647/ae0605); `tests/dmd.rs` holds this one against the
+/// 2026 paper's Fig. 6 and against this module's own facet kinematics.
+pub fn blazed_number(pitch_um: f64, lambda_um: f64, tilt_deg: f64, incidence_deg: f64) -> f64 {
+    let tb = tilt_deg.to_radians();
+    let a = incidence_deg.to_radians();
+    let x = 4.0 * pitch_um / (std::f64::consts::SQRT_2 * lambda_um) * tb.sin() * (tb - a).cos();
     (x.rem_euclid(2.0) - 1.0).abs()
 }
 

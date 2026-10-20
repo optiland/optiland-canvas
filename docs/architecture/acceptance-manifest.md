@@ -276,7 +276,7 @@ DOI where one exists. The master list is the Sources section of
 | C44 | chirp-z zoom against the direct DFT; the Airy zero sampled exactly | W2 ✅ | `oc-wave/tests/czt.rs` |
 | C45 | the Fraunhofer PSF against Optiland's `ScalarFFTPSF` and `MMDFTPSF` (oracle, not validation) | W2 ✅ | `oc-py/tests/test_wave_oracles.py` |
 | C46 | DMD orders on the direction-cosine grid; the sampled far field against the analytic envelope; the factorized against the sampled; unit-cell power | W3a ✅ | `oc-wave/tests/dmd.rs` |
-| C47 | the blazed number against Popoff et al. 2024, Fig. 5 | W3a ✅ | `dmd.rs` |
+| C47 | the blazed number against Popoff et al. 2026, Eq. (5) and the legend of Fig. 6, and against the kernel's own facet kinematics (the 2024 paper's Eq. (2) was retracted) | W3a ✅; the expert review, E2 ✅ | `dmd.rs` |
 | C48 | average photopic diffraction efficiency against TI DLPA083B Table 6-1 (a vendor simulation; six rows within ±3 pp, the 5.4 µm f/2.4 row +4.4 pp, held to ±5 pp and named) | W3a ✅ | `dmd.rs` |
 | C49 | N-level phase quantization, dead space and wavelength detuning | W3b ✅ | `oc-wave/tests/slm.rs` |
 | C50 | the LCoS director split; fringing against quadrature | W3b ✅ | `slm.rs` (fringing against direct quadrature in Rust) |
@@ -294,6 +294,7 @@ DOI where one exists. The master list is the Sources section of
 | C61 | polarization on the wave path, two components per sample: Malus's law and crossed sheets' extinction, a retarder between crossed polarizers and circular light, tilted crossed polarizers against the f64 tracer, a half-wave plate in a Mach–Zehnder arm (Fresnel–Arago, the fringes restored by an analyzer), an LCoS's two beams added in power, coatings in crossed planes; the chain found through crossed polarizers | the wave-optics review, I5 ✅ | `oc-wave/src/path.rs`, `oc-wave/tests/path.rs`; `oc-trace/src/sequence3.rs` (unpolarized extraction) |
 | C60 | sampling where the beam focuses: the paraxial step's exact error against the propagators' own difference, `Auto` by the smaller of two known errors, a pinhole at a lens's focus against exp(−2), a 10× expander against the ABCD law | the wave-optics review, I4 ✅ | `oc-wave/tests/propagate.rs`, `oc-wave/tests/path.rs` |
 | C64 | the ledger in two groups, physical (never negative) and numerical (term by term), checked on every result (`WaveLedger::check`, the report's `inconsistencies`, asserted empty by every path test); an arm's readout losses booked in the arm; one junction rule for the arms a splitter, a grating or an LCoS sends apart | the expert review, E1 ✅ | `oc-wave/src/report.rs` tests, `oc-wave/tests/path.rs` |
+| C65 | the demonstrated defects of the expert review: a grating order's momentum and phase (R01); both orders of a grating booked once (R02); windows off the chief ray carried where they are by the zoomed and the rotated spectrum, a traced face's ray grid, a plate's probe and a modulator's footprint (R03); the readout padded against the field's periodic copies; the analytic carrier and a rigid motion of the scene as gauges (R06) | the expert review, E2 ✅ | `oc-wave/tests/path.rs`, `oc-wave/tests/propagate.rs`, `oc-wave/tests/dmd.rs` |
 
 ## Per-PR checklist
 

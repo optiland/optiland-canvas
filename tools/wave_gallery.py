@@ -66,7 +66,7 @@ SOURCES = {
     "Wen 2013": "J. Wen, Y. Zhang, M. Xiao, Adv. Opt. Photon. 5, 83–130 (2013).",
     "DLMF": "NIST Digital Library of Mathematical Functions, ch. 7 and 10.",
     "Born & Wolf": "M. Born, E. Wolf, Principles of Optics, 7th ed., CUP (1999).",
-    "Popoff 2024": "S. M. Popoff et al., J. Phys. Photonics 6, 043001 (2024), doi:10.1088/2515-7647/ad6dc0.",
+    "Popoff 2026": "S. M. Popoff et al., J. Phys. Photonics 8, 023002 (2026), doi:10.1088/2515-7647/ae60d5 (the 2024 version, 6, 043001, was retracted: 7, 049701 (2025), doi:10.1088/2515-7647/ae0605).",
     "TI DLPA083B": "Texas Instruments, DMD Optical Efficiency for Visible Wavelengths, application note DLPA083B (2019, rev. 2023).",
     "Harvey 1998": "J. E. Harvey, C. L. Vernold, Appl. Opt. 37, 8158 (1998).",
     "Harvey 2011": "J. E. Harvey et al., Proc. SPIE 8122, 812205 (2011).",
@@ -1079,7 +1079,7 @@ def fig8(D: Data, outdir: Path) -> dict:
     axc.plot(aco, sh[1], **sim_style(ORANGE, "s", ms=3.0), label="brightest-order share, 10.8 µm", zorder=3)
     pubs = e["c_published_vs_model"]
     axc.plot([q["alpha_deg"] for q in pubs], [q["published"] for q in pubs], ls="none", marker="D", ms=5.5, mfc="none", mec=INK, mew=1.0,
-             label="Popoff et al. 2024, Fig. 5", zorder=4)
+             label="Popoff et al. 2026, Fig. 6", zorder=4)
     axc.set_xlim(-45, 45)
     axc.set_ylim(-0.02, 1.08)
     axc.set_xticks([-45, -30, -15, 0, 15, 30, 45])
@@ -1131,8 +1131,9 @@ def fig8(D: Data, outdir: Path) -> dict:
         f"the normal (+); the lattice is offset from it by the incident direction (×, the flat-array specular order). At this wavelength the device "
         f"is far from blazed: the brightest order ({e['a_brightest']['m']},{e['a_brightest']['n']}) carries {100*e['a_brightest']['share']:.0f}% and "
         f"the f/2.4 projection cone (orange) collects {100*e['a_share_in_projection_cone']:.1f}% of this single plane wave's light. "
-        f"(b) Popoff's blazed number μ (Eq. 2) against incidence across the hinge, "
-        f"633 nm, 12° tilt (lines), with the four values read from Popoff et al. 2024 Fig. 5 (diamonds): {pubtxt}; worst |Δ| "
+        f"(b) The blazed number μ of Popoff et al. 2026 (Eq. (5); the 2024 Eq. (2) was retracted) against incidence across the hinge, "
+        f"633 nm, 12° tilt (lines), with the four values read from the legend of their Fig. 6 (diamonds; given there for θ_B = −12°, "
+        f"so their α = 15° is −15° at this tilt): {pubtxt}; worst |Δ| "
         f"{e['c_worst_abs_diff_published']:.3f}. Squares: the brightest order's share of the reflected power from the order model (fill 0.95), "
         f"an independent check that tracks μ: near 0.9 where μ ≈ 1, near 0.2 where μ ≈ 0. "
         f"(c) Collected share of the reflected power against wavelength for five TI devices (illumination and projection cones matched, 64 plane "
@@ -1141,14 +1142,14 @@ def fig8(D: Data, outdir: Path) -> dict:
         f"agreement shows the same model, not the same device. Δ (model − TI, percentage points): {deltas}; the 5.4 µm device at f/2.4 is "
         f"{e['b_5p4um_f2p4']['delta_pp']:+.1f} pp, the one row outside ±3 pp. Scalar thin-element model; at 633 nm a 7.56 µm pitch is "
         f"{7.56/0.633:.1f}λ, below the 14λ at which the crate's ScalarLimit validity flag warns that scalar theory may be off by more than ±5%. "
-        f"Sources: [Popoff 2024], [TI DLPA083B], [Harvey 1998], [Harvey 2011]."
+        f"Sources: [Popoff 2026], [TI DLPA083B], [Harvey 1998], [Harvey 2011]."
     )
     return {
         "id": "F8",
         "title": "The DMD as a blazed grating, and its projector efficiency",
         **files,
         "caption": caption,
-        "sources": [SOURCES[k] for k in ("Popoff 2024", "TI DLPA083B", "Harvey 1998", "Harvey 2011")],
+        "sources": [SOURCES[k] for k in ("Popoff 2026", "TI DLPA083B", "Harvey 1998", "Harvey 2011")],
         "datasets": ["f8_dmd.json"],
         "numbers": e,
     }

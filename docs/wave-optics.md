@@ -224,7 +224,7 @@ incoming ray to the plane across the outgoing one:
 |---|---|---|
 | flat mirror | mirror image, amplitude `−√R`; what it does not reflect is absorbed | yes, in scalar optics (image theory [1]) |
 | beam-splitter arm (`ExplicitRt`) | `−√R` reflected from its front, `+√R` from its back, `√T` transmitted, on the arm the chain took; the other arm's share is booked as `other_arm`, the rest as absorbed | as the element's R and T; the signs make it unitary (below) |
-| grating | its order's momentum along the grooves, amplitude `√η`; the other orders are booked as `untracked_orders` | thin element |
+| grating | its order carries the grating's own phase, `exp(i m K·(r − r_g))` with `K = 2π/d` across the grooves from the surface's origin: with the chain along the tracer's order direction that is the order's momentum, and what is left, `exp(i m K·(p − r_g))`, moves with the grating; amplitude `√η`; the other orders are booked as `untracked_orders`, once when the order and the zero order both reach the detector | thin element |
 | ideal thin lens | `exp(−ik\|r − c\|²/2f)` about the lens's centre | thin element |
 | a flat element's outline | the element acts inside its own shape, the edge weighted by exact cell coverage; light outside passes it by, on the chain where the chain goes straight on (a transmitted arm, a thin lens), off it as `passed_by` where the chain turns (a mirror, a grating's order) | thin element |
 | aperture | as the tracer has it: light passes inside the opening, is stopped between the opening and the outer extent, and passes beyond the outer extent (an aperture with none is unbounded); each edge weighted by exact cell coverage, of the shape itself square to the beam and of its projection along the beam otherwise | thin element |
@@ -233,7 +233,7 @@ incoming ray to the plane across the outgoing one:
 | plane-parallel plate (a body entered and left by two flat, parallel faces, bare or with a residual AR) | one step: the closed-form slab, round trips included, on each plane wave of the field, then the angular spectrum across the planes (below) | exact for a plate of infinite extent, s or p; its rim laid on the field |
 | flat coated surface (`Coating`: a coated splitter, a dichroic) | each plane wave times the coating's complex `r` or `t` at its own angle, from the transfer matrix, then handed over like any flat element; a plate-backed coating's plate in series, without round trips, as the coating declares it incoherent | exact for the stack, s or p |
 | detector, `Readout::Projected` | power per pixel: each field cell's `\|U\|²ΔA` binned into the pixel its projection lands in, in up to 16 × 16 sub-cells a field cell (an eighth of a pixel while a cell spans at most two pixels) | power conserved to round-off |
-| detector, `Readout::Diffracted` | the last free-space step taken straight onto the detector by the zoomed angular spectrum (`asm_zoom`), at `s × s` points a pixel: a focal spot far smaller than the field's own samples is resolved, with no paraxial step | exact scalar propagation; the field repeats a window away when unpadded |
+| detector, `Readout::Diffracted` | the last free-space step taken straight onto the detector by the zoomed angular spectrum (`asm_zoom`), at `s × s` points a pixel: a focal spot far smaller than the field's own samples is resolved, with no paraxial step | exact scalar propagation; padded so that the field's periodic copies, a padded window apart, stay clear of the face (`Periodic` warns where 4096 samples a side cannot) |
 
 When the beam leaves an element at another angle than it came, its
 cross-section changes by `cos θ_out / cos θ_in`; the handover's amplitude
@@ -374,7 +374,12 @@ radii to either side of its centroid, would fill less than a quarter of the
 window, or on a window already narrowed more than four fifths of it, the
 field is carried onto a window fitted to it, centred on its predicted
 centroid, with the same sample count and never wider than the declared
-window. The zoomed angular spectrum carries it, exactly, padded enough that
+window. A window so centred lies off the chief ray, and every step takes
+it where it is: the zoomed and the rotated spectrum sum their plane waves
+about the window's centre, where the transform is taken; a traced face's
+ray grid and a plate's probe span the window wherever it lies; a
+modulator's footprint is the window's own corners (the off-centre tests
+below). The zoomed angular spectrum carries it, exactly, padded enough that
 its plane waves' walk over the step stays inside; where that walk exceeds the
 window and the step is longer than the window's critical distance (a narrow
 window widening again, typically), the zoomed Fresnel transform, the Fresnel
@@ -469,7 +474,9 @@ light.
 detector, the axial ray reaches it by several chains. Each carries the same
 launched field along its own arm, and the arms' fields are added on the
 detector's own grid, `s × s` points a pixel (two for `Readout::Projected`),
-before the power is formed. That is the coherent sum of paths the
+before the power is formed; each arm is carried onto the face by a spectrum
+padded so that the field's periodic copies stay clear of it. That is the
+coherent sum of paths the
 scattering-network formulation asks for (`T = C(I − SP)⁻¹SB`, here a network
 without feedback, so a finite sum of paths). It needs three things the single
 chain did not:
@@ -602,6 +609,10 @@ These are acceptance case C53, in `crates/oc-wave/tests/path.rs`.
 | `crossed_polarizers_before_a_lens_leave_it_a_dark_field_to_carry` | the chain is geometry: behind crossed polarizers a singlet carries an all-zero field, the ledger closed | 1e-12 | detected 1.7e-33 |
 | `a_pinhole_at_a_lens_s_focus_passes_what_the_focused_gaussian_puts_through_it` | a waist on a lens of focal length f has radius λf/(πw₀) at the focal plane (bundle M30, [13]): a pinhole of that radius stops `exp(−2)` | 1e-5 | 5.7e-7 |
 | `a_ten_times_beam_expander_widens_the_beam_as_the_abcd_law_says` | the radius at the second lens by the Gaussian ABCD law [13], through a 50 µm focus | 1e-5 | 4.2e-7 |
+| `a_grating_order_leaves_with_its_momentum_and_its_phase` | the grating equation [1] (R01 of the expert review): a 20 l/mm grating met at 10°, η = 0.65; the order's field stays centred on the chief ray turned to the order, lands where the traced chief ray does, and takes the phase `e^{−i2πΔ/d}` when the grating moves Δ across its grooves | centroid 1e-4 mm; landing 6e-3 mm; phase 1e-8 | 2.3e-14 mm; 5.2e-4 mm; 1.2e-12 |
+| `both_orders_of_a_grating_book_what_neither_carries_once` | the order and the zero order on one detector (R02): `untracked_orders = 1 − η − η₀` once, nothing left to the remainder | 1e-6; 2e-3 | 0.250; detected 0.750, remainder −1.1e-7 |
+| `a_window_fitted_off_the_chief_ray_carries_the_field_where_it_is` | a half-blocked 0.1 mm beam whose fitted window lies 55 µm off the chief ray (R03): in free space its centroid on the detector against a fixed window's and against the second-moment law [25]; through a singlet, the power and centroid against a fixed window's | 2e-4 mm; 1e-2 mm (the detector holds 96.7% of the light); 2e-3 mm; 2e-2 (the windows hold different shares of the edge's light) | 9.9e-5 mm; 4.9e-3 mm; 3.1e-4 mm; 9.9e-3 |
+| `a_rigidly_moved_scene_reads_the_same_detector` | gauge (R06): a folded path, a Mach–Zehnder and two Michelsons rotated 0.7 rad about (1, 2, 3) and moved, against themselves | 1e-9; 1e-5 of the launched (k·OPL round-off, 1e-7 rad) | 2.3e-12; 2.2e-10, 1.0e-7, 1.2e-6 |
 
 The transfer's own tests (acceptance case C62, `crates/oc-wave/src/transfer.rs`):
 
@@ -632,6 +643,10 @@ The propagation tests of W8 (acceptance case C57, `crates/oc-wave/tests/propagat
 | `the_zoomed_angular_spectrum_lands_on_the_angular_spectrum_on_its_own_grid` | the FFT angular spectrum on the same points [1] | 1e-10 | 2.7e-14 of peak |
 | `an_off_axis_window_holds_the_field_the_large_window_does` | a beam walked 0.6 mm sideways, against the FFT angular spectrum on a window four times as wide [7] | 1e-6 | 1.9e-12 of peak |
 | `a_tilted_plane_holds_the_field_its_plane_waves_sum_to` | a plane tilted 20°, 2 mm along, against the plane waves of the same spectrum summed at its points [6]; with no tilt, against `asm_zoom` | 2e-3; 1e-10 | 5.9e-4 (the bilinear reading of the spectrum, padded 4×); 8.3e-14 |
+| `an_off_centre_input_window_propagates_where_its_field_is` | a window centred 0.2 mm off the frame origin, with and without a carrier (R03 of the expert review): the zoomed spectrum against the FFT angular spectrum on a wide centred window [1], onto windows centred anywhere; the rotation onto a shifted parallel plane against the zoom | 1e-6; 1e-9 | 2.0e-12; 8.3e-13 |
+| `a_translated_frame_and_a_translated_grid_hold_the_same_field` | gauge: one field encoded as a grid at `c` or as a frame moved to `c`, by the zoom and by the rotation onto one plane | 1e-12 | 3.2e-15; 5.2e-16 |
+| `the_zoomed_fresnel_and_fraunhofer_transforms_take_the_grid_where_it_is` | the chirp-z Fresnel transform of an off-centre window against the zoomed angular spectrum (padded 8×, for its periodic copies); a shifted field's far field against the centred one's times the shift phase `e^{−i2πf·c}` [1] | 1e-4; 1e-10 | 4.2e-6; 8.3e-16 |
+| `a_baked_carrier_propagates_like_an_analytic_one` | gauge (R06): the carrier analytic or folded into the samples, through `Auto` and through the zoom | 1e-10 | 8.2e-13; 2.6e-13 |
 
 The DMD case shows what the ledger is for. Of the launched power, 72.1%
 reaches the detector and 11.7% falls in the dead space between mirrors
@@ -663,7 +678,8 @@ Every call returns a `WaveReport`:
 
 - the step taken, with its method, distance and sampling regime;
 - `warnings`: `BandLimited`, `WrapAround`, `OutsideRegime`, `Paraxial`,
-  `Undersampled`, and on a wave path `TiltProjection`;
+  `Undersampled`, and on a wave path `TiltProjection` and `Periodic` (a
+  face wider than the period of the padded spectrum read onto it);
 - `validity` flags;
 - named approximations;
 - a `WaveLedger`, where every step books what it changed to a cause, in two

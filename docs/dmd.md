@@ -186,8 +186,8 @@ C46–C48.
 | Test | Held against | Gate | Measured |
 |---|---|---|---|
 | `dmd_orders_sit_on_the_harvey_vernold_grid` | `t_in + λ(m, n)/p` [3]; Harvey normalization sums to the reflected power | 1e-12 | exact; 634 orders propagate at 532 nm, 7.56 µm |
-| `the_blazed_number_matches_popoff_figure_5` | [1] Eq. (2), Fig. 5: 0.06, 0.04, 0.97, 1.00 | ±0.01 | 0.059, 0.036, 0.969, 0.998 |
-| `a_blazed_dmd_concentrates_one_order_and_an_anti_blazed_one_splits_four` | [1] §2: one order dominates at μ ≈ 1; several share at μ ≈ 0 | shares | 10.8 µm: 85% in one order; 7.6 µm: 26%, 18%, 18%, 14% |
+| `the_blazed_number_matches_popoff_figure_6_and_the_facet_kinematics` | [1] Eq. (5) at θ_B = −12°, the values in the legend of Fig. 6: 0.09, 0.71 (7.6 µm at 0° and 15°), 0.81, 0.06 (10.8 µm); the same number from `facet_normal`, `reflect` and the lattice's `√2λ/d` step along the diagonal, over α = −45° to 45° | ±0.01; 1e-12 | 0.094, 0.709, 0.814, 0.060; 5.3e-15 |
+| `a_blazed_dmd_concentrates_one_order_and_an_anti_blazed_one_splits_four` | [1] §2: one order dominates where μ is near 1 (10.8 µm, μ = 0.81 at normal incidence); several share where it is near 0 (7.6 µm, μ = 0.09) | shares | 10.8 µm: 85% in one order; 7.6 µm: 26%, 18%, 18%, 14% |
 | `a_flat_state_dmd_puts_the_fill_factor_squared_in_the_zero_order` | the rectangular-grating Fourier series: `η₀₀ = ρ⁴`, `Σ = ρ²` | 1e-12 | exact |
 | `the_factorized_far_field_lands_on_the_closed_form_orders` | `\|Û\|/(N²p²) = \|c_mn\|` | 1e-12 | 8.0e-17 |
 | `the_sampled_dmd_far_field_converges_on_the_factorized_one` | the same model computed two ways | log-log slope < −1.5; 2e-3 at 32 samples per mirror | slope −1.87; 8.4e-4 |
@@ -220,7 +220,7 @@ a real device: no measured DMD data is in the suite yet.
 
 Bibliographic data checked 2026-10-19.
 
-1. S. M. Popoff, R. Gutiérrez-Cuevas, Y. Bromberg, M. W. Matthès, "A practical guide to digital micro-mirror devices (DMDs) for wavefront shaping," *J. Phys. Photonics* 6, 043001 (2024), doi:10.1088/2515-7647/ad6dc0 (arXiv:2311.17496). Eqs. (1)–(2), Fig. 5 and §2 read from the published text.
+1. S. M. Popoff, L. Malosse, R. Gutiérrez-Cuevas, Y. Bromberg, J. Commère, M. Glanc, R. Galicher, M. W. Matthès, "A practical guide to digital micro-mirror devices (DMDs) for wavefront shaping," *J. Phys. Photonics* 8, 023002 (2026), doi:10.1088/2515-7647/ae60d5. Eqs. (1)–(5), Figs. 3 and 6, §2 and Apps. A–B read from the published text (2026-10-20). The 2024 version, *J. Phys. Photonics* 6, 043001, doi:10.1088/2515-7647/ad6dc0 (arXiv:2311.17496), was retracted (*J. Phys. Photonics* 7, 049701 (2025), doi:10.1088/2515-7647/ae0605) for its blazed number, Eq. (2), on which its Figs. 4(a) and 5–9 rested; nothing here is held against the 2024 text any more.
 2. Texas Instruments, *DMD Optical Efficiency for Visible Wavelengths*, application note DLPA083B (June 2019, rev. April 2023). Read in full: Tables 2-1 and 6-1, §§4.2–4.3, Eqs. 1–3, Figs. 4-1 to 4-8.
 3. J. E. Harvey, C. L. Vernold, "Description of diffraction grating behavior in direction cosine space," *Appl. Opt.* 37(34), 8158–8160 (1998), doi:10.1364/AO.37.008158.
 4. J. E. Harvey et al., "Linear systems formulation of non-paraxial scalar diffraction theory," *Proc. SPIE* 8122, 812205 (2011), doi:10.1117/12.894562.

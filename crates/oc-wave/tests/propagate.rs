@@ -336,3 +336,205 @@ fn a_tilted_plane_holds_the_field_its_plane_waves_sum_to() {
     eprintln!("measured: tilted plane (20°), spectrum rotation against the direct plane-wave sum, worst / peak = {:.3e}", worst / peak);
     assert!(worst / peak < 2e-3, "{}", worst / peak);
 }
+
+#[test]
+fn an_off_centre_input_window_propagates_where_its_field_is() {
+    // R03 of the expert review. The FFT takes a window's spectrum about the
+    // window's centre `c`, so the plane-wave sum must be evaluated at `x − c`
+    // (`asm_zoom`), and a target origin lies `Δo − c` from that centre
+    // (`asm_tilted`). A window centred off the frame origin, as a re-grid
+    // makes, must carry its field where it is: against the FFT angular
+    // spectrum on a wide, centred window holding the same field [1], with
+    // and without a carrier, onto output windows centred anywhere; and the
+    // spectrum rotation onto a shifted parallel plane against the zoomed
+    // angular spectrum, to round-off.
+    use oc_core::{Isometry3, Vec3};
+    use oc_wave::beams::GaussianBeam;
+    use oc_wave::{asm_tilted, asm_zoom, propagate, AsmOptions, Cx, Fft2, Grid2, Propagator};
+    let pitch = 1.0 / 128.0;
+    let c = [0.2, -0.1];
+    let small = Grid2::new([128, 128], [pitch, pitch], c).unwrap();
+    let big = Grid2::square(512, pitch).unwrap();
+    let mut fft = Fft2::new();
+    let z = 20.0;
+    for carrier in [[0.0, 0.0], [0.02, -0.01]] {
+        let mut a = GaussianBeam { w0_mm: 0.08, lambda_um: 0.6328, n: 1.0, power: 1.0, center: c }.sample(small, 0.0).unwrap();
+        let mut b = GaussianBeam { w0_mm: 0.08, lambda_um: 0.6328, n: 1.0, power: 1.0, center: c }.sample(big, 0.0).unwrap();
+        a.carrier = carrier;
+        b.carrier = carrier;
+        let (wide, _) = propagate(&b, z, Propagator::AngularSpectrum(AsmOptions { band_limit: false, pad: 2 }), &mut fft).unwrap();
+        let peak = wide.data.iter().map(|q| q.abs()).fold(0.0, f64::max);
+        // Forty samples about where the beam lands (it walks z·α), on the
+        // wide grid's own points, and a window centred elsewhere.
+        for shift in [[c[0] + z * carrier[0], c[1] + z * carrier[1]], [0.0, 0.0]] {
+            let win = Grid2::new([40, 40], [pitch, pitch], [(shift[0] / pitch).round() * pitch, (shift[1] / pitch).round() * pitch]).unwrap();
+            let (zoom, _) = asm_zoom(&a, z, win, 2, &mut fft).unwrap();
+            let mut worst: f64 = 0.0;
+            for j in 0..40 {
+                for i in 0..40 {
+                    let (x, y) = win.xy(i, j);
+                    let (bi, bj) = ((x / pitch).round() as isize + 256, (y / pitch).round() as isize + 256);
+                    worst = worst.max((zoom.at(i, j) - wide.at(bi as usize, bj as usize)).abs());
+                }
+            }
+            measured(&format!("off-centre input window, carrier {carrier:?}, output about {shift:?}: zoomed against the wide FFT angular spectrum, worst / peak"), worst / peak);
+            assert!(worst / peak < 1e-6, "{}", worst / peak);
+        }
+        // The spectrum rotation onto a parallel plane shifted sideways (to
+        // where the beam lands, and a little beside it) is the same
+        // plane-wave sum, so it must agree with the zoomed angular spectrum
+        // to round-off, input centre or not.
+        let land = [c[0] + z * carrier[0] + 0.05, c[1] + z * carrier[1]];
+        let out = Grid2::new([40, 40], [0.01, 0.01], [0.0, 0.0]).unwrap();
+        let shifted = Isometry3::from_pos(Vec3::new(land[0], land[1], z));
+        let (t0, _) = asm_tilted(&a, shifted, out, 4, &mut fft).unwrap();
+        let win = Grid2::new([40, 40], [0.01, 0.01], land).unwrap();
+        let (z0, _) = asm_zoom(&a, z, win, 4, &mut fft).unwrap();
+        // asm_tilted leaves no carrier; put the zoom's back on its samples.
+        let k = z0.k_mm();
+        let (mut worst0, mut peak0): (f64, f64) = (0.0, 0.0);
+        for j in 0..40 {
+            for i in 0..40 {
+                let (x, y) = win.xy(i, j);
+                let full = z0.at(i, j) * Cx::expi(k * (z0.carrier[0] * x + z0.carrier[1] * y));
+                peak0 = peak0.max(full.abs());
+                worst0 = worst0.max((t0.at(i, j) - full).abs());
+            }
+        }
+        measured(&format!("off-centre input window, carrier {carrier:?}: shifted parallel plane by spectrum rotation against the zoomed angular spectrum, worst / peak"), worst0 / peak0);
+        assert!(worst0 / peak0 < 1e-9, "{}", worst0 / peak0);
+    }
+}
+
+#[test]
+fn a_translated_frame_and_a_translated_grid_hold_the_same_field() {
+    // R03 and R06 of the expert review (gauge): one physical field, encoded
+    // two ways, a grid centred at `c` in a frame at the origin and a centred
+    // grid in a frame moved to `c`, propagated onto the same physical points
+    // by the zoomed angular spectrum and by the spectrum rotation onto one
+    // absolute plane, must agree to round-off. The encoding is not physics.
+    use oc_core::{Isometry3, Vec3};
+    use oc_wave::beams::GaussianBeam;
+    use oc_wave::{asm_tilted, asm_zoom, Fft2, Grid2};
+    let pitch = 1.0 / 128.0;
+    let c = [0.3, 0.15];
+    let z = 12.0;
+    let mut fft = Fft2::new();
+    let on_grid = GaussianBeam { w0_mm: 0.1, lambda_um: 0.6328, n: 1.0, power: 1.0, center: c }
+        .sample(Grid2::new([128, 128], [pitch, pitch], c).unwrap(), 0.0)
+        .unwrap();
+    let mut in_frame = GaussianBeam { w0_mm: 0.1, lambda_um: 0.6328, n: 1.0, power: 1.0, center: [0.0, 0.0] }
+        .sample(Grid2::square(128, pitch).unwrap(), 0.0)
+        .unwrap();
+    in_frame.frame = Isometry3::from_pos(Vec3::new(c[0], c[1], 0.0));
+    assert!(on_grid.data.iter().zip(&in_frame.data).all(|(a, b)| (*a - *b).abs() < 1e-12));
+    let out_a = Grid2::new([48, 48], [0.005, 0.005], [c[0] + 0.02, c[1] - 0.03]).unwrap();
+    let out_b = Grid2::new([48, 48], [0.005, 0.005], [0.02, -0.03]).unwrap();
+    let (za, _) = asm_zoom(&on_grid, z, out_a, 2, &mut fft).unwrap();
+    let (zb, _) = asm_zoom(&in_frame, z, out_b, 2, &mut fft).unwrap();
+    let peak = za.data.iter().map(|q| q.abs()).fold(0.0, f64::max);
+    let worst = za.data.iter().zip(&zb.data).map(|(a, b)| (*a - *b).abs()).fold(0.0, f64::max);
+    measured("translated grid against translated frame, zoomed angular spectrum, worst / peak", worst / peak);
+    assert!(worst / peak < 1e-12, "{}", worst / peak);
+    // One absolute target plane, tilted 15° about y.
+    let q = glam::DQuat::from_rotation_y(15f64.to_radians());
+    let target = Isometry3::new(Vec3::new(c[0] + 0.02, c[1], z), [q.x, q.y, q.z, q.w]).unwrap();
+    let out = Grid2::new([40, 40], [0.006, 0.006], [0.0, 0.0]).unwrap();
+    let (ta, _) = asm_tilted(&on_grid, target, out, 4, &mut fft).unwrap();
+    let (tb, _) = asm_tilted(&in_frame, target, out, 4, &mut fft).unwrap();
+    let peak = ta.data.iter().map(|q| q.abs()).fold(0.0, f64::max);
+    let worst = ta.data.iter().zip(&tb.data).map(|(a, b)| (*a - *b).abs()).fold(0.0, f64::max);
+    measured("translated grid against translated frame, spectrum rotation onto one plane, worst / peak", worst / peak);
+    assert!(worst / peak < 1e-12, "{}", worst / peak);
+}
+
+#[test]
+fn the_zoomed_fresnel_and_fraunhofer_transforms_take_the_grid_where_it_is() {
+    // Both chirp-z transforms run on the samples' absolute coordinates, so a
+    // window centred off the frame origin needs no correction: the zoomed
+    // Fresnel transform of a paraxial beam on such a window agrees with the
+    // zoomed angular spectrum, and the far field of a shifted field differs
+    // from the centred one's by the shift phase e^{−i2π f·c} alone [1].
+    use oc_wave::beams::GaussianBeam;
+    use oc_wave::czt::{fraunhofer_zoom, fresnel_zoom};
+    use oc_wave::{asm_zoom, Cx, Fft2, Grid2};
+    let pitch = 1.0 / 128.0;
+    let c = [0.25, -0.2];
+    let mut fft = Fft2::new();
+    let u = GaussianBeam { w0_mm: 0.1, lambda_um: 0.6328, n: 1.0, power: 1.0, center: c }
+        .sample(Grid2::new([128, 128], [pitch, pitch], c).unwrap(), 0.0)
+        .unwrap();
+    // 400 mm on: the beam is 0.8 mm wide there, so the angular spectrum is
+    // padded eight times, for its periodic copies (a padded window apart)
+    // to stay clear of the window read; the chirp-z Fresnel transform has
+    // no copies.
+    let z = 400.0;
+    let out = Grid2::new([48, 48], [0.03, 0.03], [c[0], c[1]]).unwrap();
+    let (f, _) = fresnel_zoom(&u, z, out, &mut fft).unwrap();
+    let (a, _) = asm_zoom(&u, z, out, 8, &mut fft).unwrap();
+    let peak = a.data.iter().map(|q| q.abs()).fold(0.0, f64::max);
+    let worst = f.data.iter().zip(&a.data).map(|(p, q)| (*p - *q).abs()).fold(0.0, f64::max);
+    measured("zoomed Fresnel transform of an off-centre window against the zoomed angular spectrum, worst / peak", worst / peak);
+    assert!(worst / peak < 1e-4, "{}", worst / peak);
+    let u0 = GaussianBeam { w0_mm: 0.1, lambda_um: 0.6328, n: 1.0, power: 1.0, center: [0.0, 0.0] }
+        .sample(Grid2::square(128, pitch).unwrap(), 0.0)
+        .unwrap();
+    let zf = 2.0e4;
+    let far = Grid2::new([32, 32], [0.5, 0.5], [0.0, 0.0]).unwrap();
+    let (fc, _) = fraunhofer_zoom(&u, zf, far, &mut fft).unwrap();
+    let (f0, _) = fraunhofer_zoom(&u0, zf, far, &mut fft).unwrap();
+    let lam = 0.6328e-3;
+    let peak = f0.data.iter().map(|q| q.abs()).fold(0.0, f64::max);
+    let mut worst: f64 = 0.0;
+    for j in 0..32 {
+        for i in 0..32 {
+            let (x, y) = far.xy(i, j);
+            let shift = Cx::expi(-2.0 * std::f64::consts::PI * (x * c[0] + y * c[1]) / (lam * zf));
+            worst = worst.max((fc.at(i, j) - f0.at(i, j) * shift).abs());
+        }
+    }
+    measured("zoomed far field of a shifted field against the centred one's times the shift phase, worst / peak", worst / peak);
+    assert!(worst / peak < 1e-10, "{}", worst / peak);
+}
+
+#[test]
+fn a_baked_carrier_propagates_like_an_analytic_one() {
+    // R06 of the expert review (gauge): the analytic carrier is a
+    // representation, not physics. A field with its carrier analytic and the
+    // same field with the carrier folded into its samples (`bake_carrier`)
+    // must propagate to the same field, by `Auto` (the band-limited angular
+    // spectrum here) and by the zoomed angular spectrum, to round-off, where
+    // the tilt is well sampled.
+    use oc_wave::beams::GaussianBeam;
+    use oc_wave::{asm_zoom, propagate, Cx, Fft2, Grid2, Propagator};
+    let pitch = 1.0 / 128.0;
+    let g = Grid2::square(256, pitch).unwrap();
+    let mut a = GaussianBeam { w0_mm: 0.1, lambda_um: 0.6328, n: 1.0, power: 1.0, center: [0.0, 0.0] }.sample(g, 0.0).unwrap();
+    a.carrier = [0.02, -0.01];
+    let mut b = a.clone();
+    b.bake_carrier();
+    let mut fft = Fft2::new();
+    let z = 5.0;
+    let (pa, _) = propagate(&a, z, Propagator::Auto, &mut fft).unwrap();
+    let (pb, _) = propagate(&b, z, Propagator::Auto, &mut fft).unwrap();
+    let mut qa = pa.clone();
+    qa.bake_carrier();
+    let peak = qa.data.iter().map(|q| q.abs()).fold(0.0, f64::max);
+    let worst = qa.data.iter().zip(&pb.data).map(|(p, q)| (*p - *q).abs()).fold(0.0, f64::max);
+    measured("analytic against baked carrier, Auto, worst / peak", worst / peak);
+    assert!(worst / peak < 1e-10, "{}", worst / peak);
+    let out = Grid2::new([64, 64], [0.004, 0.004], [z * 0.02, -z * 0.01]).unwrap();
+    let (za, _) = asm_zoom(&a, z, out, 2, &mut fft).unwrap();
+    let (zb, _) = asm_zoom(&b, z, out, 2, &mut fft).unwrap();
+    let k = za.k_mm();
+    let mut worst: f64 = 0.0;
+    for j in 0..64 {
+        for i in 0..64 {
+            let (x, y) = out.xy(i, j);
+            let full = za.at(i, j) * Cx::expi(k * (za.carrier[0] * x + za.carrier[1] * y));
+            worst = worst.max((full - zb.at(i, j)).abs());
+        }
+    }
+    measured("analytic against baked carrier, zoomed angular spectrum, worst / peak", worst / peak);
+    assert!(worst / peak < 1e-10, "{}", worst / peak);
+}

@@ -225,11 +225,20 @@ let result = wave_path(&scene, &spec, revision)?;   // power per detector pixel,
 let spec = WavePathSpec::for_source(&scene, source, detector, 512, 4.0)?;
 ```
 
-**How the path is planned.** `extract_sequences3`
-([ADR 0002](architecture/adr/0002-sequence-extraction-from-the-trace.md)) gives
+**How the path is planned.** `extract_wave_sequences3`, the wave path's form of
+`extract_sequences3`
+([ADR 0002](architecture/adr/0002-sequence-extraction-from-the-trace.md)), gives
 each chain of surfaces the chief ray meets on its way to the detector, at
 each of the source's lines; there are several where splitter arms recombine
-on the detector (below). The tracer logs no event when a ray
+on the detector (below). It differs from the plain extraction twice, so that a
+chain stands for the field rather than for its axial ray (R17 and R18 of the
+expert review). An aperture does not stop the axial ray: an annular stop's
+centre blocks it, but the field passes around it, and the path lays the stop
+on the field where the chain crosses it and notes that the axial ray is
+stopped there. And under the geometric limit a DMD is traced once for each
+mirror family its pattern holds, every mirror taken in that family, so each
+family the field lights has its chain whatever the one pixel or gap the axial
+ray meets. The tracer logs no event when a ray
 passes an aperture's opening, so the path intersects the chief ray with every
 aperture plane itself and inserts the crossings. The field rides in a frame
 across the chief ray, its transverse axes carried round each turn by the
@@ -451,9 +460,19 @@ facets folded 17% of the power back into the band in the DMD-and-lens test
 below (booked as `resampling`) and weighted its orders wrongly; taken out
 first, the resampling there is 1.3e-4.
 
-**What the path follows at a modulator.** The chief ray, and so the beam,
-leaves a DMD along the reflection off the facet it hits, and an SLM along the
-phase gradient there (or specularly, for the unmodulated arm). Of the field
+**What the path follows at a modulator.** Under the geometric limit the chief
+ray, and so the beam, leaves a DMD along the reflection off a family's facet,
+the chain carrying the family whose direction it leaves along, and an SLM
+along the phase gradient there (or specularly, for the unmodulated arm).
+Under the orders model (`RayModel::Orders`), as the tracer has it (the device
+in air, its orders in closed form), each order the tracer follows is a chain,
+and the chain owns its order: of every family's reflected field it keeps the
+lattice cell of its order, about its direction on the lattice of the
+pattern's unit cell where the axial ray meets it, the families' cells added as
+fields and taken up about the order's own direction. What the chains share,
+the device's absorption and its mask's band, is booked once, and the cells no
+chain follows once, as `untracked_orders` (R16 of the expert review; before,
+each order's chain carried a copy of the whole spectrum). Of the field
 an LCoS meets, the component along its director is modulated and the one
 across it is not [20]: the chain carries two components (below) and takes
 into its beam the one that beam is made of. Of the other, the device takes
@@ -463,10 +482,10 @@ reach the detector, each is a chain of its own; they meet orthogonally
 polarized and add in power, and the ledger books each beam's share once. The
 field keeps
 every diffraction order that falls inside its window; orders outside are
-booked as `spectral_projection` or `left_window`. It does not steer onto a chosen
-order: an iris on a Lee hologram's −1 order, off the chief ray, would block
-the chief ray itself. The wave path does not follow an order yet; the ray
-tracer's orders model (`RayModel::Orders`) traces them as rays.
+booked as `spectral_projection` or `left_window`. Under the geometric limit it
+does not steer onto a chosen order; under the orders model each followed order
+has its own chain, but a Fourier-plane filter that picks one order is not yet
+a tested case.
 
 **Planar layers, plane wave by plane wave.** A planar interface keeps every
 plane wave's tangential wavevector, so each plane wave of a field meets it on
@@ -720,6 +739,7 @@ These are acceptance case C53, in `crates/oc-wave/tests/path.rs`.
 | `a_singlet_psf_matches_optiland_huygens_psf` | Optiland's `HuygensPSF` of the same singlet at f/10, at its paraxial focus (oracle, below) | Strehl ±0.01; rms 1e-2 of the ideal peak | Strehl 0.8622 against 0.8642; rms 2.8e-4 |
 | `a_tilted_detector_reads_the_beam_on_its_own_plane` | Kogelnik–Li [13] on a face tilted 30°, times the obliquity: each pixel's power against the 8 × 8 sub-pixel mean of the law, and the power caught | 2e-3 of the peak; power on the face 3e-3 | 8.4e-4; 1.8e-8 (−1.9e-3 under the bilinear spectrum reading before E3) |
 | `an_aperture_whose_outer_extent_the_beam_passes_beyond_leaves_it_alone` | the tracer's aperture: light beyond the outer extent passes; against an open aperture at the same plane | bit-identical | identical |
+| `an_annular_stop_whose_centre_blocks_the_axial_ray_lets_the_arago_spot_through` | R18 of the expert review: a top-hat beam 1 µm before an annulus 0.1 < r < 0.3 mm, whose centre stops the axial ray; on the axis 15, 25 and 40 mm behind it, Heurtley's exact field [5] taken for each edge by Babinet, `(z/R_in) e^{ikR_in} − (z/R_out) e^{ikR_out}`; the report names the stopped axial ray | 1e-2 of `max(|U/U₀|², 1)` | 1.8e-4, 3.5e-3, 3.5e-3 on 1.55, 3.97, 3.75 |
 | `a_fold_mirror_smaller_than_the_beam_reflects_only_what_meets_it` | a 0.6 mm disc at 45° in a 1 mm Gaussian [13]: the power off its projected ellipse, by quadrature, passes beside it | 1e-4 | 1.5e-5 |
 | `a_thin_lens_smaller_than_the_beam_lets_the_rest_pass_beside_it` | 10 µm behind a 0.5 mm thin lens: the lens's phase inside, free space's field outside, away from the edge | 2e-3 | 1.0e-3 inside; 3.0e-5 outside |
 | `a_lens_rim_smaller_than_the_beam_stops_and_diffracts_as_an_iris_against_it` | a 1 mm iris 1.5 µm before a lens too large to clip; the lens rim itself, with exact cover | power 3e-4; spot 2e-3 of peak | 1.1e-4 (the back face's rim stops 9e-4 of what reaches it, which is real); 3.7e-4 |
@@ -802,14 +822,15 @@ The propagation tests of W8 (acceptance case C57, `crates/oc-wave/tests/propagat
 | `the_zoomed_fresnel_and_fraunhofer_transforms_take_the_grid_where_it_is` | the chirp-z Fresnel transform of an off-centre window against the zoomed angular spectrum (padded 8×, for its periodic copies); a shifted field's far field against the centred one's times the shift phase `e^{−i2πf·c}` [1] | 1e-4; 1e-10 | 4.2e-6; 8.3e-16 |
 | `a_baked_carrier_propagates_like_an_analytic_one` | gauge (R06): the carrier analytic or folded into the samples, through `Auto` and through the zoom | 1e-10 | 8.2e-13; 2.6e-13 |
 
-The DMD case shows what the ledger is for. Of the launched power, 72.1%
+The DMD case shows what the ledger is for. Of the launched power, 73.0%
 reaches the detector and 11.7% falls in the dead space between mirrors
-(`absorbed_element`): the physical buckets. The numerical ones: 7.7% is the
-sub-cell projection error of the mirror edges on the device grid
-(`subcell_projection`), 2.3% is the band cut before the take-up, orders the
-beam grid cannot hold (`spectral_projection`), 6.2% misses the detector
-(`left_window`), 1.3e-4 is lost resampling between grids (`resampling`), and
-3.6e-13 is left unaccounted (`numerical`).
+(`absorbed_element`): the physical buckets. The numerical ones: 8.1% is what
+the mirrors reflect beyond the device grid's band and the band cut before the
+take-up, orders the beam grid cannot hold (`spectral_projection`), 3.6e-6 the
+sub-cell projection error (`subcell_projection`; with the band-limited mask
+the mirrors' edges are in the spectrum, no longer averaged into each cell),
+7.1% misses the detector (`left_window`), 1.3e-4 is lost resampling between
+grids (`resampling`), and 3.7e-13 is left unaccounted (`numerical`).
 
 ## From Python
 
@@ -987,8 +1008,12 @@ The coating fixtures keep their own pin, `optiland==0.6.1`
 
 - **Scalar diffraction.** No vector diffraction and no high-NA focusing: the
   field's two polarization components diffract each as a scalar field, and
-  the longitudinal component is not carried. Scalar theory's error exceeds ±5% for features below about
-  14 wavelengths [11].
+  the longitudinal component is not carried. A modulator whose mirror or
+  electrode is under 14 wavelengths raises a `ScalarLimit` flag: Pommet,
+  Moharam and Grann [11] found scalar efficiencies off by more than ±5% for
+  their binary gratings below about 14λ (their 8-level case below a period of
+  20λ, the error growing with index, depth, levels and incidence). A heuristic,
+  not a bound: no pitch above it certifies a device.
 - **Oblique elements by projection.** A lens, an aperture or a modulator seen
   obliquely is handed over by projecting the field along the rays
   (`TiltProjection`, reported); only the detector's readout uses the
@@ -998,8 +1023,9 @@ The coating fixtures keep their own pin, `optiland==0.6.1`
   rays follow the beam's paraxial wavefront, not the field's own: a field that
   departs from it (aberrations, a hologram's orders inside one lattice cell)
   is traced along it, and the report gives the departure.
-- **On a wave path, the beam follows the chief ray.** Steering onto a chosen
-  diffraction order is W7. Arms that recombine are added once: a cavity's
+- **On a wave path, the beam follows the chief ray.** Under a modulator's
+  orders model each followed order is a chain of its own; elsewhere steering
+  onto a chosen diffraction order is W7. Arms that recombine are added once: a cavity's
   round trips are summed only inside a plane-parallel plate, where they are
   in closed form; a cavity of two separate mirrors is not followed round.
 - **One Jones matrix per element.** A polarizer, a retarder or an LCoS's

@@ -57,14 +57,51 @@ c_mn = (√R T_w / A_cell) Σ_ij e^{−i2π G_mn·r_ij} · M̂(G_mn − (t_spec 
   evanescent power in proportion. This is Harvey's non-paraxial scalar
   treatment [4], which TI cites for its DMD efficiencies [2].
 
+Each `Order` holds two things apart: its `coefficient`, the thin element's
+`c_mn`, which a coherent calculation adds as a field, and its `efficiency`,
+the power fraction under the table's model. Under `Tea` the efficiency is
+`|coefficient|²`; under `HarveyRenormalized` it is that times
+`Σ_all|c|²/Σ_propagating|c|²` and the coefficient is left alone, so
+`√efficiency` is not an amplitude (Q5 of the expert review of the wave
+engine). `OrderTable::renormalized()` turns a `Tea` table into Harvey's. The
+renormalization is a declared scalar redistribution of the evanescent orders'
+share, not a field the element produces.
+
 **Sampled near field** (`oc_wave::modulator::dmd_reflect`). A field on the DMD
-plane is multiplied mirror by mirror, each edge weighted by its exact area in
-the sample cell. Each mirror state reflects into its own direction, so a state
-is a *family*: its tilt is held as the field's analytic carrier, and the
-samples keep only a piston phase per mirror. Without the carrier, a 7.56 µm
-mirror tilted 12° at 0.4 µm would need about thirty samples to resolve its
-ramp; with it, four suffice. The families not followed are booked as
-`other_family`.
+plane is multiplied by the family's mask, sample by sample. The mask is
+band-limited exactly to the field's grid: its spectrum in closed form, `M̂`
+times the lattice sum of the mirrors' pistons, taken on the grid's own
+frequencies and summed back onto its samples. So every order the grid holds
+has its exact amplitude whatever the sampling, and what the mirrors reflect
+beyond the grid's band is booked as `spectral_projection`. A mask averaged
+over each sample's cell, as before, weighted an order `m` by `sinc(m/s)` at `s`
+samples a mirror: 0.935 in amplitude for an order 1.6 lattice steps out at 8
+(Q17 of the expert review). The power the mirrors intercept and reflect is
+each sample's exact cell coverage. A device lit within a pixel of a window
+edge it reaches past keeps the cell average, and the report says so: the
+band-limited mask is periodic over the window and would fold the mirrors the
+edge cuts onto the far side.
+
+Each mirror state reflects into its own direction, so a state is a *family*:
+its tilt is held as the field's analytic carrier, and the samples keep only a
+piston phase per mirror. Without the carrier, a 7.56 µm mirror tilted 12° at
+0.4 µm would need about thirty samples to resolve its ramp; with it, four
+suffice. The families not followed are booked as `other_family`.
+
+**The facet against the mask** (`facet_integral`, `facet_interception_ratio`).
+The array-normal mask with its pivot ramp is a defined thin-element
+approximation, not one facet's scattering (Q4 of the expert review). One flat
+square facet of side `a` under a uniform plane wave, with its physical
+tangents `u`, `v`, has the surface integral `a² sinc(a q·u/2π) sinc(a q·v/2π)`,
+`q = k_in − k_out`. Both peak at the facet's specular direction. Off it the
+facet sees the outgoing ray's normal component through its tilted tangent,
+which the mask does not, so the two envelopes part: at third order in the
+angle across the hinge, at fourth along it (below). The power differs too: the
+mask reflects `ρ² cos θ` of each mirror's cell, where an isolated facet would
+intercept `ρ²|d_in·n_f|/|d_in·z|`, `1/cos 24°` = 1.095 times as much at 24°
+incidence on 12° facets. Neighbours shade an actual array, so neither is the
+device, and no correction is applied. Above 15° incidence the report raises a
+`ThinElement` flag with that ratio.
 
 **Far field of a whole device, factorized** (`dmd_far_field`). Every mirror of
 one state has the same response, so the far field is one mirror's transform
@@ -141,8 +178,22 @@ propagating orders in direction cosines, at a wavelength you choose, and says
 when the pitch is below 14λ. The 3D view draws the device as one dark,
 glossy face; its pattern is not drawn there yet.
 
-**Not yet:** a wave path that follows a chosen order through a Fourier-plane
-filter (C56).
+**On the wave path** the device's chains come from the wave path's own
+extraction (`extract_wave_sequences3`). Under the geometric limit it traces
+once for each mirror family the pattern holds, every mirror taken in that
+family, so each family the field lights has its chain whatever the one pixel
+(or gap) the axial ray meets (R17 of the expert review); the chain carries the
+family whose direction it leaves along, and the report says when the axial
+ray's own pixel is another. Under the orders model each order the tracer
+follows is a chain, and a chain carries its own order only: of every family's
+reflected field it keeps the cell of its order on the lattice of the
+pattern's unit cell (directions `λ/P` apart about the incident one), added as
+fields, and the cells no chain follows are booked once as `untracked_orders`
+(R16 and finding 2). Before, each order's chain carried the whole spectrum.
+
+**Not yet:** a tested wave path through a Fourier-plane filter that picks one
+order, a Lee hologram's −1 (C56). The orders model gives each order its own
+chain, which such a filter needs; the case itself is not in the suite.
 
 | Test | Checks | Gate | Measured |
 |---|---|---|---|
@@ -152,6 +203,9 @@ filter (C56).
 | `a_dmd_matches_f64_mirror_for_mirror` (`oc-gpu/tests/cpu3_vs_f64.rs`) | the preview against the f64 reference, ray for ray: ON, OFF and flat mirrors, both hinge layouts, the dead space, skew rays | the suite's landing and flux gates | passes |
 | `a_dmd_matches_cpu` (`oc-gpu/tests/gpu3_vs_cpu3.rs`) | the shader against its CPU mirror | the suite's gates | passes (Vulkan) |
 | `a_dmd_in_the_scene_focuses_its_orders_f_lambda_over_p_apart` (`oc-wave/tests/path.rs`) | orders `λ/p` apart [3], so `fλ/p` apart at a lens's focus | 1% | 1.000 |
+| `a_dmd_scene_reads_the_same_whatever_the_device_sampling` (same) | V06: the focusing scene with the device laid at 4, 8 and 16 samples a pixel, nothing else changed | 1e-3 of the peak pixel | 2.7e-5 at 4, 5.5e-6 at 8 |
+| `a_dmd_s_orders_each_carry_their_own_cell_and_add_up_to_the_full_field` (same) | R16: the orders model against one full-field chain, 2 mm behind the device where four orders overlap, at most 1, 2, 4 orders and thresholds 0.1, 0.03; detected plus unfollowed constant over the sweep | four orders 1e-3 of the peak, 1e-4 of the launched; the threshold picks the count's orders exactly | 1.9e-4; detected 0.9017 both; one order 0.518, two 0.817; the sum constant to 6e-5 |
+| `a_dmd_chain_follows_the_mirrors_the_field_lights_not_the_axial_ray_s_pixel` (same) | R17: the axial ray on the gap at four mirrors' corner (a 400 × 400 device), and on an OFF mirror among ON ones, against the plain device | 1e-3 of the peak; three times the mirror's share | gap 5.6e-6 (the tracer's own chain is absorbed there); OFF mirror 4.3e-3, the mirror's share 2.6e-3 |
 | `dmd_orders_traced_match_the_unit_cell_order_for_order` (`oc-trace/tests/modulator_orders3.rs`) | the tracer's children against the unit cell's twelve brightest orders, direction and flux | 1e-12 | passes |
 | `untraced_orders_are_in_the_ledger` (same) | the orders past the count booked as untraced; the dead space absorbed; the ledger closes | 1e-12; 1e-10 | 1.3e-15 residual |
 | `ti_dlpa083_through_the_tracer_matches_direct_integration` (same) | TI's method [2] §4.2 through the tracer: 64 plane waves of an f/2.4 cone onto an all-ON 7.56 µm device, an f/2.4 stop 200 mm away and a detector, against the closed-form integration | 5e-3 | 0.882030 against 0.882032 |
@@ -161,10 +215,16 @@ filter (C56).
 - One mirror shading its neighbour at oblique incidence, the mirror's edges,
   hinges and curvature ([1] §3), and thermal drift. TI's on-state fill factor
   includes shading, which this model does not have; see the presets below.
-- Rigorous electromagnetics. Scalar theory's error exceeds ±5% for features
-  below about 14λ [6]: a 7.56 µm pitch is 14λ at 0.54 µm and 12λ at 0.633 µm.
-  The sampled near field raises a `ScalarLimit` validity flag when
-  `pitch < 14λ`.
+- Rigorous electromagnetics. Pommet, Moharam and Grann [6] found scalar
+  theory's efficiencies off by more than ±5% against rigorous coupled-wave
+  analysis for binary features below about 14λ, for their 8-level element of
+  index 1.5 at normal incidence below a period of 20λ, and the error growing
+  with index, depth, level count and incidence. The sampled near field raises
+  a `ScalarLimit` flag when the mirror is under 14λ, recording the pitch, the
+  mirror, the gap, the relief across the mirror (`ρp sin θ`) and the
+  incidence. It is a heuristic, not a bound: a 7.56 µm pitch is 14λ at
+  0.54 µm, and no pitch above the mark certifies a device. A gap far below a
+  wavelength, as every DMD has, is recorded but does not raise it.
 - The superpixel method [7] is not implemented yet.
 - Light outside the device's active area is treated as absorbed by its frame.
 
@@ -190,7 +250,10 @@ C46–C48.
 | `a_blazed_dmd_concentrates_one_order_and_an_anti_blazed_one_splits_four` | [1] §2: one order dominates where μ is near 1 (10.8 µm, μ = 0.81 at normal incidence); several share where it is near 0 (7.6 µm, μ = 0.09) | shares | 10.8 µm: 85% in one order; 7.6 µm: 26%, 18%, 18%, 14% |
 | `a_flat_state_dmd_puts_the_fill_factor_squared_in_the_zero_order` | the rectangular-grating Fourier series: `η₀₀ = ρ⁴`, `Σ = ρ²` | 1e-12 | exact |
 | `the_factorized_far_field_lands_on_the_closed_form_orders` | `\|Û\|/(N²p²) = \|c_mn\|` | 1e-12 | 8.0e-17 |
-| `the_sampled_dmd_far_field_converges_on_the_factorized_one` | the same model computed two ways | log-log slope < −1.5; 2e-3 at 32 samples per mirror | slope −1.87; 8.4e-4 |
+| `the_sampled_dmd_far_field_converges_on_the_factorized_one` | the same model computed two ways, between the window's own frequencies | log-log slope < −1.5; 2e-3 at 32 samples per mirror | slope −1.92; 2.3e-5 (the cell-averaged mask: −1.87; 8.4e-4) |
+| `on_its_window_s_frequencies_the_near_field_is_the_factorized_far_field_at_any_sampling` | Q17: the band-limited mask's near field against the factorized far field on the window's frequencies inside the grid's band, at 4, 8, 16 and 32 samples a mirror | 1e-10 of the peak | 3.0e-14 to 4.8e-13 |
+| `the_thin_element_mask_against_one_facet_s_surface_integral` | V04, Q4: one facet's surface integral against the mask's envelope at 24° on 12° facets, both peaking at the specular; the gap's order in the angle; the interception ratio; the mask's reflected share `ρ² cos θ`; the `ThinElement` flag above 15° | order to 5%; parity; 1e-12 | the gap 6.7e-4 of the peak 1° across the hinge, 3.0e-3 at 2°, third order (×7.93 on doubling); along it 5.9e-7 at 1°, fourth order (×15.8); ratio 1.0946 = 1/cos 24°; `ρ² cos θ` to 5e-14 |
+| `a_harvey_table_scales_efficiencies_and_leaves_the_coefficients_alone` | Q5: Harvey's table is `renormalized()` TEA's, coefficients equal, efficiencies `k|c|²` | exact | `k` 1.016 at 7.56 µm and 633 nm |
 | `a_binary_grating_on_the_on_mirrors_puts_one_over_pi_squared_in_each_first_order` | [5] Eq. (15) in the limit; the exact prediction `1/(P sin(π/P))·\|1 − M̂_off/M̂_on\|` | 1e-10 | lattice factor² 0.1026, 0.1014, 0.1013 for P = 16, 64, 256 (1/π² = 0.1013); the OFF mirrors leak 5e-4 into the ON direction |
 | `ti_dlpa083_average_photopic_diffraction_efficiency` | [2] Table 6-1 and §4.3, a **vendor simulation** | ±3 pp (one row ±5 pp, below) | see the table below |
 | `the_lee_generator_follows_gutierrez_cuevas_and_popoff_eq_11` | [5] Eq. (11) | exact | passes |

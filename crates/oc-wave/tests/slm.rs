@@ -129,7 +129,9 @@ fn a_kinoform_at_the_wrong_wavelength_loses_efficiency_as_sinc_squared() {
 fn the_lcos_modulates_only_the_director_component() {
     // [S1]: the director component carries cos²(ψ − δ) of the power and is
     // modulated; the rest, sin²(ψ − δ), reflects as from a plain mirror. The
-    // two are orthogonally polarized and add in intensity.
+    // two are orthogonally polarized and add in intensity. Each beam's power
+    // is what it reflects onto the grid and beyond the grid's band (the
+    // band-limited mask books the staircase's edges there).
     let d = lcos(16, 8.0, 256, 1.0, (0.0, 0.0), 0.0, Pattern::Generated(PatternGenerator::BlazedGrating { period_px: 8.0, angle_deg: 0.0 }));
     let (a, b) = lcos_split(&d, 30.0).unwrap();
     assert!((a * a - 30f64.to_radians().cos().powi(2)).abs() < 1e-15);
@@ -144,11 +146,14 @@ fn the_lcos_modulates_only_the_director_component() {
     for z in &mut uo.data {
         *z *= b;
     }
-    let (vm, _) = lcos_reflect(&um, &d, LcosBeam::Modulated).unwrap();
-    let (vo, _) = lcos_reflect(&uo, &d, LcosBeam::Unmodulated).unwrap();
-    let total = vm.power() + vo.power();
-    measured("director split: modulated share", vm.power() / total);
-    assert!((vm.power() / total - a * a).abs() < 1e-12);
+    let (vm, rm) = lcos_reflect(&um, &d, LcosBeam::Modulated).unwrap();
+    let (vo, ro) = lcos_reflect(&uo, &d, LcosBeam::Unmodulated).unwrap();
+    let (pm, po) = (vm.power() + rm.ledger.spectral_projection, vo.power() + ro.ledger.spectral_projection);
+    let total = pm + po;
+    measured("director split: modulated share", pm / total);
+    measured("director split: modulated beam beyond the grid's band, of its power", rm.ledger.spectral_projection / pm);
+    assert!((pm / total - a * a).abs() < 1e-12, "{} vs {}", pm / total, a * a);
+    assert!(rm.ledger.numerical.abs() < 1e-12 * rm.ledger.launched && ro.ledger.spectral_projection.abs() < 1e-12 * ro.ledger.launched);
     // The unmodulated beam is a plain mirror: its samples are all equal.
     let first = vo.data[0];
     assert!(vo.data.iter().all(|z| (*z - first).abs() < 1e-12));
@@ -157,11 +162,12 @@ fn the_lcos_modulates_only_the_director_component() {
 #[test]
 fn the_sampled_lcos_lands_on_the_closed_form_orders() {
     // An 8-level grating of 4 periods, electrodes of fill 0.75 with dead
-    // space, sampled 8 per pixel with every edge on a sample boundary. Over
-    // whole periods, the far field at an order's direction is c_mn times the
-    // device's area. Over data constant on each sample cell the integral is
-    // the sampled sum times the cell's own sinc(fΔ) per axis. So the two must
-    // agree to round-off.
+    // space, sampled 8 per pixel. Over whole periods, the far field at an
+    // order's direction is c_mn times the device's area. The mask is
+    // band-limited exactly to the grid from its closed-form transform (Q17 of
+    // the expert review), so at the window's own frequencies the near field's
+    // transform is that closed form: on a window of 40 pixels the orders,
+    // 1/(8p) apart, are among them, and the two must agree to round-off.
     let (np, per, nlev) = (32u32, 8usize, 8u16);
     let pitch_um = 8.0;
     let d = lcos(np, pitch_um, nlev, 0.75, (0.5, 0.3), 0.0, Pattern::Explicit(
@@ -171,11 +177,12 @@ fn the_sampled_lcos_lands_on_the_closed_form_orders() {
     let dx = p / per as f64;
     // Even counts: pixel edges sit on integer multiples of Δx from the
     // centre, so the grid is offset half a sample to put its cell edges there.
-    let ns = np as usize * per + 2 * per;
+    let ns = (np as usize + 8) * per;
     let g = Grid2::new([ns, ns], [dx, dx], [0.5 * dx, 0.5 * dx]).unwrap();
     let u = Field2::from_fn(g, 0.633, |_, _| Cx::ONE).unwrap();
     let (v, r) = lcos_reflect(&u, &d, LcosBeam::Modulated).unwrap();
-    assert!(r.ledger.subcell_projection.abs() < 1e-12 * r.ledger.launched, "aligned edges lose nothing");
+    assert!(r.ledger.numerical.abs() < 1e-12 * r.ledger.launched && r.ledger.spectral_projection >= 0.0, "{:?}", r.ledger);
+    measured("sampled LCoS, 8 samples a pixel: reflected beyond the grid's band, of the launched", r.ledger.spectral_projection / r.ledger.launched);
     let t = unit_cell_orders(&d, &UnitCell { period: [nlev as usize, 1], values: (0..nlev).collect() }, 0.633, NORMAL, OrderModel::Tea, LcosBeam::Modulated).unwrap();
     let area = (np as f64 * p).powi(2);
     let lm = 0.633 / 1000.0;
@@ -187,9 +194,8 @@ fn the_sampled_lcos_lands_on_the_closed_form_orders() {
     let mut worst: f64 = 0.0;
     for o in t.orders.iter().filter(|o| o.m.abs() <= 10 && o.n.abs() <= 2) {
         let f = [o.dir.x / lm, o.dir.y / lm];
-        let s = czt2(&v, f, [1.0, 1.0], [1, 1], &mut fft)[0] * (sinc(f[0] * dx) * sinc(f[1] * dx) / area)
-            * Cx::expi(2.0 * PI * (f[0] * r0[0] + f[1] * r0[1]));
-        worst = worst.max((s - o.amplitude).abs());
+        let s = czt2(&v, f, [1.0, 1.0], [1, 1], &mut fft)[0] / area * Cx::expi(2.0 * PI * (f[0] * r0[0] + f[1] * r0[1]));
+        worst = worst.max((s - o.coefficient).abs());
     }
     measured("sampled LCoS far field vs closed-form c_mn", worst);
     assert!(worst < 1e-10, "{worst}");

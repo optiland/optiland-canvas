@@ -626,9 +626,16 @@ struct Junction {
     /// grating's η, a coating's R or T averaged over the field).
     share: f64,
     /// What this arm booked at the element for the other arms' shares
-    /// (`PerBeam`).
+    /// (`PerBeam`; an LCoS's other beam under `Orders`).
     foreign_absorbed: f64,
     foreign_family: f64,
+    /// `Orders`: what every order chain through the element books the same,
+    /// in beam units (the device's absorption, its mask's band and sub-cell
+    /// terms, an LCoS's other beam), booked once for them all.
+    shared: WaveLedger,
+    /// `Orders`: the device's beam the chain takes (an LCoS's modulated 0
+    /// or unmodulated 1; a DMD's 0).
+    beam: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -643,6 +650,11 @@ enum JunctionKind {
     /// (one joins the other there, [`ChainJob::absorb`]): each arm keeps
     /// what it booked there, and the join books their interference.
     Recombine,
+    /// The arms meet a modulator with one field and each leaves by its own
+    /// diffraction order, the lattice cell of that order its own (R16 of the
+    /// expert review): what they share is booked once, and the cells no arm
+    /// owns once, as orders no chain follows.
+    Orders,
 }
 
 /// The ledger bucket a junction's unfollowed shares go to.
@@ -704,6 +716,55 @@ fn band_to(u: &Field2, out: &Grid2, fft: &mut Fft2) -> (Field2, f64) {
     let mut v = u.clone();
     v.data = b;
     (v, removed)
+}
+
+/// `u` with the plane waves an outgoing window cannot hold taken out, and the
+/// power they carried. A frequency `f` of `u`'s envelope lands at
+/// `M f + δ` on the window's samples: `M`'s rows the columns of the map from
+/// the window's points onto `u`'s plane (its transpose Jacobian), `δ` the
+/// frequency the two carriers leave between them. It is kept while that lies
+/// within the window's band `lim`, a rectangle on the window's axes that on
+/// `u`'s plane is in general rotated and sheared, not a rectangle on `u`'s
+/// own axes (Q18 of the expert review).
+fn band_through(u: &Field2, m: [[f64; 2]; 2], delta: [f64; 2], lim: [f64; 2], fft: &mut Fft2) -> (Field2, f64) {
+    let g = u.grid;
+    let n = g.n;
+    let mut b = u.data.clone();
+    crate::fft::ifftshift2(&mut b, n);
+    fft.forward(&mut b, n, g.cell_area_mm2());
+    let df = g.freq_pitch(0) * g.freq_pitch(1);
+    let mut removed = 0.0;
+    for ky in 0..n[1] {
+        let fy = g.fft_freq(1, ky);
+        for kx in 0..n[0] {
+            let fx = g.fft_freq(0, kx);
+            let (a, c) = (m[0][0] * fx + m[0][1] * fy + delta[0], m[1][0] * fx + m[1][1] * fy + delta[1]);
+            if a.abs() > lim[0] || c.abs() > lim[1] {
+                let v = &mut b[ky * n[0] + kx];
+                removed += v.norm_sqr() * df;
+                *v = Cx::ZERO;
+            }
+        }
+    }
+    if removed == 0.0 {
+        return (u.clone(), 0.0);
+    }
+    fft.inverse(&mut b, n, df);
+    crate::fft::fftshift2(&mut b, n);
+    let mut v = u.clone();
+    v.data = b;
+    (v, removed)
+}
+
+/// Where a step along the outgoing beam's `x` and `y` lands on a plane of
+/// normal `n` and axes `ex`, `ey`, projected along the beam: on the plane's
+/// axes (the columns of the map's Jacobian) and in space.
+fn takeup_columns(out: &Beam, n: Vec3, ex: Vec3, ey: Vec3) -> (([f64; 2], Vec3), ([f64; 2], Vec3)) {
+    let column = |e: Vec3| {
+        let pv = e - out.d * (e.dot(n) / out.d.dot(n));
+        ([pv.dot(ex), pv.dot(ey)], pv)
+    };
+    (column(out.x), column(out.y))
 }
 
 /// A window a field is to be carried onto, and how.
@@ -1020,6 +1081,10 @@ struct ChainJob {
     id: usize,
     members: Vec<usize>,
     name: String,
+    /// At each modulator event under the orders ray model, the directions
+    /// every chain through it leaves by (this one's included): the orders
+    /// the job follows out of the device.
+    siblings: std::collections::HashMap<usize, Vec<Vec3>>,
     run_to: usize,
     absorbs: Vec<(usize, usize)>,
     joins: Option<(usize, usize)>,
@@ -1277,11 +1342,21 @@ impl ChainJob {
             points.push((p, after, ev));
             prev = after;
         }
+        let modulator = |id: oc_core::id::ObjectId| {
+            scene.surfaces.iter().any(|s| s.common.id == id && [&s.response_front, &s.response_back].iter().any(|r| matches!(r, SurfaceResponse::Modulator { .. })))
+        };
         let keys = points
             .iter()
-            .map(|(p, _, ev)| {
+            .enumerate()
+            .map(|(i, (p, _, ev))| {
                 let at = format!("{:.6},{:.6},{:.6}", p.x, p.y, p.z);
                 match ev {
+                    // At a modulator, chains that leave by different orders
+                    // part there: the key holds the direction they leave by.
+                    Ev::Hit(h) if modulator(h.object) => {
+                        let d = points.get(i + 1).map_or(Vec3::ZERO, |n| (n.0 - points[i].1).normalize());
+                        format!("hit {} {:?} {at} toward {:.9},{:.9},{:.9}", h.object.0, h.action, d.x, d.y, d.z)
+                    }
                     Ev::Hit(h) => format!("hit {} {:?} {at}", h.object.0, h.action),
                     Ev::Aperture(ai) => format!("aperture {ai} {at}"),
                     Ev::Transfer { hit, .. } => format!("transfer {} {:?} {at}", hit.object.0, hit.action),
@@ -1320,6 +1395,7 @@ impl ChainJob {
             id: 0,
             members: vec![1],
             name: "arm 1".to_string(),
+            siblings: std::collections::HashMap::new(),
             run_to,
             absorbs: Vec::new(),
             joins: None,
@@ -1379,7 +1455,22 @@ impl ChainJob {
                     share: if input > 0.0 { (prev.input * prev.share + j.input * j.share) / input } else { 0.0 },
                     foreign_absorbed: prev.foreign_absorbed + j.foreign_absorbed,
                     foreign_family: prev.foreign_family + j.foreign_family,
+                    shared: sum_ledgers(&prev.shared, &j.shared),
                     ..j
+                }
+            }
+            // An LCoS's orders: the beam the chain does not take is booked
+            // with the orders' shared part, once for all the beam's orders.
+            Some(prev) if prev.object == j.object && prev.kind == JunctionKind::Orders && j.kind == JunctionKind::PerBeam => {
+                let mut shared = prev.shared;
+                shared.absorbed_element += j.foreign_absorbed;
+                shared.other_family += j.foreign_family;
+                Junction {
+                    foreign_absorbed: prev.foreign_absorbed + j.foreign_absorbed,
+                    foreign_family: prev.foreign_family + j.foreign_family,
+                    shared,
+                    beam: j.beam,
+                    ..prev
                 }
             }
             _ => j,
@@ -1720,6 +1811,8 @@ impl ChainJob {
                 share: if total > 0.0 { ran / total } else { 0.0 },
                 foreign_absorbed: dropped * rho,
                 foreign_family: dropped * (1.0 - rho),
+                shared: WaveLedger::default(),
+                beam: u8::from(!modulated),
             });
             // The component leaves along the device's image of its direction:
             // its part along the surface kept, as the tangential chart has it.
@@ -2308,7 +2401,17 @@ impl ChainJob {
             _ => None,
         };
         if let Some((bucket, input, share)) = junction {
-            self.note_junction(Junction { object: h.object.0, kind: JunctionKind::Split, bucket, input, share, foreign_absorbed: 0.0, foreign_family: 0.0 });
+            self.note_junction(Junction {
+                object: h.object.0,
+                kind: JunctionKind::Split,
+                bucket,
+                input,
+                share,
+                foreign_absorbed: 0.0,
+                foreign_family: 0.0,
+                shared: WaveLedger::default(),
+                beam: 0,
+            });
         }
         // A flat mirror's handover is image theory, exact at any tilt;
         // anything else seen obliquely is a projection.
@@ -2919,6 +3022,19 @@ impl ChainJob {
                 self.report.ledger.absorbed_aperture += stopped;
                 self.report.ledger.subcell_projection += beyond;
                 let id = a.common.id.0;
+                // Where the axial ray crosses the plane: a chain followed
+                // through an aperture that stops it (R18 of the expert review).
+                {
+                    let w = t.inverse_transform_point(p) - plane.origin;
+                    let at = oc_core::Vec2::new(w.dot(plane.u), w.dot(plane.v));
+                    let contains = oc_core::geom3::primitives::planar_shape_contains;
+                    let blocked = !contains(&a.shape.clear_opening, at) && a.shape.outer_extent.as_ref().map_or(true, |e| contains(e, at));
+                    if blocked {
+                        self.report.approx(format!(
+                            "aperture #{id} stops the axial ray; the chain continues, and the field passes the aperture's opening around it"
+                        ));
+                    }
+                }
                 if !square {
                     // Not square to the beam, the opening is its projection
                     // along the beam: an approximation by the depth it spans.
@@ -2949,8 +3065,13 @@ impl ChainJob {
                 let response = if from_front { &s.response_front } else { &s.response_back };
                 let d2 = self.next_dir(idx, p, beam.d);
                 let out = beam.turned(p, d2);
-                if let SurfaceResponse::Modulator { device, .. } = response {
-                    self.u = modulator_step(&self.u, &beam, &out, s, device, &h, &self.spec, self.pol, &mut self.report)?;
+                if let SurfaceResponse::Modulator { device, ray_model, .. } = response {
+                    let followed = orders_traced(device, ray_model, self.u.n_medium).then(|| self.siblings.get(&idx).cloned().unwrap_or_else(|| vec![out.d]));
+                    let (v, junction) = modulator_step(&self.u, &beam, &out, s, device, &h, &self.spec, self.pol, followed.as_deref(), &mut self.report)?;
+                    self.u = v;
+                    if let Some(j) = junction {
+                        self.note_junction(j);
+                    }
                 } else {
                     let (s, response) = (s.clone(), response.clone());
                     self.flat_element(&s, &response, &h, p, n_s, &out, from_front)?;
@@ -3304,6 +3425,49 @@ impl ChainJob {
             name: self.name,
         })
     }
+}
+
+/// Whether the ray tracer follows a modulator's diffraction orders, as its
+/// `modulator_orders` decides: the orders ray model, the device in air, and
+/// orders in closed form (not an LCoS with fringing). Otherwise it traces the
+/// geometric limit, and so does the wave path.
+fn orders_traced(device: &oc_core::modulator::SpatialModulator, ray_model: &oc_core::modulator::RayModel, n_medium: f64) -> bool {
+    let closed_form = match &device.kind {
+        ModulatorKind::Dmd(_) => true,
+        ModulatorKind::Lcos(l) => l.fringing_um <= 0.0,
+    };
+    !ray_model.is_geometric() && (n_medium - 1.0).abs() <= 1e-9 && closed_form
+}
+
+/// For each chain, at each modulator event under the orders ray model, the
+/// directions all the chains that reach it with the same history leave by:
+/// the orders the job follows out of that device (R16 of the expert review).
+fn note_siblings(scene: &Scene3, mut jobs: Vec<ChainJob>) -> Vec<ChainJob> {
+    let orders_model = |id: oc_core::id::ObjectId| {
+        scene.surfaces.iter().any(|s| {
+            s.common.id == id && [&s.response_front, &s.response_back].iter().any(|r| matches!(r, SurfaceResponse::Modulator { ray_model, .. } if !ray_model.is_geometric()))
+        })
+    };
+    let out_dir = |j: &ChainJob, i: usize| j.points.get(i + 1).map(|n| (n.0 - j.points[i].1).normalize());
+    let mut found: Vec<std::collections::HashMap<usize, Vec<Vec3>>> = vec![std::collections::HashMap::new(); jobs.len()];
+    for (a, ja) in jobs.iter().enumerate() {
+        for (i, (_, _, ev)) in ja.points.iter().enumerate() {
+            let Ev::Hit(h) = ev else { continue };
+            if !orders_model(h.object) {
+                continue;
+            }
+            let dirs: Vec<Vec3> = jobs
+                .iter()
+                .filter(|jb| jb.keys.len() > i && jb.keys[..i] == ja.keys[..i] && matches!(&jb.points[i].2, Ev::Hit(hb) if hb.object == h.object && hb.action == h.action))
+                .filter_map(|jb| out_dir(jb, i))
+                .collect();
+            found[a].insert(i, dirs);
+        }
+    }
+    for (j, f) in jobs.iter_mut().zip(found) {
+        j.siblings = f;
+    }
+    jobs
 }
 
 /// Whether two frames are one: the same origin and the same axes, to
@@ -3697,6 +3861,15 @@ fn losses_between(after: &WaveLedger, before: &WaveLedger) -> WaveLedger {
 /// takes back what it booked for the other arm's. Where arms join at an
 /// element (`Recombine`), each keeps what it booked there, and the join's
 /// own entry moves their interference to the port they leave unread.
+/// The buckets of two ledgers added (`launched` too).
+fn sum_ledgers(a: &WaveLedger, b: &WaveLedger) -> WaveLedger {
+    let mut s = *a;
+    add_losses(&mut s, b);
+    s.launched += b.launched;
+    s.detected += b.detected;
+    s
+}
+
 fn book_history(l: &mut WaveLedger, arms: &[&[HistoryEntry]]) {
     use std::collections::{HashMap, HashSet};
     let mut met: HashMap<u64, usize> = HashMap::new();
@@ -3712,6 +3885,8 @@ fn book_history(l: &mut WaveLedger, arms: &[&[HistoryEntry]]) {
     // before it and the element, each distinct event once.
     let mut shares: HashMap<String, f64> = HashMap::new();
     let mut counted: HashSet<String> = HashSet::new();
+    // Under the orders model, the device's beams the arms take, by event.
+    let mut beams: HashMap<String, HashSet<u8>> = HashMap::new();
     for a in arms {
         let mut history = String::new();
         for e in *a {
@@ -3721,6 +3896,12 @@ fn book_history(l: &mut WaveLedger, arms: &[&[HistoryEntry]]) {
             if let Some(j) = e.junction {
                 if j.kind == JunctionKind::Split && counted.insert(history.clone()) {
                     *shares.entry(format!("{before}#{}", j.object)).or_default() += j.share;
+                }
+                if j.kind == JunctionKind::Orders {
+                    beams.entry(format!("{before}#{}", j.object)).or_default().insert(j.beam);
+                    if counted.insert(history.clone()) {
+                        *shares.entry(format!("{before}#{}#{}", j.object, j.beam)).or_default() += j.share;
+                    }
                 }
             }
         }
@@ -3747,7 +3928,7 @@ fn book_history(l: &mut WaveLedger, arms: &[&[HistoryEntry]]) {
                             if taken > j.share * (1.0 + 1e-12) {
                                 // Other arms part here and carry their shares on.
                                 *bucket_mut(&mut d, j.bucket) = j.input * (1.0 - taken) - d.absorbed_element;
-                            } else if n_met >= 2 {
+                            } else if n_met >= 2 && j.bucket == Bucket::OtherArm {
                                 // Arms of other histories meet the element: what
                                 // went by its other port reached the detector.
                                 *bucket_mut(&mut d, j.bucket) = 0.0;
@@ -3762,6 +3943,25 @@ fn book_history(l: &mut WaveLedger, arms: &[&[HistoryEntry]]) {
                         if n_met >= 2 {
                             d.absorbed_element -= j.foreign_absorbed;
                             d.other_family -= j.foreign_family;
+                        }
+                    }
+                    JunctionKind::Orders => {
+                        let tag = format!("{before}#{}#{}", j.object, j.beam);
+                        let taken = shares.get(&tag).copied().unwrap_or(j.share);
+                        let both = beams.get(&format!("{before}#{}", j.object)).is_some_and(|b| b.len() >= 2);
+                        if parted.insert(tag) {
+                            // The first of the orders: the shared part, and
+                            // the cells no order chain owns.
+                            *bucket_mut(&mut d, j.bucket) = j.input * (1.0 - taken);
+                            if both {
+                                // The other beam's orders book that beam.
+                                d.absorbed_element -= j.foreign_absorbed;
+                                d.other_family -= j.foreign_family;
+                            }
+                        } else {
+                            // Another order of the same field: its own terms.
+                            d = losses_between(&d, &j.shared);
+                            *bucket_mut(&mut d, j.bucket) = 0.0;
                         }
                     }
                     JunctionKind::Recombine => {}
@@ -4157,7 +4357,7 @@ impl WaveJob {
         let mut modes = Vec::with_capacity(lines.len());
         let mut dirs: Vec<Vec3> = Vec::new();
         for (lam, w) in lines {
-            let seqs = oc_trace::extract_sequences3(scene, spec.source, spec.detector, Some(lam), revision)
+            let seqs = oc_trace::extract_wave_sequences3(scene, spec.source, spec.detector, Some(lam), revision)
                 .map_err(|e| WaveError::OutOfRange(format!("no chain from the source to the detector: {e}")))?;
             // The source's own state as one coherent pair of components;
             // unpolarized light as two incoherent launches, along x and y;
@@ -4178,6 +4378,7 @@ impl WaveJob {
                     .cloned()
                     .map(|seq| ChainJob::new(&shared, spec, seq, spec.power * w / total * share, jones))
                     .collect::<Result<Vec<_>, _>>()?;
+                let jobs = note_siblings(scene, jobs);
                 let (jobs, arms) = plan_joins(jobs, spec.window_mm);
                 dirs.extend(jobs.iter().filter(|j| j.joins.is_none()).map(|j| j.final_dir()));
                 let chains: Vec<Chain> = jobs.into_iter().map(|j| Chain::Running(Box::new(j))).collect();
@@ -4546,6 +4747,18 @@ pub fn wave_path(scene: &Scene3, spec: &WavePathSpec, revision: u64) -> Result<W
 
 /// Lay the beam onto a DMD or SLM, reflect it, and take it up across the
 /// outgoing ray.
+///
+/// Under the geometric ray model the chain follows one mirror family, the
+/// one whose specular direction its outgoing direction is (R17 of the expert
+/// review: not the family of the one pixel the axial ray met), and carries
+/// that family's whole field. Under the orders ray model (`followed`, the
+/// directions the job's chains leave the device by) the chain owns its own
+/// order: of every family's reflected field it keeps the lattice cell of its
+/// order (directions `λ/p` apart about the incident one, Harvey & Vernold
+/// 1998), re-carriered to its own direction, and the families' cells are
+/// added; the cells it does not own are booked through the device's
+/// junction, once for the job, as the orders no chain follows (R16: no
+/// copy of the full spectrum per chain).
 #[allow(clippy::too_many_arguments)]
 fn modulator_step(
     u: &Field2,
@@ -4556,8 +4769,9 @@ fn modulator_step(
     h: &oc_core::seq3::SeqHit3,
     spec: &WavePathSpec,
     pol: Pol,
+    followed: Option<&[Vec3]>,
     report: &mut WaveReport,
-) -> Result<Field2, WaveError> {
+) -> Result<(Field2, Option<Junction>), WaveError> {
     let t = &s.common.transform;
     let n_s = t.rotate(Vec3::Z);
     // The device-plane grid: the beam window's footprint, at a few samples a
@@ -4603,14 +4817,44 @@ fn modulator_step(
     }
     let before = u.power();
     let dev_in = on_dev.power();
-    let (reflected, rep) = match &device.kind {
-        ModulatorKind::Dmd(_) => {
-            // The chain followed the family of the pixel the chief ray hit.
-            let l = t.inverse_transform_point(h.point);
-            let p = device.pitch_mm();
-            let fi = ((l.x / p + device.pixels[0] as f64 / 2.0).floor().max(0.0) as usize).min(device.pixels[0] as usize - 1);
-            let fj = ((l.y / p + device.pixels[1] as f64 / 2.0).floor().max(0.0) as usize).min(device.pixels[1] as usize - 1);
-            dmd_reflect(&on_dev, device, DmdState::from_value(device.value(fi, fj)))?
+    let (ex, ey) = (t.rotate(Vec3::X), t.rotate(Vec3::Y));
+    let lam_dev = on_dev.wavelength_in_medium_mm();
+    // The pixel the axial ray meets.
+    let l_hit = t.inverse_transform_point(h.point);
+    let fi = ((l_hit.x / p + device.pixels[0] as f64 / 2.0).floor().max(0.0) as usize).min(device.pixels[0] as usize - 1);
+    let fj = ((l_hit.y / p + device.pixels[1] as f64 / 2.0).floor().max(0.0) as usize).min(device.pixels[1] as usize - 1);
+    // What the device reflects, by family (a DMD's mirror states, an LCoS's
+    // one beam), each with its own carrier and ledger.
+    let families: Vec<(Field2, WaveReport)> = match &device.kind {
+        ModulatorKind::Dmd(dspec) => {
+            // The families the device holds; under the geometric model, the
+            // one the chain leaves along.
+            let states: Vec<DmdState> = [DmdState::On, DmdState::Off, DmdState::Flat]
+                .into_iter()
+                .filter(|st| (0..device.pixels[1] as usize).any(|j| (0..device.pixels[0] as usize).any(|i| DmdState::from_value(device.value(i, j)) == *st)))
+                .collect();
+            let specular = |st: DmdState| {
+                let nf = t.rotate(oc_core::modulator::facet_normal(dspec, st));
+                beam.d - nf * (2.0 * beam.d.dot(nf))
+            };
+            match followed {
+                None => {
+                    let st = states
+                        .iter()
+                        .copied()
+                        .min_by(|a, b| (specular(*a) - out.d).length().partial_cmp(&(specular(*b) - out.d).length()).unwrap_or(std::cmp::Ordering::Equal))
+                        .unwrap_or(DmdState::On);
+                    if DmdState::from_value(device.value(fi, fj)) != st {
+                        report.approx(format!(
+                            "DMD #{}: the chain carries the {st:?} mirrors, whose direction it leaves along, though the pixel the axial ray meets is {:?}",
+                            h.object.0,
+                            DmdState::from_value(device.value(fi, fj))
+                        ));
+                    }
+                    vec![dmd_reflect(&on_dev, device, st)?]
+                }
+                Some(_) => states.into_iter().map(|st| dmd_reflect(&on_dev, device, st)).collect::<Result<_, _>>()?,
+            }
         }
         ModulatorKind::Lcos(_) => {
             let beam_kind = if h.action == SeqAction::Diffract { LcosBeam::Modulated } else { LcosBeam::Unmodulated };
@@ -4625,20 +4869,150 @@ fn modulator_step(
                 )));
             }
             report.approx("LCoS on the wave path: the field's two polarization components split on the director, each into its own beam; the two never interfere");
-            lcos_reflect(&on_dev, device, beam_kind)?
+            vec![lcos_reflect(&on_dev, device, beam_kind)?]
+        }
+    };
+    let (reflected, rep, junction) = match followed {
+        None => {
+            let (f, r) = families.into_iter().next().expect("one family");
+            (f, r, None)
+        }
+        Some(dirs) => {
+            // Each family's cell of this chain's order, re-carriered to its
+            // direction, added; the rest of every family's cells booked. The
+            // orders lie `λ/P` apart about the incident direction, `P` the
+            // period of the pattern's unit cell where the axial ray meets it
+            // (the tracer's lattice, `local_unit_cell`).
+            let t_in = on_dev.carrier;
+            let (cell, _) = oc_core::modulator::local_unit_cell(device, fi, fj);
+            let step = [lam_dev / (cell.period[0] as f64 * p), lam_dev / (cell.period[1] as f64 * p)];
+            let tang = |d: Vec3| [d.dot(ex), d.dot(ey)];
+            let order_of = |tt: [f64; 2]| [((tt[0] - t_in[0]) / step[0]).round() as i64, ((tt[1] - t_in[1]) / step[1]).round() as i64];
+            let own_t = tang(out.d);
+            let own = order_of(own_t);
+            let k_dev = on_dev.k_mm();
+            let mut sum = on_dev.clone();
+            sum.data.iter_mut().for_each(|z| *z = Cx::ZERO);
+            sum.carrier = own_t;
+            let mut cells = 0.0;
+            let mut rep = WaveReport::default();
+            let dmd = matches!(device.kind, ModulatorKind::Dmd(_));
+            let mut fft = Fft2::new();
+            for (k, (f, r)) in families.into_iter().enumerate() {
+                let n = f.grid.n;
+                let mut b = f.data.clone();
+                crate::fft::ifftshift2(&mut b, n);
+                fft.forward(&mut b, n, f.grid.cell_area_mm2());
+                let df = f.grid.freq_pitch(0) * f.grid.freq_pitch(1);
+                for ky in 0..n[1] {
+                    let fy = f.grid.fft_freq(1, ky);
+                    for kx in 0..n[0] {
+                        let fx = f.grid.fft_freq(0, kx);
+                        let v = &mut b[ky * n[0] + kx];
+                        let e = v.norm_sqr() * df;
+                        cells += e;
+                        if order_of([f.carrier[0] + lam_dev * fx, f.carrier[1] + lam_dev * fy]) != own {
+                            *v = Cx::ZERO;
+                        }
+                    }
+                }
+                fft.inverse(&mut b, n, df);
+                crate::fft::fftshift2(&mut b, n);
+                let dc = [f.carrier[0] - own_t[0], f.carrier[1] - own_t[1]];
+                for jy in 0..n[1] {
+                    for ix in 0..n[0] {
+                        let (x, y) = f.grid.xy(ix, jy);
+                        let idx = f.grid.idx(ix, jy);
+                        sum.data[idx] += b[idx] * Cx::expi(k_dev * (dc[0] * x + dc[1] * y));
+                    }
+                }
+                // A DMD's absorption once (the dead space and the
+                // reflectance, the same in every family's run); its families
+                // all carried.
+                let mut l = r.ledger;
+                if dmd {
+                    if k > 0 {
+                        l.absorbed_element = 0.0;
+                    }
+                    l.other_family = 0.0;
+                }
+                rep.ledger.absorbed_element += l.absorbed_element;
+                rep.ledger.other_family += l.other_family;
+                rep.ledger.spectral_projection += l.spectral_projection;
+                rep.ledger.subcell_projection += l.subcell_projection;
+                rep.ledger.numerical += l.numerical;
+                for w in r.warnings {
+                    rep.warn(w);
+                }
+                for v in r.validity {
+                    rep.flag(v);
+                }
+                for a in r.approximated {
+                    rep.approx(a);
+                }
+                rep.steps.extend(r.steps);
+            }
+            let others: Vec<[i64; 2]> = dirs.iter().map(|d| order_of(tang(*d))).filter(|o| *o != own).collect();
+            // The order's power: its families' cells added as fields (light
+            // from mirrors of either family meets in one order and
+            // interferes there). Over every cell those powers add up to the
+            // families' (their fields lie on disjoint mirrors), so the
+            // cells no chain owns hold the rest.
+            let owned = sum.power();
+            rep.ledger.untracked_orders += cells - owned;
+            rep.ledger.detected = owned;
+            // In beam units: the reflected cells the job's order chains
+            // share, and what each of them books the same.
+            let scale = if dev_in > 0.0 { before / dev_in } else { 0.0 };
+            let input = cells * scale;
+            let shared = WaveLedger {
+                absorbed_element: rep.ledger.absorbed_element * scale,
+                other_family: rep.ledger.other_family * scale,
+                spectral_projection: rep.ledger.spectral_projection * scale,
+                subcell_projection: rep.ledger.subcell_projection * scale,
+                numerical: rep.ledger.numerical * scale,
+                ..Default::default()
+            };
+            report.approx(format!(
+                "{} #{}: the chain owns its order {:?} of the device's lattice; of every mirror family the cell of that order is kept, the others ({} followed by other chains of this job) booked once as orders no chain follows",
+                oc_core::build3::response_kind(&s.response_front),
+                h.object.0,
+                own,
+                others.len()
+            ));
+            let junction = Junction {
+                object: h.object.0,
+                kind: JunctionKind::Orders,
+                bucket: Bucket::UntrackedOrders,
+                input,
+                share: if input > 0.0 { owned * scale / input } else { 0.0 },
+                foreign_absorbed: 0.0,
+                foreign_family: 0.0,
+                shared,
+                beam: u8::from(h.action != SeqAction::Diffract && matches!(device.kind, ModulatorKind::Lcos(_))),
+            };
+            (sum, rep, Some(junction))
         }
     };
     // The device grid, finer than the outgoing window, holds plane waves that
     // window cannot: read between device samples, they would fold back in at
     // directions they do not have, and weight the orders wrongly. Take them
-    // out first, about the reflected family's carrier, as a re-grid does,
-    // and book them. The window's samples, `p` apart across the outgoing
-    // ray, are `p/√(1 − (e·d)²)` apart along a device axis `e` on its plane.
+    // out first, and book them. A step across the outgoing ray, along its
+    // `x` or `y`, lands on the device plane at `P = e − d (e·n)/(d·n)`, which
+    // on the device's axes is a column of the map's Jacobian `A`; a device
+    // frequency `f` then lands at `Aᵀf` on the window, offset by what the
+    // reflected family's carrier and the outgoing reference leave, and the
+    // window holds it while that is within its band.
     let scale = if dev_in > 0.0 { before / dev_in } else { 0.0 };
-    let pb = u.grid.pitch_mm[0].max(u.grid.pitch_mm[1]);
-    let along = |e: Vec3| pb / (1.0 - e.dot(out.d).powi(2)).max(1e-12).sqrt();
-    let band = Grid2::new(reflected.grid.n, [along(t.rotate(Vec3::X)), along(t.rotate(Vec3::Y))], [0.0, 0.0])?;
-    let (reflected, cut) = band_to(&reflected, &band, &mut Fft2::new());
+    let lam_mm = u.wavelength_in_medium_mm();
+    let ((aa, pa), (ab, pbv)) = takeup_columns(out, n_s, t.rotate(Vec3::X), t.rotate(Vec3::Y));
+    let rc = reflected.carrier;
+    let delta = [
+        -(out.d.dot(pa) - (rc[0] * aa[0] + rc[1] * aa[1])) / lam_mm,
+        -(out.d.dot(pbv) - (rc[0] * ab[0] + rc[1] * ab[1])) / lam_mm,
+    ];
+    let lim = [0.5 / u.grid.pitch_mm[0], 0.5 / u.grid.pitch_mm[1]];
+    let (reflected, cut) = band_through(&reflected, [aa, ab], delta, lim, &mut Fft2::new());
     // Take the reflected field up across the outgoing ray. Its samples are
     // the incident ones times a piston per pixel, so the incident field's
     // sphere is the one to take out of them.
@@ -4676,8 +5050,9 @@ fn modulator_step(
     // outgoing ray does not carry is resampling.
     report.ledger.absorbed_element += rep.ledger.absorbed_element * scale;
     report.ledger.other_family += rep.ledger.other_family * scale;
+    report.ledger.untracked_orders += rep.ledger.untracked_orders * scale;
     report.ledger.subcell_projection += rep.ledger.subcell_projection * scale;
-    report.ledger.spectral_projection += cut * scale;
+    report.ledger.spectral_projection += (rep.ledger.spectral_projection + cut) * scale;
     report.ledger.numerical += rep.ledger.numerical * scale;
     report.ledger.resampling += (rep.ledger.detected - cut) * scale - v.power();
     for f in rep.validity {
@@ -4699,7 +5074,7 @@ fn modulator_step(
             cut * scale / before.max(f64::MIN_POSITIVE)
         ),
     ));
-    Ok(v)
+    Ok((v, junction))
 }
 
 #[cfg(test)]
@@ -4802,6 +5177,90 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_take_up_keeps_what_the_outgoing_window_holds_through_the_projection() {
+        // Q18 of the expert review. A device tilted 30° about a diagonal of
+        // its own axes, read across a beam along +Z: a plane wave of device
+        // frequency f lands on the beam's samples at Aᵀf, A the map's
+        // Jacobian, which a plane wave sampled at the projected points of the
+        // beam's grid shows directly. The window holds |Aᵀf| within its band
+        // per axis: a region on the device that is rotated and sheared, so a
+        // device frequency inside the rectangle the rule before kept (on the
+        // device's own axes, the window's pitch projected along each) can
+        // fall outside it, and one outside inside; `band_through` keeps
+        // exactly the waves it holds.
+        let q = glam::DQuat::from_axis_angle(Vec3::new(1.0, 1.0, 0.0).normalize(), 30f64.to_radians());
+        let dev = Isometry3::new(Vec3::ZERO, [q.x, q.y, q.z, q.w]).unwrap();
+        let (n, ex, ey) = (dev.rotate(Vec3::Z), dev.rotate(Vec3::X), dev.rotate(Vec3::Y));
+        let out = Beam { origin: Vec3::ZERO, x: Vec3::X, y: Vec3::Y, d: Vec3::Z };
+        let ((aa, _), (ab, _)) = takeup_columns(&out, n, ex, ey);
+        // A plane wave on the device, sampled at the beam grid's projected
+        // points: its frequency on the beam's samples.
+        let g = Grid2::square(128, 0.01).unwrap();
+        let fdev = [23.0, -11.0];
+        let mut u = Field2::zeros(g, 0.6328).unwrap();
+        for j in 0..g.n[1] {
+            for i in 0..g.n[0] {
+                let (a, b) = g.xy(i, j);
+                let r = onto_plane(Vec3::new(a, b, 0.0), Vec3::Z, Vec3::ZERO, n).unwrap();
+                let l = dev.inverse_transform_point(r);
+                u.data[g.idx(i, j)] = Cx::expi(2.0 * std::f64::consts::PI * (fdev[0] * l.x + fdev[1] * l.y));
+            }
+        }
+        let want = [aa[0] * fdev[0] + aa[1] * fdev[1], ab[0] * fdev[0] + ab[1] * fdev[1]];
+        // The phase's slope across the samples, by adjacent steps.
+        let at = |i: usize, j: usize| u.at(i, j);
+        let got = [
+            crate::transfer::phase_gradient(&at, 64, 64, 0, 0.01) / (2.0 * std::f64::consts::PI),
+            crate::transfer::phase_gradient(&at, 64, 64, 1, 0.01) / (2.0 * std::f64::consts::PI),
+        ];
+        assert!((got[0] - want[0]).abs() < 1e-9 && (got[1] - want[1]).abs() < 1e-9, "{got:?} vs {want:?}");
+        // Three waves on a device grid, of known powers, and a window band.
+        let gd = Grid2::square(256, 0.005).unwrap();
+        let df = gd.freq_pitch(0);
+        let lim = [30.0, 30.0];
+        let m = [aa, ab];
+        let mapped = |f: [f64; 2]| [m[0][0] * f[0] + m[0][1] * f[1], m[1][0] * f[0] + m[1][1] * f[1]];
+        let holds = |f: [f64; 2]| {
+            let o = mapped(f);
+            o[0].abs() <= lim[0] && o[1].abs() <= lim[1]
+        };
+        // On the grid's own frequencies, so that each is one bin.
+        let bin = |f: f64| (f / df).round() * df;
+        // The rule before: a rectangle on the device's own axes, the window's
+        // pitch projected along each, `p/√(1 − (e·d)²)`.
+        let shrink = |e: Vec3| (1.0 - e.dot(out.d).powi(2)).max(0.0).sqrt();
+        let inside_axes = |f: [f64; 2]| f[0].abs() <= lim[0] * shrink(ex) && f[1].abs() <= lim[1] * shrink(ey);
+        // Near the band's corners the two rules part: a wave the window holds
+        // outside that rectangle, one it does not hold inside it, and one both
+        // keep.
+        let corners: Vec<[f64; 2]> = (-14..=14).flat_map(|i| (-14..=14).map(move |j| [i as f64 * 2.5, j as f64 * 2.5])).map(|f| [bin(f[0]), bin(f[1])]).collect();
+        let held_outside = *corners.iter().find(|f| holds(**f) && !inside_axes(**f)).expect("a wave held outside the rectangle");
+        let dropped_inside = *corners.iter().find(|f| !holds(**f) && inside_axes(**f)).expect("a wave dropped inside it");
+        let waves: Vec<([f64; 2], f64)> = vec![(held_outside, 1.0), (dropped_inside, 0.5), ([bin(-5.0), bin(5.0)], 0.25)];
+        let mut v = Field2::zeros(gd, 0.6328).unwrap();
+        for j in 0..gd.n[1] {
+            for i in 0..gd.n[0] {
+                let (x, y) = gd.xy(i, j);
+                v.data[gd.idx(i, j)] = waves.iter().fold(Cx::ZERO, |s, (f, a)| s + Cx::expi(2.0 * std::f64::consts::PI * (f[0] * x + f[1] * y)) * *a);
+            }
+        }
+        let area = gd.width_mm(0) * gd.width_mm(1);
+        let (kept, removed) = band_through(&v, m, [0.0, 0.0], lim, &mut Fft2::new());
+        let want_removed: f64 = waves.iter().filter(|(f, _)| !holds(*f)).map(|(_, a)| a * a * area).sum();
+
+        assert!((removed - want_removed).abs() < 1e-12 * area, "{removed} vs {want_removed}");
+        let mut worst: f64 = 0.0;
+        for j in 0..gd.n[1] {
+            for i in 0..gd.n[0] {
+                let (x, y) = gd.xy(i, j);
+                let w = waves.iter().filter(|(f, _)| holds(*f)).fold(Cx::ZERO, |s, (f, a)| s + Cx::expi(2.0 * std::f64::consts::PI * (f[0] * x + f[1] * y)) * *a);
+                worst = worst.max((kept.at(i, j) - w).abs());
+            }
+        }
+        assert!(worst < 1e-12, "{worst}");
     }
 
     #[test]

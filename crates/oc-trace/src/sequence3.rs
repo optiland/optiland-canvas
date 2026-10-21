@@ -184,7 +184,7 @@ pub fn extract_sequence3(
     detector: DetectorId,
     revision: u64,
 ) -> Result<SequencePrescription3, SequenceError> {
-    let mut chains = extract_chains(scene, source, detector, None, revision, false)?;
+    let mut chains = extract_chains(scene, source, detector, None, revision, false, &|c| c)?;
     Ok(chains.remove(0))
 }
 
@@ -202,9 +202,79 @@ pub fn extract_sequences3(
     lambda_um: Option<f64>,
     revision: u64,
 ) -> Result<Vec<SequencePrescription3>, SequenceError> {
-    extract_chains(scene, source, detector, lambda_um, revision, true)
+    extract_chains(scene, source, detector, lambda_um, revision, true, &|c| c)
 }
 
+/// The chains a coherent wave path follows from `source` to `detector`: as
+/// [`extract_sequences3`], with two differences that make a chain stand for
+/// the field rather than for its axial ray (R17 and R18 of the expert review
+/// of the wave engine). An aperture does not stop the axial ray, so a field
+/// an aperture lets through around the axis (an annular stop's, whose centre
+/// blocks the axial ray) still has a chain; the wave path lays the aperture on
+/// the field where the chain crosses it. And under the geometric ray model a
+/// DMD is traced once per mirror family its pattern holds, every mirror
+/// taken in that family, so that each family the field lights has its chain
+/// whatever the one pixel (or gap) the axial ray meets. The chains of every
+/// run are gathered, the same chain found twice kept once; the error is the
+/// plain extraction's when no run reaches the detector.
+pub fn extract_wave_sequences3(
+    scene: &Scene3,
+    source: SourceId,
+    detector: DetectorId,
+    lambda_um: Option<f64>,
+    revision: u64,
+) -> Result<Vec<SequencePrescription3>, SequenceError> {
+    use oc_core::modulator::{DmdState, ModulatorKind};
+    use oc_core::scene3::SurfaceResponse;
+    let mut families: Vec<Option<DmdState>> = vec![None];
+    for s in &scene.surfaces {
+        for r in [&s.response_front, &s.response_back] {
+            if let SurfaceResponse::Modulator { device, ray_model, .. } = r {
+                if matches!(device.kind, ModulatorKind::Dmd(_)) && ray_model.is_geometric() {
+                    for st in [DmdState::On, DmdState::Off, DmdState::Flat] {
+                        let present = (0..device.pixels[1] as usize).any(|j| (0..device.pixels[0] as usize).any(|i| DmdState::from_value(device.value(i, j)) == st));
+                        if present && !families.contains(&Some(st)) {
+                            families.push(Some(st));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut found: Vec<SequencePrescription3> = Vec::new();
+    let mut first_err = None;
+    for fam in families {
+        match extract_chains(scene, source, detector, lambda_um, revision, true, &|mut c| {
+            c.apertures_stop = false;
+            c.dmd_family = fam;
+            c
+        }) {
+            Ok(chains) => {
+                for c in chains {
+                    let same = |a: &SequencePrescription3| {
+                        a.hits.len() == c.hits.len()
+                            && a.hits.iter().zip(&c.hits).all(|(x, y)| x.object == y.object && x.action == y.action && (x.point - y.point).length() < 1e-9)
+                            && (a.terminal.point - c.terminal.point).length() < 1e-9
+                    };
+                    if !found.iter().any(same) {
+                        found.push(c);
+                    }
+                }
+            }
+            Err(e) => {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+    }
+    if found.is_empty() {
+        return Err(first_err.expect("one run at least"));
+    }
+    Ok(found)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn extract_chains(
     scene: &Scene3,
     source: SourceId,
@@ -212,6 +282,7 @@ fn extract_chains(
     lambda_um: Option<f64>,
     revision: u64,
     all: bool,
+    tune: &dyn Fn(TraceConfig3) -> TraceConfig3,
 ) -> Result<Vec<SequencePrescription3>, SequenceError> {
     let src = scene
         .sources
@@ -226,7 +297,7 @@ fn extract_chains(
     if let Some(l) = lambda_um {
         launch.lambda_um = l;
     }
-    let cfg = extraction_config(revision);
+    let cfg = tune(extraction_config(revision));
     let result = trace3(scene, &[launch], &cfg);
     let events = &result.events;
 

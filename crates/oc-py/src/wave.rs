@@ -197,7 +197,7 @@ pub fn modulator_orders(
         .map(|o| {
             serde_json::json!({
                 "m": o.m, "n": o.n, "dir": [o.dir.x, o.dir.y, o.dir.z],
-                "amplitude": [o.amplitude.re, o.amplitude.im], "efficiency": o.efficiency,
+                "coefficient": [o.coefficient.re, o.coefficient.im], "efficiency": o.efficiency,
             })
         })
         .collect();

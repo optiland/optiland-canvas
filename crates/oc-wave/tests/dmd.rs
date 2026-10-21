@@ -190,7 +190,7 @@ fn the_factorized_far_field_lands_on_the_closed_form_orders() {
     for o in t.orders.iter().filter(|o| o.m.abs() <= 3 && o.n.abs() <= 3) {
         let far = dmd_far_field(&d, lam, din, AngularGrid { start: [o.dir.x, o.dir.y], step: [1e-3, 1e-3], n: [1, 1] }, &[DmdState::On], &mut fft).unwrap();
         let got = far.data[0].abs() / ((n * n) as f64 * p * p);
-        worst = worst.max((got - o.amplitude.abs()).abs());
+        worst = worst.max((got - o.coefficient.abs()).abs());
     }
     measured("factorized far field vs closed-form |c_mn|", worst);
     assert!(worst < 1e-12, "{worst}");
@@ -198,9 +198,14 @@ fn the_factorized_far_field_lands_on_the_closed_form_orders() {
 
 #[test]
 fn the_sampled_dmd_far_field_converges_on_the_factorized_one() {
-    // The sampled near field (exact cell areas, the ON family's carrier),
-    // transformed, against the factorized far field: the same thin-element
-    // model computed two ways. 6 × 6 mirrors under a normal plane wave.
+    // The sampled near field (the ON family's mask band-limited to the grid,
+    // its carrier), transformed, against the factorized far field: the same
+    // thin-element model computed two ways. 6 × 6 mirrors under a normal
+    // plane wave. Between the window's own frequencies the near field's
+    // transform interpolates its lattice of values, and the mask's content
+    // beyond the grid's band enters there through the interpolation's tails:
+    // that converges with the sampling (at the orders themselves, on the
+    // lattice, the two agree to round-off: the next test).
     let n = 6;
     let d = dmd(n, 7.56, 12.0, TiltAxis::Diagonal, 0.9, Pattern::Uniform { value: 1 });
     let p = 7.56e-3;
@@ -273,7 +278,7 @@ fn a_binary_grating_on_the_on_mirrors_puts_one_over_pi_squared_in_each_first_ord
         let first = g.orders.iter().find(|o| o.m == period as i32 * b.m + 1 && o.n == b.n).unwrap();
         let on1 = env(first, DmdState::On, s_on);
         let off1 = env(first, DmdState::Off, s_off);
-        let got = (first.amplitude.abs() / on1.abs()) / (b.amplitude.abs() / env(b, DmdState::On, s_on).abs());
+        let got = (first.coefficient.abs() / on1.abs()) / (b.coefficient.abs() / env(b, DmdState::On, s_on).abs());
         let lattice = 1.0 / (period as f64 * (PI / period as f64).sin());
         let predicted = lattice * (1.0 - off1 / on1).abs();
         measured(&format!("binary grating, period {period}: first-order power, lattice factor²"), lattice * lattice);
@@ -342,4 +347,153 @@ fn the_lee_generator_follows_gutierrez_cuevas_and_popoff_eq_11() {
     }));
     let on: usize = (0..64).map(|i| weak.value(i, 7) as usize).sum();
     assert!((on as f64 - 16.0).abs() <= 1.0, "{on}");
+}
+
+#[test]
+fn on_its_window_s_frequencies_the_near_field_is_the_factorized_far_field_at_any_sampling() {
+    // Q17 of the expert review. The device's mask is band-limited exactly to
+    // the field's grid, from its closed-form transform, instead of averaged
+    // over each sample's cell (which weights order m by sinc(m/s) at s
+    // samples a mirror: 0.935 in amplitude for an order 1.6 lattice steps out
+    // at 8). So on the window's own frequencies, k/W, inside the grid's band,
+    // the near field's transform is the factorized far field to round-off,
+    // at 4 samples a mirror as at 32; its power in each order is then the
+    // factorized one, whatever the sampling. 6 × 6 mirrors on an 8-mirror
+    // window, under a normal plane wave.
+    let n = 6;
+    let d = dmd(n, 7.56, 12.0, TiltAxis::Diagonal, 0.9, Pattern::Uniform { value: 1 });
+    let p = 7.56e-3;
+    let lam = 0.633;
+    let lm = lam / 1000.0;
+    let din = Vec3::new(0.0, 0.0, -1.0);
+    let mut fft = Fft2::new();
+    for per in [4usize, 8, 16, 32] {
+        let m = n as usize * per + 2 * per;
+        let g = Grid2::square(m, p / per as f64).unwrap();
+        let u = Field2::from_fn(g, lam, |_, _| Cx::ONE).unwrap();
+        let (v, r) = dmd_reflect(&u, &d, DmdState::On).unwrap();
+        assert!(r.ledger.numerical.abs() < 1e-12 * r.ledger.launched, "{:?}", r.ledger);
+        // The window's lattice, k/W, within 0.9 of the band, in a patch of
+        // 41 × 41 about the family's carrier.
+        let w = m as f64 * g.pitch_mm[0];
+        let df = 1.0 / w;
+        let band = 0.5 / g.pitch_mm[0];
+        let kmax = ((0.9 * band / df).floor() as i64).min(20);
+        let k0 = [-kmax as f64 * df, -kmax as f64 * df];
+        let kn = (2 * kmax + 1) as usize;
+        let near = czt2(&v, k0, [df, df], [kn, kn], &mut fft);
+        let start = [v.carrier[0] + lm * k0[0], v.carrier[1] + lm * k0[1]];
+        let far = dmd_far_field(&d, lam, din, AngularGrid { start, step: [lm * df, lm * df], n: [kn, kn] }, &[DmdState::On], &mut fft).unwrap();
+        let peak = far.data.iter().map(|z| z.abs()).fold(0.0, f64::max);
+        let worst = near.iter().zip(&far.data).map(|(a, b)| (*a - *b).abs()).fold(0.0, f64::max);
+        measured(&format!("band-limited DMD mask, {per} samples per mirror: on {kn}² of the window's frequencies, near field against the factorized far field, worst / peak"), worst / peak);
+        assert!(worst / peak < 1e-10, "{per}: {}", worst / peak);
+    }
+}
+
+#[test]
+fn the_thin_element_mask_against_one_facet_s_surface_integral() {
+    // V04 and Q4 of the expert review: a reference for the array-normal mask
+    // and pivot ramp, which is a defined thin-element approximation. One flat
+    // square facet's integral under a uniform plane wave, with its physical
+    // tangents, is a² sinc(a q·u/2π) sinc(a q·v/2π), q = k_in − k_out
+    // (`facet_integral`); the thin element's mirror envelope is the
+    // projected outline's transform at the in-plane offset from the
+    // specular direction (`mirror_ft`). 10 µm mirrors of fill 0.95 tilted 12°
+    // about a side, lit at 24° so that the ON specular is the array normal.
+    // Both peak there. The facet's tangent across the hinge leaves the
+    // array plane, so off the specular the facet sees the outgoing ray's
+    // normal component, which the array-normal mask does not: the two
+    // envelopes' arguments differ at second order in the angle s. Across the
+    // hinge that skews the facet's envelope, an |E|² gap odd in s and of
+    // third order; along it the facet's second sinc departs from 1 at s²,
+    // a gap of fourth order. And the power each takes:
+    // the mask reflects ρ² cos θ of a mirror's cell, an isolated facet would
+    // intercept ρ²|d·n_f|/|d·z|, 1/cos 24° = 1.095 times as much at this
+    // geometry. Measured and stated, not corrected.
+    use oc_wave::modulator::{facet_integral, facet_interception_ratio, FACET_INCIDENCE_FLAG_DEG};
+    use oc_wave::report::ValidityFlag;
+    let d = dmd(41, 10.0, 12.0, TiltAxis::Side, 0.95, Pattern::Uniform { value: 1 });
+    let ds = spec(&d).clone();
+    let (p, lam) = (1e-2, 0.633);
+    let lm = lam / 1000.0;
+    let k = 2.0 * PI / lm;
+    let a = ds.mirror_fill * p;
+    let din = on_axis_illumination(&ds);
+    let nf = facet_normal(&ds, DmdState::On);
+    let ds_out = reflect(din, nf);
+    assert!((ds_out - Vec3::Z).length() < 1e-12, "{ds_out:?}");
+    let (h, _) = hinge(ds.tilt_axis);
+    let u_m = Vec3::new(h.x, h.y, 0.0);
+    let v_m = nf.cross(u_m).normalize();
+    let facet = |t: [f64; 2]| {
+        let dout = Vec3::new(t[0], t[1], (1.0 - t[0] * t[0] - t[1] * t[1]).sqrt());
+        facet_integral(a, u_m, v_m, din * k, dout * k).re / (a * a)
+    };
+    let thin = |t: [f64; 2]| mirror_ft(&ds, p, DmdState::On, [(t[0] - ds_out.x) / lm, (t[1] - ds_out.y) / lm]) / (12f64.to_radians().cos() * a * a);
+    assert!((facet([0.0, 0.0]) - 1.0).abs() < 1e-15 && (thin([0.0, 0.0]) - 1.0).abs() < 1e-15);
+    // The plane across the hinge, and along it.
+    let w = Vec3::new(-h.y, h.x, 0.0);
+    let gap = |e: Vec3, deg: f64| {
+        let s = deg.to_radians().sin();
+        facet([e.x * s, e.y * s]).powi(2) - thin([e.x * s, e.y * s]).powi(2)
+    };
+    for (name, e, order) in [("across", w, 3), ("along", u_m, 4)] {
+        for deg in [0.5, 1.0, 2.0, 4.0, 8.0] {
+            measured(&format!("facet integral against the thin element's envelope, {deg}° {name} the hinge: Δ|E|²/peak"), gap(e, deg));
+        }
+        // Near the peak (the envelope's first zero is 3.8° out), doubling
+        // the angle multiplies the gap by 2 to its order.
+        let r = gap(e, 0.25) / gap(e, 0.125);
+        measured(&format!("facet integral against the thin element, {name} the hinge: gap at 0.25° over 0.125°"), r);
+        let want = 2f64.powi(order);
+        assert!((r / want - 1.0).abs() < 0.05, "{name}: {r} vs {want}");
+        assert!((gap(e, -0.25) - (-1f64).powi(order) * gap(e, 0.25)).abs() < 1e-3 * gap(e, 0.25).abs(), "{name}: parity");
+    }
+    // Interception.
+    let ratio = facet_interception_ratio(&ds, DmdState::On, din);
+    measured("isolated facet over array-normal mask, interception at 24° on 12° facets", ratio);
+    assert!((ratio - 1.0 / 24f64.to_radians().cos()).abs() < 1e-12, "{ratio}");
+    // The window on the device's edges: its cells half a sample off centre.
+    let dx = p / 8.0;
+    let g = Grid2::new([41 * 8, 41 * 8], [dx, dx], [0.5 * dx, 0.5 * dx]).unwrap();
+    let mut u = Field2::from_fn(g, lam, |_, _| Cx::ONE).unwrap();
+    u.carrier = [din.x, din.y];
+    let (_, r) = dmd_reflect(&u, &d, DmdState::On).unwrap();
+    let l = r.ledger;
+    let reflected = (l.detected + l.spectral_projection + l.subcell_projection) / l.launched;
+    let want = ds.mirror_fill * ds.mirror_fill * 12f64.to_radians().cos();
+    measured("DMD mask, uniform light: reflected fraction against ρ² cos θ", reflected - want);
+    assert!((reflected - want).abs() < 1e-12, "{reflected} vs {want}");
+    assert!(r.validity.iter().any(|v| matches!(v, ValidityFlag::ThinElement { detail } if detail.contains("isolated"))), "{:?}", r.validity);
+    // Below the mark, no flag.
+    let near = Vec3::new(0.1, 0.0, -(1.0f64 - 0.01).sqrt());
+    assert!(near.x.asin().to_degrees() < FACET_INCIDENCE_FLAG_DEG);
+    u.carrier = [near.x, near.y];
+    let (_, r) = dmd_reflect(&u, &d, DmdState::On).unwrap();
+    assert!(!r.validity.iter().any(|v| matches!(v, ValidityFlag::ThinElement { .. })), "{:?}", r.validity);
+}
+
+#[test]
+fn a_harvey_table_scales_efficiencies_and_leaves_the_coefficients_alone() {
+    // Q5 of the expert review: under Harvey's renormalization ([D4]) the
+    // efficiencies are |c_mn|²·Σ_all/Σ_propagating and the coefficients are
+    // the thin element's c_mn as they are; the two differ, and the table says
+    // so by its model. Renormalizing a TEA table gives the Harvey table;
+    // renormalizing that changes nothing.
+    let d = dmd(1, 7.56, 12.0, TiltAxis::Diagonal, 0.97, Pattern::Uniform { value: 1 });
+    let din = on_axis_illumination(spec(&d));
+    let lam = 0.633;
+    let tea = unit_cell_orders(&d, &UnitCell::uniform(1), lam, din, OrderModel::Tea, LcosBeam::Modulated).unwrap();
+    let harvey = unit_cell_orders(&d, &UnitCell::uniform(1), lam, din, OrderModel::HarveyRenormalized, LcosBeam::Modulated).unwrap();
+    assert_eq!(tea.renormalized(), harvey);
+    assert_eq!(harvey.renormalized(), harvey);
+    let k = tea.total / tea.propagating;
+    measured("Harvey's factor Σ_all/Σ_propagating, 7.56 µm at 633 nm", k);
+    assert!(k > 1.0);
+    for (a, b) in tea.orders.iter().zip(&harvey.orders) {
+        assert_eq!(a.coefficient, b.coefficient);
+        assert!((a.efficiency - a.coefficient.norm_sqr()).abs() < 1e-15);
+        assert!((b.efficiency - k * b.coefficient.norm_sqr()).abs() < 1e-15);
+    }
 }

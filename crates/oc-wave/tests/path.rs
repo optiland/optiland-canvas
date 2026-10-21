@@ -2564,3 +2564,237 @@ fn a_grating_takes_its_tm_efficiency_across_its_grooves() {
         assert!((got - want).abs() < 1e-6 && (got - rays).abs() < 1e-6, "{name}: {got}, rays {rays}, want {want}");
     }
 }
+
+#[test]
+fn a_dmd_scene_reads_the_same_whatever_the_device_sampling() {
+    // V06 and Q17 of the expert review: the device's sampling is its own
+    // convergence axis. The scene of the focusing test above, a 10 µm DMD lit
+    // at 24° and a lens of f = 15 mm, on a 1.28 mm window of 256 samples (the
+    // beam's band fixed), the device laid at 4, 8 and 16 samples a pixel and
+    // nothing else changed: with the mask band-limited exactly to the device
+    // grid, the detector reads the same at every sampling, to what the
+    // take-up's reading between device samples leaves.
+    use oc_core::modulator::{facet_normal, DmdSpec, DmdState, ModulatorKind, Pattern, SpatialModulator, TiltAxis};
+    let mut s = Scene3::new();
+    let src = source(&mut s);
+    let mk = |value: u16| SpatialModulator {
+        pixels: [201, 201],
+        pitch_um: 10.0,
+        kind: ModulatorKind::Dmd(DmdSpec { tilt_deg: 12.0, tilt_axis: TiltAxis::Side, mirror_fill: 0.95, reflectance: 1.0, window_transmittance: 1.0 }),
+        pattern: Pattern::Uniform { value },
+    };
+    let dmd_pos = Vec3::new(100.0, 0.0, 0.0);
+    let id = s.add_modulator(dmd_pos, 180.0 - 24.0, mk(1)).unwrap();
+    let t = s.surfaces.iter().find(|x| x.common.id.0 == id).unwrap().common.transform;
+    let n_dev = t.rotate(Vec3::Z);
+    let bis = (n_dev - Vec3::X).normalize();
+    let ModulatorKind::Dmd(spec_d) = &mk(1).kind else { unreachable!() };
+    let on = t.rotate(facet_normal(spec_d, DmdState::On));
+    let value = if on.dot(bis) > t.rotate(facet_normal(spec_d, DmdState::Off)).dot(bis) { 1 } else { 0 };
+    if let SurfaceResponse::Modulator { device, .. } = &mut s.surfaces.iter_mut().find(|x| x.common.id.0 == id).unwrap().response_front {
+        device.pattern = Pattern::Uniform { value };
+    }
+    let lens_pos = dmd_pos + n_dev * 5.0;
+    s.add_planar_element(lens_pos, 1.0, n_dev.y.atan2(n_dev.x).to_degrees(), lens(15.0), lens(15.0));
+    let det = s.add_area_detector(lens_pos + n_dev * 15.0, -n_dev, 1.25, 1.25, [32, 32]);
+    s.validate().unwrap();
+    let run = |per: usize| {
+        let mut sp = spec(src, det, 0.15, 256, 1.28);
+        sp.device_samples_per_pixel = per;
+        wave_path(&s, &sp, 1).unwrap()
+    };
+    let (a, b, c) = (run(4), run(8), run(16));
+    let peak = c.power.iter().cloned().fold(0.0, f64::max);
+    let diff = |x: &WavePathResult| x.power.iter().zip(&c.power).map(|(p, q)| (p - q).abs()).fold(0.0, f64::max) / peak;
+    measured("DMD scene, device sampled 4 against 16 samples a pixel: the detector's pixels, worst / peak", diff(&a));
+    measured("DMD scene, device sampled 8 against 16 samples a pixel: the detector's pixels, worst / peak", diff(&b));
+    measured("DMD scene, device sampled 4 against 16 samples a pixel: detected, of the launched", a.report.ledger.detected - c.report.ledger.detected);
+    assert!(diff(&a) < 1e-3 && diff(&b) < 1e-3, "{} {}", diff(&a), diff(&b));
+}
+
+/// A 10 µm, 12° side-tilt DMD lit at 24° from a source 20 mm before it, its
+/// mirrors of the value whose facets send the beam back along the device
+/// normal (or the `pattern` given), and a detector `det_at` mm along that
+/// normal, `half` mm across. The scene, its source and detector, the device's
+/// id, its normal and that value.
+fn dmd_scene(pixels: u32, fill: f64, pattern: Option<oc_core::modulator::Pattern>, det_at: f64, half: f64, bins: [usize; 2]) -> (Scene3, SourceId, DetectorId, u64, Vec3, u16) {
+    use oc_core::modulator::{facet_normal, DmdSpec, DmdState, ModulatorKind, Pattern, SpatialModulator, TiltAxis};
+    let mut s = Scene3::new();
+    let src = source(&mut s);
+    let mk = |pattern: Pattern| SpatialModulator {
+        pixels: [pixels, pixels],
+        pitch_um: 10.0,
+        kind: ModulatorKind::Dmd(DmdSpec { tilt_deg: 12.0, tilt_axis: TiltAxis::Side, mirror_fill: fill, reflectance: 1.0, window_transmittance: 1.0 }),
+        pattern,
+    };
+    let dmd_pos = Vec3::new(20.0, 0.0, 0.0);
+    let id = s.add_modulator(dmd_pos, 180.0 - 24.0, mk(Pattern::Uniform { value: 1 })).unwrap();
+    let t = s.surfaces.iter().find(|x| x.common.id.0 == id).unwrap().common.transform;
+    let n_dev = t.rotate(Vec3::Z);
+    let bis = (n_dev - Vec3::X).normalize();
+    let ModulatorKind::Dmd(spec_d) = &mk(Pattern::Uniform { value: 1 }).kind else { unreachable!() };
+    let on = t.rotate(facet_normal(spec_d, DmdState::On));
+    let value = if on.dot(bis) > t.rotate(facet_normal(spec_d, DmdState::Off)).dot(bis) { 1 } else { 0 };
+    if let SurfaceResponse::Modulator { device, .. } = &mut s.surfaces.iter_mut().find(|x| x.common.id.0 == id).unwrap().response_front {
+        device.pattern = pattern.unwrap_or(Pattern::Uniform { value });
+    }
+    let det = s.add_area_detector(dmd_pos + n_dev * det_at, -n_dev, half, half, bins);
+    s.validate().unwrap();
+    (s, src, det, id, n_dev, value)
+}
+
+#[test]
+fn a_dmd_s_orders_each_carry_their_own_cell_and_add_up_to_the_full_field() {
+    // R16 and finding 2 of the expert review: under the orders ray model each
+    // order's chain must carry its own order, not a copy of the device's
+    // whole spectrum. Mirrors of full fill along their hinge, so the uniform
+    // device's orders lie on one line, m = −8 … −5 the ones the 1.28 mm,
+    // 512-sample window holds (|f| < 200 cycles/mm about the ON direction);
+    // a detector 2 mm from the device, where the orders, 0.127 mm apart
+    // there, overlap and interfere. One full-field chain (the geometric ray
+    // model) against the orders decomposed, swept over the count and the
+    // threshold: the detected power climbs with the orders followed, the
+    // orders no chain follows are booked as such, never as light, and with
+    // the four the window holds the decomposition reads what the one field
+    // reads.
+    use oc_core::modulator::RayModel;
+    let (s, src, det, id, _, _) = dmd_scene(201, 1.0, None, 2.0, 0.5, [64, 64]);
+    let run = |model: RayModel| {
+        let mut s = s.clone();
+        if let SurfaceResponse::Modulator { ray_model, .. } = &mut s.surfaces.iter_mut().find(|x| x.common.id.0 == id).unwrap().response_front {
+            *ray_model = model;
+        }
+        s.validate().unwrap();
+        wave_path(&s, &spec(src, det, 0.1, 512, 1.28), 1).unwrap()
+    };
+    let full = run(RayModel::Geometric);
+    let peak = full.power.iter().cloned().fold(0.0, f64::max);
+    let l0 = full.report.ledger;
+    measured("DMD, one full-field chain: detected / launched", l0.detected / l0.launched);
+    let mut last = 0.0;
+    let mut by_count = Vec::new();
+    for (max_orders, min_efficiency) in [(1u32, 0.0), (2, 0.0), (4, 0.0), (8, 0.1), (8, 0.03)] {
+        let r = run(RayModel::Orders { max_orders, min_efficiency });
+        let l = r.report.ledger;
+        let diff = r.power.iter().zip(&full.power).map(|(p, q)| (p - q).abs()).fold(0.0, f64::max) / peak;
+        measured(&format!("DMD orders, at most {max_orders} above {min_efficiency}: detected / launched"), l.detected / l.launched);
+        measured(&format!("DMD orders, at most {max_orders} above {min_efficiency}: orders no chain follows / launched"), l.untracked_orders / l.launched);
+        measured(&format!("DMD orders, at most {max_orders} above {min_efficiency}: pixels against the full field, worst / peak"), diff);
+        assert!(r.report.approximated.iter().any(|a| a.contains("owns its order")), "{:?}", r.report.approximated);
+        // Never more than the full field holds, by more than what the
+        // window's edges leave.
+        assert!(l.detected <= l0.detected * (1.0 + 1e-4), "{max_orders}: {} vs {}", l.detected, l0.detected);
+        assert!(l.untracked_orders > 0.0);
+        by_count.push((max_orders, min_efficiency, l.detected, diff, l.detected + l.untracked_orders));
+        if min_efficiency == 0.0 {
+            assert!(l.detected > last, "{max_orders}: {} after {last}", l.detected);
+            last = l.detected;
+        }
+    }
+    // The threshold picks the same orders as the count: 0.1 the two
+    // brightest, 0.03 the four.
+    assert!((by_count[3].2 - by_count[1].2).abs() < 1e-12 && (by_count[4].2 - by_count[2].2).abs() < 1e-12, "{by_count:?}");
+    let four = by_count[2];
+    assert!((four.2 - l0.detected).abs() < 1e-4 * l0.launched && four.3 < 1e-3, "{four:?} vs {}", l0.detected);
+    // Disjoint: what the chains detect and what no chain follows add up to
+    // the same whatever the count, so no order is carried twice.
+    for b in &by_count {
+        measured(&format!("DMD orders, at most {} above {}: detected + unfollowed, against one order's", b.0, b.1), b.4 - by_count[0].4);
+        assert!((b.4 - by_count[0].4).abs() < 1e-4 * l0.launched, "{by_count:?}");
+    }
+    assert!(by_count[0].3 > 0.1, "one order alone must not read as the full field: {by_count:?}");
+}
+
+#[test]
+fn a_dmd_chain_follows_the_mirrors_the_field_lights_not_the_axial_ray_s_pixel() {
+    // R17 of the expert review: the chain must not hang on the one pixel the
+    // axial ray meets. Two cases against the plain device (401 × 401 mirrors,
+    // the axial ray on a mirror's centre), all read at a lens's focus:
+    // - 400 × 400 mirrors put the axial ray on the gap at four mirrors'
+    //   corner, which absorbs it; the field lights the mirrors around it. The
+    //   wave path's extraction traces every mirror family present as if every
+    //   mirror held it, so the chain is there; the lattice is shifted half a
+    //   pitch, which changes the orders' phases only, so the focused orders
+    //   read the same.
+    // - The axial ray's own mirror set OFF, the rest ON: the chain carries
+    //   the ON mirrors (the direction it leaves along), and the reading moves
+    //   by the one mirror's share, not by the field's.
+    use oc_core::modulator::Pattern;
+    let lensed = |pixels: u32, pattern: Option<Pattern>| {
+        let (mut s, src, _, _, n_dev, value) = dmd_scene(pixels, 0.95, pattern, 2.0, 0.5, [16, 16]);
+        s.detectors.clear();
+        let lens_pos = Vec3::new(20.0, 0.0, 0.0) + n_dev * 5.0;
+        s.add_planar_element(lens_pos, 1.0, n_dev.y.atan2(n_dev.x).to_degrees(), lens(15.0), lens(15.0));
+        let det = s.add_area_detector(lens_pos + n_dev * 15.0, -n_dev, 1.25, 1.25, [32, 32]);
+        s.validate().unwrap();
+        (s, src, det, value)
+    };
+    let read = |s: &Scene3, src, det| {
+        let mut sp = spec(src, det, 0.15, 256, 1.28);
+        sp.device_samples_per_pixel = 8;
+        wave_path(s, &sp, 1).unwrap()
+    };
+    let (s, src, det, value) = lensed(401, None);
+    let plain = read(&s, src, det);
+    let peak = plain.power.iter().cloned().fold(0.0, f64::max);
+    let diff = |r: &WavePathResult| r.power.iter().zip(&plain.power).map(|(p, q)| (p - q).abs()).fold(0.0, f64::max) / peak;
+    // On the gap.
+    let (s, src, det, _) = lensed(400, None);
+    let rays = oc_trace::extract_sequences3(&s, src, det, Some(LAM), 1);
+    assert!(rays.is_err(), "the axial ray itself is absorbed in the gap");
+    let gap = read(&s, src, det);
+    measured("DMD, axial ray on a gap: pixels against the axial ray on a mirror, worst / peak", diff(&gap));
+    measured("DMD, axial ray on a gap: detected, against the axial ray on a mirror", gap.report.ledger.detected - plain.report.ledger.detected);
+    assert!(diff(&gap) < 1e-3, "{}", diff(&gap));
+    // On an OFF mirror.
+    let n = 401usize;
+    let mut values = vec![value; n * n];
+    values[(n / 2) * n + n / 2] = 1 - value;
+    let (s, src, det, _) = lensed(401, Some(Pattern::Explicit(values)));
+    let off = read(&s, src, det);
+    // The one mirror's share of the beam (w = 0.15 mm at the device, met at
+    // 24°): 2p² cos 24°/(πw²) of the power, its order amplitudes by half that.
+    let share = 2.0 * 1e-4 * 24f64.to_radians().cos() / (std::f64::consts::PI * 0.15 * 0.15);
+    measured("DMD, axial ray on an OFF mirror: pixels against all ON, worst / peak", diff(&off));
+    measured("DMD, axial ray on an OFF mirror: the mirror's share of the beam", share);
+    assert!(diff(&off) < 3.0 * share, "{} vs {share}", diff(&off));
+    assert!(off.report.approximated.iter().any(|a| a.contains("though the pixel the axial ray meets")), "{:?}", off.report.approximated);
+}
+
+#[test]
+fn an_annular_stop_whose_centre_blocks_the_axial_ray_lets_the_arago_spot_through() {
+    // R18 of the expert review: a stop that blocks the axial ray but passes
+    // a field around it must not read as darkness. A top-hat beam of radius
+    // 0.5 mm, 1 µm before an annulus 0.1 < r < 0.3 mm. On the axis, z behind
+    // it, Heurtley's exact Rayleigh–Sommerfeld field of a disc's opening
+    // ([5] in docs/wave-optics.md) taken once for each edge, by linearity
+    // (Babinet), gives U = U₀[(z/R_in) e^{ikR_in} − (z/R_out) e^{ikR_out}],
+    // R = √(z² + a²): the inner disc's Arago spot meeting the outer edge's
+    // wave. The wave path's extraction lets the axial ray through the stop,
+    // says so, and the field there is the closed form.
+    use oc_core::scene3::PlanarShape2;
+    let (a_in, a_out, z0) = (0.1, 0.3, 1e-3);
+    let k = 2.0 * std::f64::consts::PI / (LAM / 1000.0);
+    for z in [15.0, 25.0, 40.0] {
+        let mut s = Scene3::new();
+        let src = source(&mut s);
+        let ap = s.add_aperture(Vec3::new(z0, 0.0, 0.0), a_out, 0.0);
+        s.apertures.iter_mut().find(|a| a.common.id.0 == ap).unwrap().shape.clear_opening = PlanarShape2::Annulus { inner_mm: a_in, outer_mm: a_out };
+        let det = s.add_area_detector(Vec3::new(z0 + z, 0.0, 0.0), -Vec3::X, 0.05, 0.05, [5, 5]);
+        s.validate().unwrap();
+        let mut sp = spec(src, det, 0.1, 2048, 1.6);
+        sp.beam = BeamProfile::TopHat { radius_mm: 0.5 };
+        let r = wave_path(&s, &sp, 1).unwrap();
+        assert!(r.report.approximated.iter().any(|a| a.contains("stops the axial ray")), "{:?}", r.report.approximated);
+        let g = r.field.grid;
+        let u = r.field.at(g.n[0] / 2, g.n[1] / 2);
+        let u0 = (1.0 / (std::f64::consts::PI * 0.25)).sqrt();
+        let (ri, ro) = ((z * z + a_in * a_in).sqrt(), (z * z + a_out * a_out).sqrt());
+        let want = (oc_wave::Cx::expi(k * ri) * (z / ri) - oc_wave::Cx::expi(k * ro) * (z / ro)).norm_sqr();
+        let got = u.norm_sqr() / (u0 * u0);
+        measured(&format!("annular stop, z = {z} mm: on-axis |U/U₀|², against the closed form"), got - want);
+        measured(&format!("annular stop, z = {z} mm: on-axis |U/U₀|², closed form"), want);
+        assert!((got - want).abs() < 1e-2 * want.max(1.0), "z {z}: {got} vs {want}");
+        assert!(r.report.ledger.detected > 0.0);
+    }
+}

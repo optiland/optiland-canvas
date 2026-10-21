@@ -736,14 +736,25 @@ pub enum LcosBeam {
 }
 
 /// One diffraction order.
+///
+/// `coefficient` and `efficiency` are two things (Q5 of the expert review of
+/// the wave engine): the coefficient is the thin element's Fourier
+/// coefficient `c_mn`, the field a coherent calculation adds; the efficiency
+/// is the power fraction under the table's [`OrderModel`]. Under
+/// [`OrderModel::Tea`] `efficiency = |coefficient|²`; under
+/// [`OrderModel::HarveyRenormalized`] it is not: the efficiencies are scaled
+/// by `Σ_all|c|²/Σ_propagating|c|²` and the coefficients are left as they
+/// are, so a coherent consumer must not take `√efficiency` for an amplitude.
+/// The renormalization is a declared scalar redistribution of the
+/// evanescent orders' share, not a field the element produces.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Order {
     pub m: i32,
     pub n: i32,
     /// Unit direction of the reflected order, `+Z` going.
     pub dir: Vec3,
-    /// The thin-element Fourier coefficient `c_mn`.
-    pub amplitude: Cx,
+    /// The thin-element Fourier coefficient `c_mn`, whatever the model.
+    pub coefficient: Cx,
     /// The power fraction under the table's [`OrderModel`].
     pub efficiency: f64,
 }
@@ -761,6 +772,24 @@ pub struct OrderTable {
 }
 
 impl OrderTable {
+    /// The table under [`OrderModel::HarveyRenormalized`]: every efficiency
+    /// `|c_mn|²·total/propagating`, the coefficients unchanged. A table
+    /// already renormalized is returned as it is.
+    pub fn renormalized(&self) -> OrderTable {
+        let mut t = self.clone();
+        if t.model == OrderModel::HarveyRenormalized {
+            return t;
+        }
+        if t.propagating > 0.0 {
+            let k = t.total / t.propagating;
+            for o in &mut t.orders {
+                o.efficiency = o.coefficient.norm_sqr() * k;
+            }
+        }
+        t.model = OrderModel::HarveyRenormalized;
+        t
+    }
+
     /// The order carrying the most power.
     pub fn brightest(&self) -> Option<&Order> {
         self.orders
@@ -904,22 +933,20 @@ pub fn unit_cell_orders(
                 m,
                 n,
                 dir: Vec3::new(t[0], t[1], (1.0 - s2).sqrt()),
-                amplitude: c,
+                coefficient: c,
                 efficiency: c.norm_sqr(),
             });
         }
     }
-    if model == OrderModel::HarveyRenormalized && propagating > 0.0 {
-        let k = total / propagating;
-        for o in &mut orders {
-            o.efficiency *= k;
-        }
-    }
-    Ok(OrderTable {
+    let table = OrderTable {
         orders,
         total,
         propagating,
-        model,
+        model: OrderModel::Tea,
+    };
+    Ok(match model {
+        OrderModel::Tea => table,
+        OrderModel::HarveyRenormalized => table.renormalized(),
     })
 }
 

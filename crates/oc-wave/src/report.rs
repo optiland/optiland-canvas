@@ -78,9 +78,37 @@ pub enum SamplingWarning {
 /// A model limit that applies to the result as a whole.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ValidityFlag {
-    /// A feature smaller than 14 wavelengths: scalar theory's error exceeds
-    /// ±5% there (Pommet, Moharam & Grann, JOSA A 11, 1827 (1994)).
-    ScalarLimit { feature_um: f64, lambda_um: f64 },
+    /// A heuristic, not a bound: a device's active feature (a mirror's side,
+    /// an electrode's width) under 14 wavelengths. Pommet, Moharam & Grann
+    /// (JOSA A 11, 1827 (1994)) found scalar theory's efficiencies off by
+    /// more than ±5% against rigorous coupled-wave analysis for binary
+    /// features below about 14λ, the error least near 50% fill (where the
+    /// period sets it instead), for their 8-level element of index 1.5 at
+    /// normal incidence below a period of 20λ, and growing with index, depth,
+    /// level count and incidence (Q20 of the expert review). No pitch above
+    /// the mark certifies a device; the flag records what sets the error.
+    ScalarLimit {
+        /// The lattice pitch, µm.
+        #[serde(default)]
+        pitch_um: f64,
+        /// The active feature the mark is taken on, µm.
+        feature_um: f64,
+        /// The dead space between features, µm.
+        #[serde(default)]
+        gap_um: f64,
+        /// The relief across a feature (a mirror's tilt over its side), µm,
+        /// where the model knows it.
+        #[serde(default)]
+        depth_um: Option<f64>,
+        /// The refractive-index contrast of the relief, where it is a
+        /// dielectric the model knows (none for a mirror).
+        #[serde(default)]
+        index_contrast: Option<f64>,
+        /// The light's incidence on the device, degrees.
+        #[serde(default)]
+        incidence_deg: f64,
+        lambda_um: f64,
+    },
     /// An LCoS phase scaled as `λ₀/λ`, ignoring the dispersion of its
     /// birefringence.
     PhaseDispersionApprox,
@@ -341,7 +369,12 @@ mod tests {
         let mut r = WaveReport::default();
         r.warn(SamplingWarning::BandLimited { removed: 0.01 });
         r.flag(ValidityFlag::ScalarLimit {
+            pitch_um: 8.0,
             feature_um: 8.0,
+            gap_um: 0.0,
+            depth_um: None,
+            index_contrast: None,
+            incidence_deg: 0.0,
             lambda_um: 1.55,
         });
         r.approx("thin element");

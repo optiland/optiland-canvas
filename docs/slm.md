@@ -41,12 +41,37 @@ c_mn = g·δ_m0 δ_n0 + (ρ²/(PₓPᵧ)) sinc(ρm/Pₓ) sinc(ρn/Pᵧ) Σ_ij (�
 - With dead space the zero order holds `|g|²(1 − ρ²)²`, and the rows diffract
   at `λ/p` too.
 
-**Sampled near field** (`lcos_reflect`). Each sample takes the area-weighted
-mean of the reflectance over its cell. With `fringing_um = w > 0`, the
-electrode phase at a sample is the pixel phases averaged over a `w × w` window:
-a step between pixels becomes a linear ramp of width `w`, and a 2π reset gets
-a flyback. This is the linear broadening of the fringing-field model [5], [6].
-It has no closed form, so it is sampled only.
+**Sampled near field** (`lcos_reflect`). Without fringing the device's mask
+is band-limited exactly to the field's grid: its spectrum in closed form,
+each electrode's square transform times the lattice sum of `√R e^{iφ_ij} − g`,
+plus the dead space's `g` over the device, taken on the grid's own
+frequencies and summed back onto its samples. Every order the grid holds then
+has its exact amplitude at any sampling, and what the grid cannot hold is
+booked as `spectral_projection`. A mask averaged over each sample's cell, as
+before, weighted an order `m` by `sinc(m/s)` at `s` samples a pixel (Q17 of the
+expert review of the wave engine). The power the electrodes and the dead
+space reflect is still each sample's exact cell coverage.
+
+The cell average stays in two cases, each named in the report. With
+`fringing_um = w > 0`, the electrode phase at a sample is the pixel phases
+averaged over a `w × w` window: a step between pixels becomes a linear ramp of
+width `w`, and a 2π reset gets a flyback. This is the linear broadening of the
+fringing-field model [5], [6]. It has no closed form, so it is sampled only.
+And a device lit within a pixel of a window edge it reaches past keeps the
+cell average, because the band-limited mask is periodic over the window and
+would fold the cut electrodes across it (above `1e-9` of the field's power in
+those strips, `FOLD_TOLERANCE`).
+
+**What the fringing model is.** The box-averaged phase is a phenomenological
+regularization of the displayed phase map, not a liquid-crystal model: no
+electrostatics, no director field, no asymmetry between rising and falling
+edges, no polarization conversion, and no dependence on the drive state,
+which at a 2π reset is the opposite end of the table even though the phase is
+the same. Its test checks the sampled field against direct quadrature of the
+same surrogate, which verifies the implementation, not the physics (Q19 of
+the expert review). Measured transition kernels, or a voltage-to-director-to-
+phase model, would be needed before the fringing loss is a property of a
+device.
 
 **Far field of a whole device, factorized** (`lcos_far_field`). This is the
 electrode transform times the lattice sum, plus the dead space over the
@@ -125,9 +150,19 @@ the modulated beam's orders.
 - Liquid-crystal dynamics and flicker, the dispersion of the birefringence,
   and the phase's dependence on the angle of incidence.
 - The dead space's own liquid-crystal phase; it is unmodulated here.
-- Rigorous electromagnetics. An 8 µm pixel at 1.55 µm is 5λ, well inside the
-  region where scalar theory's error exceeds ±5% [8]. The sampled near field
-  raises a `ScalarLimit` flag below 14λ.
+- Rigorous electromagnetics. Pommet, Moharam and Grann [8] found scalar
+  theory's efficiencies off by more than ±5% against rigorous coupled-wave
+  analysis for binary features below about 14λ, for their 8-level element of
+  index 1.5 at normal incidence below a period of 20λ, and the error growing
+  with index, depth, level count and incidence. The sampled near field raises
+  a `ScalarLimit` flag when the electrode is under 14λ, recording the pitch,
+  the electrode, the gap and the incidence (the relief depth and the index
+  contrast of the liquid crystal are not in the model, so they are left
+  empty). It is a heuristic, not a bound: an 8 µm pixel at 1.55 µm (5λ) is
+  flagged, and no pitch above the mark certifies a device.
+- The wavelength scaling `λ₀/λ` holds a constant optical path; the
+  birefringence's dispersion and any drive dependence on the wavelength are
+  not modelled, and no calibrated tables per wavelength ship.
 - No vendor device presets ship until a datasheet has been checked and cited.
 
 ## Validation
@@ -140,12 +175,12 @@ C49–C51.
 | `an_n_level_blazed_grating_reaches_sinc_squared_one_over_n` | `sinc²(1/N)`: 0.40528, 0.81057, 0.94964, 0.98721 [4] | 1e-12 | exact |
 | `fill_factor_and_dead_space_set_the_zero_order` | `η₀₀ = \|g\|²(1 − ρ²)²`, `η₁₀ = ρ⁴ sinc²(ρ/N)` [3]; Parseval | 1e-12 | exact |
 | `a_kinoform_at_the_wrong_wavelength_loses_efficiency_as_sinc_squared` | the quantized geometric series; `sinc²(1 − λ₀/λ)` in the limit [4] | 1e-12; 1e-4 | exact; 0.9675 at λ₀/λ = 0.9 and 1.1 |
-| `the_lcos_modulates_only_the_director_component` | `cos²(ψ − δ)` modulated, the rest a plain mirror [1] | 1e-12 | 0.750 at 30° |
-| `the_sampled_lcos_lands_on_the_closed_form_orders` | the closed form, edges on sample boundaries | 1e-10 | 2.7e-15 |
+| `the_lcos_modulates_only_the_director_component` | `cos²(ψ − δ)` modulated, the rest a plain mirror [1]; each beam's power what it reflects onto the grid and beyond its band | 1e-12 | 0.750 at 30°; the staircase's edges put 7.4e-3 of the modulated beam beyond the band |
+| `the_sampled_lcos_lands_on_the_closed_form_orders` | Q17: the band-limited mask's near field against the closed form on the window's own frequencies | 1e-10 | 7.3e-14; 2.9e-2 of the launched reflected beyond the grid's band at 8 samples a pixel |
 | `fringing_lowers_blazed_efficiency_and_matches_quadrature` | direct quadrature of the same model [5], [6] | 1e-3 | first order 0.950, 0.906, 0.860, 0.766 at w = 0, ¼, ½, 1 pixel; agreement 4.8e-5 or better |
 | `a_spiral_phase_leaves_a_dark_core_of_charge_one` | `exp(iℓφ)` focuses to a dark core, its phase winding ℓ times [9] | 1e-10; ℓ = 1 | 8e-33; 1 |
 | `gerchberg_saxton_error_never_increases` | the error-reduction property [10] | non-increasing | 2.00 → 0.096 in 60 iterations |
-| `pommet_flag_is_raised_below_14_wavelengths` | [8] | exact | passes |
+| `pommet_flag_is_raised_below_14_wavelengths` | [8], as a heuristic on the electrode's width | exact | passes |
 
 The Python bridge repeats the staircase and Gerchberg–Saxton checks
 (`crates/oc-py/tests/test_wave_modulators.py`).

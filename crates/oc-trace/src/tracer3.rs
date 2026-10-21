@@ -106,6 +106,18 @@ pub struct TraceConfig3 {
     /// existed. `polarization` above is the older spelling of one switch and
     /// stays as an alias: the trace is polarized only when both say so.
     pub fidelity: oc_core::fidelity::FidelityProfile,
+    /// Whether an aperture stops a ray outside its opening. True for every
+    /// trace but the wave path's chain extraction
+    /// ([`crate::sequence3::extract_wave_sequences3`]), which follows the
+    /// axial ray through an aperture that blocks it so that a field the
+    /// aperture lets through around the axis (an annulus's) still has a
+    /// chain to be carried along.
+    pub apertures_stop: bool,
+    /// Every DMD mirror taken in this state, whatever its pixel holds, under
+    /// the geometric ray model; `None` for the pattern itself. The wave path's
+    /// chain extraction traces once per family present, so that a family a
+    /// field lights has a chain whatever the one pixel the axial ray meets.
+    pub dmd_family: Option<oc_core::modulator::DmdState>,
 }
 
 impl TraceConfig3 {
@@ -164,6 +176,8 @@ impl Default for TraceConfig3 {
             deposit_apertures: false,
             deposit_surfaces: false,
             fidelity: oc_core::fidelity::FidelityProfile::default(),
+            apertures_stop: true,
+            dmd_family: None,
         }
     }
 }
@@ -1739,6 +1753,7 @@ fn nearest_event(
                         consider(ev, &mut best, &mut best_t);
                     });
             }
+            ObjKind::Aperture(_) if !cfg.apertures_stop => {}
             ObjKind::Aperture(ai) => {
                 if let Some((t, point)) =
                     aperture_block(&scene.apertures[*ai], &w.ray, skip, best_t)
@@ -2712,17 +2727,19 @@ fn modulator_ray(
                     "orders asked for, but the device is not in air: traced in the geometric limit",
                 );
             }
-            let state = DmdState::from_value(device.value(i, j));
+            let state = cfg.dmd_family.unwrap_or_else(|| DmdState::from_value(device.value(i, j)));
             let c = device.pixel_center_mm(i, j);
             // Inside the projected mirror? Undo the projection: across the
-            // hinge the outline is compressed by cos θ.
+            // hinge the outline is compressed by cos θ. A family forced on
+            // every mirror (the wave path's extraction) reflects wherever the
+            // ray lands: the chain stands for the family, not for one pixel.
             let n_local = facet_normal(d, state);
             let (h, wv) = oc_core::modulator::hinge(d.tilt_axis);
             let (dx, dy) = (p_local.x - c[0], p_local.y - c[1]);
             let (sh, sw) = (dx * h.x + dy * h.y, (dx * wv.x + dy * wv.y) / n_local.z);
             let (ux, uy) = (h.x * sh + wv.x * sw, h.y * sh + wv.y * sw);
             let half = 0.5 * d.mirror_fill * p;
-            if ux.abs() > half || uy.abs() > half {
+            if cfg.dmd_family.is_none() && (ux.abs() > half || uy.abs() > half) {
                 apply(stack, r, &SurfaceResponse::Absorber, n_oppose);
                 return;
             }

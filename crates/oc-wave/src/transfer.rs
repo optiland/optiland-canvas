@@ -97,6 +97,9 @@ pub(crate) struct TransferStats {
     /// power-weighted rms departure.
     pub arriving_ray_angle: f64,
     pub arriving_ray_rms: f64,
+    /// The rms direction of the arriving field's angular spectrum about the
+    /// reference's ([`spectral_departure`]), rad.
+    pub arriving_spectral_rms: f64,
     /// The slab the map spans, entry plane to exit plane along the beam, mm.
     pub slab_mm: f64,
     /// The largest phase step between neighbouring samples of the field that
@@ -317,9 +320,23 @@ impl Map {
     }
 }
 
+/// The phase gradient at sample `(i, j)` along `axis`, rad/mm: the mean of
+/// the phase steps to its two neighbours, each taken in (−π, π]. It aliases
+/// only where the step between adjacent samples passes π, the samples' own
+/// limit; the difference across two samples, `arg(u_{i+1} u*_{i−1})`, would
+/// alias where the step passes π/2, and read a step of 0.8π as −0.2π (R08 of
+/// the expert review).
+pub(crate) fn phase_gradient(at: &dyn Fn(usize, usize) -> Cx, i: usize, j: usize, axis: usize, pitch: f64) -> f64 {
+    let ((pi, pj), (ni, nj)) = if axis == 0 { ((i - 1, j), (i + 1, j)) } else { ((i, j - 1), (i, j + 1)) };
+    let c = at(i, j);
+    let back = (c * at(pi, pj).conj()).arg();
+    let ahead = (at(ni, nj) * c.conj()).arg();
+    0.5 * (back + ahead) / pitch
+}
+
 /// A field's wavefront: direction cosines `t = (α + c·a, β + c·b)` across
 /// the beam (carrier included), fitted by intensity-weighted least squares to
-/// the phase gradient where the field is bright. Returns `[c, α, β]` and the
+/// the phase gradient where the field is bright ([`phase_gradient`]). Returns `[c, α, β]` and the
 /// largest departure of a bright sample's direction from the fit; the
 /// carrier alone when nothing is bright enough to fit.
 pub(crate) fn fit_sphere(u: &Field2) -> ([f64; 3], f64) {
@@ -337,8 +354,9 @@ pub(crate) fn fit_sphere(u: &Field2) -> ([f64; 3], f64) {
             if w < 1e-3 * top {
                 continue;
             }
-            let gx = (u.at(i + 1, j) * u.at(i - 1, j).conj()).arg() / (2.0 * gu.pitch_mm[0]);
-            let gy = (u.at(i, j + 1) * u.at(i, j - 1).conj()).arg() / (2.0 * gu.pitch_mm[1]);
+            let at = |p: usize, q: usize| u.at(p, q);
+            let gx = phase_gradient(&at, i, j, 0, gu.pitch_mm[0]);
+            let gy = phase_gradient(&at, i, j, 1, gu.pitch_mm[1]);
             let (a, b) = gu.xy(i, j);
             grads.push((a, b, gx / k_in + u.carrier[0], gy / k_in + u.carrier[1], w));
         }
@@ -463,8 +481,8 @@ pub(crate) fn departure(u: &Field2, r: &Reference) -> (f64, f64) {
             if w < 1e-4 * top {
                 continue;
             }
-            let gx = (rest(i + 1, j) * rest(i - 1, j).conj()).arg() / (2.0 * gu.pitch_mm[0]);
-            let gy = (rest(i, j + 1) * rest(i, j - 1).conj()).arg() / (2.0 * gu.pitch_mm[1]);
+            let gx = phase_gradient(&rest, i, j, 0, gu.pitch_mm[0]);
+            let gy = phase_gradient(&rest, i, j, 1, gu.pitch_mm[1]);
             let d = (gx / k).hypot(gy / k);
             sw += w;
             s2 += w * d * d;
@@ -474,6 +492,44 @@ pub(crate) fn departure(u: &Field2, r: &Reference) -> (f64, f64) {
         }
     }
     (worst, (s2 / sw).sqrt())
+}
+
+/// How far `u`'s plane waves depart from a reference's directions, rad: the
+/// power-weighted rms direction of the angular spectrum of the field with
+/// the reference's phase taken out. The phase metric ([`departure`]) reads
+/// the local phase gradient, which a field of several directions can hide:
+/// `1 + 0.5 cos(qx)` has none anywhere, and is three plane waves, two of
+/// them `q/k` off the reference (Q9 and R07 of the expert review). The
+/// spectral metric sees them: `q/3k` rms for that field.
+pub(crate) fn spectral_departure(u: &Field2, r: &Reference) -> f64 {
+    let g = u.grid;
+    let n = g.n;
+    let k = u.k_mm();
+    let mut b = vec![Cx::ZERO; g.len()];
+    for j in 0..n[1] {
+        for i in 0..n[0] {
+            let (a, bb) = g.xy(i, j);
+            b[g.idx(i, j)] = u.at(i, j) * Cx::expi(-ref_phase(k, r, u.carrier, a, bb));
+        }
+    }
+    crate::fft::ifftshift2(&mut b, n);
+    crate::Fft2::new().forward(&mut b, n, g.cell_area_mm2());
+    let lam = u.wavelength_in_medium_mm();
+    let (mut sw, mut s2) = (0.0, 0.0);
+    for ky in 0..n[1] {
+        let fy = g.fft_freq(1, ky);
+        for kx in 0..n[0] {
+            let fx = g.fft_freq(0, kx);
+            let w = b[ky * n[0] + kx].norm_sqr();
+            sw += w;
+            s2 += w * lam * lam * (fx * fx + fy * fy);
+        }
+    }
+    if sw > 0.0 {
+        (s2 / sw).sqrt()
+    } else {
+        0.0
+    }
 }
 
 /// The edge of the region of the entry plane whose rays pass the element, as
@@ -765,6 +821,7 @@ pub(crate) fn apply(m: &TracedMap, u: &Field2, out: &Beam, n_out: f64) -> Result
     };
     let u = &um;
     let (angle, rms) = departure(u, &m.reference);
+    let spectral = spectral_departure(u, &m.reference);
 
     // The arriving field, carrier included, read between its samples with
     // the reference's phase taken out (`Smooth`).
@@ -850,6 +907,7 @@ pub(crate) fn apply(m: &TracedMap, u: &Field2, out: &Beam, n_out: f64) -> Result
             curvature: 0.5 * (m.reference.curv[0] + m.reference.curv[1]),
             arriving_ray_angle: angle,
             arriving_ray_rms: rms,
+            arriving_spectral_rms: spectral,
             slab_mm: m.slab,
             max_phase_step: step,
         },
@@ -1054,5 +1112,141 @@ mod tests {
         let d = rel(&a, &b);
         println!("measured: a 10 mrad lobe traced about the chief ray against about its own direction, relative = {d:.3e}; departure {:.3e} against {:.3e} rad", sb.arriving_ray_angle, sa.arriving_ray_angle);
         assert!(sa.arriving_ray_angle < 1e-3 && sb.arriving_ray_angle > 9e-3, "{} {}", sa.arriving_ray_angle, sb.arriving_ray_angle);
+    }
+
+    /// A body of index 1, a 30 mm block centred at x = 50 whose front face
+    /// has radius `r1` (infinite: flat): a face light crosses unrefracted,
+    /// so a transfer across it is free space, done geometrically.
+    fn null_body(r1: f64) -> Scene3 {
+        let mut s = Scene3::new();
+        let g = SingletGeom { r1_mm: r1, r2_mm: f64::INFINITY, thickness_mm: 30.0, semi_aperture_mm: 6.0, conic1: 0.0, conic2: 0.0 };
+        s.add_singlet(Vec3::new(50.0, 0.0, 0.0), g, 1.0, 1e6);
+        s
+    }
+
+    fn beam_at(x: f64) -> Beam {
+        Beam { origin: Vec3::new(x, 0.0, 0.0), x: Vec3::Y, y: Vec3::Z, d: Vec3::X }
+    }
+
+    #[test]
+    fn a_phase_step_of_0_8_pi_a_sample_reads_as_0_8_pi() {
+        // R08 of the expert review: a smooth field whose phase steps 0.8π
+        // between adjacent samples. The difference across two samples wraps
+        // (1.6π reads −0.4π, so −0.2π a sample); the mean of the two adjacent
+        // steps, each in (−π, π], reads 0.8π, and the fitted wavefront the
+        // direction `0.8π/(kΔx)`.
+        let pitch = 0.01;
+        let g = Grid2::square(128, pitch).unwrap();
+        let mut u = GaussianBeam { w0_mm: 0.3, lambda_um: 0.6328, n: 1.0, power: 1.0, center: [0.0, 0.0] }.sample(g, 0.0).unwrap();
+        let step = 0.8 * std::f64::consts::PI;
+        for j in 0..g.n[1] {
+            for i in 0..g.n[0] {
+                let idx = g.idx(i, j);
+                u.data[idx] *= Cx::expi(step * i as f64);
+            }
+        }
+        let at = |i: usize, j: usize| u.at(i, j);
+        let read = phase_gradient(&at, 64, 64, 0, pitch) * pitch;
+        let two_apart = 0.5 * (u.at(65, 64) * u.at(63, 64).conj()).arg();
+        println!("measured: a 0.8π step a sample, read by adjacent steps, against 0.8π = {:.3e}; across two samples it reads {:.4}π", read - step, two_apart / std::f64::consts::PI);
+        assert!((read - step).abs() < 1e-12, "{read}");
+        assert!((two_apart + 0.2 * std::f64::consts::PI).abs() < 1e-12, "{two_apart}");
+        let ([c, a, b], _) = fit_sphere(&u);
+        let want = step / (u.k_mm() * pitch);
+        println!("measured: the fitted direction against 0.8π/(kΔx), relative = {:.3e}", a / want - 1.0);
+        assert!((a / want - 1.0).abs() < 1e-9 && c.abs() < 1e-9 && b.abs() < 1e-12, "{c} {a} {b}");
+    }
+
+    #[test]
+    fn a_field_with_no_phase_departure_can_depart_in_its_spectrum() {
+        // R07 of the expert review. `U = 1 + 0.5 cos(qx)` is positive, so
+        // its phase gradient is zero everywhere: about a flat reference the
+        // phase metric reads no departure. It is three plane waves, the two
+        // sidebands `q/k` off the axis, which dephase from the carrier by
+        // `(k − √(k² − q²))L`; carried geometrically across a slab of free
+        // space as long as makes that π (a face of index 1), it differs from
+        // the exact angular spectrum by `2/3` of its norm (Goodman, ch. 3).
+        // The spectral metric reads the sidebands, `q/3k` rms, and their walk
+        // across the slab exceeds a sample: the transfer is not certified.
+        let s = null_body(f64::INFINITY);
+        let pitch = 1.6 / 256.0;
+        let g = Grid2::square(256, pitch).unwrap();
+        let period = 0.05;
+        let q = 2.0 * std::f64::consts::PI / period;
+        let u = Field2::from_fn(g, 0.6328, |x, _| Cx::real(1.0 + 0.5 * (q * x).cos())).unwrap();
+        let k = u.k_mm();
+        let l = std::f64::consts::PI / (k - (k * k - q * q).sqrt());
+        let (inc, out) = (beam_at(34.9), beam_at(34.9 + l));
+        let flat = Reference { curv: [0.0, 0.0], tilt: [0.0, 0.0], centre: [0.0, 0.0] };
+        let (v, st) = transfer(&s, &u, &inc, &out, 1.0, 129, &flat).unwrap();
+        let (exact, _) = crate::propagate::propagate(&u, l, crate::Propagator::AngularSpectrum(crate::AsmOptions { band_limit: false, pad: 1 }), &mut crate::Fft2::new()).unwrap();
+        // The field fills the window; the map leaves its outermost row of
+        // samples, which no traced ray reaches, empty (a beam that vanishes
+        // at its window's edge, as every beam the path carries does, loses
+        // nothing there). The comparison is over the interior.
+        let (mut d2, mut n2) = (0.0, 0.0);
+        for j in 8..g.n[1] - 8 {
+            for i in 8..g.n[0] - 8 {
+                d2 += (v.at(i, j) - exact.at(i, j)).norm_sqr();
+                n2 += exact.at(i, j).norm_sqr();
+            }
+        }
+        let err = (d2 / n2).sqrt();
+        let want_rms = (0.6328e-3 / period) / 3.0;
+        println!("measured: 1 + 0.5 cos(qx) across a slab of free space {l:.4} mm long, traced: against the angular spectrum, relative = {err:.4} (2/3 expected); phase departure {:.3e} rad; spectral departure against q/3k, relative = {:.3e}", st.arriving_ray_angle, st.arriving_spectral_rms / want_rms - 1.0);
+        assert!((err - 2.0 / 3.0).abs() < 1e-6, "{err}");
+        assert!(st.arriving_ray_angle < 1e-12, "{}", st.arriving_ray_angle);
+        assert!((st.arriving_spectral_rms / want_rms - 1.0).abs() < 1e-9, "{}", st.arriving_spectral_rms);
+        assert!(st.arriving_spectral_rms * st.slab_mm > pitch, "the walk {} against the pitch {pitch}", st.arriving_spectral_rms * st.slab_mm);
+    }
+
+    #[test]
+    fn a_face_that_changes_nothing_leaves_free_space_whatever_slab_holds_it() {
+        // R10 of the expert review. A curved face of index 1 on both sides
+        // changes nothing, so the path through it is free space, 7.5 mm from
+        // x = 30 to x = 37.5. The wave path carries it by the angular
+        // spectrum to the slab, geometrically across it, and on: what that
+        // leaves out is the diffraction across the slab alone. So the result
+        // must not depend on where the face sits in the slab (the same slab
+        // split two ways, to round-off), and its error against the angular
+        // spectrum all the way grows with the slab, as `(k/2)·D·√⟨θ⁴⟩`, √2
+        // times the note's estimate `k⟨θ²⟩D/2` for a Gaussian (from its
+        // spectral departure); the margins only add to D.
+        use crate::propagate::propagate;
+        use crate::{AsmOptions, Fft2, Propagator};
+        let s = null_body(20.0);
+        let g = Grid2::square(256, 2.0 / 256.0).unwrap();
+        let u0 = GaussianBeam { w0_mm: 0.1, lambda_um: 0.6328, n: 1.0, power: 1.0, center: [0.0, 0.0] }.sample(g, 0.0).unwrap();
+        let mut fft = Fft2::new();
+        let asm = Propagator::AngularSpectrum(AsmOptions { band_limit: false, pad: 2 });
+        let (exact, _) = propagate(&u0, 7.5, asm, &mut fft).unwrap();
+        let flat = Reference { curv: [0.0, 0.0], tilt: [0.0, 0.0], centre: [0.0, 0.0] };
+        // The face's sag over the window's corner, R 20 mm: 0.05 mm.
+        let sag = 2.0f64 / (2.0 * 20.0);
+        let run = |m1: f64, m2: f64, fft: &mut Fft2| {
+            let (x_in, x_out) = (35.0 - m1, 35.0 + sag + m2);
+            let (a, _) = propagate(&u0, x_in - 30.0, asm, fft).unwrap();
+            let (b, st) = transfer(&s, &a, &beam_at(x_in), &beam_at(x_out), 1.0, 129, &flat).unwrap();
+            let (c, _) = propagate(&b, 37.5 - x_out, asm, fft).unwrap();
+            (c, st)
+        };
+        let (one, _) = run(0.03, 0.01, &mut fft);
+        let (two, _) = run(0.01, 0.03, &mut fft);
+        let split = rel(&one, &two);
+        println!("measured: a null face, the same 0.09 mm slab split two ways, relative = {split:.3e}");
+        assert!(split < 1e-10, "{split}");
+        let k = u0.k_mm();
+        let mut ratios = Vec::new();
+        for m in [1e-3, 1e-2, 1e-1, 1.0] {
+            let (v, st) = run(m, m, &mut fft);
+            let err = rel(&exact, &v);
+            let estimate = 0.5 * k * st.arriving_spectral_rms.powi(2) * st.slab_mm;
+            println!("measured: a null face, margins {m} mm (slab {:.4} mm): against the angular spectrum all the way, relative = {err:.3e}; the note's estimate {estimate:.3e}, ratio {:.4}", st.slab_mm, err / estimate);
+            ratios.push((st.slab_mm, err, err / estimate));
+        }
+        for &(_, _, r) in &ratios {
+            assert!((r - std::f64::consts::SQRT_2).abs() < 0.03, "{ratios:?}");
+        }
+        assert!(ratios.windows(2).all(|w| w[1].1 > w[0].1), "{ratios:?}");
     }
 }

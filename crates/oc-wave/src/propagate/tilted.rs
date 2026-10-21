@@ -43,9 +43,24 @@
 //! field is then evaluated on the output grid by chirp-z, as
 //! [`super::asm::asm_zoom`] does, so a small tilted window is not wrapped.
 //! A plane wave travelling back across the source plane (`w ≤ 0`) is not part
-//! of the forward field and is left out. The output carries the source
-//! carrier's direction, seen in the target frame, as its own analytic
+//! of the forward field and is left out. A target frequency `(u′, v′)` is
+//! met by two wavevectors, `w′ = ±√(1/λ² − u′² − v′²)`; each that is a
+//! forward wave of the source is kept, with its own Jacobian, so a plane
+//! steeply tilted (or facing back along the beam) holds every plane wave
+//! that crosses it, whichever side it crosses from. The output carries the
+//! source carrier's direction, seen in the target frame, as its own analytic
 //! carrier; its samples are the envelope about it.
+//!
+//! What the plane cannot hold is booked by cause, from the source spectrum
+//! (Parseval): its evanescent waves, which do not reach a distant plane, as
+//! `evanescent`; plane waves whose frequencies on the plane fall beyond the
+//! target spectrum's span as `spectral_projection`; the rest of what the
+//! output window does not catch as `left_window`. The power through the
+//! window is the irradiance times one obliquity, the carrier's: for a field
+//! of directions spread about it, an approximation the step names. Plane
+//! waves within about 6° of grazing the plane (`|w′|λ < 0.1`) are kept, and
+//! warned of (`OutsideRegime`): the scalar field there is computed, the
+//! flux it carries through the plane is not modelled.
 
 use super::embed;
 use crate::fft::{fftshift2, ifftshift2, next_fast_len};
@@ -192,14 +207,13 @@ pub fn asm_tilted(
     let c = Vec3::new(u0, v0, (inv_l2 - u0 * u0 - v0 * v0).max(0.0).sqrt());
     let ct = Vec3::new(c.dot(tx), c.dot(ty), c.dot(tz));
     let (up0, vp0) = (ct.x, ct.y);
-    // A face may look back along the beam (a detector facing it): forward
-    // plane waves then have w′ < 0 in its frame.
-    let sgn = if tz.z >= 0.0 { 1.0 } else { -1.0 };
     let (mx, my) = (p[0], p[1]);
     let f_at = |k: usize, axis: usize| (k as f64 - (if axis == 0 { mx } else { my } / 2) as f64) * if axis == 0 { du } else { dv };
     let norm = 1.0 / (w * w) as f64;
     let mut spec = vec![Cx::ZERO; mx * my];
     let (mut wx, mut wy) = (Vec::with_capacity(w + 1), Vec::with_capacity(w + 1));
+    // The power read at grazing waves, against all read.
+    let (mut grazing, mut read_all) = (0.0, 0.0);
     for ky in 0..my {
         let vp = vp0 + f_at(ky, 1);
         for kx in 0..mx {
@@ -208,36 +222,77 @@ pub fn asm_tilted(
             if w2 <= 0.0 {
                 continue;
             }
-            let wp = sgn * w2.sqrt();
-            let k = to_src(up, vp, wp);
-            if k.z <= 0.0 {
-                continue;
-            }
-            // The read, at the source's fractional samples.
-            let (gx, gy) = ((k.x - u0) / du + (p[0] / 2) as f64, (k.y - v0) / dv + (p[1] / 2) as f64);
-            if gx < reach[0].0 || gx > reach[0].1 || gy < reach[1].0 || gy > reach[1].1 {
-                continue;
-            }
-            let i0 = kernel_weights(beta[0], w, gx, p[0], &mut wx);
-            let j0 = kernel_weights(beta[1], w, gy, p[1], &mut wy);
-            if wx.is_empty() || wy.is_empty() {
-                continue;
-            }
-            let mut a = Cx::ZERO;
-            for (dj, cy) in wy.iter().enumerate() {
-                let row = (j0 + dj) * p[0] + i0;
-                let mut line = Cx::ZERO;
-                for (di, cx) in wx.iter().enumerate() {
-                    line += buf[row + di] * *cx;
+            let mut acc = Cx::ZERO;
+            // Both wavevectors with this frequency on the plane, each if it
+            // is a forward wave of the source.
+            for wp in [w2.sqrt(), -w2.sqrt()] {
+                let k = to_src(up, vp, wp);
+                if k.z <= 0.0 {
+                    continue;
                 }
-                a += line * *cy;
+                // The read, at the source's fractional samples.
+                let (gx, gy) = ((k.x - u0) / du + (p[0] / 2) as f64, (k.y - v0) / dv + (p[1] / 2) as f64);
+                if gx < reach[0].0 || gx > reach[0].1 || gy < reach[1].0 || gy > reach[1].1 {
+                    continue;
+                }
+                let i0 = kernel_weights(beta[0], w, gx, p[0], &mut wx);
+                let j0 = kernel_weights(beta[1], w, gy, p[1], &mut wy);
+                if wx.is_empty() || wy.is_empty() {
+                    continue;
+                }
+                let mut a = Cx::ZERO;
+                for (dj, cy) in wy.iter().enumerate() {
+                    let row = (j0 + dj) * p[0] + i0;
+                    let mut line = Cx::ZERO;
+                    for (di, cx) in wx.iter().enumerate() {
+                        line += buf[row + di] * *cx;
+                    }
+                    a += line * *cy;
+                }
+                // ∂(u, v)/∂(u′, v′) with w′ = ±√(1/λ² − u′² − v′²).
+                let (dux, duy) = (tx.x - tz.x * up / wp, ty.x - tz.x * vp / wp);
+                let (dvx, dvy) = (tx.y - tz.y * up / wp, ty.y - tz.y * vp / wp);
+                let jac = (dux * dvy - duy * dvx).abs();
+                let phase = 2.0 * PI * (k.x * d.x + k.y * d.y + k.z * d.z);
+                let term = a * Cx::expi(phase) * jac;
+                let e = term.norm_sqr();
+                read_all += e;
+                if wp.abs() * lam < 0.1 {
+                    grazing += e;
+                }
+                acc += term;
             }
-            // ∂(u, v)/∂(u′, v′) with w′ = √(1/λ² − u′² − v′²).
-            let (dux, duy) = (tx.x - tz.x * up / wp, ty.x - tz.x * vp / wp);
-            let (dvx, dvy) = (tx.y - tz.y * up / wp, ty.y - tz.y * vp / wp);
-            let jac = (dux * dvy - duy * dvx).abs();
-            let phase = 2.0 * PI * (k.x * d.x + k.y * d.y + k.z * d.z);
-            spec[ky * mx + kx] = a * norm * at_c * Cx::expi(phase) * jac;
+            spec[ky * mx + kx] = acc * norm * at_c;
+        }
+    }
+    // What the plane cannot hold, by cause, from the source spectrum.
+    let (mut evan, mut beyond, mut tot) = (0.0, 0.0, 0.0);
+    {
+        let g = u.grid;
+        let mut s = u.data.clone();
+        ifftshift2(&mut s, n);
+        fft.forward(&mut s, n, g.cell_area_mm2());
+        let half = [(mx / 2) as f64, (my / 2) as f64];
+        for ky in 0..n[1] {
+            let fy = g.fft_freq(1, ky) + v0;
+            for kx in 0..n[0] {
+                let fx = g.fft_freq(0, kx) + u0;
+                let e = s[ky * n[0] + kx].norm_sqr();
+                if e == 0.0 {
+                    continue;
+                }
+                tot += e;
+                let w2 = inv_l2 - fx * fx - fy * fy;
+                if w2 <= 0.0 {
+                    evan += e;
+                    continue;
+                }
+                let kv = Vec3::new(fx, fy, w2.sqrt());
+                let (a, b) = ((kv.dot(tx) - up0) / du + half[0], (kv.dot(ty) - vp0) / dv + half[1]);
+                if a < 0.0 || b < 0.0 || a > (mx - 1) as f64 || b > (my - 1) as f64 {
+                    beyond += e;
+                }
+            }
         }
     }
     // Evaluate on the output points by chirp-z, one axis at a time: the
@@ -271,14 +326,27 @@ pub fn asm_tilted(
     // |U|² over a tilted plane is not power: the power crossing it is the
     // irradiance times the obliquity, taken here as the carrier direction's.
     let obliquity = (ct.z * lam).abs().min(1.0);
+    let launched = report.ledger.launched;
+    let share = |x: f64| if tot > 0.0 { x / tot * launched } else { 0.0 };
+    report.ledger.evanescent = share(evan);
+    report.ledger.spectral_projection = share(beyond);
     report.ledger.detected = v.power() * obliquity;
-    report.ledger.left_window = (report.ledger.launched - report.ledger.detected).max(0.0);
+    report.ledger.left_window = (launched - report.ledger.detected - report.ledger.evanescent - report.ledger.spectral_projection).max(0.0);
+    if read_all > 0.0 && grazing > 1e-6 * read_all {
+        report.warn(crate::report::SamplingWarning::OutsideRegime {
+            method: Method::AngularSpectrum { band_limited: false },
+            reason: format!(
+                "{:.1e} of the field read onto the tilted plane is in plane waves within about 6° of grazing it (|w′|λ < 0.1): the scalar field there is computed, the flux it carries through the plane is not modelled",
+                grazing / read_all
+            ),
+        });
+    }
     report.steps.push(StepReport {
         method: Method::AngularSpectrum { band_limited: false },
         z_mm: d.z,
         sampling: None,
         note: format!(
-            "angular spectrum of a {}×{} field (padded to {}×{}) onto a plane tilted {:.3}° and {:.4} mm along, by spectrum rotation (Matsushima, Schimmel & Wyrowski 2003), the spectrum read between its samples by a Kaiser–Bessel kernel {w} samples wide, and chirp-z onto {}×{} points; power through the window projected by the carrier's obliquity",
+            "angular spectrum of a {}×{} field (padded to {}×{}) onto a plane tilted {:.3}° and {:.4} mm along, by spectrum rotation (Matsushima, Schimmel & Wyrowski 2003), the spectrum read between its samples by a Kaiser–Bessel kernel {w} samples wide, and chirp-z onto {}×{} points; every forward plane wave that crosses the plane kept, from either side; power through the window projected by one obliquity, the carrier's",
             n[0], n[1], p[0], p[1], tz.z.abs().min(1.0).acos().to_degrees(), d.z, ox, oy
         ),
     });

@@ -25,6 +25,22 @@ pub use asm::{asm_zoom, AsmOptions};
 pub use tilted::asm_tilted;
 pub use regime::{critical_distance_mm, fresnel_phase_error_rad, voelz_sampling};
 
+/// The relative field error past which neither candidate of
+/// [`Propagator::Auto`] certifies a step: the step still runs with the
+/// smaller indicator, and the report says it is not certified
+/// (`OutsideRegime`).
+pub const STEP_TOLERANCE: f64 = 1e-2;
+
+/// The critical distance of a window as the propagators pad it,
+/// `next_fast_len(2n)` samples a side: per axis `PΔx²/λ`, the smaller of
+/// the two (Voelz & Roggemann 2009; the padded length, axis by axis, as
+/// Matsushima & Shimobaba's band limit uses it).
+pub fn padded_critical_distance_mm(grid: &crate::Grid2, lambda_mm: f64) -> f64 {
+    (0..2)
+        .map(|a| critical_distance_mm(grid.pitch_mm[a], crate::fft::next_fast_len(2 * grid.n[a]) as f64 * grid.pitch_mm[a], lambda_mm))
+        .fold(f64::INFINITY, f64::min)
+}
+
 use crate::report::{Method, SamplingWarning, StepReport};
 use crate::{Cx, Field2, Fft2, WaveError, WaveReport};
 
@@ -92,15 +108,24 @@ pub fn propagate(
     if let Some((ep, eb)) = paraxial {
         if let Some(st) = report.steps.last_mut() {
             st.note += &format!(
-                "; chosen on this field's errors: the paraxial step's {ep:.2e} (exact, from its spectrum), the band limit's {eb:.2e}"
+                "; chosen on this field's model-error indicators, from its spectrum padded as the step pads it: the paraxial step's {ep:.2e}, the band limit's {eb:.2e} (the Fresnel step's quadrature, kernel truncation and window are not among them)"
             );
+        }
+        if ep.min(eb) > STEP_TOLERANCE {
+            let method = report.steps.last().map_or(Method::Element, |s| s.method);
+            report.warn(SamplingWarning::OutsideRegime {
+                method,
+                reason: format!(
+                    "not certified: both candidates' indicators exceed {STEP_TOLERANCE:.0e} of the field (the paraxial step's {ep:.2e}, the band limit's {eb:.2e}); the smaller ran"
+                ),
+            });
         }
     }
     if matches!(how, Propagator::FresnelTf | Propagator::FresnelIr) {
         let e = paraxial.map_or_else(|| paraxial_error(u, z_mm, fft), |p| p.0);
         if paraxial.is_none() {
             if let Some(st) = report.steps.last_mut() {
-                st.note += &format!("; the paraxial step's error on this field {e:.2e} (exact, from its spectrum)");
+                st.note += &format!("; the paraxial model's error indicator on this field {e:.2e}, from its padded spectrum (the step's own quadrature and kernel truncation not among it)");
             }
         }
         if e > 1e-4 {
@@ -120,43 +145,55 @@ pub fn propagate(
 /// ```
 ///
 /// the identity of the bundle's M13 (Eq. M32), the difference in its stable
-/// form, summed over the field's own angular spectrum, its carrier included.
-/// An evanescent plane wave, which the paraxial propagator carries unchanged
-/// and the exact one does not, counts whole. Returned relative to the
-/// field's norm, `‖(U − U₂)g‖/‖g‖`. Unlike a bound from the window's corner it
-/// knows where the field's power actually is: a narrow beam tilted far off
-/// its plane's normal is paraxial in nothing.
+/// form, summed over the field's own angular spectrum, its carrier included,
+/// the field padded as the steps pad it (`next_fast_len(2n)` a side, so the
+/// spectrum is sampled `1/(PΔx)` apart per axis). An evanescent plane wave,
+/// which the exact propagator damps by `e^{−z√(|q|² − k²)}` and the paraxial
+/// one carries unchanged, counts by the difference of the two transfer
+/// factors, `|e^{−z√(|q|² − k²)} − e^{izκ₂}|²`. Returned relative to the
+/// field's norm, `‖(U − U₂)g‖/‖g‖`: an indicator of the paraxial model's
+/// error on this field, not a bound on a sampled Fresnel step's (whose
+/// quadrature and kernel truncation it leaves out). Unlike a bound from the
+/// window's corner it knows where the field's power actually is: a narrow
+/// beam tilted far off its plane's normal is paraxial in nothing.
 pub fn paraxial_error(u: &Field2, z_mm: f64, fft: &mut Fft2) -> f64 {
     regime_errors(u, z_mm, fft).0
 }
 
 /// The field a band-limited angular-spectrum step over `z_mm` would remove,
 /// relative to the field's norm: the root of the power its spectrum holds
-/// outside the band limit of Matsushima & Shimobaba (2009) for the window
-/// padded twice, Eqs. (13), (18)–(20), as `asm` applies it.
+/// outside the band limit of Matsushima & Shimobaba (2009), Eqs. (13),
+/// (18)–(20), for the window as `asm` pads it (`next_fast_len(2n)` a side,
+/// `Δu = 1/(PΔx)` per axis).
 pub fn band_limit_error(u: &Field2, z_mm: f64, fft: &mut Fft2) -> f64 {
     regime_errors(u, z_mm, fft).1
 }
 
-/// Both errors from one transform of the field.
+/// Both indicators from one transform of the field, padded as the steps pad
+/// it.
 fn regime_errors(u: &Field2, z_mm: f64, fft: &mut Fft2) -> (f64, f64) {
     let n = u.grid.n;
-    let mut buf = u.data.clone();
-    crate::fft::ifftshift2(&mut buf, n);
-    fft.forward(&mut buf, n, u.grid.cell_area_mm2());
+    let p = [crate::fft::next_fast_len(2 * n[0]), crate::fft::next_fast_len(2 * n[1])];
+    let Ok(gp) = crate::Grid2::new(p, u.grid.pitch_mm, u.grid.center_mm) else { return (0.0, 0.0) };
+    let mut buf = embed(u, p);
+    crate::fft::ifftshift2(&mut buf, p);
+    fft.forward(&mut buf, p, u.grid.cell_area_mm2());
     let lam = u.wavelength_in_medium_mm();
     let k = 2.0 * std::f64::consts::PI / lam;
     let (u0, v0) = (u.carrier[0] / lam, u.carrier[1] / lam);
-    // The band limit for the window padded twice, as the step would run.
-    let (du, dv) = (1.0 / (2.0 * u.grid.width_mm(0)), 1.0 / (2.0 * u.grid.width_mm(1)));
+    // The band limit for the window as the step pads it.
+    let (du, dv) = (gp.freq_pitch(0), gp.freq_pitch(1));
     let u_lim = 1.0 / (lam * ((2.0 * du * z_mm).powi(2) + 1.0).sqrt());
     let v_lim = 1.0 / (lam * ((2.0 * dv * z_mm).powi(2) + 1.0).sqrt());
     let (mut err, mut cut, mut tot) = (0.0, 0.0, 0.0);
-    for ky in 0..n[1] {
-        let fy = u.grid.fft_freq(1, ky) + v0;
-        for kx in 0..n[0] {
-            let fx = u.grid.fft_freq(0, kx) + u0;
-            let e = buf[ky * n[0] + kx].norm_sqr();
+    for ky in 0..p[1] {
+        let fy = gp.fft_freq(1, ky) + v0;
+        for kx in 0..p[0] {
+            let fx = gp.fft_freq(0, kx) + u0;
+            let e = buf[ky * p[0] + kx].norm_sqr();
+            if e == 0.0 {
+                continue;
+            }
             tot += e;
             if fx * fx / (u_lim * u_lim) + lam * lam * fy * fy > 1.0 || lam * lam * fx * fx + fy * fy / (v_lim * v_lim) > 1.0 {
                 cut += e;
@@ -164,7 +201,10 @@ fn regime_errors(u: &Field2, z_mm: f64, fft: &mut Fft2) -> (f64, f64) {
             let q2 = (2.0 * std::f64::consts::PI).powi(2) * (fx * fx + fy * fy);
             let w = k * k - q2;
             if w <= 0.0 {
-                err += e;
+                // |e^{−|z|κ} − e^{iz(k − q²/2k)}|², κ = √(q² − k²).
+                let damp = (-z_mm.abs() * (-w).sqrt()).exp();
+                let phase = z_mm * (k - q2 / (2.0 * k));
+                err += (damp * damp + 1.0 - 2.0 * damp * phase.cos()) * e;
                 continue;
             }
             let dk = -q2 * q2 / (2.0 * k * (k + w.sqrt()).powi(2));
@@ -183,8 +223,7 @@ fn regime_errors(u: &Field2, z_mm: f64, fft: &mut Fft2) -> (f64, f64) {
 /// distance; beyond it, the smaller of the two errors this field would meet,
 /// which are returned with the choice.
 fn choose(u: &Field2, z_mm: f64, fft: &mut Fft2) -> (Propagator, Option<(f64, f64)>) {
-    let padded_width = (2 * u.grid.n[0]) as f64 * u.grid.pitch_mm[0];
-    let zc = critical_distance_mm(u.grid.pitch_mm[0], padded_width, u.wavelength_in_medium_mm());
+    let zc = padded_critical_distance_mm(&u.grid, u.wavelength_in_medium_mm());
     if z_mm.abs() <= zc {
         return (Propagator::AngularSpectrum(AsmOptions::default()), None);
     }

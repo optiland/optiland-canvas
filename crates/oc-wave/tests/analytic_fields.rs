@@ -26,6 +26,8 @@
 //!   University Press (1999), the Airy pattern: first zero at
 //!   `v = 3.8317`, `1.21967 λz/D`; encircled energy `1 − J₀²(v) − J₁²(v)`
 //!   (section number to be confirmed against the printed edition).
+//! - [33] M. Abramowitz, I. A. Stegun, *Handbook of Mathematical Functions*,
+//!   NBS (1964), Table 25.4: the ten-point Gauss–Legendre nodes and weights.
 //!
 //! Bibliographic data retrieved 2026-10-19.
 
@@ -412,4 +414,115 @@ fn a_cosine_grating_reimages_at_the_exact_talbot_distance() {
     }
     measured("half-Talbot shift, worst error", worst);
     assert!(worst < 1e-10, "{worst}");
+}
+
+/// The exact scalar field of `exp(−r²/w₀²)` (unit amplitude at its waist) at
+/// radius `r`, `z` on: its continuous angular spectrum `πw₀² e^{−π²w₀²ρ²}`
+/// carried by the exact transfer function `e^{i2πz√(1/λ² − ρ²)}` and summed
+/// as a Hankel transform, `2π∫ Â(ρ) J₀(2πρr) e^{i2πzw(ρ)} ρ dρ` [1], by
+/// composite ten-point Gauss–Legendre quadrature [33] out to where the
+/// spectrum falls below e^{−64}. No window, no samples: a reference the
+/// propagators' finite spectra do not share.
+fn gaussian_exact(lam_um: f64, w0: f64, r: f64, z: f64) -> Cx {
+    const X: [f64; 5] = [0.148_874_338_981_631_2, 0.433_395_394_129_247_2, 0.679_409_568_299_024_4, 0.865_063_366_688_984_5, 0.973_906_528_517_171_7];
+    const W: [f64; 5] = [0.295_524_224_714_752_9, 0.269_266_719_309_996_3, 0.219_086_362_515_982, 0.149_451_349_150_580_6, 0.066_671_344_308_688_1];
+    let lam = lam_um / 1000.0;
+    let rho_max = 8.0 / (PI * w0);
+    let panels = 2000;
+    let h = rho_max / panels as f64;
+    let f = |rho: f64| {
+        let a = PI * w0 * w0 * (-(PI * w0 * rho).powi(2)).exp();
+        let w2 = 1.0 / (lam * lam) - rho * rho;
+        let t = if w2 > 0.0 { Cx::expi(2.0 * PI * z * w2.sqrt()) } else { Cx::real((-2.0 * PI * z * (-w2).sqrt()).exp()) };
+        t * (2.0 * PI * a * bessel_j(0, 2.0 * PI * rho * r) * rho)
+    };
+    let mut s = Cx::ZERO;
+    for k in 0..panels {
+        let mid = (k as f64 + 0.5) * h;
+        for (x, w) in X.iter().zip(&W) {
+            s += (f(mid + 0.5 * h * x) + f(mid - 0.5 * h * x)) * (0.5 * h * w);
+        }
+    }
+    s
+}
+
+#[test]
+fn the_angular_spectrum_converges_on_exact_fields_as_each_sampling_is_refined() {
+    // R11 of the expert review: pitch, window, padding and output sampling
+    // refined one at a time, against fields no finite spectrum shares.
+    //
+    // A Gaussian, w₀ = 50 µm at 0.6328 µm (z_R = 12.4 mm), 20 mm on, by the
+    // exact transfer function (no band limit), against its continuous
+    // angular spectrum by quadrature at r = 0, 96 µm and 192 µm (about one
+    // and two radii there).
+    let (lam, w0, z) = (0.6328, 0.05, 20.0);
+    let exact: Vec<Cx> = [0.0, 0.096, 0.192].iter().map(|&r| gaussian_exact(lam, w0, r, z)).collect();
+    let scale = exact[0].abs();
+    let mut fft = Fft2::new();
+    let run = |pitch: f64, width: f64, pad: usize, fft: &mut Fft2| -> f64 {
+        let n = (width / pitch).round() as usize;
+        let g = Grid2::square(n, pitch).unwrap();
+        let u = Field2::from_fn(g, lam, |x, y| Cx::real((-(x * x + y * y) / (w0 * w0)).exp())).unwrap();
+        let (v, _) = propagate(&u, z, Propagator::AngularSpectrum(AsmOptions { band_limit: false, pad }), fft).unwrap();
+        [0.0, 0.096, 0.192]
+            .iter()
+            .zip(&exact)
+            .map(|(&r, e)| {
+                let i = n / 2 + (r / pitch).round() as usize;
+                (v.at(i, n / 2) - *e).abs() / scale
+            })
+            .fold(0.0, f64::max)
+    };
+    let pitches: Vec<f64> = [0.032, 0.016, 0.008].iter().map(|&p| run(p, 1.024, 2, &mut fft)).collect();
+    let widths: Vec<f64> = [0.256, 0.512, 1.024].iter().map(|&w| run(0.004, w, 2, &mut fft)).collect();
+    let pads: Vec<f64> = [1usize, 2, 4].iter().map(|&p| run(0.004, 0.512, p, &mut fft)).collect();
+    measured(&format!("R11 Gaussian, pitch 32, 16, 8 µm (window 1.024 mm, pad 2): worst / peak = {:.2e}, {:.2e}, {:.2e}", pitches[0], pitches[1], pitches[2]), pitches[2]);
+    measured(&format!("R11 Gaussian, window 0.256, 0.512, 1.024 mm (pitch 4 µm, pad 2): worst / peak = {:.2e}, {:.2e}, {:.2e}", widths[0], widths[1], widths[2]), widths[2]);
+    measured(&format!("R11 Gaussian, pad 1, 2, 4 (pitch 4 µm, window 0.512 mm): worst / peak = {:.2e}, {:.2e}, {:.2e}", pads[0], pads[1], pads[2]), pads[2]);
+    for (name, e) in [("pitch", &pitches), ("window", &widths), ("pad", &pads)] {
+        assert!(e[0] > e[1] && e[1] >= e[2] * 0.5, "{name}: {e:?}");
+        assert!(e[2] < 1e-9, "{name}: {e:?}");
+    }
+    // Output sampling: the zoomed spectrum onto windows of pitch 4, 2 and
+    // 1 µm holds the same field at the same points, whatever the pitch.
+    let g = Grid2::square(128, 0.004).unwrap();
+    let u = Field2::from_fn(g, lam, |x, y| Cx::real((-(x * x + y * y) / (w0 * w0)).exp())).unwrap();
+    let mut outs = Vec::new();
+    for h in [0.004f64, 0.002, 0.001] {
+        let m = (0.4 / h).round() as usize;
+        let out = Grid2::new([m, 1], [h, h], [0.0, 0.0]).unwrap();
+        let (v, _) = oc_wave::asm_zoom(&u, z, out, 2, &mut fft).unwrap();
+        let at: Vec<Cx> = [0.0, 0.096, 0.192].iter().map(|&r| v.at(m / 2 + (r / h).round() as usize, 0)).collect();
+        outs.push(at);
+    }
+    let spread = outs.iter().flat_map(|o| o.iter().zip(&outs[0]).map(|(a, b)| (*a - *b).abs() / scale)).fold(0.0, f64::max);
+    let err = outs[2].iter().zip(&exact).map(|(a, e)| (*a - *e).abs() / scale).fold(0.0, f64::max);
+    measured("R11 Gaussian, output pitch 4, 2, 1 µm by the zoomed spectrum: the three against each other, worst / peak", spread);
+    measured("R11 Gaussian, output pitch 1 µm against the quadrature, worst / peak", err);
+    assert!(spread < 1e-12 && err < 1e-9, "{spread} {err}");
+
+    // A circular aperture, a = 0.1 mm at 0.5 µm, 2 mm on (Fresnel number
+    // 10), on its axis against Heurtley's exact solution [5]. The sampled
+    // disc's area-weighted edge stands in for the circle to second order in
+    // Δx, so refining the pitch cuts the error about fourfold; a wider window
+    // and more padding converge on what that pitch allows.
+    let (lam, a) = (0.5, 0.1);
+    let z = a * a / (lam / 1000.0 * 10.0);
+    let want = heurtley(lam, a, z);
+    let on_axis = |per: usize, span: f64, pad: usize, fft: &mut Fft2| -> f64 {
+        let dx = a / per as f64;
+        let n = (span * a / dx).round() as usize;
+        let u = disc_field(n, dx, lam, a);
+        let (v, _) = propagate(&u, z, Propagator::AngularSpectrum(AsmOptions { band_limit: false, pad }), fft).unwrap();
+        (v.at(n / 2, n / 2) - want).abs()
+    };
+    let ep: Vec<f64> = [64usize, 128, 256].iter().map(|&per| on_axis(per, 4.0, 2, &mut fft)).collect();
+    let ew: Vec<f64> = [4.0, 8.0, 16.0].iter().map(|&s| on_axis(64, s, 2, &mut fft)).collect();
+    let eq: Vec<f64> = [1usize, 2, 4].iter().map(|&p| on_axis(64, 4.0, p, &mut fft)).collect();
+    measured(&format!("R11 Heurtley, a/Δx 64, 128, 256 (window 4a, pad 2): |ΔU| = {:.2e}, {:.2e}, {:.2e}", ep[0], ep[1], ep[2]), ep[2]);
+    measured(&format!("R11 Heurtley, window 4a, 8a, 16a (a/Δx 64, pad 2): |ΔU| = {:.2e}, {:.2e}, {:.2e}", ew[0], ew[1], ew[2]), ew[2]);
+    measured(&format!("R11 Heurtley, pad 1, 2, 4 (a/Δx 64, window 4a): |ΔU| = {:.2e}, {:.2e}, {:.2e}", eq[0], eq[1], eq[2]), eq[2]);
+    assert!(ep[0] / ep[1] > 3.0 && ep[1] / ep[2] > 3.0, "not second order in the pitch: {ep:?}");
+    assert!((ew[1] - ew[2]).abs() <= (ew[0] - ew[2]).abs() + 1e-12 && (ew[2] / ep[0] - 1.0).abs() < 0.5, "{ew:?} {ep:?}");
+    assert!((eq[1] - eq[2]).abs() <= (eq[0] - eq[2]).abs() + 1e-12, "{eq:?}");
 }

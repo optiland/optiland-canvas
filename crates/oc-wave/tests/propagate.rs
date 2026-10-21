@@ -107,7 +107,7 @@ fn voelz_regime_picks_the_transfer_function_below_the_critical_distance() {
     // Heurtley test in analytic_fields.rs.)
     let (_, r) = propagate(&u, 200.0, Propagator::Auto, &mut fft).unwrap();
     assert_eq!(r.steps[0].method, Method::AngularSpectrum { band_limited: true });
-    assert!(r.steps[0].note.contains("chosen on this field's errors"), "{}", r.steps[0].note);
+    assert!(r.steps[0].note.contains("model-error indicators"), "{}", r.steps[0].note);
     let (eb, ep) = (oc_wave::propagate::band_limit_error(&u, 200.0, &mut fft), oc_wave::propagate::paraxial_error(&u, 200.0, &mut fft));
     measured("Gaussian at 200 mm: the band limit's error", eb);
     measured("Gaussian at 200 mm: the paraxial step's error", ep);
@@ -577,4 +577,198 @@ fn a_baked_carrier_propagates_like_an_analytic_one() {
     }
     measured("analytic against baked carrier, zoomed angular spectrum, worst / peak", worst / peak);
     assert!(worst / peak < 1e-10, "{}", worst / peak);
+}
+
+#[test]
+fn the_regime_indicators_read_the_spectrum_as_the_step_pads_it() {
+    // Q7 of the expert review: on a padded axis of P samples of pitch Δx the
+    // spectrum is sampled 1/(PΔx) apart, P the padded length itself
+    // (next_fast_len(2n), here 540 for n = 257, not 514), axis by axis. The
+    // band-limit indicator is then the field the band-limited step removes,
+    // to round-off [2]: a 0.2 mm square aperture far past the critical
+    // distance, on a 257 × 200 window.
+    use oc_wave::elements::{apply_aperture, Shape};
+    let g = Grid2::new([257, 200], [0.004, 0.005], [0.0, 0.0]).unwrap();
+    let mut u = Field2::from_fn(g, 0.5, |_, _| oc_wave::Cx::ONE).unwrap();
+    let mut r0 = WaveReport::default();
+    apply_aperture(&mut u, &Shape::Rect { c: [0.0, 0.0], h: [0.1, 0.1] }, false, &mut r0).unwrap();
+    let mut fft = Fft2::new();
+    let z = 400.0;
+    assert!(z > oc_wave::propagate::padded_critical_distance_mm(&g, 0.5e-3));
+    let (_, r) = propagate(&u, z, Propagator::AngularSpectrum(AsmOptions::default()), &mut fft).unwrap();
+    let removed = (r.ledger.band_limit_removed / r.ledger.launched).sqrt();
+    let indicator = oc_wave::propagate::band_limit_error(&u, z, &mut fft);
+    measured("band-limit indicator against the field the step removes, 257 × 200 window, relative", indicator / removed - 1.0);
+    assert!(removed > 1e-2, "{removed}");
+    assert!((indicator / removed - 1.0).abs() < 1e-9, "{indicator} vs {removed}");
+}
+
+#[test]
+fn an_evanescent_wave_counts_by_the_difference_of_the_two_transfer_factors() {
+    // Q6 of the expert review: the exact propagator damps an evanescent
+    // plane wave by e^{−z√(|q|² − k²)}, the paraxial one carries it with
+    // unit modulus, so the identity of bundle M13 holds with
+    // |e^{−zκ} − e^{izκ₂}|² for it, not with the whole bin. A Gaussian with
+    // a weak grating of period 0.8λ on it (evanescent), 3 µm wide on a
+    // 25.6 µm window (1.5e-8 of its amplitude at the edge, so the window
+    // holds the whole difference), both propagators on the same padded
+    // grid, 2 µm apart: the indicator against their difference.
+    let g = Grid2::square(256, 0.0001).unwrap();
+    let lam_mm = 0.5e-3;
+    let mut u = gaussian(g, 0.5, 1.0, 0.003, 0.0, 1.0, [0.0, 0.0]).unwrap();
+    let period = 0.8 * lam_mm;
+    let f = (1.0 / period / g.freq_pitch(0)).round() * g.freq_pitch(0);
+    for j in 0..g.n[1] {
+        for i in 0..g.n[0] {
+            let (x, _) = g.xy(i, j);
+            let idx = g.idx(i, j);
+            u.data[idx] *= oc_wave::Cx::ONE + oc_wave::Cx::real(0.3) * oc_wave::Cx::expi(2.0 * std::f64::consts::PI * f * x);
+        }
+    }
+    let mut fft = Fft2::new();
+    let z = 0.002;
+    let exact = Propagator::AngularSpectrum(AsmOptions { band_limit: false, pad: 2 });
+    let (a, _) = propagate(&u, z, exact, &mut fft).unwrap();
+    let (b, _) = propagate(&u, z, Propagator::FresnelTf, &mut fft).unwrap();
+    let diff: f64 = a.data.iter().zip(&b.data).map(|(x, y)| (*x - *y).norm_sqr()).sum::<f64>().sqrt();
+    let norm: f64 = u.data.iter().map(|x| x.norm_sqr()).sum::<f64>().sqrt();
+    let want = oc_wave::propagate::paraxial_error(&u, z, &mut fft);
+    measured("evanescent grating: the propagators' difference against the indicator, relative", diff / norm / want - 1.0);
+    assert!(want > 0.1, "{want}");
+    assert!((diff / norm / want - 1.0).abs() < 1e-6, "{} vs {want}", diff / norm);
+}
+
+#[test]
+fn a_step_neither_candidate_holds_is_run_but_not_certified() {
+    // Q6 of the expert review: the two indicators are model errors, not
+    // certified totals; where both exceed the tolerance (1e-2 of the field)
+    // the step runs with the smaller and the report says it is not
+    // certified. A 3 µm slit at 0.5 µm diffracts over ±10°: 50 mm on, the
+    // band limit cuts most of its spectrum and the paraxial step is wrong
+    // across it.
+    use oc_wave::elements::{apply_aperture, Shape};
+    let g = Grid2::square(512, 0.0005).unwrap();
+    let mut u = Field2::from_fn(g, 0.5, |_, _| oc_wave::Cx::ONE).unwrap();
+    let mut r0 = WaveReport::default();
+    apply_aperture(&mut u, &Shape::Rect { c: [0.0, 0.0], h: [0.0015, 0.1] }, false, &mut r0).unwrap();
+    let mut fft = Fft2::new();
+    let z = 50.0;
+    let (ep, eb) = (oc_wave::propagate::paraxial_error(&u, z, &mut fft), oc_wave::propagate::band_limit_error(&u, z, &mut fft));
+    measured("3 µm slit at 50 mm: the paraxial step's indicator", ep);
+    measured("3 µm slit at 50 mm: the band limit's indicator", eb);
+    assert!(ep > oc_wave::propagate::STEP_TOLERANCE && eb > oc_wave::propagate::STEP_TOLERANCE, "{ep} {eb}");
+    let (_, r) = propagate(&u, z, Propagator::Auto, &mut fft).unwrap();
+    assert!(
+        r.warnings.iter().any(|w| matches!(w, SamplingWarning::OutsideRegime { reason, .. } if reason.contains("not certified"))),
+        "{:?}",
+        r.warnings
+    );
+}
+
+#[test]
+fn the_rotated_spectrum_converges_over_tilt_and_bandwidth() {
+    // Q8 of the expert review: the rotated spectrum against the plane waves
+    // of the same padded spectrum summed directly at the plane's points
+    // [6], over tilts of 0° to 60° and two beam widths (the narrower beam's
+    // spectrum four times as wide). The kernel reads the spectrum between
+    // its samples; nothing else separates the two.
+    use oc_core::{Isometry3, Vec3};
+    use oc_wave::beams::GaussianBeam;
+    use oc_wave::{asm_tilted, Cx, Fft2, Grid2};
+    let pitch = 1.0 / 128.0;
+    let g = Grid2::square(128, pitch).unwrap();
+    let mut fft = Fft2::new();
+    let out = Grid2::new([40, 40], [0.01, 0.01], [0.0, 0.0]).unwrap();
+    let lam = 0.6328e-3;
+    let p = 256usize;
+    let df = 1.0 / (p as f64 * pitch);
+    for w0 in [0.1, 0.025] {
+        let u = GaussianBeam { w0_mm: w0, lambda_um: 0.6328, n: 1.0, power: 1.0, center: [0.0, 0.0] }.sample(g, 0.0).unwrap();
+        let mut buf = vec![Cx::ZERO; p * p];
+        for j in 0..128 {
+            for i in 0..128 {
+                buf[(j + 64) * p + i + 64] = u.at(i, j);
+            }
+        }
+        oc_wave::ifftshift2(&mut buf, [p, p]);
+        fft.forward(&mut buf, [p, p], pitch * pitch);
+        oc_wave::fftshift2(&mut buf, [p, p]);
+        for deg in [0.0f64, 20.0, 40.0, 60.0] {
+            let q = glam::DQuat::from_rotation_y(deg.to_radians());
+            let target = Isometry3::new(Vec3::new(0.0, 0.0, 1.0), [q.x, q.y, q.z, q.w]).unwrap();
+            let (v, rep) = asm_tilted(&u, target, out, 2, &mut fft).unwrap();
+            let k = v.k_mm();
+            let (mut worst, mut peak): (f64, f64) = (0.0, 0.0);
+            for j in (0..40).step_by(4) {
+                for i in (0..40).step_by(4) {
+                    let (x, y) = out.xy(i, j);
+                    let r = target.transform_point(Vec3::new(x, y, 0.0));
+                    let mut s = Cx::ZERO;
+                    for ky in 0..p {
+                        let fy = (ky as f64 - (p / 2) as f64) * df;
+                        for kx in 0..p {
+                            let a = buf[ky * p + kx];
+                            if a.norm_sqr() < 1e-30 {
+                                continue;
+                            }
+                            let fx = (kx as f64 - (p / 2) as f64) * df;
+                            let w2 = 1.0 / (lam * lam) - fx * fx - fy * fy;
+                            if w2 <= 0.0 {
+                                continue;
+                            }
+                            s += a * Cx::expi(2.0 * std::f64::consts::PI * (fx * r.x + fy * r.y + w2.sqrt() * r.z));
+                        }
+                    }
+                    let s = s * (df * df);
+                    let full = v.at(i, j) * Cx::expi(k * (v.carrier[0] * x + v.carrier[1] * y));
+                    peak = peak.max(s.abs());
+                    worst = worst.max((full - s).abs());
+                }
+            }
+            measured(&format!("rotated spectrum, w₀ {w0} mm, plane tilted {deg}°: against the direct plane-wave sum, worst / peak"), worst / peak);
+            assert!(worst / peak < 1e-7, "{w0} {deg}: {}", worst / peak);
+            assert!(rep.inconsistencies.is_empty(), "{:?}", rep.inconsistencies);
+        }
+    }
+}
+
+#[test]
+fn the_rotated_spectrum_books_what_the_plane_cannot_hold_by_cause() {
+    // Q8 of the expert review: missing reads are booked apart. A field whose
+    // grating of period 0.8λ is evanescent (ε = 0.3 of the amplitude, so
+    // ε²/(1 + ε²) of the power) cannot reach a plane 10 µm on: that share
+    // is `evanescent`, not lost from the window. A plane tilted 87° from the
+    // beam is crossed at grazing incidence, and the report warns that the
+    // flux there is not modelled; at 20° it does not.
+    use oc_core::{Isometry3, Vec3};
+    use oc_wave::{asm_tilted, Cx, Fft2, Grid2};
+    let g = Grid2::square(256, 0.0001).unwrap();
+    let mut u = gaussian(g, 0.5, 1.0, 0.003, 0.0, 1.0, [0.0, 0.0]).unwrap();
+    let f = (1.0 / (0.8 * 0.5e-3) / g.freq_pitch(0)).round() * g.freq_pitch(0);
+    for j in 0..g.n[1] {
+        for i in 0..g.n[0] {
+            let (x, _) = g.xy(i, j);
+            let idx = g.idx(i, j);
+            u.data[idx] *= Cx::ONE + Cx::real(0.3) * Cx::expi(2.0 * std::f64::consts::PI * f * x);
+        }
+    }
+    let mut fft = Fft2::new();
+    let out = Grid2::new([128, 128], [0.0002, 0.0002], [0.0, 0.0]).unwrap();
+    let q = glam::DQuat::from_rotation_y(20f64.to_radians());
+    let target = Isometry3::new(Vec3::new(0.0, 0.0, 0.01), [q.x, q.y, q.z, q.w]).unwrap();
+    let (_, rep) = asm_tilted(&u, target, out, 2, &mut fft).unwrap();
+    let want = 0.09 / 1.09;
+    let got = rep.ledger.evanescent / rep.ledger.launched;
+    measured("rotated spectrum: the evanescent grating's share booked as evanescent, against ε²/(1 + ε²)", got - want);
+    assert!((got - want).abs() < 1e-6, "{got} vs {want}: {:?}", rep.ledger);
+    assert!(!rep.warnings.iter().any(|w| matches!(w, SamplingWarning::OutsideRegime { .. })), "{:?}", rep.warnings);
+    let beam = oc_wave::beams::GaussianBeam { w0_mm: 0.1, lambda_um: 0.6328, n: 1.0, power: 1.0, center: [0.0, 0.0] }.sample(Grid2::square(128, 1.0 / 128.0).unwrap(), 0.0).unwrap();
+    let q = glam::DQuat::from_rotation_y(87f64.to_radians());
+    let grazing = Isometry3::new(Vec3::new(0.0, 0.0, 0.5), [q.x, q.y, q.z, q.w]).unwrap();
+    let (_, rep) = asm_tilted(&beam, grazing, Grid2::new([64, 64], [0.02, 0.02], [0.0, 0.0]).unwrap(), 2, &mut fft).unwrap();
+    assert!(
+        rep.warnings.iter().any(|w| matches!(w, SamplingWarning::OutsideRegime { reason, .. } if reason.contains("grazing"))),
+        "{:?}",
+        rep.warnings
+    );
 }

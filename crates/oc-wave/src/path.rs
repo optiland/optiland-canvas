@@ -461,14 +461,19 @@ fn centred(mut g: Grid2) -> Grid2 {
 }
 
 /// A field's second moments, across its plane and in angle, per axis: its
-/// centroid `x̄` and variance `σ²`, its mean direction `θ̄` (a direction
-/// cosine, the carrier included) and angular variance `σ_θ²`, and the cross
-/// moment `C = ⟨(x − x̄)θ⟩`, `θ = ∂φ/∂x / k` the local direction. Under
-/// paraxial propagation a distance `z` they give the beam's size exactly,
+/// centroid `x̄` and variance `σ²`, its mean slope `θ̄` and the slopes'
+/// variance `σ_θ²`, and the cross moment `C = ⟨(x − x̄)θ⟩`. A slope is how
+/// far a plane wave walks across the beam per unit length, `t/√(1 − |t|²)`
+/// for direction cosines `t` (the carrier included): the transverse velocity
+/// `q/k_z` rather than the direction cosine itself, which only the paraxial
+/// limit equates with it (Q16 of the expert review); the local slope comes
+/// from the phase gradient ([`crate::transfer::phase_gradient`]). Under
+/// propagation a distance `z` they give the beam's size,
 /// `σ²(z) = σ² + 2zC + z²σ_θ²` (the second-moment law of the Wigner
-/// distribution; A. E. Siegman, *Proc. SPIE* 1224, 2 (1990)), whatever the
-/// beam's shape: what re-gridding needs to choose the window at the next
-/// plane before the field is carried there.
+/// distribution, exact in the paraxial limit; A. E. Siegman, *Proc. SPIE*
+/// 1224, 2 (1990)), whatever the beam's shape: a predictor, not a bound on
+/// its tails, which re-gridding uses to choose the window at the next plane
+/// before the field is carried there, and checks after the step.
 struct Moments {
     power: f64,
     mean: [f64; 2],
@@ -496,10 +501,11 @@ impl Moments {
             return None;
         }
         let (mx, my) = (mx / p, my / p);
-        // The local direction θ = α + c·x + the rest: the fitted sphere and
-        // tilt analytically, what they leave by the phase difference of
+        // The local direction t = α + c·x + the rest: the fitted sphere and
+        // tilt analytically, what they leave by the phase steps between
         // neighbouring samples (which a sphere turning most of a radian a
-        // sample would make a finite difference understate).
+        // sample would make a finite difference understate), and the slope
+        // from it.
         let ([c, al, be], _) = fit_sphere(u);
         let sm = Smooth::with(u, [c, al - u.carrier[0], be - u.carrier[1]]);
         let rest = |i: usize, j: usize| {
@@ -516,10 +522,12 @@ impl Moments {
                 }
                 vx += w * (x - mx).powi(2);
                 vy += w * (y - my).powi(2);
-                let tx = if i > 0 && i + 1 < g.n[0] { (rest(i + 1, j) * rest(i - 1, j).conj()).arg() / (2.0 * g.pitch_mm[0] * k) } else { 0.0 };
-                let ty = if j > 0 && j + 1 < g.n[1] { (rest(i, j + 1) * rest(i, j - 1).conj()).arg() / (2.0 * g.pitch_mm[1] * k) } else { 0.0 };
-                cx += (x - mx) * w * (al + c * x + tx);
-                cy += (y - my) * w * (be + c * y + ty);
+                let tx = if i > 0 && i + 1 < g.n[0] { crate::transfer::phase_gradient(&rest, i, j, 0, g.pitch_mm[0]) / k } else { 0.0 };
+                let ty = if j > 0 && j + 1 < g.n[1] { crate::transfer::phase_gradient(&rest, i, j, 1, g.pitch_mm[1]) / k } else { 0.0 };
+                let (dx, dy) = (al + c * x + tx, be + c * y + ty);
+                let cz = (1.0 - dx * dx - dy * dy).max(1e-12).sqrt();
+                cx += (x - mx) * w * dx / cz;
+                cy += (y - my) * w * dy / cz;
             }
         }
         // The angular moments from the field's spectrum.
@@ -535,12 +543,22 @@ impl Moments {
             for kx in 0..n[0] {
                 let fx = g.fft_freq(0, kx) + u0;
                 let w = buf[ky * n[0] + kx].norm_sqr();
+                let (ax, ay) = (lam * fx, lam * fy);
+                let c2 = 1.0 - ax * ax - ay * ay;
+                if w == 0.0 || c2 <= 0.0 {
+                    // An evanescent wave walks nowhere.
+                    continue;
+                }
+                let (px, py) = (ax / c2.sqrt(), ay / c2.sqrt());
                 q += w;
-                tx += w * lam * fx;
-                ty += w * lam * fy;
-                sx += w * (lam * fx).powi(2);
-                sy += w * (lam * fy).powi(2);
+                tx += w * px;
+                ty += w * py;
+                sx += w * px * px;
+                sy += w * py * py;
             }
+        }
+        if q <= 0.0 {
+            return None;
         }
         let (tx, ty) = (tx / q, ty / q);
         Some(Moments {
@@ -1004,17 +1022,34 @@ struct Departures {
     power: f64,
     worst: f64,
     rms2: f64,
+    /// The spectral departure, power-weighted, and the field's pitch.
+    spectral2: f64,
+    pitch: f64,
 }
 
 impl Departures {
     /// A field of power `p`: its steepest departure counts where it holds a
-    /// millionth of what the transfer carried so far, its rms by its power.
-    fn add(&mut self, p: f64, worst: f64, rms: f64) {
+    /// millionth of what the transfer carried so far, its rms and its
+    /// spectral departure by its power.
+    fn add(&mut self, p: f64, worst: f64, rms: f64, spectral: f64) {
         self.power += p;
         self.rms2 += p * rms * rms;
+        self.spectral2 += p * spectral * spectral;
         if p >= 1e-6 * self.power {
             self.worst = self.worst.max(worst);
         }
+    }
+
+    /// The rms direction of the fields' angular spectra about the reference.
+    fn spectral(&self) -> f64 {
+        (self.spectral2 / self.power.max(f64::MIN_POSITIVE)).sqrt()
+    }
+
+    /// Whether the transfer is certified: the light the spectral departure
+    /// moves across the slab stays within a sample, so that tracing it along
+    /// the reference instead of its own directions keeps it on its sample.
+    fn certified(&self) -> bool {
+        self.spectral() * self.slab <= self.pitch
     }
 
     fn note(&self) -> String {
@@ -1030,11 +1065,18 @@ impl Departures {
             self.slab,
             self.worst * self.slab,
             0.5 * self.k * self.worst * self.worst * self.slab
+        ) + &format!(
+            "; its angular spectrum about the reference spreads {:.3} mrad rms, which across the slab moves its light by {:.2e} mm and dephases its plane waves by about {:.2e} rad{}",
+            1e3 * self.spectral(),
+            self.spectral() * self.slab,
+            0.5 * self.k * self.spectral().powi(2) * self.slab,
+            if self.certified() { "" } else { ": more than a sample, so the transfer is not certified" }
         )
     }
 }
 
 /// One of a modulator's orders, carried apart from the others.
+#[derive(Clone)]
 struct Lobe {
     u: Field2,
     uy: Option<Field2>,
@@ -1433,6 +1475,13 @@ impl ChainJob {
     /// window widening again, typically), the zoomed Fresnel transform, whose
     /// paraxial error on the field is reported.
     fn regrid_plan(&mut self, z: f64) -> Result<Option<Regrid>, WaveError> {
+        self.plan_window(z, None)
+    }
+
+    /// The window plan for a step of `z`: as [`Self::regrid_plan`] decides,
+    /// or, with `force`, a window of that half-width whatever the beam's
+    /// size suggests.
+    fn plan_window(&mut self, z: f64, force: Option<f64>) -> Result<Option<Regrid>, WaveError> {
         let mut fields: Vec<&Field2> = vec![&self.u];
         fields.extend(self.uy.as_ref());
         for l in &self.rest {
@@ -1459,23 +1508,31 @@ impl ChainJob {
         let target = needed.min(half_max).max(16.0 * lam);
         let shrink = target < 0.25 * half_now;
         let grow = half_now < half_max * (1.0 - 1e-9) && needed > 0.8 * half_now;
-        if !(shrink || grow) {
-            return Ok(None);
-        }
-        let half = if grow { (2.0 * needed).min(half_max) } else { target };
+        let half = match force {
+            Some(h) => h,
+            None if !(shrink || grow) => return Ok(None),
+            None if grow => (2.0 * needed).min(half_max),
+            None => target,
+        };
         let centre = [m.mean[0] + z * m.tilt[0], m.mean[1] + z * m.tilt[1]];
         let pitch = 2.0 * half / n as f64;
         let out = Grid2::new([n, n], [pitch, pitch], centre)?;
         // How far the field's plane waves walk across the beam over z.
         let walk = z * (m.tilt[0].abs().max(m.tilt[1].abs()) + 4.0 * m.spread[0].max(m.spread[1]).sqrt());
         let width_in = 2.0 * half_now;
-        let zc = g.width_mm(0) * g.pitch_mm[0] / lam;
+        let zc = crate::propagate::padded_critical_distance_mm(&g, lam);
+        // The padding that holds the walk, within 8 and 4096 samples a side.
+        let pad = ((2.0 * walk / width_in).ceil() as usize).max(2);
+        let cap = (4096 / n.max(1)).clamp(2, 8);
+        // Past the critical distance the zoomed Fresnel transform, where its
+        // paraxial indicator is within the tolerance, or where no padding
+        // can hold the walk; else the zoomed spectrum, padded.
         let how = if walk <= width_in {
             RegridHow::Zoom(2)
-        } else if z > zc {
+        } else if z > zc && (pad > cap || crate::propagate::paraxial_error(&self.u, z, &mut self.fft) <= crate::propagate::STEP_TOLERANCE) {
             RegridHow::Fresnel
         } else {
-            RegridHow::Zoom(((2.0 * walk / width_in).ceil() as usize).clamp(2, 8))
+            RegridHow::Zoom(pad.min(cap))
         };
         Ok(Some(Regrid { out, how, half, needed }))
     }
@@ -1496,6 +1553,15 @@ impl ChainJob {
                 let mut step = crate::czt::fresnel_zoom(u, z, pl.out, &mut self.fft)?;
                 if e > 1e-4 {
                     step.1.warn(SamplingWarning::Paraxial { field_error: e });
+                }
+                if e > crate::propagate::STEP_TOLERANCE {
+                    step.1.warn(SamplingWarning::OutsideRegime {
+                        method: Method::FresnelIr,
+                        reason: format!(
+                            "not certified: the field's walk over {z:.4} mm needs more padding than the zoomed spectrum is given, and the zoomed Fresnel transform's paraxial indicator, {e:.2e}, exceeds {:.0e} of the field",
+                            crate::propagate::STEP_TOLERANCE
+                        ),
+                    });
                 }
                 (step, "the zoomed Fresnel transform")
             }
@@ -2112,6 +2178,19 @@ impl ChainJob {
             self.beam = beam_out;
         }
         if let Some(d) = self.departures.take() {
+            if !d.certified() {
+                self.report.warn(SamplingWarning::OutsideRegime {
+                    method: Method::Element,
+                    reason: format!(
+                        "{} #{}: the field's plane waves depart from the reference its rays are traced along by {:.3} mrad rms, which moves its light by {:.2e} mm across the {:.4} mm slab, more than a sample: the transfer is not certified",
+                        d.what,
+                        d.id,
+                        1e3 * d.spectral(),
+                        d.spectral() * d.slab,
+                        d.slab
+                    ),
+                });
+            }
             self.report.approx(d.note());
         }
         self.paraxial(&ev, p, &beam_in, n_in)?;
@@ -2270,36 +2349,96 @@ impl ChainJob {
 
     /// The field `z` on to `p`, both components onto one window; the
     /// reference's wavefront and ray with it.
+    /// Every field of the chain (both components, every order carried
+    /// apart) carried `z` on, on the window `plan` chose or on the one it
+    /// has: the new fields and the step's report, the first field's steps.
+    #[allow(clippy::type_complexity)]
+    fn carry_all(&mut self, z: f64, plan: Option<&Regrid>) -> Result<(Field2, Option<Field2>, Vec<Lobe>, WaveReport), WaveError> {
+        let one = |job: &mut Self, f: &Field2| -> Result<(Field2, WaveReport), WaveError> {
+            match plan {
+                Some(pl) => job.regrid_apply(f, z, pl),
+                None => propagate(f, z, Propagator::Auto, &mut job.fft),
+            }
+        };
+        let (u0, uy0) = (self.u.clone(), self.uy.clone());
+        let (v, mut report) = one(self, &u0)?;
+        let vy = match uy0 {
+            Some(uy) => {
+                let (vy, mut ry) = one(self, &uy)?;
+                ry.steps.clear();
+                merge(&mut report, ry);
+                Some(vy)
+            }
+            None => None,
+        };
+        let mut lobes = Vec::with_capacity(self.rest.len());
+        for l in self.rest.clone() {
+            let (lu, mut r) = one(self, &l.u)?;
+            r.steps.clear();
+            merge(&mut report, r);
+            let luy = match &l.uy {
+                Some(f) => {
+                    let (vy, mut r) = one(self, f)?;
+                    r.steps.clear();
+                    merge(&mut report, r);
+                    Some(vy)
+                }
+                None => None,
+            };
+            lobes.push(Lobe { u: lu, uy: luy, at: l.at });
+        }
+        Ok((v, vy, lobes, report))
+    }
+
+    /// Carry the fields `z` on (see [`Self::regrid_plan`] for the window).
+    /// Where the step loses more than a millionth of the launched power off
+    /// the edge of a window narrower than the spec's, it is run again from
+    /// the field before it on a window twice as wide (at most the spec's),
+    /// and the one that loses less to the window, off its edge and beyond
+    /// its band together, is kept; the report says which, and what each
+    /// lost (Q16 of the expert review: check what the window kept after the
+    /// step, and enlarge it from the field before the crop).
     fn free_space(&mut self, z: f64, p: Vec3) -> Result<(), WaveError> {
         let plan = self.regrid_plan(z)?;
-        let (v, r) = match &plan {
-            Some(pl) => self.regrid_apply(&self.u.clone(), z, pl)?,
-            None => propagate(&self.u, z, Propagator::Auto, &mut self.fft)?,
-        };
-        merge(&mut self.report, r);
-        self.u = v;
-        if let Some(uy) = self.uy.take() {
-            let (vy, ry) = match &plan {
-                Some(pl) => self.regrid_apply(&uy, z, pl)?,
-                None => propagate(&uy, z, Propagator::Auto, &mut self.fft)?,
-            };
-            let mut ry = ry;
-            ry.steps.clear();
-            merge(&mut self.report, ry);
-            self.uy = Some(vy);
-        }
-        let mut lobes = std::mem::take(&mut self.rest);
-        for l in &mut lobes {
-            for f in std::iter::once(&mut l.u).chain(l.uy.as_mut()) {
-                let (v, mut r) = match &plan {
-                    Some(pl) => self.regrid_apply(f, z, pl)?,
-                    None => propagate(f, z, Propagator::Auto, &mut self.fft)?,
-                };
-                r.steps.clear();
-                merge(&mut self.report, r);
-                *f = v;
+        let (mut v, mut vy, mut lobes, mut r) = self.carry_all(z, plan.as_ref())?;
+        let launched = self.report.ledger.launched.max(f64::MIN_POSITIVE);
+        let lost = |l: &WaveLedger| l.left_window + l.spectral_projection + l.band_limit_removed;
+        if r.ledger.left_window > 1e-6 * launched {
+            let g = self.u.grid;
+            let now = plan.as_ref().map_or(0.5 * g.width_mm(0).max(g.width_mm(1)), |pl| pl.half);
+            let half_max = 0.5 * self.spec.window_mm;
+            if now < half_max * (1.0 - 1e-9) {
+                if let Some(wider) = self.plan_window(z, Some((2.0 * now).min(half_max)))? {
+                    let (v2, vy2, lobes2, mut r2) = self.carry_all(z, Some(&wider))?;
+                    let (a, b) = (lost(&r.ledger), lost(&r2.ledger));
+                    if b < a {
+                        r2.steps.push(element_step(
+                            z,
+                            format!(
+                                "the step lost {:.3e} of the launched power off the edge of its window; run again from the field before it on a window {:.4e} mm across, which loses {:.3e} off its edge and beyond its band",
+                                r.ledger.left_window / launched,
+                                2.0 * wider.half,
+                                b / launched
+                            ),
+                        ));
+                        (v, vy, lobes, r) = (v2, vy2, lobes2, r2);
+                    } else {
+                        r.steps.push(element_step(
+                            z,
+                            format!(
+                                "the step lost {:.3e} of the launched power off the edge of its window; a window {:.4e} mm across would lose {:.3e} off its edge and beyond its band, so the first stands",
+                                r.ledger.left_window / launched,
+                                2.0 * wider.half,
+                                b / launched
+                            ),
+                        ));
+                    }
+                }
             }
         }
+        merge(&mut self.report, r);
+        self.u = v;
+        self.uy = vy;
         // An order free space has emptied, its power booked as it left,
         // rejoins the strongest.
         let pw = |u: &Field2, uy: &Option<Field2>| u.power() + uy.as_ref().map_or(0.0, |f| f.power());
@@ -2520,8 +2659,9 @@ impl ChainJob {
                 }
                 let k_in = self.u.k_mm();
                 let orders = !self.rest.is_empty() || self.at != [0.0; 4];
-                let note = self.departures.get_or_insert(Departures { what, id: first.object.0, curvature: st.curvature, slab: st.slab_mm, k: k_in, orders, ..Default::default() });
-                note.add(before, st.arriving_ray_angle, st.arriving_ray_rms);
+                let pitch = self.u.grid.pitch_mm[0].min(self.u.grid.pitch_mm[1]);
+                let note = self.departures.get_or_insert(Departures { what, id: first.object.0, curvature: st.curvature, slab: st.slab_mm, k: k_in, orders, pitch, ..Default::default() });
+                note.add(before, st.arriving_ray_angle, st.arriving_ray_rms, st.arriving_spectral_rms);
                 if st.max_phase_step > std::f64::consts::PI {
                     self.report.warn(SamplingWarning::Undersampled {
                         what: format!("the field after {what} #{}", first.object.0),

@@ -60,10 +60,12 @@ grid:
 | Function | What it computes | Valid where | Source |
 |---|---|---|---|
 | `asm_zoom(field, z, out, pad)` | the plane waves advanced `z` exactly and summed on any output window and pitch by chirp-z, so a focal spot is sampled far finer than the field and a window may sit off the axis | the padded window covers the output's offset (a field repeats a padded window away) | [1], [7], [9] |
-| `asm_tilted(field, plane, out, pad)` | the field on any plane: tilted, shifted and distant at once, each plane wave read in the target frame, `(u, v, w) = Rᵀ(u′, v′, w′)`, with the Jacobian `\|∂(u, v)/∂(u′, v′)\|` and the phase to the plane's origin | the source spectrum is read between its samples by gridding, a Kaiser–Bessel kernel ten samples wide on the spectrum of the field padded at least twice [30], [31]: the kernel's aliasing, 4e-10 in its test | [6], [7], [30], [31] |
+| `asm_tilted(field, plane, out, pad)` | the field on any plane: tilted, shifted and distant at once, each plane wave read in the target frame, `(u, v, w) = Rᵀ(u′, v′, w′)`, with the Jacobian `\|∂(u, v)/∂(u′, v′)\|` and the phase to the plane's origin | the source spectrum is read between its samples by gridding, a Kaiser–Bessel kernel ten samples wide on the spectrum of the field padded at least twice [30], [31]: the kernel's aliasing, 2e-10 to 7e-10 of the peak from 0° to 60° in its test; each target frequency is met by two wavevectors, `w′ = ±√(1/λ² − u′² − v′²)`, and each that is a forward wave of the source is kept, so a plane steeply tilted holds every wave that crosses it; what it cannot hold is booked by cause (its evanescent waves as `evanescent`, waves beyond the target spectrum's span as `spectral_projection`, the rest off the window as `left_window`); waves within 6° of grazing it are kept and warned of (`OutsideRegime`); the power through the window takes one obliquity, the carrier's | [6], [7], [30], [31] |
 
 **The critical distance** `z_c = LΔx/λ`, for a window `L` wide after padding,
-divides the two Fresnel methods [3]. Up to `z_c` the angular spectrum's
+divides the two Fresnel methods [3]. The window is taken as the propagators
+pad it, `P = next_fast_len(2n)` samples a side, axis by axis, and `z_c` is
+the smaller axis's (`padded_critical_distance_mm`). Up to `z_c` the angular spectrum's
 transfer function is sampled finely enough everywhere and its band limit
 removes nothing. Running a Fresnel method on the wrong side of `z_c` is allowed,
 since comparisons need it, but the report carries an `OutsideRegime` warning.
@@ -86,9 +88,19 @@ before its band limit stops cutting what matters. The tests show that, and
 - the band-limited angular spectrum up to `z_c`, where it is exact and the
   band limit removes nothing;
 - beyond `z_c`, whichever of the Fresnel impulse response and the
-  band-limited angular spectrum makes the smaller error on this very field,
-  both known from its spectrum before either runs, and both written into the
-  step's note.
+  band-limited angular spectrum has the smaller model-error indicator on
+  this very field, both computed from its spectrum padded as the step pads
+  it before either runs, and both written into the step's note;
+- when both indicators exceed `STEP_TOLERANCE`, 1e-2 of the field, the step
+  still runs with the smaller, and the report says it is not certified
+  (`OutsideRegime`).
+
+The indicators are what each model leaves out of the exact angular
+spectrum on this field, not certified totals: a sampled Fresnel step's
+quadrature, its kernel's truncation and its window are not among them (Q6
+of the expert review). The propagators' convergence with pitch, window,
+padding and output sampling is tested on its own, against fields no finite
+spectrum shares (below).
 
 The paraxial step's error is known exactly. With `κ = √(k² − |q|²)` and its
 paraxial form `κ₂ = k − |q|²/2k`, the exact and the paraxial propagators
@@ -100,13 +112,19 @@ differ on a field `g` by
 
 which follows from Parseval's theorem because both are diagonal in the plane
 waves; the difference is written in its stable form. `paraxial_error` sums it
-over the field's own spectrum, its carrier included, so a narrow beam tilted
-far from its plane's normal is not mistaken for a paraxial one, as a bound
-from the window's corner (the old rule, `πρ⁴/(4λz³) < 0.1` rad [1]) would.
-The band limit's error is the field it would remove, `band_limit_error`.
-Every Fresnel step, chosen or forced, says its paraxial error in its note,
-and above `1e-4` raises the `Paraxial` warning with it. The identity holds
-to 5e-8 between the canvas's own two propagators (test below).
+over the field's own spectrum, its carrier included, the field padded as the
+step pads it (its spectrum sampled `1/(PΔx)` apart per axis, Q7 of the
+expert review), so a narrow beam tilted far from its plane's normal is not
+mistaken for a paraxial one, as a bound from the window's corner (the old
+rule, `πρ⁴/(4λz³) < 0.1` rad [1]) would. An evanescent plane wave, which the
+exact propagator damps and the paraxial one carries unchanged, counts by the
+difference of the two transfer factors, `|e^{−z√(|q|² − k²)} − e^{izκ₂}|²`.
+The band limit's indicator is the field it would remove, `band_limit_error`,
+the same that the band-limited step books, to round-off. Every Fresnel
+step, chosen or forced, says its paraxial error in its note, and above
+`1e-4` raises the `Paraxial` warning with it. The identity holds to 5e-8
+between the canvas's own two propagators, and to 2.1e-12 on a field with
+evanescent content (tests below).
 
 **Padding and wrap-around.** The angular spectrum and both Fresnel methods
 zero-pad to `2×` the samples (rounded up to a size with only 2, 3 and 5 as
@@ -311,7 +329,20 @@ off traced about the chief ray, its piston 0.1486 rad against the 0.1479 of
 `k₀θ²/2·(L_air + L_glass/n)` (tests below). So each face's report gives the
 departure, the steepest where the field holds a hundredth of its peak and the
 power-weighted rms, with the move it makes across the slab and the phase it
-gathers there.
+gathers there (the local direction from the phase steps between adjacent
+samples, each in (−π, π], so it aliases only past π a sample; the
+difference across two samples aliased past π/2, R08 of the expert review).
+A field of several directions can hide them from its phase: `1 + 0.5 cos(qx)`
+has no phase gradient anywhere, and is three plane waves, two `q/k` off the
+axis, which a slab of free space traced geometrically, as long as dephases
+them by π, leaves `2/3` of the field's norm away from the angular spectrum
+(R07). So the report also gives the rms direction of the field's angular
+spectrum about the reference, the move that makes across the slab and the
+dephasing about `kθ²L/2` it brings; where the move exceeds a sample the
+transfer is reported not certified (`OutsideRegime`). Through a face that
+changes nothing (index 1 on both sides), the geometric slab differs from
+the angular spectrum by `√2` times that estimate for a Gaussian, the exact
+first-order factor, whatever the face's place in the slab (R10).
 
 A modulator's field holds several directions at once: its orders. Where a
 traced face lies ahead, the field leaving a DMD or an LCoS is cut, in its
@@ -325,9 +356,13 @@ crosses each face about its own direction, and the orders add back into one
 field at the detector. At most nine are carried apart, each of at least 1e-4
 of the power; a weaker one joins its nearest, and one that free space has
 emptied rejoins the strongest. Through an N-BK7 singlet, R ±8 mm, a DMD
-whose blaze lies 27 mrad from its nearest order crosses both faces with an
-rms departure of 0.36 mrad; traced about the chief ray, its brightest
-orders would have departed by their 27 and 36 mrad.
+whose blaze lies 27 mrad from its nearest order crosses both faces with its
+orders departing from their own references by at most 0.29 mrad where the
+field holds a hundredth of its peak; the power-weighted rms, down to 1e-4 of
+the peak, reads 3.3 mrad (3.8 by the spectrum), the weak orders folded at
+the window's band edge (the difference across two samples read 0.36 by
+folding their steps). Traced about the chief ray, its brightest orders would
+have departed by their 27 and 36 mrad.
 
 The orders carried apart are the lattice's. A hologram's own orders, inside
 one cell of the lattice, share their cell's reference, and their departure
@@ -363,12 +398,16 @@ interpolation still costs is booked at each step as `resampling`.
 a wide beam and resolve the focus it is brought to: a 1 mm beam focused by
 f = 100 mm has a 20 µm waist, under two samples of a 6 mm window of 512. So
 before each free-space step the path predicts the beam's size at the next
-plane from the field's own second moments, its variance `σ²`, its angular
-variance `σ_θ²` and their cross moment `C = ⟨(x − x̄)θ⟩` (the local direction
-`θ` from the phase gradient, the fitted sphere taken out first so that a
-steep wavefront is not understated): under paraxial propagation
-`σ²(z) = σ² + 2zC + z²σ_θ²` exactly, whatever the beam's shape (the
-second-moment law; A. E. Siegman [25]). When the beam, taken as six rms
+plane from the field's own second moments, its variance `σ²`, the variance
+of its slopes `σ_θ²` and their cross moment `C = ⟨(x − x̄)θ⟩`. A slope is how
+far a plane wave walks across the beam per unit length, `t/√(1 − |t|²)` for
+direction cosines `t`, the transverse velocity `q/k_z` that only the
+paraxial limit equates with `t` (Q16 of the expert review); the local slope
+comes from the phase steps between adjacent samples, the fitted sphere taken
+out first so that a steep wavefront is not understated. Then
+`σ²(z) = σ² + 2zC + z²σ_θ²`, exact under paraxial propagation whatever the
+beam's shape (the second-moment law; A. E. Siegman [25]): a predictor, not a
+bound on the tails, which is why the step is checked after it runs (below). When the beam, taken as six rms
 radii to either side of its centroid, would fill less than a quarter of the
 window, or on a window already narrowed more than four fifths of it, the
 field is carried onto a window fitted to it, centred on its predicted
@@ -383,7 +422,16 @@ its plane waves' walk over the step stays inside; where that walk exceeds the
 window and the step is longer than the window's critical distance (a narrow
 window widening again, typically), the zoomed Fresnel transform, the Fresnel
 integral as one chirp-z transform onto the new grid, its paraxial error
-reported. A coarser window holds fewer directions: the plane waves beyond its
+reported, but only where that error's indicator is within `STEP_TOLERANCE`
+or no padding up to 8 (and 4096 samples a side) can hold the walk; else the
+zoomed spectrum, padded. A Fresnel step taken past the tolerance is reported
+not certified. After each step the path checks what the window kept: where
+a window narrower than the declared one lost more than a millionth of the
+launched power off its edge, the step is run again from the field before it
+on a window twice as wide, and the one that loses less to the window, off
+its edge and beyond its band together, is kept, with both losses in the
+report (Q16); through the f/10 singlet of the Optiland comparison the second
+window lost 1.2e-3 of the launched power where the first lost 2.9e-3. A coarser window holds fewer directions: the plane waves beyond its
 band are taken out of the field first, and booked as `spectral_projection`,
 for free space keeps every plane
 wave and the new samples, read at their points, would fold them back in at
@@ -618,7 +666,7 @@ These are acceptance case C53, in `crates/oc-wave/tests/path.rs`.
 | `a_glass_plate_shifts_a_gaussian_as_free_space_of_t_over_n` | a plate of thickness `t`, index `n` is free space `t/n` to a Gaussian [13]; faces anti-reflected, one closed-form step | 1e-5 | 1.9e-7 (implied index within 1.8e-5; face by face it was 2.4e-6 and 2.3e-4) |
 | `a_gaussian_through_a_singlet_waists_where_self_predicts` | Self [14] with the singlet's focal length and principal planes traced by the f64 tracer (an N-BK7 equiconvex lens, R ±50 mm, 4 mm) | 1e-3 | waist position 2.5e-4 of its Rayleigh range (2.9 µm); radius 5.1e-5 |
 | `a_tilted_plate_displaces_the_beam_where_the_rays_say` | the chief ray's landing point behind a plate at 30° | 0.05 pixel | 5.2e-5 mm |
-| `a_singlet_psf_matches_optiland_huygens_psf` | Optiland's `HuygensPSF` of the same singlet at f/10, at its paraxial focus (oracle, below) | Strehl ±0.01; rms 1e-2 of the ideal peak | Strehl 0.8653 against 0.8642; rms 1.2e-4 |
+| `a_singlet_psf_matches_optiland_huygens_psf` | Optiland's `HuygensPSF` of the same singlet at f/10, at its paraxial focus (oracle, below) | Strehl ±0.01; rms 1e-2 of the ideal peak | Strehl 0.8622 against 0.8642; rms 2.8e-4 |
 | `a_tilted_detector_reads_the_beam_on_its_own_plane` | Kogelnik–Li [13] on a face tilted 30°, times the obliquity: each pixel's power against the 8 × 8 sub-pixel mean of the law, and the power caught | 2e-3 of the peak; power on the face 3e-3 | 8.4e-4; 1.8e-8 (−1.9e-3 under the bilinear spectrum reading before E3) |
 | `an_aperture_whose_outer_extent_the_beam_passes_beyond_leaves_it_alone` | the tracer's aperture: light beyond the outer extent passes; against an open aperture at the same plane | bit-identical | identical |
 | `a_fold_mirror_smaller_than_the_beam_reflects_only_what_meets_it` | a 0.6 mm disc at 45° in a 1 mm Gaussian [13]: the power off its projected ellipse, by quadrature, passes beside it | 1e-4 | 1.5e-5 |
@@ -641,7 +689,7 @@ These are acceptance case C53, in `crates/oc-wave/tests/path.rs`.
 | `a_retarder_between_crossed_polarizers_passes_half_sin2_2phi_sin2_half_delta` | `sin²2φ·sin²(δ/2)/2` [26], [27] at five (φ, δ); circular light from a quarter-wave plate at 45°, `1/4` through any analyzer | 1e-9 | 9.6e-15; 4.8e-15 |
 | `tilted_crossed_polarizers_leak_as_the_ray_tracer_says` | crossed at ±45° to the plane of incidence, met at 40°: the f64 tracer's polarized trace of the chief ray, bare and in glass of 1.5 (one model, two implementations); bare, `(sin²θ/(1 + cos²θ))²/2` from the axes' projection | 1e-6; 1e-9 | 1.8e-14 and 3.5e-14; 1.9e-14 |
 | `a_half_wave_plate_in_one_arm_of_a_mach_zehnder_takes_its_fringes_away_and_a_polarizer_brings_them_back` | Fresnel–Arago [27]: half the launched in the X port at every Δφ; behind an analyzer at β, `1/4 − cos Δφ·cos 2(θ − β)/4` [26], θ = 20°, β = 20°, 50°, 65° | 1e-6 | 4.9e-8 |
-| `a_dmd_s_orders_cross_a_singlet_each_about_its_own_direction` | the orders of a DMD whose blaze lies between two of them, through an N-BK7 singlet (R ±8 mm): each crosses each face about its own direction [10], [17]; the chief ray lies 27 mrad from the nearest | rms departure 2.7 mrad; `numerical` 1e-6 | 0.36 mrad; 5.9e-9 (resampling 9.9e-3 at the DMD's take-up) |
+| `a_dmd_s_orders_cross_a_singlet_each_about_its_own_direction` | the orders of a DMD whose blaze lies between two of them, through an N-BK7 singlet (R ±8 mm): each crosses each face about its own direction [10], [17]; the chief ray lies 27 mrad from the nearest | steepest departure 0.54 mrad; rms and spectral departure 5.4 mrad; `numerical` 1e-6 | 0.29 mrad; 3.3 and 3.8 mrad (the weak orders folded at the window's band edge; the difference across two samples read 0.36 by folding their steps); 5.9e-9 (resampling 9.9e-3 at the DMD's take-up) |
 | `crossed_polarizers_before_a_lens_leave_it_a_dark_field_to_carry` | the chain is geometry: behind crossed polarizers a singlet carries an all-zero field, the ledger closed | 1e-12 | detected 1.7e-33 |
 | `a_pinhole_at_a_lens_s_focus_passes_what_the_focused_gaussian_puts_through_it` | a waist on a lens of focal length f has radius λf/(πw₀) at the focal plane (bundle M30, [13]): a pinhole of that radius stops `exp(−2)` | 1e-5 | 5.7e-7 |
 | `a_ten_times_beam_expander_widens_the_beam_as_the_abcd_law_says` | the radius at the second lens by the Gaussian ABCD law [13], through a 50 µm focus | 1e-5 | 4.2e-7 |
@@ -660,6 +708,9 @@ The transfer's own tests (acceptance case C62, `crates/oc-wave/src/transfer.rs`)
 | Test | Held against | Gate | Measured |
 |---|---|---|---|
 | `a_transfer_about_a_fixed_reference_is_linear_in_the_field` | `T(u₁ + u₂) = T(u₁) + T(u₂)`, two Gaussians tilted ±10 mrad through a lens face; with a sphere fitted to each field (before I6), the same | 1e-12 | 5.7e-17; 0.15 |
+| `a_phase_step_of_0_8_pi_a_sample_reads_as_0_8_pi` (a unit test of `transfer.rs`) | R08 of the expert review: a smooth field whose phase steps 0.8π a sample; the adjacent steps read 0.8π, the difference across two samples −0.2π; the fitted wavefront the direction `0.8π/(kΔx)` | 1e-12; 1e-9, relative | 1.4e-14; −8.3e-15 |
+| `a_field_with_no_phase_departure_can_depart_in_its_spectrum` (unit test) | R07: `1 + 0.5 cos(qx)` across a slab of free space that dephases its sidebands by π, traced through a face of index 1, against the angular spectrum [1]: `2/3` of its norm away; the phase metric reads no departure, the spectral one `q/3k`, and the sidebands' walk across the slab exceeds a sample | 1e-6; 1e-12; 1e-9, relative | 0.66667; 0; 0 |
+| `a_face_that_changes_nothing_leaves_free_space_whatever_slab_holds_it` (unit test) | R10: a curved face of index 1, the same slab split two ways; margins of 1 µm to 1 mm, the error against the angular spectrum all the way `√2` times the note's estimate `k⟨θ²⟩D/2` for a Gaussian | 1e-10; √2 ± 0.03 | 5.4e-12; 1.4142 at every margin (errors 7.4e-4 to 2.9e-2) |
 | `a_tilted_beam_through_a_plane_face_matches_the_exact_interface_when_traced_about_its_own_direction` | the plane interface plane wave by plane wave (0.1 mm of air, `√(1 − R)`, 0.3 mm of N-BK7) [1], [16]; traced about the chief ray, the piston `k₀θ²/2·(L_air + L_glass/n)` | 1e-3; 2% | 4.9e-4; 0.1486 rad against 0.1479 |
 | `a_tilted_beam_crosses_a_curved_face_where_its_rays_do` | a Gaussian 0.3 mm off the axis and tilted 30 mrad through a face of R 8 mm: its centroid against its traced rays' (geometric field tracing [17]; a check of the map against the rays it is fitted to) | 3 nm | 1.4 nm (the rays' own centroid lies 11 nm from the central ray) |
 | `each_lobe_traced_about_its_own_direction_matches_it_traced_alone` | the same lobe about its own direction and about the chief ray's: what one reference for all costs | departure reported | 0.15 relative |
@@ -684,6 +735,8 @@ The propagation tests of W8 (acceptance case C57, `crates/oc-wave/tests/propagat
 | `the_zoomed_angular_spectrum_lands_on_the_angular_spectrum_on_its_own_grid` | the FFT angular spectrum on the same points [1] | 1e-10 | 2.7e-14 of peak |
 | `an_off_axis_window_holds_the_field_the_large_window_does` | a beam walked 0.6 mm sideways, against the FFT angular spectrum on a window four times as wide [7] | 1e-6 | 1.9e-12 of peak |
 | `a_tilted_plane_holds_the_field_its_plane_waves_sum_to` | a plane tilted 20°, 2 mm along, against the plane waves of the same spectrum summed at its points [6], [30], [31]; with no tilt, against `asm_zoom`; rolled about its normal, against the field itself | 1e-7; 1e-10; 1e-9 | 4.1e-10 (the gridding kernel's aliasing, padded 2×); 2.5e-11; rolled 30° about its normal, against the Gaussian at the rolled points, 2.5e-11 |
+| `the_rotated_spectrum_converges_over_tilt_and_bandwidth` | Q8: the rotated spectrum against the plane waves summed directly on planes tilted 0°, 20°, 40° and 60°, for beams of 0.1 and 0.025 mm [6], [30], [31] | 1e-7 of the peak | 2.2e-10 to 6.7e-10 |
+| `the_rotated_spectrum_books_what_the_plane_cannot_hold_by_cause` | Q8: an evanescent grating's share, `ε²/(1 + ε²)`, booked as `evanescent`; a plane at 87° to the beam warned of grazing waves, one at 20° not | 1e-6 | 1.4e-16; warned |
 | `an_off_centre_input_window_propagates_where_its_field_is` | a window centred 0.2 mm off the frame origin, with and without a carrier (R03 of the expert review): the zoomed spectrum against the FFT angular spectrum on a wide centred window [1], onto windows centred anywhere; the rotation onto a shifted parallel plane against the zoom | 1e-6; 1e-9 | 2.0e-12; 8.3e-13 |
 | `a_translated_frame_and_a_translated_grid_hold_the_same_field` | gauge: one field encoded as a grid at `c` or as a frame moved to `c`, by the zoom and by the rotation onto one plane | 1e-12 | 3.2e-15; 5.2e-16 |
 | `the_zoomed_fresnel_and_fraunhofer_transforms_take_the_grid_where_it_is` | the chirp-z Fresnel transform of an off-centre window against the zoomed angular spectrum (padded 8×, for its periodic copies); a shifted field's far field against the centred one's times the shift phase `e^{−i2πf·c}` [1] | 1e-4; 1e-10 | 4.2e-6; 8.3e-16 |
@@ -776,6 +829,9 @@ run them with `-- --nocapture` to print the measured values.
 | `rayleigh_sommerfeld_direct_agrees_with_band_limited_asm` | [4] against [2]: two discretizations of one integral (verification) | 1e-4 | 3.9e-12 of peak |
 | `the_band_limit_reports_the_power_it_removes` | the ledger closes [2] | 1e-12 | 32.5% removed and booked |
 | `the_paraxial_step_s_error_is_the_identity_s_exactly` | `‖(U − U₂)g‖² = Σ 4 sin²(z(κ − κ₂)/2)\|ĝ\|²` between the band-unlimited angular spectrum and the Fresnel transfer function on the same grid, a Gaussian tilted 0.15 rad; a forced Fresnel step's `Paraxial` warning carries the value | 1e-6 | 5.0e-8 |
+| `the_regime_indicators_read_the_spectrum_as_the_step_pads_it` | Q7 of the expert review: the band-limit indicator against the field the band-limited step removes, on a 257 × 200 window padded to 540 × 400 [2] | 1e-9, relative | 6.7e-16 |
+| `an_evanescent_wave_counts_by_the_difference_of_the_two_transfer_factors` | Q6: the identity with an evanescent grating (period 0.8λ) on a 3 µm Gaussian, the exact and the paraxial propagator on one padded grid, 2 µm apart | 1e-6, relative | 2.1e-12 |
+| `a_step_neither_candidate_holds_is_run_but_not_certified` | Q6: a 3 µm slit 50 mm on, both indicators past 1e-2: the step runs with the smaller and is reported not certified | warned | 0.89 and 0.97; warned |
 | `voelz_regime_picks_the_transfer_function_below_the_critical_distance` | `Auto` below and beyond `z_c`: beyond it the smaller error, a Gaussian's band limit removing 2.5e-8 against the paraxial step's 2.5e-6 | exact choice | angular spectrum |
 | `an_aperture_passes_exactly_its_area_of_a_uniform_field` | exact cell coverage | 1e-12 | passes, all four shapes |
 | `voelz_regime_picks_the_transfer_function_below_the_critical_distance` | `z_c = LΔx/λ` [3] | exact | passes |
@@ -783,6 +839,7 @@ run them with `-- --nocapture` to print the measured values.
 | `a_square_aperture_far_field_is_sinc_squared` | Fraunhofer sinc² [1] | rms 1e-3 of peak | rms 4.5e-4 (worst 2.2e-3, in the outer lobes, from the sampled aperture) |
 | `a_circular_aperture_makes_the_airy_pattern` | `2J₁(v)/v`; encircled energy 0.8378 at the first dark ring [1], [16] | 2e-3; ±1e-3 | 2.8e-4 of peak; 0.8376 |
 | `the_on_axis_field_of_a_circular_aperture_matches_heurtley` | the exact on-axis Rayleigh–Sommerfeld field [5], Fresnel numbers 10 to 0.25 | 5e-3 at a/Δx = 256; error ratio > 3 on halving Δx; Richardson-extrapolated 3e-4 | 2.6e-3 → 1.6e-6 across the range; ratio 4.04–4.05 (second order); extrapolated 3.9e-5 (N_F 10) to 2.6e-8 (N_F 0.25). Band-limited ASM 2.2e-3 at N_F 10; `Auto` (impulse response) 9.4e-5 to 5.8e-6 in the far field |
+| `the_angular_spectrum_converges_on_exact_fields_as_each_sampling_is_refined` | R11 of the expert review: a Gaussian (w₀ 50 µm) 20 mm on against its continuous angular spectrum summed by quadrature [1], [33]; a circular aperture on its axis against Heurtley [5]; pitch, window, padding and output sampling refined one at a time | each refinement no worse; Gaussian 1e-9 of the peak, output sampling 1e-12; Heurtley second order in the pitch (each halving > 3×) | Gaussian, pitch 32 → 8 µm: 1.3e-3, 8.7e-12, 8.6e-13; window 0.256 → 1.024 mm: 0.62, 2.7e-12, 8.6e-13; pad 1 → 4: 1.1e-5, 2.7e-12, 1.4e-12; output pitch 4 → 1 µm: 4.6e-15 apart. Heurtley, a/Δx 64 → 256: 4.2e-2, 1.1e-2, 3.3e-3; window 4a → 16a: 4.22e-2 to 4.27e-2; pad 1 → 4: 7.8e-2, 4.2e-2, 4.3e-2 |
 | `a_square_aperture_fresnel_pattern_matches_the_fresnel_integrals` | Fresnel diffraction of a square through C and S [1], [15] | 1.5e-3 at 201 samples across; ratio > 3 | 3.5e-3 → 8.4e-4 (ratio 4.2), each method in its regime |
 | `a_gaussian_beam_spreads_as_kogelnik_and_li_say` | `w(z)`, the complex field, Gouy phase [13] | 1e-5 | radius 3.5e-7; field 2.3e-7 of peak |
 | `a_thin_lens_focuses_a_gaussian_where_self_predicts` | Self's waist position and size [14], cross-checked through the q-parameter | 1e-4 | waist 8.1e-10; wavefront flat to 2.9e-5 rad at w₀″ |
@@ -831,8 +888,13 @@ mm before the back vertex, and its edge is the marginal ray's height there,
 2.5204 mm, so `sin α = 0.049928`. The marginal ray's own sine (0.050118) is
 not the reference: the spherical aberration tilts that ray by its ray error,
 and dividing by it read the PSF 0.76% low, uniformly. The Strehl ratios are
-0.8653 (canvas) and 0.8642 (Optiland), 0.12% apart; the PSFs differ by
-1.2e-4 rms of the ideal peak, and their sums over the grid by 0.08%. Two
+0.8622 (canvas) and 0.8642 (Optiland), 0.23% apart; the PSFs differ by
+2.8e-4 rms of the ideal peak, and their sums over the grid by 0.24%. The
+step from the lens toward the focus lost 2.9e-3 of the launched power off
+the window fitted to the beam's moments, and was run again on one twice as
+wide, which loses 1.2e-3 off its edge and beyond its band; on the first
+window the canvas read 0.8644, 0.02% from Optiland, with an rms difference
+of 3.7e-4. Two
 things leave a residual of that order: the canvas's sampling (finer than its
 2.9 µm pitch, the Strehl ratio drops by 0.06% at 1.5 µm), and the reference
 itself (a uniform spherical cap peaks at `4π sin²(α/2)/λ²` per watt, 0.06%
@@ -947,5 +1009,6 @@ entry says so.
 30. J. I. Jackson, C. H. Meyer, D. G. Nishimura, A. Macovski, "Selection of a convolution function for Fourier inversion using gridding," *IEEE Trans. Med. Imaging* 10(3), 473–478 (1991), doi:10.1109/42.97598. (Gridding: a spectrum read between its samples by a kernel on an oversampled grid, the field divided by the kernel's Fourier dual; the Kaiser–Bessel kernel.)
 31. P. J. Beatty, D. G. Nishimura, J. M. Pauly, "Rapid gridding reconstruction with a minimal oversampling ratio," *IEEE Trans. Med. Imaging* 24(6), 799–808 (2005), doi:10.1109/TMI.2005.848376. (The kernel's shape parameter for a width and an oversampling, Eq. (5).)
 32. L. Greengard, J.-Y. Lee, "Accelerating the nonuniform fast Fourier transform," *SIAM Rev.* 46(3), 443–454 (2004), doi:10.1137/S003614450343200X. (The same step as the interpolation of a type-2 non-uniform FFT.)
+33. M. Abramowitz, I. A. Stegun, *Handbook of Mathematical Functions*, National Bureau of Standards (1964), Table 25.4. (The ten-point Gauss–Legendre nodes and weights the Gaussian's reference quadrature uses.)
 
 The FFT is `rustfft` 6.4.1 (MIT OR Apache-2.0).

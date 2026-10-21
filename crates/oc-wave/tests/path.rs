@@ -1756,9 +1756,14 @@ fn a_dmd_s_orders_cross_a_singlet_each_about_its_own_direction() {
         })
         .fold(f64::INFINITY, f64::min);
     // Each face's report: how far the field's directions depart from the
-    // references they were traced along, power-weighted over the orders (a
-    // weak order at the window's band edge departs by its fold, and the
-    // steepest departure says so).
+    // references they were traced along, power-weighted over the orders. A
+    // weak order at the window's band edge turns its phase by nearly π a
+    // sample and departs by its fold: the power-weighted rms, which counts
+    // the field down to 1e-4 of its peak, reads it (3.3 mrad on the first
+    // face; the difference over two samples, used before R08, folded that
+    // step to a small one and read 0.36), and so does the spectral metric
+    // (3.8 mrad), while where the field holds a hundredth of its peak the
+    // orders follow their own references to 0.3 mrad.
     let read = |key: &str| -> Vec<f64> {
         r.report
             .approximated
@@ -1770,14 +1775,19 @@ fn a_dmd_s_orders_cross_a_singlet_each_about_its_own_direction() {
             })
             .collect()
     };
-    let (worst, rms) = (read("depart from it by up to "), read("(rms "));
+    let (worst, rms, spectral) = (read("depart from it by up to "), read("(rms "), read("spreads "));
     let rms_max = rms.iter().cloned().fold(0.0, f64::max);
+    let worst_max = worst.iter().cloned().fold(0.0, f64::max);
+    let spectral_max = spectral.iter().cloned().fold(0.0, f64::max);
     measured("DMD orders through a singlet: the nearest order's angle to the chief ray, mrad", 1e3 * nearest);
     measured("DMD orders through a singlet: the orders' rms departure from their own references, the larger face's, mrad", rms_max);
-    measured("DMD orders through a singlet: the steepest departure, the larger face's, mrad", worst.iter().cloned().fold(0.0, f64::max));
+    measured("DMD orders through a singlet: the steepest departure, the larger face's, mrad", worst_max);
+    measured("DMD orders through a singlet: the spectral departure, the larger face's, mrad", spectral_max);
     assert!(nearest > 0.02, "the blaze must lie between orders: {nearest}");
     assert_eq!(rms.len(), 2, "one note per face: {:?}", r.report.approximated);
-    assert!(rms_max < 0.1 * 1e3 * nearest, "{rms:?} against {nearest}");
+    assert_eq!(spectral.len(), 2, "one note per face: {:?}", r.report.approximated);
+    assert!(worst_max < 0.02 * 1e3 * nearest, "{worst:?} against {nearest}");
+    assert!(rms_max < 0.2 * 1e3 * nearest && spectral_max < 0.2 * 1e3 * nearest, "{rms:?}, {spectral:?} against {nearest}");
     // The orders, carried apart, each through an operator of its own, add
     // back with a cross term their ledgers do not hold; the DMD's take-up
     // onto the narrow beam's fine window resamples a little of the power.

@@ -585,10 +585,14 @@ pub enum SurfaceResponse {
         transmittance: SpectralScalar,
     },
     Absorber,
-    /// An ideal thin lens: the transmitted ray bends so the slope law
-    /// `u' = u − h/f` holds exactly at every height `h` in the lens plane
-    /// (direction-aware, so a backward ray converges toward the front focus).
-    /// Full transmission, no reflection, no dispersion, no added path length —
+    /// An ideal thin lens: the phase screen `exp(−ik|r − c|²/2f)` about the
+    /// surface's origin, one operator for the wave path and the rays. A ray
+    /// goes along the phase's gradient: its direction cosines across the lens
+    /// shift by `−p/f` at the point `p` it meets the lens plane, and it goes on
+    /// to the same side. This is the paraxial lens: a collimated bundle at
+    /// height `h` crosses the axis at `f√(1 − (h/f)²)` and an axial conjugate
+    /// holds to first order; a ray taken past grazing is absorbed. Full
+    /// transmission, no reflection, no dispersion, no added path length —
     /// the stand-in for a designed multi-element assembly whose prescription
     /// is not modelled (an infinity objective, a camera lens). Only meaningful
     /// on a standalone planar surface; a body patch authoring it is rejected

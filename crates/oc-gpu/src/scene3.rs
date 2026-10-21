@@ -1349,8 +1349,9 @@ pub enum GpuResponse {
         t: Spectral32,
     },
     /// Ideal thin lens; `f` is the focal length in NORMALIZED units
-    /// (`focal_length_mm / norm.scale`), so the slope law `u' = u − h/f`
-    /// works directly on normalized hit heights.
+    /// (`focal_length_mm / norm.scale`), so the phase-gradient law
+    /// `d′_t = d_t − p_t/f` on direction cosines works directly on
+    /// normalized hit points.
     ThinLens {
         f: f32,
     },

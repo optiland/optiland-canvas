@@ -2798,3 +2798,51 @@ fn an_annular_stop_whose_centre_blocks_the_axial_ray_lets_the_arago_spot_through
         assert!(r.report.ledger.detected > 0.0);
     }
 }
+
+#[test]
+fn a_traced_ray_leaves_a_thin_lens_along_the_wave_s_phase_gradient() {
+    // Q22 of the expert review: the ideal lens is one operator. The wave
+    // path's lens is the phase screen exp(−ik|r − c|²/2f)
+    // (`apply_thin_lens`, Goodman's thin lens [1]); a plane wave met by it
+    // leaves each point of the lens plane with the direction cosines of its
+    // carrier plus the phase's gradient over k (the eikonal). The f64
+    // tracer's ray through the same lens, at that point and with that
+    // incidence, leaves along them. The gradient is read by a central
+    // difference, exact for a quadratic phase.
+    use oc_trace::{trace3, LaunchRay3, TraceConfig3};
+    use oc_wave::elements::apply_thin_lens;
+    use oc_wave::{Cx, Field2, Grid2, WaveReport};
+    for f in [20.0, -35.0] {
+        let mut s = Scene3::new();
+        let id = s.add_planar_element(Vec3::ZERO, 10.0, 0.0, lens(f), lens(f));
+        let tr = s.surfaces.iter().find(|o| o.common.id.0 == id).unwrap().common.transform;
+        let n = tr.rotate(Vec3::Z);
+        let k = 2.0 * std::f64::consts::PI / (LAM / 1000.0);
+        let cfg = TraceConfig3 { ghosts: false, polarization: false, ..TraceConfig3::default() };
+        for (t_in, p) in [([0.0, 0.0], [3.0, -2.0]), ([0.05, -0.02], [-4.0, 1.5]), ([-0.1, 0.08], [0.5, 6.0])] {
+            // The wave: a plane wave of local direction cosines t_in on a grid
+            // about p, through the lens; samples 10 nm apart, so that the
+            // phase turns by much less than π between them.
+            let dx = 1e-5;
+            let g = Grid2::new([9, 9], [dx, dx], p).unwrap();
+            let mut u = Field2::from_fn(g, LAM, |_, _| Cx::ONE).unwrap();
+            u.carrier = t_in;
+            apply_thin_lens(&mut u, f, [0.0, 0.0], &mut WaveReport::default()).unwrap();
+            let (ic, jc) = (4, 4);
+            let slope = |a: Cx, b: Cx| (a * b.conj()).arg() / (2.0 * dx * k);
+            let wave = [t_in[0] + slope(u.at(ic + 1, jc), u.at(ic - 1, jc)), t_in[1] + slope(u.at(ic, jc + 1), u.at(ic, jc - 1))];
+            // The ray: the same incidence, meeting the lens at p.
+            let d_local = Vec3::new(t_in[0], t_in[1], (1.0 - t_in[0] * t_in[0] - t_in[1] * t_in[1]).sqrt());
+            let d = tr.rotate(d_local);
+            let hit = tr.transform_point(Vec3::new(p[0], p[1], 0.0));
+            assert!(d.dot(n) > 0.0);
+            let ray = oc_core::vec3::Ray3::new(hit - d * 10.0, d).unwrap();
+            let r = trace3(&s, &[LaunchRay3 { ray, lambda_um: LAM, flux: 1.0, source: None, pol: None }], &cfg);
+            let last = *r.segments.iter().max_by(|a, b| a.opl0_mm.partial_cmp(&b.opl0_mm).unwrap()).unwrap();
+            let out = tr.quat().inverse() * (last.b - last.a).normalize();
+            let err = (out.x - wave[0]).abs().max((out.y - wave[1]).abs());
+            measured(&format!("thin lens f = {f} mm at ({}, {}) mm: the ray's direction cosines against the wave's phase gradient", p[0], p[1]), err);
+            assert!(err < 1e-9, "f {f}, p {p:?}: ray ({}, {}) vs wave {wave:?}", out.x, out.y);
+        }
+    }
+}

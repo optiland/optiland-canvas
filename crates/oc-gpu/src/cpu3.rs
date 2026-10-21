@@ -726,24 +726,24 @@ fn interact_surface(
             }
         }
         GpuResponse::ThinLens { f } => {
-            // Ideal-lens slope law u' = u − h/f in the surface's local frame
-            // (direction-aware; mirrors tracer3's f64 branch). Full
-            // transmission, no reflection, no absorption.
+            // The quadratic phase's gradient in the surface's local frame
+            // (mirrors tracer3's f64 branch): d′_t = d_t − p_t/f on direction
+            // cosines, d′_z = sign(d_z)√(1 − |d′_t|²). Full transmission; a
+            // ray the gradient takes past grazing is absorbed.
             let f = *f;
             let rt = s.rot.transpose();
             let pl = rt * (point - s.pos);
             let dl = rt * w.d;
-            let dir = if dl.z.abs() < 1e-6 || f == 0.0 {
-                w.d
-            } else {
-                s.rot
-                    * Vec3::new(
-                        dl.x - dl.z.abs() * pl.x / f,
-                        dl.y - dl.z.abs() * pl.y / f,
-                        dl.z,
-                    )
-                    .normalize()
-            };
+            if f == 0.0 {
+                return;
+            }
+            let (tx, ty) = (dl.x - pl.x / f, dl.y - pl.y / f);
+            let t2 = tx * tx + ty * ty;
+            if t2 >= 1.0 {
+                return;
+            }
+            let side = if dl.z < 0.0 { -1.0 } else { 1.0 };
+            let dir = (s.rot * Vec3::new(tx, ty, side * (1.0 - t2).sqrt())).normalize();
             push(
                 stack,
                 Work {

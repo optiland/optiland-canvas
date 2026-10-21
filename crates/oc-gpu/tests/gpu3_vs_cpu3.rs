@@ -653,6 +653,34 @@ fn a_tilted_mirror_matches_cpu() {
 }
 
 #[test]
+fn a_thin_lens_matches_cpu() {
+    // The shader's ideal lens against its CPU mirror: the quadratic phase's
+    // gradient on direction cosines, converging and diverging, forward,
+    // backward and skew; and a ray the gradient takes past grazing (6 mm off
+    // the axis of an f = 5 mm lens), absorbed by both.
+    let Some(tracer) = tracer_or_skip() else {
+        return;
+    };
+    for f in [50.0, -50.0, 5.0] {
+        let mut scene = Scene3::new();
+        add_surface(&mut scene, Vec3::ZERO, Vec3::X, 20.0, SurfaceResponse::ThinLens { focal_length_mm: f });
+        scene.validate().unwrap();
+        assert_gpu_matches_cpu(
+            &tracer,
+            &scene,
+            &[
+                (Vec3::new(-30.0, 0.001, 0.0), Vec3::X),
+                (Vec3::new(-30.0, 2.0, 0.0), Vec3::X),
+                (Vec3::new(-30.0, 0.0, -3.0), Vec3::X),
+                (Vec3::new(30.0, 1.5, -2.0), Vec3::NEG_X),
+                (Vec3::new(-30.0, 3.0, 2.0), Vec3::new(1.0, 0.1, -0.05).normalize()),
+                (Vec3::new(-30.0, 6.0, 0.0), Vec3::X),
+            ],
+        );
+    }
+}
+
+#[test]
 fn an_aperture_and_detector_match_cpu() {
     let Some(tracer) = tracer_or_skip() else {
         return;

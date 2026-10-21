@@ -925,8 +925,10 @@ fn an_aperture_and_detector_match_f64() {
 
 #[test]
 fn a_thin_lens_matches_f64_for_skew_rays() {
-    // The ideal-lens slope law runs in both engines; the f32 preview must land
-    // where the f64 reference does, forward and backward.
+    // The ideal lens bends a ray along its quadratic phase's gradient,
+    // d′_t = d_t − p_t/f on direction cosines, in both engines; the f32
+    // preview must land where the f64 reference does, forward, backward and
+    // at skew incidence.
     let mut scene = Scene3::new();
     let id = scene.alloc_object_id();
     let mut common = ObjectCommon::new(id, LayerId(0));
@@ -953,6 +955,8 @@ fn a_thin_lens_matches_f64_for_skew_rays() {
         (Vec3::new(-30.0, 0.0, -8.0), Vec3::X),
         (Vec3::new(-30.0, 7.0, -4.0), Vec3::X),
         (Vec3::new(30.0, 6.0, -2.0), Vec3::NEG_X),
+        (Vec3::new(-30.0, 3.0, 2.0), Vec3::new(1.0, 0.1, -0.05).normalize()),
+        (Vec3::new(30.0, -4.0, 1.0), Vec3::new(-1.0, -0.08, 0.12).normalize()),
     ];
     assert_landing_matches(&scene, &rays);
 }

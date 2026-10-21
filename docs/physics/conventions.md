@@ -121,6 +121,20 @@ response `h = e^{ikz}/(iλz)·exp(ik r²/2z)` and the thin lens
 `t = exp(−ik r²/2f)` (so `f > 0` converges) are all Goodman's, in this
 convention.
 
+The thin lens is one operator for waves and rays (Q22 of the expert review of
+the wave engine). A ray goes along the phase's gradient (the eikonal, Born &
+Wolf §3.1), so the f64 tracer, the preview's CPU mirror and its shader all
+shift a ray's direction cosines across the lens by `−p/f` at the point `p`
+where it meets the lens plane, `d′_t = d_t − p_t/f`, and send it on to the same
+side, `d′_z = sign(d_z)√(1 − |d′_t|²)`. This is the paraxial lens and has the
+quadratic phase's spherical aberration: a collimated ray at height `h`
+crosses the axis at `f√(1 − (h/f)²)`, and an axial conjugate holds to first
+order in the aperture. A ray the gradient takes past grazing (`|d′_t| ≥ 1`)
+has no propagating wave to go on in and is absorbed at the lens, named in the
+report. Before, the rays used the slope law `u′ = u − h/f`, exact for every
+conjugate at every height, which differs from the wave's lens at finite
+angles.
+
 Held by `oc-wave/tests/fft.rs`:
 - `fft2_is_unitary_under_parseval` pins the scales.
 - `the_centered_transform_of_a_shifted_gaussian_is_a_gaussian_with_the_shift_phase`

@@ -2043,26 +2043,35 @@ fn interact_surface(
             push_event(r, cfg, w, point, opl_at, lens_interact(Vec::new()));
             return;
         }
-        r.report.note_exact(PhysicsFeature::ThinLens);
         let t = &s.common.transform;
         let p_local = t.inverse_transform_point(point);
         let d_local = t.quat().inverse() * w.ray.dir;
-        // Slope law u' = u − h/f per transverse axis, direction-aware: with the
-        // axial component preserved, d'_t = d_t − |d_z|·h_t/f sends a forward
-        // parallel bundle exactly through (0, 0, +f) and a backward one through
-        // (0, 0, −f), and images every axial conjugate exactly (1/s_o + 1/s_i =
-        // 1/f). A ray grazing in the lens plane (|d_z| ≈ 0) passes undeviated.
-        let dir = if d_local.z.abs() < 1e-12 {
-            w.ray.dir
-        } else {
-            let bent = Vec3::new(
-                d_local.x - d_local.z.abs() * p_local.x / f,
-                d_local.y - d_local.z.abs() * p_local.y / f,
-                d_local.z,
-            )
-            .normalize();
-            t.quat() * bent
-        };
+        // One operator with the wave path (Q22 of the expert review): the lens
+        // is the phase screen exp(−ik|r − c|²/2f), and a ray goes along its
+        // phase's gradient (the eikonal, Born & Wolf §3.1), so the direction
+        // cosines across the lens shift by −p/f, d′_t = d_t − p_t/f, and the
+        // ray goes on to the same side, d′_z = sign(d_z)√(1 − |d′_t|²). The
+        // quadratic phase is the paraxial lens: a collimated bundle at height
+        // h crosses the axis at f√(1 − (h/f)²), and an axial conjugate holds
+        // to first order in the aperture. Where the gradient takes the ray
+        // past grazing (|d′_t| ≥ 1) no propagating wave goes on: the flux is
+        // absorbed at the surface, and the report says so.
+        let tx = d_local.x - p_local.x / f;
+        let ty = d_local.y - p_local.y / f;
+        let t2 = tx * tx + ty * ty;
+        if t2 >= 1.0 {
+            r.report.note_approx(
+                PhysicsFeature::ThinLens,
+                "the thin lens's phase gradient takes a ray past grazing (|d_t| ≥ 1): no propagating wave goes on, and its flux is booked as absorbed at the lens",
+            );
+            r.ledger.absorbed_surface += flux_at;
+            r.terminations.record(TerminationReason::AbsorbedSurface);
+            push_event(r, cfg, w, point, opl_at, lens_interact(Vec::new()));
+            return;
+        }
+        r.report.note_exact(PhysicsFeature::ThinLens);
+        let side = if d_local.z < 0.0 { -1.0 } else { 1.0 };
+        let dir = t.quat() * Vec3::new(tx, ty, side * (1.0 - t2).sqrt());
         // Full transmission: no reflection branch, no absorption, no added OPL,
         // and no polarization action either. The bend is not a reflection, so
         // there is no plane of incidence to work in; the frame is carried across

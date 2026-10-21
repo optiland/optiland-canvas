@@ -1395,16 +1395,25 @@ fn interact_surface(w: Work, ev: Event, point: vec3<f32>, flux_end: f32, lambda:
     if (kind == RESP_ABSORBER) {
         return;
     } else if (kind == RESP_THIN_LENS) {
-        // Ideal-lens slope law u' = u - h/f in the surface's local frame
-        // (`r` carries the normalized focal length). Full transmission.
+        // The quadratic phase's gradient in the surface's local frame (mirrors
+        // tracer3): d't = dt - pt/f on direction cosines, d'z = sign(dz)
+        // sqrt(1 - |d't|^2); `r` carries the normalized focal length. Full
+        // transmission; a ray taken past grazing is absorbed.
         let fl = resp.r.value;
+        if (fl == 0.0) {
+            return;
+        }
         let srot = surface_rot(s);
         let pl = transpose(srot) * (point - s.pos.xyz);
         let dl = transpose(srot) * w.d;
-        var dir = w.d;
-        if (abs(dl.z) > 1e-6 && fl != 0.0) {
-            dir = srot * normalize(vec3<f32>(dl.x - abs(dl.z) * pl.x / fl, dl.y - abs(dl.z) * pl.y / fl, dl.z));
+        let tx = dl.x - pl.x / fl;
+        let ty = dl.y - pl.y / fl;
+        let t2 = tx * tx + ty * ty;
+        if (t2 >= 1.0) {
+            return;
         }
+        let side = select(1.0, -1.0, dl.z < 0.0);
+        let dir = normalize(srot * vec3<f32>(tx, ty, side * sqrt(1.0 - t2)));
         push(Work(point + dir * EPS, dir, flux_end, w.depth + 1u, w.gdepth, w.medium_n, w.medium_alpha, w.flags & ~SEG_TIR), min_flux);
     } else if (kind == RESP_GRATING) {
         // The grating equation in the surface's frame (mirrors tracer3): the

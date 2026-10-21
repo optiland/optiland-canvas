@@ -200,6 +200,10 @@ pub struct WavePathResult {
     /// diffracted readout's window) takes its share.
     pub arriving: f64,
     pub report: WaveReport,
+    /// Every choice the path made from the field, in order: replayed
+    /// ([`WaveJob::replaying`]), they make the path one fixed linear
+    /// operator on the field it launches.
+    pub plan: crate::plan::PathPlan,
 }
 
 /// A frame across the chief ray: origin on it, `d` along it.
@@ -289,10 +293,22 @@ fn onto_plane(r: Vec3, dir: Vec3, p: Vec3, n: Vec3) -> Option<Vec3> {
 /// change of direction does not already carry. Returns the new field and the
 /// largest depth the projection spanned, mm.
 fn hand_over(u: &Field2, inc: &Beam, n_e: Vec3, out: &Beam, factor: &dyn Fn(Vec3) -> Cx) -> (Field2, f64) {
-    let mut v = u.clone();
-    let g = u.grid;
     let k = u.k_mm();
     let p = inc.origin;
+    // The outgoing window: the incoming one's image, centred where the light
+    // from the incoming window's centre leaves the element across the
+    // outgoing ray. A window off the chief ray is not where it was once the
+    // element turns the beam: a mirror turns it over.
+    let g = {
+        let [cx, cy] = u.grid.center_mm;
+        let centre = onto_plane(inc.point(cx, cy), inc.d, p, n_e).map_or(u.grid.center_mm, |r_e| {
+            let (a, b) = out.coords(r_e - out.d * (r_e - out.origin).dot(out.d));
+            [a, b]
+        });
+        Grid2::new(u.grid.n, u.grid.pitch_mm, centre).unwrap_or(u.grid)
+    };
+    let mut v = u.clone();
+    v.grid = g;
     let mut depth: f64 = 0.0;
     let obliquity = obliquity(inc.d, out.d, n_e);
     let smooth = Smooth::new(u);
@@ -768,6 +784,7 @@ fn takeup_columns(out: &Beam, n: Vec3, ex: Vec3, ey: Vec3) -> (([f64; 2], Vec3),
 }
 
 /// A window a field is to be carried onto, and how.
+#[derive(Clone, Debug)]
 struct Regrid {
     out: Grid2,
     how: RegridHow,
@@ -775,7 +792,7 @@ struct Regrid {
     needed: f64,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum RegridHow {
     /// The zoomed angular spectrum, padded so many times.
     Zoom(usize),
@@ -1024,6 +1041,8 @@ struct ChainJob {
     /// The field is laid out only when the chain first runs, so a job of
     /// many chains holds one full field at a time.
     launched: bool,
+    /// A field launched instead of the spec's beam ([`WaveJob::with_launch`]).
+    custom: Option<Arc<Field2>>,
     /// The polarization the field (or, while an element runs on one of two
     /// components, that component) stands for.
     pol: Pol,
@@ -1373,6 +1392,7 @@ impl ChainJob {
             power,
             n0,
             launched: false,
+            custom: None,
             pol: Pol::Unpolarized,
             uy: None,
             polarized: jones.is_some(),
@@ -1409,7 +1429,21 @@ impl ChainJob {
     fn step(&mut self, events: usize) -> Result<bool, WaveError> {
         if !self.launched {
             let grid = Grid2::square(self.spec.grid_n, self.spec.window_mm / self.spec.grid_n as f64)?;
-            let (u, ledger) = launch_field(&self.spec, grid, self.lam, self.n0, self.power, &self.beam)?;
+            let (u, ledger) = match &self.custom {
+                // The chain's share of the field given, as of the spec's beam.
+                Some(f) => {
+                    let mut u = Field2::zeros(grid, self.lam)?.in_medium(self.n0)?;
+                    let s = (self.power / self.spec.power).sqrt();
+                    for (a, b) in u.data.iter_mut().zip(&f.data) {
+                        *a = *b * s;
+                    }
+                    u.carrier = f.carrier;
+                    u.frame = self.beam.iso();
+                    let ledger = WaveLedger { launched: u.power(), ..Default::default() };
+                    (u, ledger)
+                }
+                None => launch_field(&self.spec, grid, self.lam, self.n0, self.power, &self.beam)?,
+            };
             if self.polarized {
                 let (mut a, mut b) = (u.clone(), u);
                 for z in &mut a.data {
@@ -1607,6 +1641,10 @@ impl ChainJob {
     /// or, with `force`, a window of that half-width whatever the beam's
     /// size suggests.
     fn plan_window(&mut self, z: f64, force: Option<f64>) -> Result<Option<Regrid>, WaveError> {
+        crate::plan::decide("window", || self.plan_window_free(z, force).map_err(|e| e.to_string())).map_err(WaveError::OutOfRange)
+    }
+
+    fn plan_window_free(&mut self, z: f64, force: Option<f64>) -> Result<Option<Regrid>, WaveError> {
         let mut fields: Vec<&Field2> = vec![&self.u];
         fields.extend(self.uy.as_ref());
         for l in &self.rest {
@@ -1851,7 +1889,7 @@ impl ChainJob {
         let pols = if oblique { [Pol::S(bin[0]), Pol::P(bin[0])] } else { [Pol::Unpolarized, Pol::Unpolarized] };
         // A component without power is carried as zeros, on the other's
         // outgoing window: an element fitted to a field has nothing to fit.
-        let lit: Vec<bool> = comps.iter().map(|c| c.power() > 0.0).collect();
+        let lit: Vec<bool> = crate::plan::decide("lit components", || comps.iter().map(|c| c.power() > 0.0).collect());
         let mut outs: [Option<Field2>; 2] = [None, None];
         let mut beam1 = beam0;
         let mut ran = false;
@@ -2590,7 +2628,7 @@ impl ChainJob {
         let total: f64 = power.values().sum();
         let mut ranked: Vec<((i64, i64), f64)> = power.into_iter().collect();
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0)));
-        let kept: Vec<(i64, i64)> = ranked.iter().filter(|(_, p)| *p >= 1e-4 * total).take(MAX_LOBES).map(|x| x.0).collect();
+        let kept: Vec<(i64, i64)> = crate::plan::decide("orders carried apart", || ranked.iter().filter(|(_, p)| *p >= 1e-4 * total).take(MAX_LOBES).map(|x| x.0).collect());
         // An order's direction across the outgoing beam.
         let dir = |o: (i64, i64)| -> Option<[f64; 2]> {
             let (a, b) = (cx + o.0 as f64 * step, cy + o.1 as f64 * step);
@@ -2710,7 +2748,7 @@ impl ChainJob {
         let (mut v, mut vy, mut lobes, mut r) = self.carry_all(z, plan.as_ref())?;
         let launched = self.report.ledger.launched.max(f64::MIN_POSITIVE);
         let lost = |l: &WaveLedger| l.left_window + l.spectral_projection + l.band_limit_removed;
-        if r.ledger.left_window > 1e-6 * launched {
+        if crate::plan::decide("window retried", || r.ledger.left_window > 1e-6 * launched) {
             let g = self.u.grid;
             let now = plan.as_ref().map_or(0.5 * g.width_mm(0).max(g.width_mm(1)), |pl| pl.half);
             let half_max = 0.5 * self.spec.window_mm;
@@ -2718,7 +2756,7 @@ impl ChainJob {
                 if let Some(wider) = self.plan_window(z, Some((2.0 * now).min(half_max)))? {
                     let (v2, vy2, lobes2, mut r2) = self.carry_all(z, Some(&wider))?;
                     let (a, b) = (lost(&r.ledger), lost(&r2.ledger));
-                    if b < a {
+                    if crate::plan::decide("wider window kept", || b < a) {
                         r2.steps.push(element_step(
                             z,
                             format!(
@@ -2750,7 +2788,15 @@ impl ChainJob {
         // rejoins the strongest.
         let pw = |u: &Field2, uy: &Option<Field2>| u.power() + uy.as_ref().map_or(0.0, |f| f.power());
         let total: f64 = pw(&self.u, &self.uy) + lobes.iter().map(|l| pw(&l.u, &l.uy)).sum::<f64>();
-        let (spent, kept): (Vec<Lobe>, Vec<Lobe>) = lobes.into_iter().partition(|l| pw(&l.u, &l.uy) < 1e-9 * total);
+        let empty: Vec<bool> = crate::plan::decide("orders emptied", || lobes.iter().map(|l| pw(&l.u, &l.uy) < 1e-9 * total).collect());
+        let (mut spent, mut kept): (Vec<Lobe>, Vec<Lobe>) = (Vec::new(), Vec::new());
+        for (l, e) in lobes.into_iter().zip(empty) {
+            if e {
+                spent.push(l);
+            } else {
+                kept.push(l);
+            }
+        }
         for l in spent {
             for (a, b) in self.u.data.iter_mut().zip(&l.u.data) {
                 *a += *b;
@@ -3108,6 +3154,10 @@ impl Band {
 }
 
 fn field_band(u: &Field2, fft: &mut Fft2) -> Band {
+    crate::plan::decide("readout band", || field_band_free(u, fft))
+}
+
+fn field_band_free(u: &Field2, fft: &mut Fft2) -> Band {
     let g = u.grid;
     let n = g.n;
     let mut b = u.data.clone();
@@ -4172,6 +4222,7 @@ fn combine_arms(scene: &Scene3, spec: &WavePathSpec, faces: Vec<FaceField>, revi
         field_y,
         arriving,
         report,
+        plan: Default::default(),
     })
 }
 
@@ -4220,6 +4271,10 @@ pub struct WaveJob {
     /// The direction each chain reaches the detector along, for the
     /// fringes between the arms.
     dirs: Vec<Vec3>,
+    /// The choices the job makes from the field, recorded or replayed, and
+    /// what the path is (its spec and its chains' events) for a plan to match.
+    recorder: crate::plan::Recorder,
+    context: String,
 }
 
 struct Mode {
@@ -4390,7 +4445,61 @@ impl WaveJob {
                 modes.push(Mode { lambda_um: lam, label, chains, arms });
             }
         }
-        Ok(WaveJob { scene: shared, spec: *spec, revision, modes, samples: None, capped: false, dirs })
+        let mut context = format!("{spec:?}");
+        for m in &modes {
+            context.push_str(&format!("|{}:", m.label));
+            for c in &m.chains {
+                if let Chain::Running(j) = c {
+                    context.push('[');
+                    context.push_str(&j.keys.join(";"));
+                    context.push(']');
+                }
+            }
+        }
+        let recorder = crate::plan::Recorder::recording(context.clone());
+        Ok(WaveJob { scene: shared, spec: *spec, revision, modes, samples: None, capped: false, dirs, recorder, context })
+    }
+
+    /// Launch `field` instead of the spec's beam: its samples on the launch
+    /// window (the spec's `grid_n` samples across `window_mm`, centred on
+    /// the chief ray), its carrier as given, each chain taking its share of
+    /// it as of the spec's beam (a line's weight, a polarization's half).
+    /// Refused when the field is on another grid.
+    pub fn with_launch(mut self, field: &Field2) -> Result<Self, WaveError> {
+        let grid = Grid2::square(self.spec.grid_n, self.spec.window_mm / self.spec.grid_n as f64)?;
+        if field.grid != grid {
+            return Err(WaveError::Mismatch(format!(
+                "a launch field must be on the launch window, {} samples across {} mm centred on the chief ray",
+                self.spec.grid_n, self.spec.window_mm
+            )));
+        }
+        let f = Arc::new(field.clone());
+        for m in &mut self.modes {
+            for c in &mut m.chains {
+                if let Chain::Running(j) = c {
+                    if j.launched {
+                        return Err(WaveError::OutOfRange("the job has already launched its beam".into()));
+                    }
+                    j.custom = Some(Arc::clone(&f));
+                }
+            }
+        }
+        Ok(self)
+    }
+
+    /// Make every choice from `plan` instead of from the field: the windows,
+    /// the propagators, the spheres, the orders and the readout's points the
+    /// run that recorded it made (R09 of the expert review). The job is then
+    /// one fixed linear operator on the field it launches. A plan recorded
+    /// on another path (another spec, or chains through other events) is
+    /// refused, and so is a run that asks for a choice the plan does not
+    /// hold there.
+    pub fn replaying(mut self, plan: &crate::plan::PathPlan) -> Result<Self, WaveError> {
+        if !crate::plan::Recorder::fits(plan, &self.context) {
+            return Err(WaveError::Mismatch("the plan was recorded on another path: its spec or its chains' events differ".into()));
+        }
+        self.recorder = crate::plan::Recorder::replay(plan);
+        Ok(self)
     }
 
     /// The scene revision the job answers for.
@@ -4541,6 +4650,15 @@ impl WaveJob {
     /// one. A chain that finishes among several is read out at once, so the
     /// job holds one full field at a time.
     pub fn step(&mut self, events: usize) -> Result<bool, WaveError> {
+        let mut rec = std::mem::take(&mut self.recorder);
+        let out = crate::plan::with(&mut rec, || self.step_free(events));
+        self.recorder = rec;
+        let done = out?;
+        self.recorder.check(false).map_err(WaveError::Mismatch)?;
+        Ok(done)
+    }
+
+    fn step_free(&mut self, events: usize) -> Result<bool, WaveError> {
         let lone = self.modes.len() == 1 && self.modes[0].arms == 1;
         let mut left = events;
         for mi in 0..self.modes.len() {
@@ -4604,8 +4722,17 @@ impl WaveJob {
     }
 
     /// Read the detector: each pixel's power. Refused before every chain is
-    /// done.
+    /// done. The result holds the plan of the choices the run made.
     pub fn finish(mut self) -> Result<WavePathResult, WaveError> {
+        let mut rec = std::mem::take(&mut self.recorder);
+        let out = crate::plan::with(&mut rec, || self.finish_free());
+        let mut r = out?;
+        rec.check(true).map_err(WaveError::Mismatch)?;
+        r.plan = rec.plan().clone();
+        Ok(r)
+    }
+
+    fn finish_free(mut self) -> Result<WavePathResult, WaveError> {
         if self.done() < self.events() {
             return Err(WaveError::OutOfRange(format!(
                 "the wave job has {} of {} events still to run",
@@ -4734,6 +4861,7 @@ fn placeholder_result(revision: u64, detector: DetectorId) -> Result<WavePathRes
         field_y: None,
         arriving: 0.0,
         report: WaveReport::default(),
+        plan: Default::default(),
     })
 }
 
@@ -5018,8 +5146,20 @@ fn modulator_step(
     // sphere is the one to take out of them.
     let ([c_dev, a_dev, b_dev], _) = fit_sphere(&on_dev);
     let smooth_out = Smooth::with(&reflected, [c_dev, a_dev - on_dev.carrier[0], b_dev - on_dev.carrier[1]]);
+    // The outgoing window: the incoming one's image, centred where the light
+    // from the incoming window's centre leaves the device across the
+    // outgoing ray. A window off the chief ray is not where it was: the
+    // reflection turns it over, and the footprint stretches it.
+    let gb = {
+        let [cx, cy] = u.grid.center_mm;
+        let centre = onto_plane(beam.point(cx, cy), beam.d, beam.origin, n_s).map_or(u.grid.center_mm, |r_e| {
+            let (a, b) = out.coords(r_e - out.d * (r_e - out.origin).dot(out.d));
+            [a, b]
+        });
+        Grid2::new(u.grid.n, u.grid.pitch_mm, centre)?
+    };
     let mut v = u.clone();
-    let gb = u.grid;
+    v.grid = gb;
     let mut depth: f64 = 0.0;
     let ob = obliquity(beam.d, out.d, n_s);
     for j in 0..gb.n[1] {

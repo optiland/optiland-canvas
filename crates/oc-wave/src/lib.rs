@@ -42,6 +42,7 @@ pub mod grid;
 pub mod modulator;
 #[cfg(feature = "scene")]
 pub mod path;
+pub mod plan;
 #[cfg(feature = "scene")]
 pub mod planar;
 #[cfg(feature = "scene")]

@@ -119,8 +119,17 @@ fn mirror_outline(d: &DmdSpec, pitch_mm: f64, state: DmdState) -> Shape {
 
 /// Above this share of the field's power within a pixel of a window edge the
 /// device reaches past, the mask is averaged over each sample's cell instead
-/// of band-limited ([`edge_share`]).
-pub const FOLD_TOLERANCE: f64 = 1e-9;
+/// of band-limited ([`edge_share`]). The band-limited mask, periodic over the
+/// window, folds the pixels the edge cuts onto the far side, which misplaces
+/// at most about that share of the power; the cell average weights an order
+/// `m` by `sinc(m/s)` at `s` samples a pixel, 13% of the power for an order
+/// 1.6 lattice steps out at 8. So the fold is kept, and named, until it costs
+/// a percent: a lower mark switches methods on a field barely wider than
+/// another, and moves the orders by far more than the fold would.
+pub const FOLD_TOLERANCE: f64 = 1e-2;
+
+/// Above this share the report names the band-limited mask's fold.
+const FOLD_NOTE: f64 = 1e-9;
 
 /// The share of `u`'s power on its samples within one pitch of a window edge
 /// that the device reaches past: there the band-limited mask, periodic over
@@ -273,7 +282,8 @@ pub fn dmd_reflect(
     // projected outline, its piston, the reflectance's amplitude. Averaged
     // over each sample's cell instead where lit pixels would fold across the
     // window's edge.
-    let folded = edge_share(u, device) > FOLD_TOLERANCE;
+    let share = edge_share(u, device);
+    let folded = crate::plan::decide("cell-averaged device mask", || share > FOLD_TOLERANCE);
     let mask = if folded {
         None
     } else {
@@ -342,11 +352,16 @@ pub fn dmd_reflect(
     } else {
         // What the family reflects beyond the grid's band (its mirrors' edges).
         report.ledger.spectral_projection = beyond;
+        if share > FOLD_NOTE {
+            report.approx(format!(
+                "DMD: {share:.1e} of the power lies within a pixel of a window edge the device reaches past, where the band-limited mask folds the mirrors the edge cuts across the window; at most about that share is misplaced"
+            ));
+        }
     }
     report.ledger.detected = out.power();
     report.ledger.close();
     validity_flags(&mut report, device, u.lambda_um, t_in);
-    let incidence =(t_in[0] * t_in[0] + t_in[1] * t_in[1]).sqrt().min(1.0).asin().to_degrees();
+    let incidence = (t_in[0] * t_in[0] + t_in[1] * t_in[1]).sqrt().min(1.0).asin().to_degrees();
     if incidence > FACET_INCIDENCE_FLAG_DEG {
         report.flag(ValidityFlag::ThinElement {
             detail: format!(
@@ -477,7 +492,8 @@ pub fn lcos_reflect(u: &Field2, device: &SpatialModulator, beam: LcosBeam) -> Re
     // space's g over the device (within the grid), and each electrode's
     // square times its (√R e^{iφ} − g).
     let fringed = w > 0.0 && beam == LcosBeam::Modulated;
-    let folded = edge_share(u, device) > FOLD_TOLERANCE;
+    let share = edge_share(u, device);
+    let folded = crate::plan::decide("cell-averaged device mask", || share > FOLD_TOLERANCE);
     let smoothed = fringed || folded;
     let mask = if smoothed {
         None
@@ -597,6 +613,10 @@ pub fn lcos_reflect(u: &Field2, device: &SpatialModulator, beam: LcosBeam) -> Re
         report.approx("LCoS with fringing: its smoothed phases have no closed-form transform, so the mask is averaged over each sample's cell, which weights an order m by sinc(m/s) at s samples a pixel");
     } else if folded {
         report.approx("LCoS lit within a pixel of a window edge it reaches past: its mask is averaged over each sample's cell, which weights an order m by sinc(m/s) at s samples a pixel, since the band-limited one would fold the cut electrodes across the window");
+    } else if share > FOLD_NOTE {
+        report.approx(format!(
+            "LCoS: {share:.1e} of the power lies within a pixel of a window edge the device reaches past, where the band-limited mask folds the electrodes the edge cuts across the window; at most about that share is misplaced"
+        ));
     }
     report.steps.push(StepReport {
         method: Method::Element,

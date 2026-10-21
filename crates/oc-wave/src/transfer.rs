@@ -340,6 +340,10 @@ pub(crate) fn phase_gradient(at: &dyn Fn(usize, usize) -> Cx, i: usize, j: usize
 /// largest departure of a bright sample's direction from the fit; the
 /// carrier alone when nothing is bright enough to fit.
 pub(crate) fn fit_sphere(u: &Field2) -> ([f64; 3], f64) {
+    crate::plan::decide("sphere fitted to the field", || fit_sphere_free(u))
+}
+
+fn fit_sphere_free(u: &Field2) -> ([f64; 3], f64) {
     let gu = u.grid;
     let k_in = u.k_mm();
     let mut top: f64 = 0.0;

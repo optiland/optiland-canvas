@@ -2846,3 +2846,152 @@ fn a_traced_ray_leaves_a_thin_lens_along_the_wave_s_phase_gradient() {
         }
     }
 }
+
+#[test]
+fn a_replayed_plan_makes_the_path_one_linear_operator() {
+    // R09 and finding 3 of the expert review: the path chooses its windows,
+    // propagators, spheres, orders and readout points from the field it
+    // meets, so as it runs it is not one linear operator. Replaying the
+    // plan one run recorded fixes every choice, and the path is then linear:
+    // T(aU + bV) = aT(U) + bT(V) to round-off, for two Gaussians of
+    // different waists and centres and complex a, b. The scene meets a thin
+    // lens and an open stop at its focus (a re-grid onto the focus and back
+    // off it), a DMD (its orders carried apart toward the singlet) and a
+    // singlet's two traced faces.
+    use oc_core::scene3::PlanarShape2;
+    use oc_wave::path::WaveJob;
+    use oc_wave::{Cx, Field2, Grid2};
+    let (mut s, src, _, _, n_dev, _) = dmd_scene(201, 0.95, None, 2.0, 0.5, [8, 8]);
+    s.detectors.clear();
+    s.add_planar_element(Vec3::new(5.0, 0.0, 0.0), 1.0, 0.0, lens(5.0), lens(5.0));
+    let ap = s.add_aperture(Vec3::new(10.0, 0.0, 0.0), 1.0, 0.0);
+    s.apertures.iter_mut().find(|x| x.common.id.0 == ap).unwrap().shape.outer_extent = Some(PlanarShape2::Disc { radius_mm: 2.0 });
+    // 8 mm on, so that the beam coming in passes beside the singlet's rim.
+    let lens_pos = Vec3::new(20.0, 0.0, 0.0) + n_dev * 8.0;
+    let g = oc_core::build3::SingletGeom { r1_mm: 8.0, r2_mm: -8.0, thickness_mm: 2.0, semi_aperture_mm: 1.5, conic1: 0.0, conic2: 0.0 };
+    s.add_singlet(lens_pos, g, 1.5168, 64.17);
+    let q = glam::DQuat::from_rotation_arc(Vec3::X, n_dev);
+    s.bodies.last_mut().unwrap().common.transform = oc_core::Isometry3::new(lens_pos, [q.x, q.y, q.z, q.w]).unwrap();
+    perfect_ar(&mut s);
+    // The singlet's back focus, about 7.4 mm past its back vertex, where the
+    // two orders either side of the blaze focus 0.5 mm apart.
+    let det = s.add_area_detector(lens_pos + n_dev * 8.4, -n_dev, 0.4, 0.4, [32, 32]);
+    s.validate().unwrap();
+    let sp = spec(src, det, 0.1, 256, 1.28);
+    let grid = Grid2::square(256, 1.28 / 256.0).unwrap();
+    let gauss = |w0: f64, c: [f64; 2]| oc_wave::beams::GaussianBeam { w0_mm: w0, lambda_um: LAM, n: 1.0, power: 1.0, center: c }.sample(grid, 0.0).unwrap();
+    let (u, v) = (gauss(0.1, [0.0, 0.0]), gauss(0.06, [0.03, -0.02]));
+    let (a, b) = (Cx::new(0.6, 0.3), Cx::new(-0.4, 0.8));
+    let mut w = u.clone();
+    for ((z, x), y) in w.data.iter_mut().zip(&u.data).zip(&v.data) {
+        *z = *x * a + *y * b;
+    }
+    let run = |launch: &Field2, plan: Option<&oc_wave::plan::PathPlan>| {
+        let job = WaveJob::new(&s, &sp, 1).unwrap().with_launch(launch).unwrap();
+        let mut job = match plan {
+            Some(p) => job.replaying(p).unwrap(),
+            None => job,
+        };
+        job.step(usize::MAX).unwrap();
+        let r = job.finish().unwrap();
+        assert!(r.report.inconsistencies.is_empty(), "{:?}", r.report.inconsistencies);
+        r
+    };
+    let ru = run(&u, None);
+    let plan = &ru.plan;
+    measured("replayed plan: choices the run of U made", plan.len() as f64);
+    for label in ["window", "propagator", "sphere fitted to the field", "orders carried apart", "readout band"] {
+        measured(&format!("replayed plan: choices of the {label}"), plan.count(label) as f64);
+        assert!(plan.count(label) > 0, "{label}: {plan:?}");
+    }
+    assert!(format!("{plan:?}").contains("window: Ok(Some("), "a re-grid: {plan:?}");
+    let rv = run(&v, Some(plan));
+    let rw = run(&w, Some(plan));
+    let norm = |f: &Field2| f.data.iter().map(|z| z.norm_sqr()).sum::<f64>().sqrt();
+    assert_eq!(rw.field.grid, ru.field.grid);
+    let mut sum = ru.field.clone();
+    for ((z, x), y) in sum.data.iter_mut().zip(&ru.field.data).zip(&rv.field.data) {
+        *z = *x * a + *y * b;
+    }
+    let mut diff = rw.field.clone();
+    for (z, x) in diff.data.iter_mut().zip(&sum.data) {
+        *z -= *x;
+    }
+    let err = norm(&diff) / norm(&ru.field);
+    measured("replayed plan: |T(aU + bV) − aT(U) − bT(V)| / |T(U)|", err);
+    assert!(err < 1e-12, "{err}");
+    // Free to choose, V's own run decides differently, and the sum's own run
+    // reads the detector apart from the replayed one.
+    let rv_free = run(&v, None);
+    measured("V's own run: choices made differently from U's", rv_free.plan.differences(plan) as f64);
+    assert!(rv_free.plan.differences(plan) > 0);
+    let rw_free = run(&w, None);
+    let peak = rw.power.iter().cloned().fold(0.0, f64::max);
+    let apart = rw.power.iter().zip(&rw_free.power).map(|(p, q)| (p - q).abs()).fold(0.0, f64::max) / peak;
+    measured("aU + bV, its own run against the replayed one: pixels, worst / peak", apart);
+    measured("aU + bV, its own run: choices made differently from U's", rw_free.plan.differences(plan) as f64);
+    // A plan from another scene is refused by name.
+    let other = run(&u, None);
+    let mut s2 = s.clone();
+    s2.detectors.clear();
+    let det2 = s2.add_area_detector(lens_pos + n_dev * 3.0, -n_dev, 0.5, 0.5, [8, 8]);
+    s2.validate().unwrap();
+    let refused = WaveJob::new(&s2, &spec(src, det2, 0.1, 256, 1.28), 1).unwrap().replaying(&other.plan).map(|_| ());
+    assert!(matches!(&refused, Err(oc_wave::WaveError::Mismatch(m)) if m.contains("another path")), "{refused:?}");
+}
+
+#[test]
+fn an_off_centre_window_leaves_a_mirror_and_a_dmd_where_its_light_goes() {
+    // Found while measuring R09: a hand-over kept the incoming window's
+    // coordinates across the outgoing ray, but a window off the chief ray is
+    // not where it was once an element turns the beam: a mirror turns it
+    // over, a DMD met at 24° turns it over and stretches it. The outgoing
+    // window is now centred on the image of the incoming one's centre. A
+    // thin lens focuses a 60 µm Gaussian onto an open stop, so the path
+    // re-grids there onto a window centred on the beam, off the chief ray
+    // when the beam is; then a fold mirror, or a DMD. Off the chief ray in
+    // the plane of incidence the field must leave the element as it does
+    // off it across that plane, and as on it.
+    use oc_core::scene3::PlanarShape2;
+    use oc_wave::path::WaveJob;
+    let gauss = |c: [f64; 2]| {
+        let grid = oc_wave::Grid2::square(256, 1.28 / 256.0).unwrap();
+        oc_wave::beams::GaussianBeam { w0_mm: 0.06, lambda_um: LAM, n: 1.0, power: 1.0, center: c }.sample(grid, 0.0).unwrap()
+    };
+    let focus = |s: &mut Scene3| {
+        s.add_planar_element(Vec3::new(5.0, 0.0, 0.0), 1.0, 0.0, lens(5.0), lens(5.0));
+        let ap = s.add_aperture(Vec3::new(10.0, 0.0, 0.0), 1.0, 0.0);
+        s.apertures.iter_mut().find(|x| x.common.id.0 == ap).unwrap().shape.outer_extent = Some(PlanarShape2::Disc { radius_mm: 2.0 });
+    };
+    let run = |s: &Scene3, src, det, c: [f64; 2]| {
+        let mut job = WaveJob::new(s, &spec(src, det, 0.1, 256, 1.28), 1).unwrap().with_launch(&gauss(c)).unwrap();
+        job.step(usize::MAX).unwrap();
+        let r = job.finish().unwrap();
+        assert!(r.report.inconsistencies.is_empty(), "{:?}", r.report.inconsistencies);
+        r.report.ledger
+    };
+    // The fold mirror.
+    let mut s = Scene3::new();
+    let src = source(&mut s);
+    focus(&mut s);
+    s.add_planar_mirror(Vec3::new(18.0, -2.0, 0.0), Vec3::new(22.0, 2.0, 0.0), 1.0).unwrap();
+    let det = s.add_area_detector(Vec3::new(20.0, 10.0, 0.0), -Vec3::Y, 1.0, 1.0, [32, 32]);
+    s.validate().unwrap();
+    for (name, c) in [("on the chief ray", [0.0, 0.0]), ("off it in the plane of incidence", [0.03, 0.0]), ("off it across that plane", [0.0, 0.03])] {
+        let l = run(&s, src, det, c);
+        measured(&format!("fold mirror, a window {name}: off its edge, of the launched"), l.left_window / l.launched);
+        measured(&format!("fold mirror, a window {name}: resampling, of the launched"), l.resampling / l.launched);
+        assert!(l.left_window < 2e-6 * l.launched && l.resampling.abs() < 1e-9 * l.launched, "{name}: {l:?}");
+    }
+    // The DMD, lit at 24°.
+    let (mut s, src, det, _, _, _) = dmd_scene(201, 0.95, None, 2.0, 0.5, [16, 16]);
+    focus(&mut s);
+    s.validate().unwrap();
+    let on = run(&s, src, det, [0.0, 0.0]);
+    for (name, c) in [("off the chief ray in the plane of incidence", [0.03, 0.0]), ("off it both ways", [0.03, -0.02])] {
+        let l = run(&s, src, det, c);
+        measured(&format!("DMD, a window {name}: resampling at the take-up, of the launched"), l.resampling / l.launched);
+        assert!(l.resampling < 1e-3 * l.launched, "{name}: {l:?} (on the chief ray {on:?})");
+    }
+    measured("DMD, a window on the chief ray: resampling at the take-up, of the launched", on.resampling / on.launched);
+}

@@ -77,10 +77,12 @@ beyond the grid's band is booked as `spectral_projection`. A mask averaged
 over each sample's cell, as before, weighted an order `m` by `sinc(m/s)` at `s`
 samples a mirror: 0.935 in amplitude for an order 1.6 lattice steps out at 8
 (Q17 of the expert review). The power the mirrors intercept and reflect is
-each sample's exact cell coverage. A device lit within a pixel of a window
-edge it reaches past keeps the cell average, and the report says so: the
-band-limited mask is periodic over the window and would fold the mirrors the
-edge cuts onto the far side.
+each sample's exact cell coverage. The band-limited mask is periodic over the
+window, so where the device reaches past a window edge it folds the mirrors
+the edge cuts onto the far side, misplacing at most about the power within a
+pixel of that edge; the report names that share above `1e-9`. A device lit
+there by more than 1% of the field's power (`FOLD_TOLERANCE`) keeps the cell
+average instead, and the report says so.
 
 Each mirror state reflects into its own direction, so a state is a *family*:
 its tilt is held as the field's analytic carrier, and the samples keep only a

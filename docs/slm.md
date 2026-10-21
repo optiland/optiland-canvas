@@ -58,9 +58,11 @@ averaged over a `w × w` window: a step between pixels becomes a linear ramp of
 width `w`, and a 2π reset gets a flyback. This is the linear broadening of the
 fringing-field model [5], [6]. It has no closed form, so it is sampled only.
 And a device lit within a pixel of a window edge it reaches past keeps the
-cell average, because the band-limited mask is periodic over the window and
-would fold the cut electrodes across it (above `1e-9` of the field's power in
-those strips, `FOLD_TOLERANCE`).
+cell average when those strips hold more than 1% of the field's power
+(`FOLD_TOLERANCE`): the band-limited mask is periodic over the window and
+folds the cut electrodes across it, which misplaces at most about that share,
+while the cell average moves the orders by far more. Below the mark the fold
+is kept, and above `1e-9` the report names its share.
 
 **What the fringing model is.** The box-averaged phase is a phenomenological
 regularization of the displayed phase map, not a liquid-crystal model: no

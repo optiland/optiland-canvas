@@ -223,6 +223,10 @@ fn regime_errors(u: &Field2, z_mm: f64, fft: &mut Fft2) -> (f64, f64) {
 /// distance; beyond it, the smaller of the two errors this field would meet,
 /// which are returned with the choice.
 fn choose(u: &Field2, z_mm: f64, fft: &mut Fft2) -> (Propagator, Option<(f64, f64)>) {
+    crate::plan::decide("propagator", || choose_free(u, z_mm, fft))
+}
+
+fn choose_free(u: &Field2, z_mm: f64, fft: &mut Fft2) -> (Propagator, Option<(f64, f64)>) {
     let zc = padded_critical_distance_mm(&u.grid, u.wavelength_in_medium_mm());
     if z_mm.abs() <= zc {
         return (Propagator::AngularSpectrum(AsmOptions::default()), None);

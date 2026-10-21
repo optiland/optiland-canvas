@@ -694,6 +694,36 @@ worker can drop a stale job between steps. `wave_path` is the job run in one
 step, and slicing changes no bit. The job keeps its own copy of the scene and
 answers for the revision it started at.
 
+**A recorded plan, and the path as one linear operator** (R09 and finding 3 of
+the expert review). The path chooses from the field it meets: which
+propagator a step runs, the window a field is carried onto and whether a step
+is run again wider, the sphere a field is read about, which of a modulator's
+orders are carried apart and which have emptied, which polarization
+components are lit, whether a device's mask is band-limited, the rotated
+spectrum's reach and the readout's band. As it runs it is therefore not one
+linear operator: a sum of two fields of different widths is carried on
+windows neither gets alone. Every such choice goes through one recorder
+(`oc_wave::plan`), and `WavePathResult::plan` holds them in the order made,
+with the path they were made on (the spec and every chain's events). A job
+`replaying(&plan)` makes none of its own and is then one fixed linear
+operator on the field it launches; `with_launch(&field)` launches any field
+on the launch window instead of the spec's beam. A plan recorded on another
+path is refused, and so is a run that asks for a choice the plan does not
+hold there, both by name. A replayed plan suits the field that recorded it:
+another field is carried exactly linearly but on that field's windows, which
+need not suit it (below, the sum's own run reads its brightest pixel 4.1%
+apart from the replayed one, its focus window sized for the sum rather than
+for the narrower field that recorded the plan).
+
+**Off-centre windows through a turn.** A window off the chief ray (a re-grid
+centres its window on the beam) is not where it was once an element turns
+the beam: a mirror turns it over, and a DMD met at 24° turns it over and
+stretches it. The hand-over and a modulator's take-up centre the outgoing
+window on the image of the incoming window's centre. Before, they kept the
+incoming coordinates: found while measuring the plan above, a DMD's take-up
+of a window 0.06 mm off the chief ray lost 8.2% of the power as
+`resampling`, and a fold mirror's 7.2e-5 off its window's edge.
+
 **Where the beam is described.** A source declares the coherent beam it
 launches as its `coherence` (`CoherentBeam::Gaussian { waist_radius_mm,
 waist_offset_mm }` or `TopHat { radius_mm }`), saved with the document;
@@ -733,6 +763,8 @@ These are acceptance case C53, in `crates/oc-wave/tests/path.rs`.
 | `wave_power_agrees_with_rays_when_the_fresnel_number_is_large` | the f64 ray trace of the same scene, a uniform beam through a disc at `N_F` = 1264 | 1% | 0.12% |
 | `a_dmd_in_the_scene_focuses_its_orders_f_lambda_over_p_apart` | orders `λ/p` apart in direction cosine [10], so `fλ/p` apart at a lens's focus | 1% | 1.000; resampling 1.3e-4, `numerical` 3.6e-13 |
 | `slicing_a_wave_job_changes_no_bit` | the same path run in one step | bit-identical | identical |
+| `a_replayed_plan_makes_the_path_one_linear_operator` | R09 of the expert review: two Gaussians of different waists and centres (60 and 100 µm), complex `a`, `b`, through a thin lens and an open stop at its focus (a re-grid there and back), a DMD (its orders carried apart) and a singlet's two traced faces, under the plan the first recorded: `T(aU + bV)` against `aT(U) + bT(V)`; a plan recorded on another path refused | 1e-12 of `\|T(U)\|` | 1.0e-15; 66 choices (7 windows, 17 propagators, 23 spheres, the orders, 2 readout bands); free, V's run makes 47 of them otherwise, and the sum's own run reads its brightest pixel 4.1% apart from the replayed one |
+| `an_off_centre_window_leaves_a_mirror_and_a_dmd_where_its_light_goes` | a window centred 30 µm off the chief ray in the plane of incidence, across it, and on it, through a fold mirror and through a DMD lit at 24° | mirror: off its edge 2e-6 of the launched, resampling 1e-9; DMD: resampling 1e-3 | mirror: 9.2e-7, 7.7e-7, 2.2e-7 off its edge, resampling 1.2e-12; DMD: 3.7e-4 on and off the chief ray (8.2e-2 before, at 60 µm) |
 | `a_glass_plate_shifts_a_gaussian_as_free_space_of_t_over_n` | a plate of thickness `t`, index `n` is free space `t/n` to a Gaussian [13]; faces anti-reflected, one closed-form step | 1e-5 | 1.9e-7 (implied index within 1.8e-5; face by face it was 2.4e-6 and 2.3e-4) |
 | `a_gaussian_through_a_singlet_waists_where_self_predicts` | Self [14] with the singlet's focal length and principal planes traced by the f64 tracer (an N-BK7 equiconvex lens, R ±50 mm, 4 mm) | 1e-3 | waist position 2.5e-4 of its Rayleigh range (2.9 µm); radius 5.1e-5 |
 | `a_tilted_plate_displaces_the_beam_where_the_rays_say` | the chief ray's landing point behind a plate at 30° | 0.05 pixel | 5.2e-5 mm |
@@ -776,7 +808,7 @@ These are acceptance case C53, in `crates/oc-wave/tests/path.rs`.
 | `a_ten_times_beam_expander_widens_the_beam_as_the_abcd_law_says` | the radius at the second lens by the Gaussian ABCD law [13], through a 50 µm focus | 1e-5 | 4.2e-7 |
 | `a_grating_order_leaves_with_its_momentum_and_its_phase` | the grating equation [1] (R01 of the expert review): a 20 l/mm grating met at 10°, η = 0.65; the order's field stays centred on the chief ray turned to the order, lands where the traced chief ray does, and takes the phase `e^{−i2πΔ/d}` when the grating moves Δ across its grooves | centroid 1e-4 mm; landing 6e-3 mm; phase 1e-8 | 2.3e-14 mm; 5.2e-4 mm; 1.2e-12 |
 | `both_orders_of_a_grating_book_what_neither_carries_once` | the order and the zero order on one detector (R02): `untracked_orders = 1 − η − η₀` once, nothing left to the remainder | 1e-6; 2e-3 | 0.250; detected 0.750, remainder −1.1e-7 |
-| `a_window_fitted_off_the_chief_ray_carries_the_field_where_it_is` | a half-blocked 0.1 mm beam whose fitted window lies 55 µm off the chief ray (R03): in free space its centroid on the detector against a fixed window's and against the second-moment law [25]; through a singlet, the power and centroid against a fixed window's | 2e-4 mm; 1e-2 mm (the detector holds 96.7% of the light); 2e-3 mm; 2e-2 (the windows hold different shares of the edge's light) | 9.9e-5 mm; 4.9e-3 mm; 3.1e-4 mm; 9.9e-3 |
+| `a_window_fitted_off_the_chief_ray_carries_the_field_where_it_is` | a half-blocked 0.1 mm beam whose fitted window lies 55 µm off the chief ray (R03): in free space its centroid on the detector against a fixed window's and against the second-moment law [25]; through a singlet, the power and centroid against a fixed window's | 2e-4 mm; 1e-2 mm (the detector holds 96.7% of the light); 2e-3 mm; 2e-2 (the windows hold different shares of the edge's light) | 7.2e-5 mm; 4.9e-3 mm; 3.1e-4 mm; 9.9e-3 |
 | `a_rigidly_moved_scene_reads_the_same_detector` | gauge (R06): a folded path, a Mach–Zehnder and two Michelsons rotated 0.7 rad about (1, 2, 3) and moved, against themselves | 1e-9; 1e-5 of the launched (k·OPL round-off, 1e-7 rad) | 2.3e-12; 9.8e-11, 1.8e-8, 1.4e-7 |
 | `a_vanishing_second_arm_changes_the_bright_arm_continuously` | R12 of the expert review: one readout for one arm or several, so a second arm carrying ε of the power changes the bright arm's pixels by their cross term alone, of order `√ε`, and the detected power as much; at ε = 0 one chain runs | 3√ε of the peak; 3√ε | 1.86√ε (1.9e-1, 1.9e-2, 1.9e-4 at ε = 1e-2, 1e-4, 1e-8); detected −9.3e-2, −9.3e-3, −9.3e-5 |
 | `a_rolled_detector_reads_the_same_polarized_fringes` | R14: the half-wave-plate Mach–Zehnder on a detector rolled 30° about its normal, and on one tilted 30° about its own axis, against the square detector and the Fresnel–Arago law [26], [27] at Δφ = 0, π/2 (analyzer 50°), π (analyzer 20°) | 1e-6 | square against the law 5.0e-8; rolled 1.1e-11; tilted 7.9e-9 |

@@ -176,16 +176,19 @@ pub fn asm_tilted(
     let (u0, v0) = (u.carrier[0] / lam, u.carrier[1] / lam);
     // Where the source spectrum is: reads beyond it (and the kernel's reach)
     // are skipped.
-    let peak = buf.iter().map(|z| z.norm_sqr()).fold(0.0, f64::max);
-    let (mut lo, mut hi) = ([usize::MAX; 2], [0usize; 2]);
-    for ky in 0..p[1] {
-        for kx in 0..p[0] {
-            if buf[ky * p[0] + kx].norm_sqr() > 1e-20 * peak {
-                lo = [lo[0].min(kx), lo[1].min(ky)];
-                hi = [hi[0].max(kx), hi[1].max(ky)];
+    let (lo, hi) = crate::plan::decide("reach of the rotated spectrum", || {
+        let peak = buf.iter().map(|z| z.norm_sqr()).fold(0.0, f64::max);
+        let (mut lo, mut hi) = ([usize::MAX; 2], [0usize; 2]);
+        for ky in 0..p[1] {
+            for kx in 0..p[0] {
+                if buf[ky * p[0] + kx].norm_sqr() > 1e-20 * peak {
+                    lo = [lo[0].min(kx), lo[1].min(ky)];
+                    hi = [hi[0].max(kx), hi[1].max(ky)];
+                }
             }
         }
-    }
+        (lo, hi)
+    });
     let half = 0.5 * w as f64;
     let reach = [(lo[0] as f64 - half, hi[0] as f64 + half), (lo[1] as f64 - half, hi[1] as f64 + half)];
 

@@ -516,7 +516,7 @@ fn a_mach_zehnder_sends_all_the_power_out_of_its_two_ports_whatever_the_path_dif
         measured(&format!("Mach–Zehnder at Δφ = {j}·π/2: the X port's share against (1 − cos Δφ)/2"), share - want);
         assert!((px + py - 1.0).abs() < 1e-3, "{px} + {py}");
         assert!((share - want).abs() < 2e-3, "{share} vs {want}");
-        assert!(rx.report.steps.iter().any(|st| st.note.contains("2 arms added")), "{:?}", rx.report.steps);
+        assert!(rx.report.steps.iter().any(|st| st.note.contains("arm 2 joins arm 1")), "{:?}", rx.report.steps);
         // The arms' readout onto the detector's grid books what it takes (or
         // gains, reading the spectrum between its samples) in the arm's own
         // ledger, so the network's remainder is the readouts': small, named.
@@ -1668,8 +1668,8 @@ fn a_half_wave_plate_in_one_arm_of_a_mach_zehnder_takes_its_fringes_away_and_a_p
             };
             measured(&format!("Mach–Zehnder, half-wave plate in one arm, Δφ = {j}·π/2, analyzer {analyzer:?}: X port against the Jones calculus"), got - want);
             assert!((got - want).abs() < 1e-6, "{j} {analyzer:?}: {got} vs {want}");
-            assert!(r.report.steps.iter().any(|st| st.note.contains("2 arms added")));
-            assert!(!r.report.approximated.iter().any(|a| a.contains("arms added in a scalar field")), "{:?}", r.report.approximated);
+            assert!(r.report.steps.iter().any(|st| st.note.contains("arm 2 joins arm 1")));
+            assert!(!r.report.approximated.iter().any(|a| a.contains("scalar field")), "{:?}", r.report.approximated);
         }
     }
 }
@@ -2094,7 +2094,7 @@ fn a_vanishing_second_arm_changes_the_bright_arm_continuously() {
     for eps in [1e-2, 1e-4, 1e-8] {
         let (s, src, dx, _) = mach_zehnder_split(delta, eps);
         let r = wave_path(&s, &spec(src, dx, 0.5, 256, 4.0), 1).unwrap();
-        assert!(r.report.steps.iter().any(|st| st.note.contains("2 arms added")), "{:?}", r.report.steps);
+        assert!(r.report.steps.iter().any(|st| st.note.contains("arm 2 joins arm 1")), "{:?}", r.report.steps);
         let worst = base.power.iter().zip(&r.power).map(|(p, q)| (p - q).abs()).fold(0.0, f64::max);
         measured(&format!("Mach–Zehnder with ε = {eps:.0e} in the second arm: the bright arm's pixels against ε = 0, worst / peak"), worst / peak);
         measured(&format!("Mach–Zehnder with ε = {eps:.0e} in the second arm: detected power against ε = 0"), r.report.ledger.detected - base.report.ledger.detected);
@@ -2217,7 +2217,7 @@ fn a_noncoplanar_mach_zehnder_conserves_power_across_its_ports() {
     measured("non-coplanar Mach–Zehnder: both ports' power, of the launched", pz + py);
     measured("non-coplanar Mach–Zehnder: the Z port's share", pz / (pz + py));
     assert!((pz + py - 1.0).abs() < 2e-3, "{pz} + {py}");
-    assert!(rz.report.steps.iter().any(|st| st.note.contains("2 arms added")), "{:?}", rz.report.steps);
+    assert!(rz.report.steps.iter().any(|st| st.note.contains("arm 2 joins arm 1")), "{:?}", rz.report.steps);
     let q = glam::DQuat::from_axis_angle(Vec3::new(2.0, -1.0, 3.0).normalize(), 1.1);
     let t = oc_core::Isometry3::new(Vec3::new(-4.0, 7.0, 2.0), [q.x, q.y, q.z, q.w]).unwrap();
     let moved = moved_scene(&s, t);
@@ -2225,4 +2225,64 @@ fn a_noncoplanar_mach_zehnder_conserves_power_across_its_ports() {
     let worst = rz.power.iter().zip(&rz2.power).map(|(p, q)| (p - q).abs()).fold(0.0, f64::max);
     measured("non-coplanar Mach–Zehnder, moved rigidly: the Z port's pixels against the unmoved, / launched", worst);
     assert!(worst < 1e-5, "{worst}");
+}
+
+#[test]
+fn an_aperture_behind_a_recombining_splitter_clips_the_sum_of_the_arms() {
+    // R04 of the expert review. The Mach–Zehnder's arms meet at the second
+    // splitter and leave it as one beam, so the arm that reflects there
+    // joins the one that goes through, and an aperture behind it clips
+    // their sum: a disc of radius a in the X port takes the same share of
+    // what reaches it at every phase, exp(−2a²/w²) [13] (w the beam's
+    // radius there, 300 mm from its waist; the disc's edge cells on this
+    // 15.6 µm grid differ from the closed form by 9e-5, as the single-beam
+    // disc test's do by 3.2e-5 at 512 samples), and nothing when the port
+    // is dark. Run arm by arm, the disc would take its share of each arm's
+    // power whatever the phase.
+    // The Y port, read on its own detector, carries what the X port's run
+    // books to the port it leaves unread. Sliced into single events, the
+    // job joins the arms at the same event and gives the same bits.
+    use oc_wave::path::WaveJob;
+    let k0 = 2.0 * std::f64::consts::PI / (LAM / 1000.0);
+    let a = 0.4;
+    let w0: f64 = 0.5;
+    let z_r = std::f64::consts::PI * w0 * w0 / (LAM / 1000.0);
+    let w = w0 * (1.0 + (300.0 / z_r).powi(2)).sqrt();
+    let share_law = (-2.0 * a * a / (w * w)).exp();
+    let mut shares = Vec::new();
+    for j in 0..3 {
+        let dphi = j as f64 * std::f64::consts::FRAC_PI_2;
+        let delta = dphi / (k0 * std::f64::consts::SQRT_2);
+        let (mut s, src, dx, dy) = mach_zehnder(delta);
+        s.add_aperture(Vec3::new(200.0, 100.0, 0.0), a, 0.0);
+        s.validate().unwrap();
+        let rx = wave_path(&s, &spec(src, dx, w0, 256, 4.0), 1).unwrap();
+        let ry = wave_path(&s, &spec(src, dy, w0, 256, 4.0), 1).unwrap();
+        let (lx, ly) = (rx.report.ledger, ry.report.ledger);
+        assert!(rx.report.steps.iter().any(|st| st.note.contains("arm 2 joins arm 1")), "{:?}", rx.report.steps);
+        // What reaches the disc: the X port's share of the launched,
+        // (1 − cos Δφ)/2 [23], [24].
+        let port = 0.5 * (1.0 - dphi.cos());
+        measured(&format!("Mach–Zehnder at Δφ = {j}·π/2, a disc behind the second splitter: absorbed, of the launched"), lx.absorbed_aperture);
+        if port > 0.1 {
+            let share = lx.absorbed_aperture / port;
+            measured(&format!("Mach–Zehnder at Δφ = {j}·π/2: the disc's share of the port against exp(−2a²/w²)"), share - share_law);
+            assert!((share - share_law).abs() < 2e-4, "{share} vs {share_law}");
+            shares.push(share);
+        } else {
+            assert!(lx.absorbed_aperture < 1e-6, "{lx:?}");
+        }
+        measured(&format!("Mach–Zehnder at Δφ = {j}·π/2: the X run's unread port against the Y port's run"), lx.other_arm - ly.detected);
+        assert!((lx.other_arm - ly.detected).abs() < 1e-6, "{lx:?} vs {ly:?}");
+        measured(&format!("Mach–Zehnder at Δφ = {j}·π/2: the X run's remainder, of the launched"), lx.numerical + lx.other_ports);
+        if j == 1 {
+            let sp = spec(src, dx, w0, 256, 4.0);
+            let mut job = WaveJob::new(&s, &sp, 1).unwrap();
+            while !job.step(1).unwrap() {}
+            let sliced = job.finish().unwrap();
+            assert_eq!(rx, sliced, "the sliced job differs from the whole one");
+        }
+    }
+    measured("Mach–Zehnder, a disc behind the second splitter: its share of the port at π/2 against π", shares[0] - shares[1]);
+    assert!((shares[0] - shares[1]).abs() < 1e-6, "{shares:?}");
 }

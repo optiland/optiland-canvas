@@ -469,17 +469,31 @@ slightly rotated is left out, and the report names it. A chain whose elements
 cannot tell polarizations apart carries one field standing for unpolarized
 light.
 
-**Interferometers: arms that meet.** Where splitter arms recombine on the
-detector, the axial ray reaches it by several chains. Each carries the same
-launched field along its own arm, and the arms' fields are added on the
-detector's own grid, `s × s` points a pixel, before the power is formed: the
-one readout every arm gets (above), so a second arm that carries almost
+**Interferometers: arms that meet.** Where splitter arms recombine, the
+axial ray reaches the detector by several chains, each carrying the same
+launched field along its own arm. Arms that meet at a flat element and leave
+it as one beam (a Mach–Zehnder's second splitter, a Michelson's splitter on
+the way back) **join there**: two chains that reach one flat element by
+different paths, leave it from one point along one direction (within a
+thousandth of the window, and 1e-6 in direction) and meet the same events
+from there on are one field from that element on. The later chain runs up
+to and through the element; its field is read onto the other's plane and
+grid by the spectrum rotated onto it (`asm_tilted` [6]: the planes may lie a
+little apart along the beam or across it, and their frames be turned about
+it), its two components turned onto the other's axes, and the two are added.
+The events ahead then run once, on the joint field, so an aperture behind a
+recombining splitter clips the arms' sum (R04): in the Mach–Zehnder's X
+port a disc takes the same share of what reaches it at every phase, and
+nothing when the port is dark. Joins are taken longest shared path first, so
+arms that meet early are one field before they meet others. Arms that meet
+only on the detector (a Michelson with a tilted mirror) are added there, on
+the detector's own grid, `s × s` points a pixel, before the power is formed:
+the one readout every arm gets (above), so a second arm that carries almost
 nothing changes the first's pixels by their cross term alone, of order the
-root of its power, and nothing at all once it carries nothing (R12). That is
-the coherent sum of paths the
-scattering-network formulation asks for (`T = C(I − SP)⁻¹SB`, here a network
-without feedback, so a finite sum of paths). It needs three things the single
-chain did not:
+root of its power, and nothing at all once it carries nothing (R12). Either
+way it is the coherent sum of paths the scattering-network formulation asks
+for (`T = C(I − SP)⁻¹SB`, here a network without feedback, so a finite sum
+of paths). It needs three things the single chain did not:
 
 - **One phase clock.** The samples carry the whole phase (above), and every
   arm starts from the same launched field, so the arms' fields on the same
@@ -501,11 +515,17 @@ chain did not:
   booked once and the shares no arm carries on once, `input·(1 − Σ shares)`
   less that absorption: a splitter whose two ports both reach the detector
   books no `other_arm`, and a grating whose two orders do books `1 − η − η₀`
-  of what met it, not `(1 − η) + (1 − η₀)`. The light that leaves by the
-  ports no arm reads (a recombining splitter's other output, what misses the
-  detector once the arms meet) is then the remainder, `other_ports`, named
-  and never a check; the ledger's own checks (below) report it when it comes
-  out negative.
+  of what met it, not `(1 − η) + (1 − η₀)`. Where arms join, each keeps what
+  it booked at the element, the reading of the joining arm's field books its
+  own resampling, and their interference, the two arms' powers less the
+  joint field's, goes once to the port they leave unread (`other_arm` for a
+  splitter): for a unitary splitter that port then holds
+  `(R + T)(P_a + P_b) − P` in all, which the Mach–Zehnder's other port, read
+  on its own detector, matches to 3e-10. A splitter that is not unitary
+  shows there as a negative `other_arm`, which the ledger's checks report.
+  The light that leaves by the ports no arm reads where arms meet only on
+  the detector is the remainder, `other_ports`, named and never a check; the
+  checks (below) report it when it comes out negative.
 
 The irradiance at a point of the face follows the spec's `DetectorModel`.
 `NormalFlux`, the default, is the scalar flux through the face,
@@ -628,10 +648,11 @@ These are acceptance case C53, in `crates/oc-wave/tests/path.rs`.
 | `a_grating_order_leaves_with_its_momentum_and_its_phase` | the grating equation [1] (R01 of the expert review): a 20 l/mm grating met at 10°, η = 0.65; the order's field stays centred on the chief ray turned to the order, lands where the traced chief ray does, and takes the phase `e^{−i2πΔ/d}` when the grating moves Δ across its grooves | centroid 1e-4 mm; landing 6e-3 mm; phase 1e-8 | 2.3e-14 mm; 5.2e-4 mm; 1.2e-12 |
 | `both_orders_of_a_grating_book_what_neither_carries_once` | the order and the zero order on one detector (R02): `untracked_orders = 1 − η − η₀` once, nothing left to the remainder | 1e-6; 2e-3 | 0.250; detected 0.750, remainder −1.1e-7 |
 | `a_window_fitted_off_the_chief_ray_carries_the_field_where_it_is` | a half-blocked 0.1 mm beam whose fitted window lies 55 µm off the chief ray (R03): in free space its centroid on the detector against a fixed window's and against the second-moment law [25]; through a singlet, the power and centroid against a fixed window's | 2e-4 mm; 1e-2 mm (the detector holds 96.7% of the light); 2e-3 mm; 2e-2 (the windows hold different shares of the edge's light) | 9.9e-5 mm; 4.9e-3 mm; 3.1e-4 mm; 9.9e-3 |
-| `a_rigidly_moved_scene_reads_the_same_detector` | gauge (R06): a folded path, a Mach–Zehnder and two Michelsons rotated 0.7 rad about (1, 2, 3) and moved, against themselves | 1e-9; 1e-5 of the launched (k·OPL round-off, 1e-7 rad) | 2.3e-12; 9.5e-11, 1.8e-8, 1.4e-7 |
+| `a_rigidly_moved_scene_reads_the_same_detector` | gauge (R06): a folded path, a Mach–Zehnder and two Michelsons rotated 0.7 rad about (1, 2, 3) and moved, against themselves | 1e-9; 1e-5 of the launched (k·OPL round-off, 1e-7 rad) | 2.3e-12; 9.8e-11, 1.8e-8, 1.4e-7 |
 | `a_vanishing_second_arm_changes_the_bright_arm_continuously` | R12 of the expert review: one readout for one arm or several, so a second arm carrying ε of the power changes the bright arm's pixels by their cross term alone, of order `√ε`, and the detected power as much; at ε = 0 one chain runs | 3√ε of the peak; 3√ε | 1.86√ε (1.9e-1, 1.9e-2, 1.9e-4 at ε = 1e-2, 1e-4, 1e-8); detected −9.3e-2, −9.3e-3, −9.3e-5 |
 | `a_rolled_detector_reads_the_same_polarized_fringes` | R14: the half-wave-plate Mach–Zehnder on a detector rolled 30° about its normal, and on one tilted 30° about its own axis, against the square detector and the Fresnel–Arago law [26], [27] at Δφ = 0, π/2 (analyzer 50°), π (analyzer 20°) | 1e-6 | square against the law 5.0e-8; rolled 1.1e-11; tilted 7.9e-9 |
-| `a_noncoplanar_mach_zehnder_conserves_power_across_its_ports` | R14: arms folded out of the plane reach the second splitter with frames turned about the beam; added on the detector's own axes, both ports carry the launched power, and a rigid roll of the whole scene leaves the Z port's pixels | 2e-3; 1e-5 of the launched | 1.000; 6.2e-7 |
+| `a_noncoplanar_mach_zehnder_conserves_power_across_its_ports` | R14: arms folded out of the plane reach the second splitter with frames turned about the beam; added on the detector's own axes, both ports carry the launched power, and a rigid roll of the whole scene leaves the Z port's pixels | 2e-3; 1e-5 of the launched | 1.000; 1.0e-10 (the arms joined at the second splitter) |
+| `an_aperture_behind_a_recombining_splitter_clips_the_sum_of_the_arms` | R04: the Mach–Zehnder's arms join at the second splitter, so a disc of radius 0.4 mm behind it clips their sum: the same share of the X port at Δφ = π/2 and π, `exp(−2a²/w²)` [13], nothing when the port is dark (Δφ = 0); the Y port's own run against what the X run books to its unread port; a job sliced into single events against the whole | 1e-6; 2e-4 (the disc's edge cells on a 15.6 µm grid); 1e-6 of the launched; 1e-6; bit-identical | 5.4e-8; 9.2e-5; 1.8e-16; 2.8e-10; identical |
 | `two_plane_waves_integrate_over_the_pixels_with_the_sinc_factors` (a unit test of `path.rs`) | R13: two plane waves on a 20 × 20 detector, as the arms' carriers and as their envelopes, against the rectangular pixel's closed form `A(w₁ + w₂)[1 + cos(2πΔf x_c)·sinc(Δf d)]`, for the scalar flux (cos 0.9, 0.7; 1, 1) and the paraxial area | 1e-12; the midpoint rule's `(x/sin x − 1)·sinc(Δf d)`, `x = πΔf h`, within 10% | 2.4e-15; 1.19e-2 (the rule's 1.20e-2) |
 
 The transfer's own tests (acceptance case C62, `crates/oc-wave/src/transfer.rs`):

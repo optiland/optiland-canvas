@@ -604,6 +604,10 @@ enum JunctionKind {
     /// Each arm meets the element with its own share of the field: an
     /// LCoS's two polarization beams.
     PerBeam,
+    /// Arms of other histories meet the element and leave it as one field
+    /// (one joins the other there, [`ChainJob::absorb`]): each arm keeps
+    /// what it booked there, and the join books their interference.
+    Recombine,
 }
 
 /// The ledger bucket a junction's unfollowed shares go to.
@@ -971,6 +975,20 @@ struct ChainJob {
     rest: Vec<Lobe>,
     report: WaveReport,
     fft: Fft2,
+    /// The chain's place among its line's chains (its arm's number less
+    /// one), the arms its field now stands for and their name for the
+    /// report; the events it runs (all of them, or up to and through the
+    /// element where it joins another chain); the chains that join it
+    /// (after which of its events, which chain) and the chain it joins
+    /// (which one, after which of that chain's events); and the histories
+    /// of the chains that joined it, for the network's ledger.
+    id: usize,
+    members: Vec<usize>,
+    name: String,
+    run_to: usize,
+    absorbs: Vec<(usize, usize)>,
+    joins: Option<(usize, usize)>,
+    joined: Vec<Vec<HistoryEntry>>,
 }
 
 /// What a transfer's fields departed from their references by, over every
@@ -1212,6 +1230,7 @@ impl ChainJob {
                 }
             })
             .collect();
+        let run_to = points.len();
         Ok(ChainJob {
             scene: Arc::clone(scene),
             spec: *spec,
@@ -1238,6 +1257,13 @@ impl ChainJob {
             rest: Vec::new(),
             report,
             fft: Fft2::new(),
+            id: 0,
+            members: vec![1],
+            name: "arm 1".to_string(),
+            run_to,
+            absorbs: Vec::new(),
+            joins: None,
+            joined: Vec::new(),
         })
     }
 
@@ -1266,7 +1292,7 @@ impl ChainJob {
             self.history.clear();
             self.launched = true;
         }
-        let end = self.next.saturating_add(events).min(self.points.len());
+        let end = self.next.saturating_add(events).min(self.run_to);
         while self.next < end {
             let before = self.report.ledger;
             self.junction = None;
@@ -1278,7 +1304,7 @@ impl ChainJob {
             });
             self.next += 1;
         }
-        Ok(self.next == self.points.len())
+        Ok(self.next == self.run_to)
     }
 
     /// The junction the running event met. A second pass at the same element
@@ -2688,6 +2714,8 @@ struct FaceField {
     launch: WaveLedger,
     histories: Vec<Vec<HistoryEntry>>,
     events: usize,
+    /// The arms the field stands for, for the report.
+    name: String,
 }
 
 /// How a face is read from a beam: square to it with its axes along the
@@ -2927,9 +2955,346 @@ impl ChainJob {
             arrived,
             report: self.report,
             launch: self.launch,
-            histories: vec![self.history],
+            histories: std::iter::once(self.history).chain(self.joined).collect(),
             events: self.points.len(),
+            name: self.name,
         })
+    }
+}
+
+/// Whether two frames are one: the same origin and the same axes, to
+/// round-off.
+fn same_frame(a: &Isometry3, b: &Isometry3) -> bool {
+    (a.pos - b.pos).length() <= 1e-12 && a.quat().dot(b.quat()).abs() >= 1.0 - 1e-15
+}
+
+/// The arms a field stands for, by number, for the report.
+fn arm_names(members: &[usize]) -> String {
+    match members {
+        [one] => format!("arm {one}"),
+        [rest @ .., last] => format!("arms {} and {last}", rest.iter().map(|m| m.to_string()).collect::<Vec<_>>().join(", ")),
+        [] => "no arm".to_string(),
+    }
+}
+
+/// Where chain `b` joins chain `a`, as the index of that event in each: the
+/// two reach one flat element by different paths and leave it from one
+/// point along one direction (points within `tol`, directions within
+/// 1e-6), and from there on meet the same events in the same way. `None`
+/// when they meet only on the detector, when their paths are one from the
+/// start, or when what they first share is not a flat element (a face of
+/// a body, a plate): arms that leave an element together having arrived
+/// together (an LCoS's two polarization beams) are an element's own beams,
+/// not arms that meet.
+fn join_at(a: &ChainJob, b: &ChainJob, tol: f64) -> Option<(usize, usize)> {
+    let (pa, pb) = (&a.points, &b.points);
+    let out = |p: &[(Vec3, Vec3, Ev)], k: usize| (k + 1 < p.len()).then(|| (p[k + 1].0 - p[k].1).normalize());
+    let place = |k: usize, l: usize| {
+        (pa[k].0 - pb[l].0).length() <= tol
+            && (pa[k].1 - pb[l].1).length() <= tol
+            && match (out(pa, k), out(pb, l)) {
+                (Some(x), Some(y)) => (x - y).length() <= 1e-6,
+                (None, None) => true,
+                _ => false,
+            }
+    };
+    let element = |k: usize, l: usize| match (&pa[k].2, &pb[l].2) {
+        (Ev::Hit(x), Ev::Hit(y)) => x.object == y.object && x.kind == y.kind,
+        (Ev::Aperture(x), Ev::Aperture(y)) => x == y,
+        (Ev::Transfer { hit: x, .. }, Ev::Transfer { hit: y, .. }) => x.object == y.object && x.patch == y.patch,
+        (Ev::Plate { first: x, .. }, Ev::Plate { first: y, .. }) => x.object == y.object,
+        (Ev::End, Ev::End) => true,
+        _ => false,
+    };
+    let action = |k: usize, l: usize| match (&pa[k].2, &pb[l].2) {
+        (Ev::Hit(x), Ev::Hit(y)) | (Ev::Transfer { hit: x, .. }, Ev::Transfer { hit: y, .. }) => x.action == y.action,
+        _ => true,
+    };
+    let is_hit = |k: usize, l: usize| matches!((&pa[k].2, &pb[l].2), (Ev::Hit(_), Ev::Hit(_)));
+    // The events they share, from the detector back.
+    let (mut i, mut j) = (pa.len(), pb.len());
+    while i > 0 && j > 0 && element(i - 1, j - 1) && action(i - 1, j - 1) && place(i - 1, j - 1) {
+        i -= 1;
+        j -= 1;
+    }
+    if i == pa.len() || i == 0 || j == 0 {
+        return None;
+    }
+    let (ia, ib) = (i - 1, j - 1);
+    // The element where one arm reflects and the other goes through (or
+    // the like), both leaving it as one beam.
+    if is_hit(ia, ib) && element(ia, ib) && place(ia, ib) {
+        let together = ia > 0 && ib > 0 && element(ia - 1, ib - 1) && place(ia - 1, ib - 1);
+        return (!together && !(ia == 0 && ib == 0)).then_some((ia, ib));
+    }
+    // Or the first event they share, met in the same way from different
+    // elements.
+    is_hit(i, j).then_some((i, j))
+}
+
+/// The chains of one line that join on the way to the detector
+/// ([`join_at`]): the later of two joins the earlier where they meet, and
+/// runs only up to and through that element ([`ChainJob::absorb`]). The
+/// joins are taken longest shared path first, so that arms that meet early
+/// are one field before they meet others. Returns the chains in the order
+/// they run (a chain after every chain that joins it), and how many reach
+/// the detector themselves.
+fn plan_joins(mut jobs: Vec<ChainJob>, window_mm: f64) -> (Vec<ChainJob>, usize) {
+    let n = jobs.len();
+    for (i, j) in jobs.iter_mut().enumerate() {
+        j.id = i;
+        j.members = vec![i + 1];
+        j.name = arm_names(&j.members);
+    }
+    // Arms meet where their chief rays leave one element within a
+    // thousandth of the window of each other: the joint field is read onto
+    // one grid exactly, so the bound only keeps arms that merely pass near
+    // each other apart.
+    let tol = 1e-3 * window_mm;
+    let mut live = vec![true; n];
+    let mut kids: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n];
+    loop {
+        let mut best: Option<(usize, usize, usize, usize)> = None;
+        let mut best_len = 0;
+        for a in 0..n {
+            for b in a + 1..n {
+                if !(live[a] && live[b]) {
+                    continue;
+                }
+                if let Some((ia, ib)) = join_at(&jobs[a], &jobs[b], tol) {
+                    // A chain that others join after `ib` cannot stop there.
+                    if jobs[b].absorbs.iter().any(|&(e, _)| e > ib) {
+                        continue;
+                    }
+                    let len = jobs[a].points.len() - ia;
+                    if len > best_len {
+                        best_len = len;
+                        best = Some((a, b, ia, ib));
+                    }
+                }
+            }
+        }
+        let Some((a, b, ia, ib)) = best else { break };
+        live[b] = false;
+        jobs[b].run_to = ib + 1;
+        jobs[b].joins = Some((a, ia));
+        jobs[a].absorbs.push((ia, b));
+        kids[a].push((ia, b));
+    }
+    fn visit(id: usize, kids: &[Vec<(usize, usize)>], order: &mut Vec<usize>) {
+        let mut k = kids[id].clone();
+        k.sort_unstable();
+        for (_, c) in k {
+            visit(c, kids, order);
+        }
+        order.push(id);
+    }
+    let mut order = Vec::with_capacity(n);
+    for (r, _) in live.iter().enumerate().filter(|(_, &l)| l) {
+        visit(r, &kids, &mut order);
+    }
+    let arms = live.iter().filter(|&&l| l).count();
+    let mut slots: Vec<Option<ChainJob>> = jobs.into_iter().map(Some).collect();
+    let jobs = order.into_iter().map(|i| slots[i].take().expect("each chain once")).collect();
+    (jobs, arms)
+}
+
+impl ChainJob {
+    /// Take in `b`, a chain that has run up to and through the element
+    /// where it joins this one; this chain has just run the same element,
+    /// its event `idx`. Both leave it along one direction, so from here on
+    /// they are one field.
+    ///
+    /// `b`'s field is read onto this chain's plane and grid by the spectrum
+    /// rotated onto it ([`crate::asm_tilted`]: the two planes may lie a
+    /// little apart, along the beam or across it, and their frames be turned
+    /// about it), or taken as it is where the two share a frame and a grid;
+    /// its two components are turned onto this chain's axes, and the fields
+    /// are added. What the reading loses or gains is `b`'s, booked in its
+    /// history. What the arms' interference takes from the port followed,
+    /// the two arms' powers less the joint field's, goes once to the port
+    /// they leave unread (the element's bucket: `other_arm` for a splitter),
+    /// on top of what each arm booked there itself; for a unitary splitter
+    /// that is `(R + T)(P_a + P_b) − P` in all. The events ahead then run
+    /// once, on the joint field, so that an aperture behind a recombining
+    /// splitter clips the arms' sum and books what the sum loses (R04 of
+    /// the expert review).
+    fn absorb(&mut self, mut b: ChainJob, idx: usize) -> Result<(), WaveError> {
+        let (obj, label) = match &self.points[idx].2 {
+            Ev::Hit(h) => (h.object.0, h.label.clone()),
+            _ => return Err(WaveError::OutOfRange(format!("{} cannot join {}: arms join at a flat element", b.name, self.name))),
+        };
+        if b.uy.is_some() != self.uy.is_some() || b.lam != self.lam || (b.u.n_medium - self.u.n_medium).abs() > 1e-12 {
+            return Err(WaveError::Mismatch(format!("{} cannot join {} at #{obj}: their fields are of different kinds", b.name, self.name)));
+        }
+        if !self.rest.is_empty() || !b.rest.is_empty() {
+            self.report.approx(format!(
+                "where {} joins {} at #{obj}, a modulator's orders carried apart are added back into one field, traced along one reference ahead",
+                b.name, self.name
+            ));
+        }
+        self.merge_lobes();
+        b.merge_lobes();
+        let pw = |u: &Field2, uy: &Option<Field2>| u.power() + uy.as_ref().map_or(0.0, |f| f.power());
+        let (out_t, out_b) = (pw(&self.u, &self.uy), pw(&b.u, &b.uy));
+        let target = self.u.frame;
+        let grid = self.u.grid;
+        let carrier = self.u.carrier;
+        let k = self.u.k_mm();
+        let same = same_frame(&b.u.frame, &target) && b.u.grid == grid && b.u.carrier == carrier;
+        let names = (b.name.clone(), self.name.clone());
+        let mut rep = WaveReport::default();
+        let read = |f: &Field2, fft: &mut Fft2, rep: &mut WaveReport| -> Result<Vec<Cx>, WaveError> {
+            if same {
+                return Ok(f.data.clone());
+            }
+            let (v, mut r) = crate::asm_tilted(f, target, grid, 2, fft)?;
+            // Onto this chain's carrier: the rest of the branch's on the
+            // samples, which must hold it.
+            let dc = [v.carrier[0] - carrier[0], v.carrier[1] - carrier[1]];
+            let step = k * (dc[0].abs() * grid.pitch_mm[0]).max(dc[1].abs() * grid.pitch_mm[1]);
+            if step > 0.5 * std::f64::consts::PI {
+                return Err(WaveError::OutOfRange(format!(
+                    "{} joins {} at #{obj} at an angle its grid cannot hold ({step:.2} rad a sample)",
+                    names.0, names.1
+                )));
+            }
+            let mut data = v.data;
+            if dc != [0.0, 0.0] {
+                for jy in 0..grid.n[1] {
+                    for ix in 0..grid.n[0] {
+                        let (x, y) = grid.xy(ix, jy);
+                        data[grid.idx(ix, jy)] *= Cx::expi(k * (dc[0] * x + dc[1] * y));
+                    }
+                }
+            }
+            r.ledger.resampling += r.ledger.numerical;
+            r.ledger.numerical = 0.0;
+            r.steps.clear();
+            merge(rep, r);
+            Ok(data)
+        };
+        let bx = read(&b.u, &mut self.fft, &mut rep)?;
+        let by = match &b.uy {
+            Some(f) => Some(read(f, &mut self.fft, &mut rep)?),
+            None => None,
+        };
+        // The branch's components onto this chain's axes.
+        let (bx, by) = match by {
+            Some(by) => {
+                let q = glam::DQuat::from_rotation_arc(b.beam.d, self.beam.d);
+                let (ex, ey) = (q * b.beam.x, q * b.beam.y);
+                let (xx, xy, yx, yy) = (ex.dot(self.beam.x), ex.dot(self.beam.y), ey.dot(self.beam.x), ey.dot(self.beam.y));
+                let mut nx = vec![Cx::ZERO; bx.len()];
+                let mut ny = vec![Cx::ZERO; bx.len()];
+                for i in 0..bx.len() {
+                    nx[i] = bx[i] * xx + by[i] * yx;
+                    ny[i] = bx[i] * xy + by[i] * yy;
+                }
+                (nx, Some(ny))
+            }
+            None => (bx, None),
+        };
+        let cell = grid.cell_area_mm2();
+        let read_b = cell * (bx.iter().map(|z| z.norm_sqr()).sum::<f64>() + by.as_ref().map_or(0.0, |d| d.iter().map(|z| z.norm_sqr()).sum::<f64>()));
+        // The reading's losses, the branch's own.
+        let mut delta = losses_between(&rep.ledger, &WaveLedger::default());
+        delta.resampling += out_b - read_b - delta.accounted();
+        // Both arms met the element and leave it as one.
+        let key = self.keys[idx].clone();
+        let mut bucket = Bucket::OtherArm;
+        if let Some(e) = self.history.iter_mut().rev().find(|e| e.key == key) {
+            if let Some(j) = &mut e.junction {
+                bucket = j.bucket;
+                if j.kind == JunctionKind::Split {
+                    j.kind = JunctionKind::Recombine;
+                }
+            }
+        }
+        if let Some(e) = b.history.last_mut() {
+            if let Some(j) = &mut e.junction {
+                if j.kind == JunctionKind::Split {
+                    j.kind = JunctionKind::Recombine;
+                }
+            }
+        }
+        b.history.push(HistoryEntry { key: format!("read onto the joint field at {key}"), junction: None, delta });
+        for (a, v) in self.u.data.iter_mut().zip(&bx) {
+            *a += *v;
+        }
+        if let (Some(uy), Some(by)) = (&mut self.uy, &by) {
+            for (a, v) in uy.data.iter_mut().zip(by) {
+                *a += *v;
+            }
+        }
+        let joint = pw(&self.u, &self.uy);
+        let interference = out_t + read_b - joint;
+        let mut join = WaveLedger::default();
+        *bucket_mut(&mut join, bucket) = interference;
+        let join_key = format!("join [{}]", b.history.iter().map(|e| e.key.as_str()).collect::<Vec<_>>().join("|"));
+        self.history.push(HistoryEntry { key: join_key, junction: None, delta: join });
+        // The report: both arms' steps, named, then the join.
+        for st in &mut self.report.steps {
+            if !st.note.starts_with("arm") {
+                st.note = format!("{}: {}", self.name, st.note);
+            }
+        }
+        for mut st in std::mem::take(&mut b.report.steps) {
+            if !st.note.starts_with("arm") {
+                st.note = format!("{}: {}", b.name, st.note);
+            }
+            self.report.steps.push(st);
+        }
+        for w in std::mem::take(&mut b.report.warnings).into_iter().chain(rep.warnings) {
+            self.report.warn(w);
+        }
+        for v in std::mem::take(&mut b.report.validity) {
+            self.report.flag(v);
+        }
+        for a in std::mem::take(&mut b.report.approximated) {
+            self.report.approx(a);
+        }
+        for s in std::mem::take(&mut b.report.inconsistencies) {
+            if !self.report.inconsistencies.contains(&s) {
+                self.report.inconsistencies.push(s);
+            }
+        }
+        let bucket_name = match bucket {
+            Bucket::OtherArm => "other_arm",
+            Bucket::UntrackedOrders => "untracked_orders",
+            Bucket::OtherFamily => "other_family",
+        };
+        let launched = self.launch.launched.max(f64::MIN_POSITIVE);
+        self.report.steps.push(element_step(
+            0.0,
+            format!(
+                "{} joins {} at #{obj} ({label}), which both leave along one direction: its field read onto {}'s plane and grid {}{}, and the two added as fields; their interference, {:+.3e} of the launched power taken from the port followed, goes to the port they leave unread ({bucket_name})",
+                b.name,
+                self.name,
+                self.name,
+                if same { "as it is (one frame, one grid)" } else { "by the spectrum rotated onto it (Matsushima, Schimmel & Wyrowski 2003)" },
+                if self.uy.is_some() { ", its two components turned onto that grid's axes" } else { "" },
+                interference / launched
+            ),
+        ));
+        if self.uy.is_none() {
+            self.report.approx("arms joined as a scalar field: their polarizations taken as the same, so their interference is an upper bound");
+        }
+        // The faces ahead are traced along this chain's reference wavefront.
+        let faces_ahead = self.points[idx + 1..].iter().any(|(_, _, e)| matches!(e, Ev::Transfer { .. } | Ev::Plate { .. }));
+        let dq = (0..2).map(|a| (b.q[a] - self.q[a]).abs() / self.q[a].abs().max(f64::MIN_POSITIVE)).fold(0.0, f64::max);
+        if faces_ahead && dq > 1e-6 {
+            self.report.approx(format!(
+                "where {} joins {} at #{obj}, the joint field keeps {}'s reference wavefront for the faces ahead ({}'s Gaussian parameter differs by {dq:.1e} of it)",
+                b.name, self.name, self.name, b.name
+            ));
+        }
+        self.members.extend(b.members.iter().copied());
+        self.members.sort_unstable();
+        self.name = arm_names(&self.members);
+        self.joined.append(&mut b.joined);
+        self.joined.push(b.history);
+        Ok(())
     }
 }
 
@@ -2985,7 +3350,9 @@ fn losses_between(after: &WaveLedger, before: &WaveLedger) -> WaveLedger {
 /// there: that light reached the detector by the other arm, and what the
 /// element sends by ports no arm reads is the remainder, `other_ports`. At a
 /// `PerBeam` junction each arm books its own share of the device's loss and
-/// takes back what it booked for the other arm's.
+/// takes back what it booked for the other arm's. Where arms join at an
+/// element (`Recombine`), each keeps what it booked there, and the join's
+/// own entry moves their interference to the port they leave unread.
 fn book_history(l: &mut WaveLedger, arms: &[&[HistoryEntry]]) {
     use std::collections::{HashMap, HashSet};
     let mut met: HashMap<u64, usize> = HashMap::new();
@@ -3053,6 +3420,7 @@ fn book_history(l: &mut WaveLedger, arms: &[&[HistoryEntry]]) {
                             d.other_family -= j.foreign_family;
                         }
                     }
+                    JunctionKind::Recombine => {}
                 }
             }
             add_losses(l, &d);
@@ -3155,11 +3523,11 @@ fn combine_arms(scene: &Scene3, spec: &WavePathSpec, faces: Vec<FaceField>, revi
     }
     let mut report = WaveReport::default();
     let arms = faces.len();
-    for (c, f) in faces.iter().enumerate() {
+    for f in &faces {
         for st in &f.report.steps {
             let mut st = st.clone();
-            if arms > 1 {
-                st.note = format!("arm {}: {}", c + 1, st.note);
+            if arms > 1 && !st.note.starts_with("arm") {
+                st.note = format!("{}: {}", f.name, st.note);
             }
             report.steps.push(st);
         }
@@ -3190,9 +3558,9 @@ fn combine_arms(scene: &Scene3, spec: &WavePathSpec, faces: Vec<FaceField>, revi
             if period < 2.0 * h {
                 report.warn(SamplingWarning::Undersampled {
                     what: format!(
-                        "the fringes of arms {} and {} on detector #{}, {period:.4e} mm apart, against readout points {h:.4e} mm apart",
-                        a + 1,
-                        b + 1,
+                        "the fringes of {} and {} on detector #{}, {period:.4e} mm apart, against readout points {h:.4e} mm apart",
+                        faces[a].name,
+                        faces[b].name,
                         spec.detector.0
                     ),
                     max_phase_step_rad: 2.0 * std::f64::consts::PI * h / period,
@@ -3275,13 +3643,15 @@ pub const MAX_WAVE_LINES: usize = 16;
 /// However the work is sliced, the result is the same to the bit:
 /// [`wave_path`] is this job run in one step.
 ///
-/// **Arms.** Where splitter arms recombine on the detector (an
-/// interferometer) the axial ray reaches it by several chains
-/// (`oc_trace::extract_sequences3`). Each carries the same launched field
-/// along its own arm, and the arms' fields are added on the detector's own
-/// grid before the power is formed ([`combine_arms`]): the coherent sum of
-/// paths the scattering network of bundle M00 asks for, for networks without
-/// feedback.
+/// **Arms.** Where splitter arms recombine (an interferometer) the axial ray
+/// reaches the detector by several chains (`oc_trace::extract_sequences3`).
+/// Each carries the same launched field along its own arm. Arms that meet at
+/// a flat element and leave it as one beam join there ([`plan_joins`],
+/// [`ChainJob::absorb`]), and the events ahead run once on the joint field;
+/// arms that meet only on the detector are added on its own grid before the
+/// power is formed ([`combine_arms`]). Either way it is the coherent sum of
+/// paths the scattering network of bundle M00 asks for, for networks
+/// without feedback.
 ///
 /// **Lines.** A source of several spectral lines is a set of mutually
 /// incoherent modes (E. Wolf, *J. Opt. Soc. Am.* 72, 343 (1982); bundle M15):
@@ -3312,7 +3682,10 @@ struct Mode {
     lambda_um: f64,
     /// What the mode is, for the report: its line, and its polarization.
     label: String,
+    /// The chains, in the order they run (a chain after every chain that
+    /// joins it), and how many of them reach the detector themselves.
     chains: Vec<Chain>,
+    arms: usize,
 }
 
 /// Whether the chains' light must be carried as two polarization components:
@@ -3356,22 +3729,27 @@ enum Chain {
     Face(Box<FaceField>),
     /// A lone chain of one line among several, finished.
     Done(Box<WavePathResult>, usize),
+    /// A chain that has run up to and through the element where it joins
+    /// another, waiting for that one to take it in.
+    Held(Box<ChainJob>),
+    /// A chain taken into the one it joined, and the events it ran.
+    Absorbed(usize),
 }
 
 impl Chain {
     fn events(&self) -> usize {
         match self {
-            Chain::Running(j) | Chain::Finished(j) => j.points.len(),
+            Chain::Running(j) | Chain::Finished(j) | Chain::Held(j) => j.run_to,
             Chain::Face(f) => f.events,
-            Chain::Done(_, n) => *n,
+            Chain::Done(_, n) | Chain::Absorbed(n) => *n,
         }
     }
     fn done(&self) -> usize {
         match self {
             Chain::Running(j) => j.next,
-            Chain::Finished(j) => j.points.len(),
+            Chain::Finished(j) | Chain::Held(j) => j.run_to,
             Chain::Face(f) => f.events,
-            Chain::Done(_, n) => *n,
+            Chain::Done(_, n) | Chain::Absorbed(n) => *n,
         }
     }
 }
@@ -3432,21 +3810,19 @@ impl WaveJob {
                 if polarization_matters(scene, &seqs, 0.5 * spec.window_mm, lam) { vec![Some([1.0, 0.0]), Some([0.0, 1.0])] } else { vec![None] };
             let share = 1.0 / pols.len() as f64;
             for jones in pols {
-                let chains = seqs
+                let jobs = seqs
                     .iter()
                     .cloned()
-                    .map(|seq| {
-                        ChainJob::new(&shared, spec, seq, spec.power * w / total * share, jones).map(|j| {
-                            dirs.push(j.final_dir());
-                            Chain::Running(Box::new(j))
-                        })
-                    })
+                    .map(|seq| ChainJob::new(&shared, spec, seq, spec.power * w / total * share, jones))
                     .collect::<Result<Vec<_>, _>>()?;
+                let (jobs, arms) = plan_joins(jobs, spec.window_mm);
+                dirs.extend(jobs.iter().filter(|j| j.joins.is_none()).map(|j| j.final_dir()));
+                let chains: Vec<Chain> = jobs.into_iter().map(|j| Chain::Running(Box::new(j))).collect();
                 let label = match jones {
                     None => format!("λ {lam} µm"),
                     Some(j) => format!("λ {lam} µm, launched along {}", if j[1] == 0.0 { "x" } else { "y" }),
                 };
-                modes.push(Mode { lambda_um: lam, label, chains });
+                modes.push(Mode { lambda_um: lam, label, chains, arms });
             }
         }
         Ok(WaveJob { scene: shared, spec: *spec, revision, modes, samples: None, capped: false, dirs })
@@ -3567,7 +3943,7 @@ impl WaveJob {
     fn read_waiting(&mut self) -> Result<(), WaveError> {
         let Some(s) = self.samples else { return Ok(()) };
         for mi in 0..self.modes.len() {
-            let several = self.modes[mi].chains.len() > 1;
+            let several = self.modes[mi].arms > 1;
             for ci in 0..self.modes[mi].chains.len() {
                 if !matches!(self.modes[mi].chains[ci], Chain::Finished(_)) {
                     continue;
@@ -3600,29 +3976,61 @@ impl WaveJob {
     /// one. A chain that finishes among several is read out at once, so the
     /// job holds one full field at a time.
     pub fn step(&mut self, events: usize) -> Result<bool, WaveError> {
-        let lone = self.modes.len() == 1 && self.modes[0].chains.len() == 1;
+        let lone = self.modes.len() == 1 && self.modes[0].arms == 1;
         let mut left = events;
         for mi in 0..self.modes.len() {
-            let several = self.modes[mi].chains.len() > 1;
+            let several = self.modes[mi].arms > 1;
             for ci in 0..self.modes[mi].chains.len() {
-                let Chain::Running(job) = &mut self.modes[mi].chains[ci] else { continue };
+                if !matches!(self.modes[mi].chains[ci], Chain::Running(_)) {
+                    continue;
+                }
                 if left == 0 {
                     return Ok(false);
                 }
-                let k = (job.points.len() - job.next).min(left);
-                let finished = job.step(k)?;
-                left -= k;
-                if finished && !lone {
-                    let placeholder = Chain::Done(Box::new(placeholder_result(self.revision, self.spec.detector)?), 0);
-                    let Chain::Running(mut job) = std::mem::replace(&mut self.modes[mi].chains[ci], placeholder) else {
-                        unreachable!()
-                    };
-                    let n = job.points.len();
-                    self.modes[mi].chains[ci] = match self.try_fix_samples(&mut job)? {
+                let Chain::Running(mut job) = std::mem::replace(&mut self.modes[mi].chains[ci], Chain::Absorbed(0)) else {
+                    unreachable!()
+                };
+                // Run, stopping after each event where other chains join
+                // this one, and take them in there: the same events however
+                // the work is sliced.
+                let mut finished = job.next >= job.run_to;
+                while left > 0 && !finished {
+                    let stop = job.absorbs.iter().map(|a| a.0 + 1).filter(|&e| e > job.next).min().unwrap_or(job.run_to).min(job.run_to);
+                    let k = (stop - job.next).min(left);
+                    finished = job.step(k)?;
+                    left -= k;
+                    let now: Vec<usize> = job.absorbs.iter().filter(|a| a.0 + 1 == job.next).map(|a| a.1).collect();
+                    if !now.is_empty() {
+                        job.absorbs.retain(|a| a.0 + 1 != job.next);
+                        for id in now {
+                            let bi = self.modes[mi]
+                                .chains
+                                .iter()
+                                .position(|c| matches!(c, Chain::Held(b) if b.id == id))
+                                .ok_or_else(|| WaveError::OutOfRange(format!("arm {} was not ready to join arm {}", id + 1, job.id + 1)))?;
+                            let Chain::Held(b) = std::mem::replace(&mut self.modes[mi].chains[bi], Chain::Absorbed(0)) else {
+                                unreachable!()
+                            };
+                            self.modes[mi].chains[bi] = Chain::Absorbed(b.run_to);
+                            let at = job.next - 1;
+                            job.absorb(*b, at)?;
+                        }
+                    }
+                }
+                let root = job.joins.is_none();
+                self.modes[mi].chains[ci] = if !finished || (root && lone) {
+                    Chain::Running(job)
+                } else if !root {
+                    Chain::Held(job)
+                } else {
+                    let n = job.run_to;
+                    match self.try_fix_samples(&mut job)? {
                         Some(s) if several => Chain::Face(Box::new(job.face(s, false)?)),
                         Some(s) => Chain::Done(Box::new(combine_arms(&self.scene, &self.spec, vec![job.face(s, true)?], self.revision)?), n),
                         None => Chain::Finished(job),
-                    };
+                    }
+                };
+                if finished && root && !lone {
                     self.read_waiting()?;
                 }
             }
@@ -3640,8 +4048,9 @@ impl WaveJob {
                 self.events()
             )));
         }
-        if self.modes.len() == 1 && self.modes[0].chains.len() == 1 {
-            let Some(Chain::Running(mut job)) = self.modes[0].chains.pop() else {
+        if self.modes.len() == 1 && self.modes[0].arms == 1 {
+            let at = self.modes[0].chains.iter().position(|c| matches!(c, Chain::Running(_)));
+            let Some(Chain::Running(mut job)) = at.map(|i| self.modes[0].chains.swap_remove(i)) else {
                 unreachable!("a lone chain stays running until it is finished")
             };
             let s = match self.try_fix_samples(&mut job)? {
@@ -3670,9 +4079,10 @@ impl WaveJob {
         let mut results = Vec::with_capacity(count);
         for m in modes {
             let lam = m.label.clone();
-            let r = if m.chains.len() > 1 {
-                let faces = m
-                    .chains
+            let arms = m.arms;
+            let live: Vec<Chain> = m.chains.into_iter().filter(|c| !matches!(c, Chain::Absorbed(_))).collect();
+            let r = if arms > 1 {
+                let faces = live
                     .into_iter()
                     .map(|c| match c {
                         Chain::Face(f) => Ok(*f),
@@ -3681,7 +4091,7 @@ impl WaveJob {
                     .collect::<Result<Vec<_>, _>>()?;
                 combine_arms(&scene, &spec, faces, revision)?
             } else {
-                match m.chains.into_iter().next() {
+                match live.into_iter().next() {
                     Some(Chain::Done(r, _)) => *r,
                     _ => return Err(WaveError::OutOfRange("a line's chain was not finished".into())),
                 }
@@ -3961,6 +4371,7 @@ mod tests {
             launch: WaveLedger { launched: 1.0, ..Default::default() },
             histories: vec![Vec::new()],
             events: 0,
+            name: "arm 1".to_string(),
         }
     }
 

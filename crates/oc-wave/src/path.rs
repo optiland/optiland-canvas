@@ -256,6 +256,23 @@ pub(crate) fn sample(u: &Field2, a: f64, b: f64) -> Cx {
         + u.at(i1, j1) * (s * t)
 }
 
+/// The ideal splitter's amplitude on one arm: reflection `−√R` from its
+/// front and `+√R` from its back, transmission `√T` both ways, the two-port
+/// of a dielectric interface (bundle M14; the Stokes relations). Its
+/// scattering matrix `S = [[−√R, √T], [√T, √R]]` has `S†S = (R + T)·I`, so
+/// it is passive for any simultaneous excitation of both ports when
+/// `R + T ≤ 1`, and unitary at equality (Q12 of the expert review). The
+/// signs are a convention, which a real coating's phases fix otherwise: a
+/// basis convention changed consistently moves no measured power; a real
+/// coating's relative phase moves an interferometer's fringes.
+fn splitter_amp(reflect: bool, from_front: bool, r: f64, t: f64) -> f64 {
+    match (reflect, from_front) {
+        (true, true) => -r.sqrt(),
+        (true, false) => r.sqrt(),
+        (false, _) => t.sqrt(),
+    }
+}
+
 /// Where the line through `r` along `dir` meets the plane through `p` with
 /// normal `n`. `None` when it runs along the plane.
 fn onto_plane(r: Vec3, dir: Vec3, p: Vec3, n: Vec3) -> Option<Vec3> {
@@ -1428,14 +1445,30 @@ impl ChainJob {
             Pol::P(_) => "p",
             Pol::Unpolarized | Pol::Projected => "s = p",
         };
+        let b = before.max(f64::MIN_POSITIVE);
         let trips = match st.round_trips {
             None => "every round trip".to_string(),
-            Some(m) => format!(
-                "{m} round trip(s), each {:.4} mm across the beam; the rest, beyond the window, {:.3e} of the power",
-                st.round_trip_shift_mm,
-                st.beyond / before.max(f64::MIN_POSITIVE)
-            ),
+            Some(m) => {
+                let kept = (st.received - st.reflected - st.beyond).max(0.0);
+                format!(
+                    "{m} round trip(s), each {:.4} mm across the beam; the rest, beyond the window, {:.3e} of the power: {:.3e} as a field of its own (the coherent tail) and {:+.3e} in its interference with the round trips kept (at most {:.3e})",
+                    st.round_trip_shift_mm,
+                    st.beyond / b,
+                    st.tail / b,
+                    st.cross / b,
+                    2.0 * (kept * st.tail).sqrt() / b
+                )
+            }
         };
+        if st.tir > 1e-12 * b {
+            self.report.approx(format!(
+                "plate #{}: {:.3e} of the power meets its faces past the critical angle and is reflected whole; across a gap of {:.1} decay lengths the frustrated total internal reflection it leaves out tunnels at most e^(−2κd) = {:.1e} of it",
+                first.object.0,
+                st.tir / b,
+                st.tir_decays,
+                (-2.0 * st.tir_decays).exp()
+            ));
+        }
         self.report.steps.push(element_step(
             0.0,
             format!(
@@ -1909,11 +1942,9 @@ impl ChainJob {
             (SurfaceResponse::ExplicitRt { reflectance, transmittance, .. }, SeqAction::Reflect | SeqAction::Transmit) => {
                 let r = unit(reflectance.sample(lam)).ok_or_else(|| refuse(kind))?;
                 let t = unit(transmittance.sample(lam)).ok_or_else(|| refuse(kind))?;
-                if h.action == SeqAction::Reflect {
-                    (if from_front { -r.sqrt() } else { r.sqrt() }, None, Loss::Arm(t.min(1.0 - r)))
-                } else {
-                    (t.sqrt(), None, Loss::Arm(r.min(1.0 - t)))
-                }
+                let reflect = h.action == SeqAction::Reflect;
+                let loss = if reflect { Loss::Arm(t.min(1.0 - r)) } else { Loss::Arm(r.min(1.0 - t)) };
+                (splitter_amp(reflect, from_front, r, t), None, loss)
             }
             (SurfaceResponse::Grating { efficiency, lines_per_mm, order, .. }, SeqAction::Diffract) => {
                 // The order carries the grating's own phase, exp(i m K·(r −
@@ -1940,30 +1971,67 @@ impl ChainJob {
             // amplitude (crate::planar), applied here; the handover then
             // carries the field on unchanged.
             (SurfaceResponse::Coating { coating }, SeqAction::Reflect | SeqAction::Transmit) => {
+                use oc_core::thinfilm::{CoatingBacking, PlateRoundTrips};
+                use crate::planar::{coating_plate_faces, plate_series, PlateFaces};
                 let reflect = h.action == SeqAction::Reflect;
                 let n0 = h.n_before;
                 let pol = self.pol;
-                // The amplitude on a table of cosines, read between its
-                // entries: it is smooth in the angle, and a transfer matrix
-                // per plane wave would cost the field's size in stacks.
-                let table: Vec<(Cx, f64, f64)> = (0..=1024)
-                    .map(|i| {
-                        let c = (i as f64 / 1024.0).max(1e-6);
-                        let at = |pp: bool| crate::planar::coating_arm(coating, reflect, n0, lam, c, pp);
+                let mode = match &coating.backing {
+                    CoatingBacking::Plate { round_trips, thickness_mm, .. } => Some((*round_trips, *thickness_mm)),
+                    _ => None,
+                };
+                let k0 = 2.0 * std::f64::consts::PI / (lam / 1000.0);
+                let cell = |c: f64| {
+                    let x = (c.clamp(0.0, 1.0) * 1024.0).min(1023.999999);
+                    (x.floor() as usize, x - x.floor())
+                };
+                let read: Box<dyn Fn(f64) -> (Cx, f64, f64)> = if let Some((PlateRoundTrips::Coherent, _)) = mode {
+                    // The faces are smooth in the angle and are tabulated; the
+                    // plate's phase turns many radians between entries and is
+                    // taken at each plane wave's own angle.
+                    let faces = |pp: bool| -> Result<Vec<PlateFaces>, WaveError> {
+                        (0..=1024)
+                            .map(|i| {
+                                let c = (i as f64 / 1024.0).max(1e-6);
+                                coating_plate_faces(coating, n0, lam, c, pp).map(|f| f.expect("a plate-backed coating"))
+                            })
+                            .collect()
+                    };
+                    let (fs, fp) = (faces(false)?, faces(true)?);
+                    Box::new(move |c: f64| {
+                        let (i, f) = cell(c);
+                        let one = |tab: &[PlateFaces]| plate_series(&PlateFaces::lerp(&tab[i], &tab[i + 1], f), PlateRoundTrips::Coherent, reflect, k0, n0, c);
                         match pol.is_p() {
-                            Some(pp) => at(pp),
-                            None => at(false).and_then(|a| at(true).map(|b| ((a.0 + b.0) * 0.5, 0.5 * (a.1 + b.1), 0.5 * (a.2 + b.2)))),
+                            Some(true) => one(&fp),
+                            Some(false) => one(&fs),
+                            None => {
+                                let (a, b) = (one(&fs), one(&fp));
+                                ((a.0 + b.0) * 0.5, 0.5 * (a.1 + b.1), 0.5 * (a.2 + b.2))
+                            }
                         }
                     })
-                    .collect::<Result<_, _>>()?;
-                let read = |c: f64| -> (Cx, f64, f64) {
-                    let x = (c.clamp(0.0, 1.0) * 1024.0).min(1023.999999);
-                    let (i, f) = (x.floor() as usize, x - x.floor());
-                    let (a, b) = (table[i], table[i + 1]);
-                    (a.0 * (1.0 - f) + b.0 * f, a.1 * (1.0 - f) + b.1 * f, a.2 * (1.0 - f) + b.2 * f)
+                } else {
+                    // The amplitude on a table of cosines, read between its
+                    // entries: it is smooth in the angle, and a transfer matrix
+                    // per plane wave would cost the field's size in stacks.
+                    let table: Vec<(Cx, f64, f64)> = (0..=1024)
+                        .map(|i| {
+                            let c = (i as f64 / 1024.0).max(1e-6);
+                            let at = |pp: bool| crate::planar::coating_arm(coating, reflect, n0, lam, c, pp);
+                            match pol.is_p() {
+                                Some(pp) => at(pp),
+                                None => at(false).and_then(|a| at(true).map(|b| ((a.0 + b.0) * 0.5, 0.5 * (a.1 + b.1), 0.5 * (a.2 + b.2)))),
+                            }
+                        })
+                        .collect::<Result<_, _>>()?;
+                    Box::new(move |c: f64| {
+                        let (i, f) = cell(c);
+                        let (a, b) = (table[i], table[i + 1]);
+                        (a.0 * (1.0 - f) + b.0 * f, a.1 * (1.0 - f) + b.1 * f, a.2 * (1.0 - f) + b.2 * f)
+                    })
                 };
                 let input = self.u.power();
-                let (v, other, absorbed, left) = crate::planar::surface_filter(&self.u, &beam, n_s, &read, &mut self.fft)?;
+                let (v, other, absorbed, left) = crate::planar::surface_filter(&self.u, &beam, n_s, &*read, &mut self.fft)?;
                 coat = Some((input, if input > 0.0 { 1.0 - (other + absorbed) / input } else { 0.0 }));
                 let l = &mut self.report.ledger;
                 l.other_arm += other;
@@ -1973,7 +2041,40 @@ impl ChainJob {
                 if beam.d.dot(n_s).abs() < 1.0 - 1e-12 && self.pol == Pol::Unpolarized {
                     self.report.approx(format!("coating #{}: met obliquely by a field standing for unpolarized light, its s and p amplitudes averaged", h.object.0));
                 }
-                self.report.approx("coatings on the path: each plane wave takes its own angle's amplitude for the chain's s or p, from the transfer matrix; a plate-backed coating's plate is incoherent, as it declares");
+                self.report.approx("coatings on the path: each plane wave takes its own angle's amplitude for the chain's s or p, from the transfer matrix");
+                if let Some((m, d)) = mode {
+                    self.report.approx(match m {
+                        PlateRoundTrips::FirstPass => format!(
+                            "coating #{}: its plate's round trips left out, as it declares (the first pass alone; what its faces send round the plate booked to the other arm)",
+                            h.object.0
+                        ),
+                        PlateRoundTrips::Incoherent => format!(
+                            "coating #{}: its plate's round trips added in power, as it declares (the first pass's field carrying the series' power; where they would land across the beam left out)",
+                            h.object.0
+                        ),
+                        PlateRoundTrips::Coherent => format!(
+                            "coating #{}: its plate's round trips summed as fields across its {d} mm of glass, as it declares, relative to free space across the plate, which the scene's geometry holds zero-thick",
+                            h.object.0
+                        ),
+                    });
+                    if m == PlateRoundTrips::Coherent {
+                        // Round trips that walk past the window fold back in.
+                        let c0 = beam.d.dot(n_s).abs();
+                        if let Some(f) = coating_plate_faces(coating, n0, lam, c0, false)? {
+                            let x = (f.r1i * f.r2i).abs();
+                            let cg = ((1.0 - (n0 / f.n_glass).powi(2) * (1.0 - c0 * c0)).max(1e-12)).sqrt();
+                            let shift = 2.0 * d * (1.0 - cg * cg).sqrt() / cg * c0;
+                            let trips = if x > 0.0 && x < 1.0 { (1e-6f64.ln() / x.ln()).ceil() } else { 0.0 };
+                            let width = self.u.grid.width_mm(0).min(self.u.grid.width_mm(1));
+                            if trips * shift > width {
+                                self.report.approx(format!(
+                                    "coating #{}: its plate's round trips, {shift:.4} mm apart across the beam, walk past the {width:.4} mm window before they fall below 1e-6 (|x| = {x:.3}); summed plane wave by plane wave, those fold back into it",
+                                    h.object.0
+                                ));
+                            }
+                        }
+                    }
+                }
                 (1.0, None, Loss::Absorbed)
             }
             // A polarizer or a retarder acts on the pair of components
@@ -4578,5 +4679,33 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_ideal_splitter_is_passive_for_any_excitation_of_both_ports() {
+        // Q12 of the expert review: S†S ≤ I for every simultaneous excitation
+        // of the two ports, not R + T ≤ 1 on each side alone. The splitter's
+        // S = [[−√R, √T], [√T, √R]] has S†S = (R + T)·I. The same reflection
+        // sign from both sides would not be passive: its S†S has eigenvalues
+        // (√R ± √T)², 2 at R = T = 1/2.
+        let eig = |s: [[f64; 2]; 2]| {
+            // S†S for real S, and its eigenvalues.
+            let a = s[0][0] * s[0][0] + s[1][0] * s[1][0];
+            let d = s[0][1] * s[0][1] + s[1][1] * s[1][1];
+            let b = s[0][0] * s[0][1] + s[1][0] * s[1][1];
+            let (m, q) = (0.5 * (a + d), (0.25 * (a - d) * (a - d) + b * b).sqrt());
+            (m - q, m + q, b)
+        };
+        for i in 0..=10 {
+            for j in 0..=(10 - i) {
+                let (r, t) = (i as f64 / 10.0, j as f64 / 10.0);
+                let s = [[splitter_amp(true, true, r, t), splitter_amp(false, false, r, t)], [splitter_amp(false, true, r, t), splitter_amp(true, false, r, t)]];
+                let (lo, hi, off) = eig(s);
+                assert!(hi <= 1.0 + 1e-15 && (hi - (r + t)).abs() < 1e-15 && (lo - (r + t)).abs() < 1e-15 && off.abs() < 1e-15, "R {r}, T {t}: {lo} {hi} {off}");
+            }
+        }
+        let same = [[-0.5f64.sqrt(), 0.5f64.sqrt()], [0.5f64.sqrt(), -0.5f64.sqrt()]];
+        let (_, hi, _) = eig(same);
+        assert!((hi - 2.0).abs() < 1e-14, "{hi}");
     }
 }

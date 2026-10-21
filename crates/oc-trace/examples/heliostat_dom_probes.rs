@@ -254,7 +254,7 @@ fn pmma_wall_coating(outer: &str, wall_mm: f64) -> Coating {
     };
     Coating {
         layers,
-        backing: oc_core::thinfilm::CoatingBacking::Plate { substrate: film, exit: ExitFace::Bare, thickness_mm: wall_mm },
+        backing: oc_core::thinfilm::CoatingBacking::Plate { substrate: film, exit: ExitFace::Bare, thickness_mm: wall_mm, round_trips: Default::default() },
         incidence: oc_core::thinfilm::Incidence::Substrate,
         design: None,
     }

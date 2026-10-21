@@ -889,7 +889,7 @@ impl SurfaceResponse {
                         ));
                     }
                 }
-                if let crate::thinfilm::CoatingBacking::Plate { substrate, exit, thickness_mm } = &coating.backing
+                if let crate::thinfilm::CoatingBacking::Plate { substrate, exit, thickness_mm, .. } = &coating.backing
                 {
                     substrate
                         .n

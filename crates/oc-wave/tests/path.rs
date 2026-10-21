@@ -1371,7 +1371,7 @@ fn quarter_wave_on_a_plate() -> (SurfaceResponse, SurfaceResponse) {
     let layer = FilmLayer::new(FilmMaterial::constant("film", n1), LAM * 1000.0 / (4.0 * n1));
     let c = Coating {
         layers: vec![layer],
-        backing: CoatingBacking::Plate { substrate: FilmMaterial::constant("glass", ns), exit: ExitFace::Bare, thickness_mm: 0.0 },
+        backing: CoatingBacking::Plate { substrate: FilmMaterial::constant("glass", ns), exit: ExitFace::Bare, thickness_mm: 0.0, round_trips: Default::default() },
         incidence: Incidence::Film,
         design: None,
     };
@@ -2295,4 +2295,98 @@ fn an_aperture_behind_a_recombining_splitter_clips_the_sum_of_the_arms() {
     }
     measured("Mach–Zehnder, a disc behind the second splitter: its share of the port at π/2 against π", shares[0] - shares[1]);
     assert!((shares[0] - shares[1]).abs() < 1e-6, "{shares:?}");
+}
+
+/// A quarter-wave MgF₂ layer on `d` mm of crown glass (1.52), its back face
+/// `exit`, its round trips as `mode`, tilted 45° in a 0.5 mm Gaussian; the
+/// detector catches what it transmits.
+fn coated_plate_run(mode: oc_core::thinfilm::PlateRoundTrips, exit: oc_core::thinfilm::ExitFace, d: f64) -> WavePathResult {
+    use oc_core::thinfilm::{Coating, CoatingBacking, FilmLayer, FilmMaterial, Incidence};
+    let c = Coating {
+        layers: vec![FilmLayer::new(FilmMaterial::constant("film", 1.38), LAM * 1000.0 / (4.0 * 1.38))],
+        backing: CoatingBacking::Plate { substrate: FilmMaterial::constant("glass", 1.52), exit, thickness_mm: d, round_trips: mode },
+        incidence: Incidence::Film,
+        design: None,
+    };
+    let (front, back) = (SurfaceResponse::Coating { coating: c.clone() }, SurfaceResponse::Coating { coating: c.seen_from_behind() });
+    let mut s = Scene3::new();
+    let src = source(&mut s);
+    s.add_planar_element(Vec3::new(50.0, 0.0, 0.0), 10.0, 135.0, front, back);
+    let det = s.add_area_detector(Vec3::new(150.0, 0.0, 0.0), -Vec3::X, 3.0, 3.0, [32, 32]);
+    s.validate().unwrap();
+    wave_path(&s, &spec(src, det, 0.5, 256, 4.0), 1).unwrap()
+}
+
+#[test]
+fn a_coated_plate_takes_its_round_trips_as_it_declares() {
+    // R21 of the expert review and finding 7: a coated plate tilted 45°.
+    // Summed as fields, behind an ideal AR back face (no round trips), 1 mm
+    // of glass is a pure phase on every plane wave relative to free space,
+    // `k₀d(n_g cos θ_g − cos θ₀)`: it moves the beam across by the slab's
+    // lateral shift `d sin(θ₀ − θ_g)/cos θ_g` and delays it by that phase at
+    // the chief ray (Born & Wolf [16], §7.6), against the first pass on the
+    // same zero-thick geometry. Through 10 µm of glass with a bare back face,
+    // the three modes transmit what their references say: the whole
+    // sandwich's transfer matrix (coherent), the ray side's incoherent plate,
+    // and `T₁T₂` (the first pass), s and p averaged.
+    use oc_core::thinfilm::{coating_rt_at, Coating, CoatingBacking, ExitFace, FilmLayer, FilmMaterial, Incidence, PlateRoundTrips};
+    let ar = ExitFace::AntiReflective { residual: 0.0 };
+    let (coh, first) = (coated_plate_run(PlateRoundTrips::Coherent, ar, 1.0), coated_plate_run(PlateRoundTrips::FirstPass, ar, 1.0));
+    let centroid = |f: &oc_wave::Field2| {
+        let g = f.grid;
+        let (mut s, mut sx, mut sy) = (0.0, 0.0, 0.0);
+        for j in 0..g.n[1] {
+            for i in 0..g.n[0] {
+                let w = f.at(i, j).norm_sqr();
+                let (x, y) = g.xy(i, j);
+                s += w;
+                sx += w * x;
+                sy += w * y;
+            }
+        }
+        (sx / s, sy / s)
+    };
+    let (a, b) = (centroid(&coh.field), centroid(&first.field));
+    let moved = ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt();
+    let th0 = std::f64::consts::FRAC_PI_4;
+    let thg = (th0.sin() / 1.52).asin();
+    let want = 1.0 * (th0 - thg).sin() / thg.cos();
+    let dc = |f: &oc_wave::Field2| f.data.iter().fold(oc_wave::Cx::ZERO, |s, z| s + *z);
+    let ratio = dc(&coh.field) / dc(&first.field);
+    let k0 = 2.0 * std::f64::consts::PI / (LAM / 1000.0);
+    let phase = k0 * 1.0 * (1.52 * thg.cos() - th0.cos());
+    let dphi = (ratio * oc_wave::Cx::expi(-phase)).arg();
+    measured("coated plate, 1 mm, coherent behind an ideal AR: the beam's move across against d sin(θ₀ − θ_g)/cos θ_g, relative", moved / want - 1.0);
+    measured("coated plate, 1 mm, coherent behind an ideal AR: the chief plane wave's delay against k₀d(n cos θ_g − cos θ₀), rad", dphi);
+    assert!((moved / want - 1.0).abs() < 1e-3, "{moved} vs {want}");
+    // The ratio of the fields' sums is the filter at the chief plane wave,
+    // less what the window's edge cuts from the moved beam's tails (3.3 radii
+    // out, about 1e-6 of the sum): the delay is held to that, of 6339 rad.
+    assert!(dphi.abs() < 1e-5 && (ratio.abs() - 1.0).abs() < 1e-5, "{ratio:?}");
+    assert!(coh.report.approximated.iter().any(|x| x.contains("summed as fields")), "{:?}", coh.report.approximated);
+    assert!(first.report.approximated.iter().any(|x| x.contains("round trips left out")), "{:?}", first.report.approximated);
+    // Ten micrometres, bare back face: each mode against its reference.
+    let lam = LAM;
+    let c0 = th0.cos();
+    let film = || FilmLayer::new(FilmMaterial::constant("film", 1.38), lam * 1000.0 / (4.0 * 1.38));
+    let whole = Coating { layers: vec![film(), FilmLayer::new(FilmMaterial::constant("glass", 1.52), 1e4)], backing: CoatingBacking::Medium, incidence: Incidence::Film, design: None };
+    let plate = |mode| Coating { layers: vec![film()], backing: CoatingBacking::Plate { substrate: FilmMaterial::constant("glass", 1.52), exit: ExitFace::Bare, thickness_mm: 0.01, round_trips: mode }, incidence: Incidence::Film, design: None };
+    let t_coh = coating_rt_at(&whole, 1.0, 1.0, lam, c0).unwrap().t();
+    let t_inc = coating_rt_at(&plate(PlateRoundTrips::Incoherent), 1.0, 1.0, lam, c0).unwrap().t();
+    let t_first = {
+        let (mut s, mut n) = (0.0, 0.0);
+        for p in [false, true] {
+            let (t, ..) = oc_wave::planar::coating_arm(&plate(PlateRoundTrips::FirstPass), false, 1.0, lam, c0, p).unwrap();
+            s += t.norm_sqr();
+            n += 1.0;
+        }
+        s / n
+    };
+    for (mode, want, gate) in [(PlateRoundTrips::Coherent, t_coh, 2e-4), (PlateRoundTrips::Incoherent, t_inc, 1e-5), (PlateRoundTrips::FirstPass, t_first, 1e-5)] {
+        let r = coated_plate_run(mode, ExitFace::Bare, 0.01);
+        let got = r.report.ledger.detected / r.report.ledger.launched;
+        measured(&format!("coated plate, 10 µm, bare back face, {mode:?}: transmitted against its reference"), got - want);
+        assert!((got - want).abs() < gate, "{mode:?}: {got} vs {want}");
+    }
+    assert!((t_coh - t_inc).abs() > 1e-3, "the modes must differ here to be told apart: {t_coh} {t_inc}");
 }

@@ -48,7 +48,7 @@ fn wall(outer: &str, pmma: &oc_core::material::Glass) -> Coating {
         "silver" => vec![FilmLayer::new(materials::silver(), 150.0)],
         _ => vec![FilmLayer::new(materials::aluminium_measured(), 150.0)],
     };
-    Coating { layers, backing: CoatingBacking::Plate { substrate: film, exit: ExitFace::Bare, thickness_mm: WALL_MM }, incidence: Incidence::Substrate, design: None }
+    Coating { layers, backing: CoatingBacking::Plate { substrate: film, exit: ExitFace::Bare, thickness_mm: WALL_MM, round_trips: Default::default() }, incidence: Incidence::Substrate, design: None }
 }
 
 fn main() {

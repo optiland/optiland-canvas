@@ -177,7 +177,7 @@ pub fn behind_glass(s: &mut Scene3, id: u64, side: f64, thickness_mm: f64) {
     }
     let coating = Coating {
         layers: vec![FilmLayer::new(materials::silver(), 150.0)],
-        backing: CoatingBacking::Plate { substrate: low_iron_film(), exit: oc_core::thinfilm::ExitFace::Bare, thickness_mm },
+        backing: CoatingBacking::Plate { substrate: low_iron_film(), exit: oc_core::thinfilm::ExitFace::Bare, thickness_mm, round_trips: Default::default() },
         incidence: Incidence::Substrate,
         design: None,
     };

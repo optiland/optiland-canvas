@@ -149,6 +149,7 @@ impl Canvas {
                 substrate,
                 exit: ExitFace::Bare,
                 thickness_mm: if mm.is_finite() { mm } else { 0.0 },
+                round_trips: Default::default(),
             }),
             "opaque" => Self::material(key).map(|substrate| CoatingBacking::Opaque { substrate }),
             other => Err(format!("no backing {other:?}: medium, plate or opaque")),

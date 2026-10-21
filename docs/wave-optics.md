@@ -250,7 +250,7 @@ incoming ray to the plane across the outgoing one:
 | DMD, LCoS SLM | laid onto the device plane at `device_samples_per_pixel`, reflected by the device model ([DMD](dmd.md), [SLM](slm.md)), taken up across the outgoing ray; at an LCoS, half of what it reflects follows the chain (below) | thin element |
 | face of a refractive body, curved mirror or other curved surface | traced across the thin slab that holds the surface where the beam meets it (below), its rim laid on the field with exact cell coverage; between a body's faces the field diffracts inside the glass by the angular spectrum, in the glass's index | the slab is geometric: no diffraction across a surface's sag |
 | plane-parallel plate (a body entered and left by two flat, parallel faces, bare or with a residual AR) | one step: the closed-form slab, round trips included, on each plane wave of the field, then the angular spectrum across the planes (below) | exact for a plate of infinite extent, s or p; its rim laid on the field |
-| flat coated surface (`Coating`: a coated splitter, a dichroic) | each plane wave times the coating's complex `r` or `t` at its own angle, from the transfer matrix, then handed over like any flat element; a plate-backed coating's plate in series, without round trips, as the coating declares it incoherent | exact for the stack, s or p |
+| flat coated surface (`Coating`: a coated splitter, a dichroic) | each plane wave times the coating's complex `r` or `t` at its own angle, from the transfer matrix, then handed over like any flat element; a plate-backed coating's round trips as its plate declares (`PlateRoundTrips`): the first pass alone (the default), added in power, or summed as fields across its thickness | exact for the stack, s or p; the plate as it declares it, zero-thick in the scene's geometry |
 | detector (`Readout::Projected` or `Readout::Diffracted { samples_per_pixel }`) | one readout for every arm: the field, carried to the detector's plane across its chief ray, is interpolated onto the detector's own sub-pixel grid, `s × s` points a pixel at the centres of equal parts of each pixel, by the zoomed angular spectrum (`asm_zoom`) where the face is square to the beam with its axes along the beam's and by the spectrum rotated onto the face (`asm_tilted`) otherwise, its carrier kept analytic; `s` holds the intensity's band on the face (the arms' directions' spread plus twice the envelope's band) at `READOUT_PER_PERIOD` (8) points a period for the band that holds all but 1e-6 of the envelope's energy and at `READOUT_PER_PERIOD_TAILS` (2.5) for its whole band, down to 1e-8 of its peak amplitude (a field cut by its window has spectral tails to its grid's Nyquist frequency, whose beat with the main lobe is of first order in the edge's amplitude: read at points that do not resolve them, a Michelson's arm gained 1e-4 of its power; resolved above two points a period, the sum over the points is the interpolant's power exactly), two at least, and `Diffracted` sets a floor of its `samples_per_pixel`; a pixel's power is the sum of its cells' integrals, the fringe between two arms' carriers integrated over each cell exactly (the rectangular pixel's sinc factors) and the envelopes by the midpoint rule, the irradiance by the `DetectorModel` (below) | exact scalar propagation; the midpoint rule on the envelopes, `(πfh)²/6` of an intensity component at frequency `f` for points `h` apart (2.6% at the band's edge, 0.64% at half of it); padded so that the field's periodic copies, a padded window apart, stay clear of the face (`Periodic` warns where 4096 samples a side cannot); the sample cap (`CoarsePreview` says what the points fell short of) |
 
 When the beam leaves an element at another angle than it came, its
@@ -480,15 +480,49 @@ shifted onto the chief ray's exit. The round trips between the faces are in
 the sum, so an etalon's multiple-beam fringes come out of it, and so does the
 lateral shift a tilted plate gives the beam (the slope of the slab's phase
 across the spectrum). A tilted plate's round trips leave the beam a
-round-trip shift apart; those that would land beyond the window are summed
-out of the series and booked as `left_window`, never wrapped back in. The
+round-trip shift apart, `2L tan θ_g cos θ₀`; those that would land beyond the
+window are summed out of the series and booked as `left_window`, never
+wrapped back in. What that takes from the observable is booked exactly,
+plane wave by plane wave, `|full|² − |kept|²`, and the step's note splits it
+into the omitted round trips as a field of their own, `lead·x^{M+1}/(1 − x)`,
+whose power has `|1 − x|²` below (summing the round trips' intensities,
+`1 − |x|²`, would leave out how they interfere), and their interference with
+the round trips kept, at most twice the product of the two norms (Q11 of the
+expert review); the kept round trips are the beams summed one by one to
+2.4e-16 (test below). A plate of lower index than its surroundings reflects
+whole what meets it past its critical angle; across a thin gap the
+evanescent wave would tunnel (frustrated total internal reflection, Born &
+Wolf [16], §1.5.4), which is not modelled: the step refuses a gap thinner
+than five decay lengths by name, and otherwise names the leak, at most
+`e^{−2κL}`, it leaves out. The
 amplitudes are in the tangential chart and power coordinates of a scattering
 two-port: `r = (y₁ − y₂)/(y₁ + y₂)`, `t = 2√(y₁y₂)/(y₁ + y₂)`,
 `y_s = n cos θ`, `y_p = n / cos θ`, unitary, with the Stokes signs of the
-splitters. A flat coated surface multiplies each plane wave by its coating's
-complex reflection or transmission, from `oc_core::thinfilm`'s transfer
-matrix put into that chart (its ray-frame `r_p` negated, its transmission
-scaled into power coordinates). A body that is not such a plate is still
+splitters. That two-port, `S = [[−√R, √T], [√T, √R]]`, has
+`S†S = (R + T)·I`: passive for any excitation of both ports at once when
+`R + T ≤ 1`, which a splitter given the same reflection sign from both sides
+would not be (Q12 of the expert review). The signs are a convention: a basis
+convention changed consistently moves no measured power, while a real
+coating's relative phase, which the transfer matrix carries, moves an
+interferometer's fringes. A flat coated surface multiplies each plane wave by
+its coating's complex reflection or transmission, from `oc_core::thinfilm`'s
+transfer matrix put into that chart (its ray-frame `r_p` negated, its
+transmission scaled into power coordinates). A coating on a plate takes the
+round trips between its two faces as the plate declares (finding 7 of the
+expert review: a monochromatic source does not lose its coherence because a
+substrate is thick, so the choice is the part's, and the report names it).
+`FirstPass`, the default, is the stack's amplitude into the glass times the
+back face's out of it, the light the faces send round the plate booked to
+the other arm. `Incoherent` adds the round trips' powers,
+`T = T₁T₂/(1 − R₁′R₂′)`, the first pass's field carrying them, as the ray
+tracer does (Katsidis & Siapkas; Byrnes [coatings](coatings.md)).
+`Coherent` sums them as fields, `t₁t₂e^{iδ}/(1 − r₁′r₂′e^{2iδ})` relative to
+free space across the plate, `δ` from its thickness, so that a tilted plate
+moves the beam across by its lateral shift and delays it by its phase; the
+faces' smooth amplitudes are tabulated over the angle and the plate's phase
+taken at each plane wave's own. The plate stays zero-thick in the scene's
+geometry, so the field behind it is the plate's relative to free space
+across the same thickness, and the report says so. A body that is not such a plate is still
 traced face by face, both polarization components taking the tracer's
 unpolarized transmittance.
 
@@ -684,6 +718,11 @@ These are acceptance case C53, in `crates/oc-wave/tests/path.rs`.
 | `an_oblique_etalon_transmits_s_and_p_as_their_own_closed_forms` | at 31°, δ = 7.5π: unpolarized light transmits `(T_s + T_p)/2` [16], [22] | 1e-5 | 1.3e-7 |
 | `a_millimetre_plate_s_transmission_follows_its_round_trip_phase` | the closed form at δ = k₀nL ≈ 15 000 rad [16] | 1e-4 | −2.3e-5 (the beam's own angular spread, its plane waves' δ 5e-4 rad apart) |
 | `a_coated_surface_reflects_and_transmits_as_its_single_layer_s_closed_form` | a quarter-wave MgF₂ layer on crown glass, by the single-layer formula computed apart from the transfer matrix [16]: `(R_s + R_p)/2` at 45°, `(1 − R_f)(1 − R_b)` through the plate | 1e-6 | 1.6e-8; 3.1e-11 |
+| `a_coated_plate_takes_its_round_trips_as_it_declares` | R21 of the expert review and finding 7: a coated plate tilted 45°; summed as fields behind an ideal AR back face, 1 mm of glass moves the beam across by `d sin(θ₀ − θ_g)/cos θ_g` and delays the chief plane wave by `k₀d(n cos θ_g − cos θ₀)` [16]; through 10 µm with a bare back face each mode against its reference: the whole sandwich's transfer matrix (coherent), the ray side's incoherent plate, `T₁T₂` (first pass) | 1e-3, relative; 1e-5 rad (of 6339); 2e-4, 1e-5, 1e-5 | 8.0e-8; −1.5e-6 rad; −7.4e-6, −1.1e-7, −1.1e-7 |
+| `a_plate_s_kept_round_trips_are_the_beams_summed_one_by_one` (a unit test of `planar.rs`) | R20: a plate of index 4 tilted 30°, 7 round trips kept: against the beams summed one by one; the first round trip's walk against `2d tan θ_g cos θ₀`; what is booked beyond the window, the tail's own power plus its interference with the kept round trips, the latter within twice the product of their norms | 1e-12; 1e-3; 1e-12 of the received | 2.4e-16; within 1e-3; holds |
+| `a_thin_low_index_gap_met_past_its_critical_angle_is_refused` (unit test) | a gap of index 1 in glass of 1.5 met at 45°: 1 µm thick (3.5 decay lengths), refused by name; 10 µm (35), run, the leak it leaves out named | refused; named | refused; 34.7 decay lengths |
+| `a_coated_plate_s_round_trips_meet_their_three_references` (unit test) | the coated plate's amplitudes at 0°, 30°, 60°, s and p, film side and glass side: coherent against the whole sandwich's transfer matrix (film and 0.5 mm of glass between air and air), incoherent against the ray side's plate, first pass against `T₁T₂` | 1e-10; 1e-12; 1e-14 | 1.8e-12; 7.8e-16; 1.1e-16 |
+| `the_ideal_splitter_is_passive_for_any_excitation_of_both_ports` (a unit test of `path.rs`) | Q12: `S†S = (R + T)·I` for the splitter's two-port over R, T in steps of 0.1 with R + T ≤ 1; the same reflection sign from both sides gives an eigenvalue of 2 at R = T = 1/2 | 1e-15 | holds |
 | `coatings_whose_planes_of_incidence_differ_reflect_s_of_one_as_p_of_the_other` | two 45° folds in crossed planes: `(R₁ₛR₂ₚ + R₁ₚR₂ₛ)/2`, each `R` by the single-layer formula [16], [26]; a shared plane's `(R₁ₛR₂ₛ + R₁ₚR₂ₚ)/2` is 12% away | 1e-5, relative | −1.1e-6 |
 | `two_polarizers_pass_unpolarized_light_as_malus_s_law_says` | Malus [27]: `cos²θ/2` at 0°, 30°, 60°, 90°; crossed sheets of extinction ε pass ε [26] | 1e-9; 1e-6, relative | 1.0e-14; 2.0e-14 |
 | `a_retarder_between_crossed_polarizers_passes_half_sin2_2phi_sin2_half_delta` | `sin²2φ·sin²(δ/2)/2` [26], [27] at five (φ, δ); circular light from a quarter-wave plate at 45°, `1/4` through any analyzer | 1e-9 | 9.6e-15; 4.8e-15 |

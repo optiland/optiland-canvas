@@ -26,6 +26,18 @@ represent that, which is why the state is Stokes.
 Between interactions the frame is constant in world space: a straight ray in an
 isotropic medium has nothing to turn it.
 
+A source can declare what it emits (`Source3.polarization`, a
+`SourcePolarization`): unpolarized, linear at an angle, circular of either
+hand, or any Jones vector. The state is written in the source's own frame,
+`x̂` its local `+Y` turned square to each ray and `ŷ = d̂ × x̂`, and the time
+convention is `e^{−iωt}`, so `(1, i)/√2` turns from `x̂` toward `ŷ`, the
+handedness `Stokes::circular` calls right (`S₃ > 0`). The f64 tracer launches
+every ray of such a source in that state on that frame
+(`a_polarized_source_launches_its_state_on_its_own_frame`), and the wave path
+launches its beam in it (below). A source that declares nothing emits
+unpolarized light, and the field is left out of its document. The f32
+preview stays unpolarized.
+
 ## What happens at a surface
 
 1. Resolve the plane of incidence and write the arriving state on it.
@@ -366,9 +378,6 @@ before.
 - **One part, one object.** A polarizing cube is a body and a surface, because
   the scene model cannot hold an interface inside a solid. They share a label
   so the object list calls them one thing, and moving one moves only that one.
-- **Source polarization.** The tracer accepts a state on a launch ray and the
-  tests use it, but no source in a scene declares one. Every scene starts
-  unpolarized and has to pass through a polarizer to become anything else.
 - **Birefringence.** A ray splitting into ordinary and extraordinary is a
   different feature, and a large one. It is Optiland's to have, not the canvas's.
 - **Dispersion of the birefringence.** A crystal waveplate's retardance moves

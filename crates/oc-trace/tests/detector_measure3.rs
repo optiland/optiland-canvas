@@ -44,6 +44,7 @@ fn point_source(scene: &mut Scene3, angular: AngularDistribution3, samples: u32)
             sequence: SamplingSequence::Sobol,
         },
         coherence: None,
+        polarization: None,
     });
     let _ = LayerId(0);
 }

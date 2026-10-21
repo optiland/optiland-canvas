@@ -6251,6 +6251,7 @@ mod scene3_tests {
                 sequence: SamplingSequence::Grid,
             },
             coherence: None,
+            polarization: None,
         });
 
         // A detector past the focus, facing back down the axis. Its local +Z
@@ -6347,6 +6348,7 @@ mod scene3_tests {
                 sequence: SamplingSequence::Grid,
             },
             coherence: None,
+            polarization: None,
         });
 
         // A mirror at the origin whose normal folds +X to (0, 0.6, 0.8): out of

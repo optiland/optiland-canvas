@@ -349,6 +349,33 @@ fn a_third_round_trip_changes_nothing() {
     assert_eq!(b, c);
 }
 
+#[test]
+fn a_source_s_polarization_round_trips_and_is_left_out_when_absent() {
+    // A source that declares no polarization writes none (old documents load
+    // as unpolarized); each declared state is written and read back exactly.
+    use oc_core::scene3::SourcePolarization;
+    let mut s = Scene3::new();
+    let _ = s.add_collimated_beam(Vec3::ZERO, 1.0, 1.0, 1, oc_core::scene::Spectrum::Monochromatic(0.55));
+    assert!(!s.to_json().contains("polarization"), "absent, left out");
+    for pol in [
+        SourcePolarization::Unpolarized,
+        SourcePolarization::Linear { angle_deg: 0.1 + 0.2 },
+        SourcePolarization::Circular { right: false },
+        SourcePolarization::Jones { x: [0.6, 0.0], y: [0.0, -0.8] },
+    ] {
+        s.sources[0].polarization = Some(pol);
+        s.validate().unwrap();
+        let back = Scene3::from_json(&s.to_json()).unwrap();
+        assert_eq!(back.sources[0].polarization, Some(pol));
+        assert_eq!(back.to_json(), s.to_json());
+    }
+    // The Jones vector is normalized on use, and its Stokes vector is the
+    // state's: (0.6, −0.8i) is elliptical, left-handed (S₃ < 0).
+    let j = SourcePolarization::Jones { x: [0.6, 0.0], y: [0.0, -0.8] };
+    let st = j.stokes(2.0);
+    assert!((st.s0 - 2.0).abs() < 1e-15 && (st.s1 - 2.0 * (0.36 - 0.64)).abs() < 1e-12 && st.s2.abs() < 1e-15 && (st.s3 + 2.0 * 0.96).abs() < 1e-12, "{st:?}");
+}
+
 // ---------------------------------------------------------------------------
 // The committed v2 fixture
 // ---------------------------------------------------------------------------

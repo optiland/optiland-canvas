@@ -492,6 +492,7 @@ impl Scene3 {
                 sequence: SamplingSequence::Grid,
             },
             coherence: None,
+            polarization: None,
         });
         id
     }

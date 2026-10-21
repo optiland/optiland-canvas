@@ -974,7 +974,7 @@ struct ChainJob {
     /// Whether the chain carries two components, and the launch's Jones
     /// vector in the beam frame.
     polarized: bool,
-    jones: [f64; 2],
+    jones: [Cx; 2],
     /// Each event: where the field reaches it, where it leaves from (the
     /// same point except after a transfer), and what it is.
     points: Vec<(Vec3, Vec3, Ev)>,
@@ -1151,7 +1151,7 @@ fn launch_field(spec: &WavePathSpec, grid: Grid2, lam: f64, n0: f64, power: f64,
 impl ChainJob {
     /// Plan the events along `seq` and frame the beam at the source; the
     /// field is launched when the chain first steps.
-    fn new(scene: &Arc<Scene3>, spec: &WavePathSpec, seq: oc_core::seq3::SequencePrescription3, power: f64, jones: Option<[f64; 2]>) -> Result<Self, WaveError> {
+    fn new(scene: &Arc<Scene3>, spec: &WavePathSpec, seq: oc_core::seq3::SequencePrescription3, power: f64, jones: Option<[Cx; 2]>) -> Result<Self, WaveError> {
         let src = scene
             .sources
             .iter()
@@ -1159,8 +1159,9 @@ impl ChainJob {
             .ok_or_else(|| WaveError::OutOfRange("no such source".into()))?;
         let lam = seq.launch.lambda_um;
         let d0 = seq.launch.dir.normalize();
-        let x0 = src.transform.rotate(Vec3::Y);
-        let x0 = (x0 - d0 * d0.dot(x0)).normalize();
+        // The source's own frame across the beam, the one its polarization
+        // is written in.
+        let x0 = oc_core::scene3::SourcePolarization::frame_x(&src.transform, d0);
         let beam = Beam { origin: seq.launch.point, x: x0, y: d0.cross(x0), d: d0 };
         let n0 = seq.hits.first().map_or(scene.env.ambient_index, |h| h.n_before);
         // A placeholder until the chain runs.
@@ -1300,7 +1301,7 @@ impl ChainJob {
             pol: Pol::Unpolarized,
             uy: None,
             polarized: jones.is_some(),
-            jones: jones.unwrap_or([1.0, 0.0]),
+            jones: jones.unwrap_or([Cx::ONE, Cx::ZERO]),
             points,
             keys,
             launch: WaveLedger::default(),
@@ -1630,6 +1631,7 @@ impl ChainJob {
         // The element's normal and the way out, and what it does to the pair.
         let mut layer: Option<usize> = None;
         let mut lcos: Option<(usize, bool)> = None;
+        let mut grooves: Option<(Vec3, u64)> = None;
         let (n_e, d_out) = match ev {
             Ev::Transfer { hit, d_out, .. } => (hit.normal, *d_out),
             Ev::Plate { plate, .. } => (plate.normal, beam0.d),
@@ -1648,6 +1650,7 @@ impl ChainJob {
                     SurfaceResponse::Modulator { device, .. } if matches!(device.kind, ModulatorKind::Lcos(_)) => {
                         lcos = Some((si, h.action == SeqAction::Diffract));
                     }
+                    SurfaceResponse::Grating { tm: Some(_), .. } => grooves = Some((s.common.transform.rotate(Vec3::Y), h.object.0)),
                     _ => {}
                 }
                 (n_s, self.next_dir(idx, p, beam0.d))
@@ -1676,23 +1679,37 @@ impl ChainJob {
             let total = ux.power() + uy.power();
             let kept = c.power();
             let dropped = (total - kept).max(0.0);
-            // The device takes the same share of either component (its fill
-            // and reflectance do not tell the beams apart), measured on the
-            // kept one, or on the other standing in for it when the kept one
-            // is dark; the rest of the other component goes into the other
-            // beam, which the chain does not follow.
+            // The other component goes into the other beam, which the chain
+            // does not follow; what the device absorbs of it is measured on
+            // its own field, reflected as that beam is (Q14 of the expert
+            // review: the beams are reflected differently, the director's
+            // modulated, the other not), on a copy of the job's state that is
+            // then thrown away.
+            let other = mix(&ux, &uy, beam0.x.dot(beam0.d.cross(keep)), beam0.y.dot(beam0.d.cross(keep)));
+            let rho = if dropped > 0.0 {
+                let saved = (self.u.clone(), self.beam, self.report.clone(), self.junction, self.at);
+                self.u = other.clone();
+                self.pol = Pol::Projected;
+                let mut ev2 = ev.clone();
+                if let Ev::Hit(h) = &mut ev2 {
+                    h.action = if modulated { SeqAction::Reflect } else { SeqAction::Diffract };
+                }
+                let before = self.report.ledger;
+                let r = self.element(idx, ev2, p);
+                let absorbed = self.report.ledger.absorbed_element - before.absorbed_element;
+                (self.u, self.beam, self.report, self.junction, self.at) = saved;
+                r?;
+                (absorbed / dropped).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
             let before = self.report.ledger;
-            let stand_in = kept <= 0.0 && dropped > 0.0;
-            let ran = if stand_in { dropped } else { kept };
-            self.u = if stand_in { mix(&ux, &uy, beam0.x.dot(beam0.d.cross(keep)), beam0.y.dot(beam0.d.cross(keep))) } else { c };
+            self.u = c;
             self.pol = Pol::Projected;
             self.element(idx, ev.clone(), p)?;
             self.pol = Pol::Unpolarized;
-            let rho = if ran > 0.0 { ((self.report.ledger.absorbed_element - before.absorbed_element) / ran).clamp(0.0, 1.0) } else { 0.0 };
-            if stand_in {
-                self.report.ledger = before;
-                self.u.data.iter_mut().for_each(|v| *v = Cx::ZERO);
-            }
+            let ran = kept;
+            let _ = before;
             self.report.ledger.absorbed_element += dropped * rho;
             self.report.ledger.other_family += dropped * (1.0 - rho);
             self.note_junction(Junction {
@@ -1715,9 +1732,29 @@ impl ChainJob {
             self.uy = Some(mix(&o, &o, e.dot(out.y), 0.0));
             return Ok(());
         }
-        let (bin, bout) = element_basis(&beam0, n_e, d_out);
+        // A grating that tells TE from TM works in its grooves' basis: TE
+        // along them, TM across, on either side.
+        let groove_basis = grooves.and_then(|(g, id)| {
+            let across = |d: Vec3| {
+                let te = g - d * d.dot(g);
+                (te.length() > 1e-9).then(|| {
+                    let te = te.normalize();
+                    [te, d.cross(te)]
+                })
+            };
+            Some((across(beam0.d)?, across(d_out)?, id))
+        });
+        let (bin, bout) = match groove_basis {
+            Some((a, b, id)) => {
+                self.report.approx(format!(
+                    "grating #{id}: the component along its grooves takes its TE fractions and the one across them its TM ones; how a conical mount mixes the two is left out"
+                ));
+                (a, b)
+            }
+            None => element_basis(&beam0, n_e, d_out),
+        };
         let comps = [mix(&ux, &uy, beam0.x.dot(bin[0]), beam0.y.dot(bin[0])), mix(&ux, &uy, beam0.x.dot(bin[1]), beam0.y.dot(bin[1]))];
-        let oblique = bin[0] != beam0.x || bin[1] != beam0.y;
+        let oblique = groove_basis.is_some() || bin[0] != beam0.x || bin[1] != beam0.y;
         let pols = if oblique { [Pol::S(bin[0]), Pol::P(bin[0])] } else { [Pol::Unpolarized, Pol::Unpolarized] };
         // A component without power is carried as zeros, on the other's
         // outgoing window: an element fitted to a field has nothing to fit.
@@ -1822,6 +1859,17 @@ impl ChainJob {
                 (Cx::ONE, Cx::real(leak.clamp(0.0, 1.0).sqrt()), format!("polarizer, axis {axis_deg}°, extinction {leak:.3e}"))
             }
             SurfaceResponse::Retarder { retardance_deg, crystal, .. } => {
+                let sin_i = (1.0 - cos_i * cos_i).max(0.0).sqrt();
+                // The plate's common delay: its fast wave's slab relative to
+                // free space across the same planes (finding 5 of the expert
+                // review: the retardance alone does not say where an
+                // interferometer's fringes sit). None for an ideal retarder.
+                let common = crystal.as_ref().map(|c| {
+                    let d = c.thickness_um(*retardance_deg) / 1000.0;
+                    let n_fast = c.n_o.min(c.n_e);
+                    let k0 = 2.0 * std::f64::consts::PI / (self.lam / 1000.0);
+                    k0 * d * ((n_fast * n_fast - (n_here * sin_i).powi(2)).max(0.0).sqrt() - n_here * cos_i)
+                });
                 let rad = match crystal {
                     None => retardance_deg.to_radians(),
                     Some(c) => {
@@ -1832,11 +1880,22 @@ impl ChainJob {
                         let c_hat = t.rotate(Vec3::X) * co + t.rotate(Vec3::Y) * so;
                         let lean = d - n_opp * d.dot(n_opp);
                         let cos_axis = if lean.length() > 1e-12 { lean.normalize().dot(c_hat) } else { 0.0 };
-                        let sin_i = (1.0 - cos_i * cos_i).max(0.0).sqrt();
                         oc_core::polarization::a_plate_retardance(c.n_o, c.n_e, c.thickness_um(*retardance_deg), self.lam, n_here * sin_i, cos_axis).abs()
                     }
                 };
-                (Cx::ONE, Cx::expi(rad), format!("retarder, fast axis {axis_deg}°, retardance {:.4}°", rad.to_degrees()))
+                match common {
+                    Some(phi) => (
+                        Cx::expi(phi),
+                        Cx::expi(phi + rad),
+                        format!("retarder, fast axis {axis_deg}°, retardance {:.4}°, its fast wave delayed {phi:.6} rad against free space", rad.to_degrees()),
+                    ),
+                    None => {
+                        self.report.approx(format!(
+                            "retarder #{id} is ideal: its retardance alone, no common delay (a real plate's, which moves an interferometer's fringes, is not modelled for it)"
+                        ));
+                        (Cx::ONE, Cx::expi(rad), format!("retarder, fast axis {axis_deg}°, retardance {:.4}°", rad.to_degrees()))
+                    }
+                }
             }
             _ => unreachable!("only polarizers and retarders are layers"),
         };
@@ -1946,7 +2005,7 @@ impl ChainJob {
                 let loss = if reflect { Loss::Arm(t.min(1.0 - r)) } else { Loss::Arm(r.min(1.0 - t)) };
                 (splitter_amp(reflect, from_front, r, t), None, loss)
             }
-            (SurfaceResponse::Grating { efficiency, lines_per_mm, order, .. }, SeqAction::Diffract) => {
+            (SurfaceResponse::Grating { efficiency, lines_per_mm, order, tm, .. }, SeqAction::Diffract) => {
                 // The order carries the grating's own phase, exp(i m K·(r −
                 // r_g)), K = 2π·lines/mm along local X from the surface's
                 // origin. The chain leaves along the tracer's order direction,
@@ -1958,10 +2017,21 @@ impl ChainJob {
                 // turned to the order's.
                 let kg = s.common.transform.rotate(Vec3::X) * (2.0 * std::f64::consts::PI * lines_per_mm * *order as f64);
                 grating_phase = Some((kg, s.common.transform.pos));
-                (unit(efficiency.sample(lam)).ok_or_else(|| refuse(kind))?.sqrt(), None, Loss::Orders)
+                // Across the grooves (TM, the component `element_polarized`
+                // hands over as p in the grooves' basis) the grating's own
+                // TM fraction, where it declares one.
+                let eff = match (tm, self.pol) {
+                    (Some(tm), Pol::P(_)) => &tm.efficiency,
+                    _ => efficiency,
+                };
+                (unit(eff.sample(lam)).ok_or_else(|| refuse(kind))?.sqrt(), None, Loss::Orders)
             }
-            (SurfaceResponse::Grating { zero_order, .. }, _) => {
-                (unit(zero_order.sample(lam)).ok_or_else(|| refuse(kind))?.sqrt(), None, Loss::Orders)
+            (SurfaceResponse::Grating { zero_order, tm, .. }, _) => {
+                let zero = match (tm, self.pol) {
+                    (Some(tm), Pol::P(_)) => &tm.zero_order,
+                    _ => zero_order,
+                };
+                (unit(zero.sample(lam)).ok_or_else(|| refuse(kind))?.sqrt(), None, Loss::Orders)
             }
             (SurfaceResponse::ThinLens { focal_length_mm }, _) => (1.0, Some((*focal_length_mm, s.common.transform.pos)), Loss::Absorbed),
             // A zero-thickness refracting surface has the same medium on both
@@ -2031,6 +2101,39 @@ impl ChainJob {
                     })
                 };
                 let input = self.u.power();
+                // For a field of two components: how far s and p themselves
+                // vary over the field's directions, the one Jones matrix per
+                // plane wave standing for both (Q13 of the expert review).
+                if matches!(pol, Pol::S(_)) {
+                    let band = field_band(&self.u, &mut self.fft);
+                    let spread = self.u.wavelength_in_medium_mm() * band.main[0].max(band.main[1]);
+                    let th0 = beam.d.dot(n_s).abs().clamp(0.0, 1.0).acos();
+                    let (lo, hi) = ((th0 - spread).max(0.0), (th0 + spread).min(0.5 * std::f64::consts::PI));
+                    let mut span = [(f64::INFINITY, f64::NEG_INFINITY, 0.0f64); 2];
+                    for (k, pp) in [false, true].into_iter().enumerate() {
+                        let a0 = crate::planar::coating_arm(coating, reflect, n0, lam, th0.cos(), pp)?.0;
+                        for i in 0..=16 {
+                            let th = lo + (hi - lo) * i as f64 / 16.0;
+                            let a = crate::planar::coating_arm(coating, reflect, n0, lam, th.cos(), pp)?.0;
+                            span[k].0 = span[k].0.min(a.abs());
+                            span[k].1 = span[k].1.max(a.abs());
+                            span[k].2 = span[k].2.max((a * a0.conj()).arg().abs());
+                        }
+                    }
+                    self.report.approx(format!(
+                        "coating #{}: over the field's directions ({:.4}° to {:.4}° from its normal) |{w}_s| spans {:.6}–{:.6} and |{w}_p| {:.6}–{:.6}, their phases up to {:.2e} and {:.2e} rad from the chief ray's; each plane wave takes its own s and p, the two mixing off the plane of incidence left out",
+                        h.object.0,
+                        lo.to_degrees(),
+                        hi.to_degrees(),
+                        span[0].0,
+                        span[0].1,
+                        span[1].0,
+                        span[1].1,
+                        span[0].2,
+                        span[1].2,
+                        w = if reflect { "r" } else { "t" }
+                    ));
+                }
                 let (v, other, absorbed, left) = crate::planar::surface_filter(&self.u, &beam, n_s, &*read, &mut self.fft)?;
                 coat = Some((input, if input > 0.0 { 1.0 - (other + absorbed) / input } else { 0.0 }));
                 let l = &mut self.report.ledger;
@@ -3930,8 +4033,9 @@ struct Mode {
 }
 
 /// Whether the chains' light must be carried as two polarization components:
-/// when one of them meets a polarizer, a retarder or an LCoS, or a flat
-/// coating or a plate obliquely, where s and p differ.
+/// when one of them meets a polarizer, a retarder, an LCoS or a grating that
+/// tells TE from TM, or a flat coating or a plate obliquely, where s and p
+/// differ.
 fn polarization_matters(scene: &Scene3, seqs: &[oc_core::seq3::SequencePrescription3], half: f64, lam: f64) -> bool {
     seqs.iter().any(|seq| {
         let mut prev = seq.launch.point;
@@ -3945,6 +4049,7 @@ fn polarization_matters(scene: &Scene3, seqs: &[oc_core::seq3::SequencePrescript
             let telling = h.kind == SeqHitKind::Surface
                 && response.is_some_and(|r| match r {
                     SurfaceResponse::Polarizer { .. } | SurfaceResponse::Retarder { .. } => true,
+                    SurfaceResponse::Grating { tm: Some(_), .. } => true,
                     SurfaceResponse::Modulator { device, .. } => matches!(device.kind, ModulatorKind::Lcos(_)),
                     SurfaceResponse::Coating { .. } => oblique && surface.is_some_and(|s| matches!(s.geometry, SurfaceGeometry3::Plane { .. })),
                     _ => false,
@@ -4019,6 +4124,13 @@ impl WaveJob {
             .iter()
             .find(|s| s.id == spec.source)
             .ok_or_else(|| WaveError::OutOfRange("no such source".into()))?;
+        let src_pol = src.polarization;
+        let describe = |p: Option<&oc_core::scene3::SourcePolarization>| match p {
+            Some(oc_core::scene3::SourcePolarization::Linear { angle_deg }) => format!("linearly polarized at {angle_deg}° from the source's frame x"),
+            Some(oc_core::scene3::SourcePolarization::Circular { right }) => format!("{} circularly polarized", if *right { "right" } else { "left" }),
+            Some(oc_core::scene3::SourcePolarization::Jones { x, y }) => format!("with the Jones vector ({:+.3}{:+.3}i, {:+.3}{:+.3}i)", x[0], x[1], y[0], y[1]),
+            _ => "unpolarized".to_string(),
+        };
         let mut lines: Vec<(f64, f64)> = match &src.spectrum {
             oc_core::scene::Spectrum::Monochromatic(l) => vec![(*l, 1.0)],
             oc_core::scene::Spectrum::Lines(v) => v.iter().copied().filter(|l| l.1 > 0.0).collect(),
@@ -4047,8 +4159,18 @@ impl WaveJob {
         for (lam, w) in lines {
             let seqs = oc_trace::extract_sequences3(scene, spec.source, spec.detector, Some(lam), revision)
                 .map_err(|e| WaveError::OutOfRange(format!("no chain from the source to the detector: {e}")))?;
-            let pols: Vec<Option<[f64; 2]>> =
-                if polarization_matters(scene, &seqs, 0.5 * spec.window_mm, lam) { vec![Some([1.0, 0.0]), Some([0.0, 1.0])] } else { vec![None] };
+            // The source's own state as one coherent pair of components;
+            // unpolarized light as two incoherent launches, along x and y;
+            // and where no element tells polarizations apart, one field.
+            let state = src_pol.and_then(|s| s.jones());
+            let pols: Vec<Option<[Cx; 2]>> = if polarization_matters(scene, &seqs, 0.5 * spec.window_mm, lam) {
+                match state {
+                    Some(j) => vec![Some(j)],
+                    None => vec![Some([Cx::ONE, Cx::ZERO]), Some([Cx::ZERO, Cx::ONE])],
+                }
+            } else {
+                vec![None]
+            };
             let share = 1.0 / pols.len() as f64;
             for jones in pols {
                 let jobs = seqs
@@ -4059,9 +4181,10 @@ impl WaveJob {
                 let (jobs, arms) = plan_joins(jobs, spec.window_mm);
                 dirs.extend(jobs.iter().filter(|j| j.joins.is_none()).map(|j| j.final_dir()));
                 let chains: Vec<Chain> = jobs.into_iter().map(|j| Chain::Running(Box::new(j))).collect();
-                let label = match jones {
-                    None => format!("λ {lam} µm"),
-                    Some(j) => format!("λ {lam} µm, launched along {}", if j[1] == 0.0 { "x" } else { "y" }),
+                let label = match (jones, state) {
+                    (None, _) => format!("λ {lam} µm"),
+                    (Some(_), Some(_)) => format!("λ {lam} µm, launched {}", describe(src_pol.as_ref())),
+                    (Some(j), None) => format!("λ {lam} µm, launched along {}", if j[1] == Cx::ZERO { "x" } else { "y" }),
                 };
                 modes.push(Mode { lambda_um: lam, label, chains, arms });
             }

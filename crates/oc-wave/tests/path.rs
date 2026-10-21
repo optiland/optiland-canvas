@@ -2365,6 +2365,9 @@ fn a_coated_plate_takes_its_round_trips_as_it_declares() {
     assert!(dphi.abs() < 1e-5 && (ratio.abs() - 1.0).abs() < 1e-5, "{ratio:?}");
     assert!(coh.report.approximated.iter().any(|x| x.contains("summed as fields")), "{:?}", coh.report.approximated);
     assert!(first.report.approximated.iter().any(|x| x.contains("round trips left out")), "{:?}", first.report.approximated);
+    // Met obliquely by a field of two components, the coating says how far
+    // its s and p amplitudes vary over the field's directions (Q13).
+    assert!(coh.report.approximated.iter().any(|x| x.contains("over the field's directions")), "{:?}", coh.report.approximated);
     // Ten micrometres, bare back face: each mode against its reference.
     let lam = LAM;
     let c0 = th0.cos();
@@ -2389,4 +2392,175 @@ fn a_coated_plate_takes_its_round_trips_as_it_declares() {
         assert!((got - want).abs() < gate, "{mode:?}: {got} vs {want}");
     }
     assert!((t_coh - t_inc).abs() > 1e-3, "the modes must differ here to be told apart: {t_coh} {t_inc}");
+}
+
+/// The angle, in an element's local frame from its `+X` toward its `+Y`, of
+/// the world direction `v` across a beam along world `+X`.
+fn local_angle(s: &Scene3, element: u64, v: Vec3) -> f64 {
+    let tr = s.surfaces.iter().find(|o| o.common.id.0 == element).unwrap().common.transform;
+    v.dot(tr.rotate(Vec3::Y)).atan2(v.dot(tr.rotate(Vec3::X))).to_degrees()
+}
+
+/// The source's frame across a beam along world `+X`: its `x̂` and `ŷ`.
+fn source_frame(s: &Scene3) -> (Vec3, Vec3) {
+    let x = oc_core::scene3::SourcePolarization::frame_x(&s.sources[0].transform, Vec3::X);
+    (x, Vec3::X.cross(x))
+}
+
+/// The f64 tracer's power on `det`, the source's own rays launched in its
+/// declared state.
+fn traced(s: &Scene3, det: DetectorId) -> f64 {
+    use oc_trace::{launch_from_scene, trace3, TraceConfig3};
+    let rays = launch_from_scene(s);
+    let launched: f64 = rays.iter().map(|r| r.flux).sum();
+    let res = trace3(s, &rays, &TraceConfig3::default());
+    res.detectors.iter().find(|d| d.detector == det).unwrap().total_incident / launched
+}
+
+#[test]
+fn a_polarized_source_through_polarizers_and_a_quarter_wave_plate_agrees_with_the_ray_tracer() {
+    // R15 of the expert review and finding 4: a source that declares its
+    // state launches it on the wave path as one coherent pair of components,
+    // and the f64 tracer its rays in it. Linear at 30° through polarizers at
+    // 0° and 60° (in the source's frame) passes cos²30°·cos²60° = 0.1875
+    // (Malus [27]). Right-circular light (`(1, i)/√2`, e^{−iωt}) through a
+    // quarter-wave plate with its fast axis along x̂ leaves linear at −45°
+    // (the Jones calculus [26]): an analyzer there passes it all, one at +45°
+    // none. One model in two implementations, and the closed form.
+    use oc_core::scene3::SourcePolarization;
+    let make = |pol: SourcePolarization, parts: &[(f64, f64, bool)]| {
+        // (x, angle in the source frame, a polarizer or a quarter-wave plate)
+        let mut s = Scene3::new();
+        let _ = source(&mut s);
+        s.sources[0].polarization = Some(pol);
+        let (fx, fy) = source_frame(&s);
+        for &(x, ang, is_polarizer) in parts {
+            let id = s.add_planar_element(Vec3::new(x, 0.0, 0.0), 10.0, 0.0, polarizer(0.0, 0.0), polarizer(0.0, 0.0));
+            let a = ang.to_radians();
+            let local = local_angle(&s, id, fx * a.cos() + fy * a.sin());
+            let r = if is_polarizer { polarizer(local, 0.0) } else { retarder(local, 90.0) };
+            let o = s.surfaces.iter_mut().find(|o| o.common.id.0 == id).unwrap();
+            o.response_front = r.clone();
+            o.response_back = r;
+        }
+        let det = s.add_area_detector(Vec3::new(200.0, 0.0, 0.0), -Vec3::X, 3.0, 3.0, [16, 16]);
+        s.validate().unwrap();
+        (s, det)
+    };
+    let cases = [
+        ("linear at 30° through polarizers at 0° and 60°", make(SourcePolarization::Linear { angle_deg: 30.0 }, &[(50.0, 0.0, true), (100.0, 60.0, true)]), 0.1875),
+        ("right circular through a quarter-wave plate on x̂ and an analyzer at −45°", make(SourcePolarization::Circular { right: true }, &[(50.0, 0.0, false), (100.0, -45.0, true)]), 1.0),
+        ("right circular through a quarter-wave plate on x̂ and an analyzer at +45°", make(SourcePolarization::Circular { right: true }, &[(50.0, 0.0, false), (100.0, 45.0, true)]), 0.0),
+        ("left circular through a quarter-wave plate on x̂ and an analyzer at +45°", make(SourcePolarization::Circular { right: false }, &[(50.0, 0.0, false), (100.0, 45.0, true)]), 1.0),
+    ];
+    for (name, (s, det), want) in cases {
+        let src = s.sources[0].id;
+        let r = wave_path(&s, &spec(src, det, 0.5, 128, 4.0), 1).unwrap();
+        let wave = r.report.ledger.detected / r.report.ledger.launched;
+        let rays = traced(&s, det);
+        measured(&format!("{name}: wave against the closed form"), wave - want);
+        measured(&format!("{name}: wave against the ray tracer"), wave - rays);
+        assert!((wave - want).abs() < 1e-6 && (wave - rays).abs() < 1e-6, "{name}: wave {wave}, rays {rays}, want {want}");
+        assert!(r.report.steps.iter().all(|st| !st.note.contains("launched along y")), "one coherent launch");
+    }
+}
+
+#[test]
+fn a_linearly_polarized_source_keeps_the_half_wave_plate_mach_zehnder_s_fringes_at_cos_40() {
+    // R15 and finding 4: the half-wave plate in one arm of the Mach–Zehnder,
+    // its fast axis at θ = 20° from the light's polarization, turns that arm's
+    // polarization through 2θ = 40°. With unpolarized light the X port holds
+    // half the launched at every Δφ (the test above); with light polarized
+    // along the plate's axis reference the arms still interfere, with
+    // visibility cos 40° = 0.766 [27]: the X port holds
+    // (1 − cos 40°·cos Δφ)/2.
+    use oc_core::scene3::SourcePolarization;
+    let k0 = 2.0 * std::f64::consts::PI / (LAM / 1000.0);
+    let theta: f64 = 20.0;
+    for j in 0..3 {
+        let dphi = j as f64 * std::f64::consts::FRAC_PI_2;
+        let delta = dphi / (k0 * std::f64::consts::SQRT_2);
+        let (mut s, src, dx, _) = mach_zehnder(delta);
+        let id = s.add_planar_element(Vec3::new(100.0, 0.0, 0.0), 10.0, 0.0, retarder(theta, 180.0), retarder(theta, 180.0));
+        // The source polarized along the plate's local +X, its axis reference.
+        let tr = s.surfaces.iter().find(|o| o.common.id.0 == id).unwrap().common.transform;
+        let (fx, fy) = source_frame(&s);
+        let ex = tr.rotate(Vec3::X);
+        s.sources[0].polarization = Some(SourcePolarization::Linear { angle_deg: ex.dot(fy).atan2(ex.dot(fx)).to_degrees() });
+        s.validate().unwrap();
+        let r = wave_path(&s, &spec(src, dx, 0.5, 256, 4.0), 1).unwrap();
+        let got = r.report.ledger.detected / r.report.ledger.launched;
+        let want = 0.5 * (1.0 - (2.0 * theta).to_radians().cos() * dphi.cos());
+        measured(&format!("half-wave plate Mach–Zehnder, polarized source, Δφ = {j}·π/2: X port against (1 − cos 40°·cos Δφ)/2"), got - want);
+        assert!((got - want).abs() < 1e-6, "{j}: {got} vs {want}");
+    }
+}
+
+#[test]
+fn a_crystal_retarder_delays_its_arm_by_its_slab_and_an_ideal_one_does_not() {
+    // Finding 5 of the expert review: a retarder's Jones matrix diag(1, e^{iδ})
+    // fixes its retardance, not a real plate's common optical delay, which
+    // moves an interferometer's fringes. A zero-order quartz half-wave plate
+    // in one arm of the Mach–Zehnder, met square and lit along its fast
+    // axis (so that it leaves the polarization alone), delays that arm by
+    // its fast wave's slab against free space, φ = k₀d(n_o − 1), d =
+    // (λ/2)/(n_e − n_o); the X port then holds (1 − cos φ)/2 at Δφ = 0. An
+    // ideal retarder delays nothing, and the report says so.
+    use oc_core::scene3::{SourcePolarization, Waveplate};
+    let crystal = Waveplate::quartz(0, LAM);
+    let d_mm = 0.5 * LAM / (crystal.n_e - crystal.n_o) / 1000.0;
+    let k0 = 2.0 * std::f64::consts::PI / (LAM / 1000.0);
+    let phi = k0 * d_mm * (crystal.n_o - 1.0);
+    for (name, plate, want) in [
+        ("quartz", SurfaceResponse::Retarder { axis_deg: 0.0, retardance_deg: 180.0, substrate_index: 1.0, crystal: Some(crystal) }, 0.5 * (1.0 - phi.cos())),
+        ("ideal", retarder(0.0, 180.0), 0.0),
+    ] {
+        let (mut s, src, dx, _) = mach_zehnder(0.0);
+        let id = s.add_planar_element(Vec3::new(100.0, 0.0, 0.0), 10.0, 0.0, plate.clone(), plate);
+        let tr = s.surfaces.iter().find(|o| o.common.id.0 == id).unwrap().common.transform;
+        let (fx, fy) = source_frame(&s);
+        let ex = tr.rotate(Vec3::X);
+        s.sources[0].polarization = Some(SourcePolarization::Linear { angle_deg: ex.dot(fy).atan2(ex.dot(fx)).to_degrees() });
+        s.validate().unwrap();
+        let r = wave_path(&s, &spec(src, dx, 0.5, 256, 4.0), 1).unwrap();
+        let got = r.report.ledger.detected / r.report.ledger.launched;
+        measured(&format!("{name} half-wave plate in one arm at Δφ = 0: X port against (1 − cos φ)/2"), got - want);
+        assert!((got - want).abs() < 1e-6, "{name}: {got} vs {want}");
+        if name == "ideal" {
+            assert!(r.report.approximated.iter().any(|a| a.contains("is ideal")), "{:?}", r.report.approximated);
+        }
+    }
+}
+
+#[test]
+fn a_grating_takes_its_tm_efficiency_across_its_grooves() {
+    // A grating that declares TM fractions (light polarized across its
+    // grooves) apart from its TE ones (along them): η_TE = 0.6, η_TM = 0.3
+    // into the order. Light polarized along the grooves sends 0.6 of itself
+    // into the order, across them 0.3, unpolarized light their mean, 0.45;
+    // the f64 tracer, which carries the same table, agrees.
+    use oc_core::scene3::{GratingTm, SourcePolarization, SpectralScalar};
+    for (name, along, want) in [("along the grooves", Some(true), 0.6), ("across the grooves", Some(false), 0.3), ("unpolarized", None, 0.45)] {
+        let (mut s, src, det, g) = grating_scene(20.0, 10.0, 0.6, 0.0, 8.0, 64);
+        let o = s.surfaces.iter_mut().find(|o| o.common.id.0 == g).unwrap();
+        for r in [&mut o.response_front, &mut o.response_back] {
+            if let SurfaceResponse::Grating { tm, .. } = r {
+                *tm = Some(GratingTm { efficiency: SpectralScalar::Constant(0.3), zero_order: SpectralScalar::Constant(0.0) });
+            }
+        }
+        let grooves = o.common.transform.rotate(Vec3::Y);
+        let (fx, fy) = source_frame(&s);
+        s.sources[0].polarization = along.map(|a| {
+            let gg = grooves - Vec3::X * Vec3::X.dot(grooves);
+            let ang = gg.dot(fy).atan2(gg.dot(fx)).to_degrees();
+            SourcePolarization::Linear { angle_deg: if a { ang } else { ang + 90.0 } }
+        });
+        s.validate().unwrap();
+        let r = wave_path(&s, &spec(src, det, 0.5, 256, 4.0), 1).unwrap();
+        let got = r.report.ledger.detected / r.report.ledger.launched;
+        let rays = traced(&s, det);
+        measured(&format!("grating with η_TE 0.6, η_TM 0.3, light {name}: the order's share against the table"), got - want);
+        measured(&format!("grating with η_TE 0.6, η_TM 0.3, light {name}: wave against the ray tracer"), got - rays);
+        assert!((got - want).abs() < 1e-6 && (got - rays).abs() < 1e-6, "{name}: {got}, rays {rays}, want {want}");
+    }
 }

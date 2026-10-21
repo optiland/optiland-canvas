@@ -266,6 +266,7 @@ fn migrate_source(s: &Source, scene3: &mut Scene3, report: &mut MigrationReport)
             sequence: crate::scene3::SamplingSequence::Grid,
         },
         coherence: None,
+        polarization: None,
     }
 }
 

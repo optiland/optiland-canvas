@@ -540,10 +540,27 @@ applies its Jones matrix there, as the ray tracer applies it to a ray along
 the chief ray: the element's front face, its layer on its own axis (its local
 `+X` turned `axis_deg` towards `+Y`, projected across the direction inside
 its glass, so that crossed polarizers leak off axis), its back face; one
-matrix for the whole field, which the report names. An unpolarized source is
-two launches, along `x` and along `y`, mutually incoherent and half its power
-each, added in power like spectral lines [22], whatever the basis: the sum is
-the same in any. Elements in different planes of incidence are so carried
+matrix for the whole field, which the report names. A source that declares
+its polarization (`Source3.polarization`, in the source's frame:
+[polarization](polarization.md)) launches one coherent pair of components in
+that state; an unpolarized source is two launches, along `x` and along `y`,
+mutually incoherent and half its power each, added in power like spectral
+lines [22], whatever the basis: the sum is the same in any (R15 and finding 4
+of the expert review: light polarized along a half-wave plate's axis keeps
+the Mach–Zehnder's fringes at visibility `cos 2θ`, where unpolarized light
+loses them). A grating that declares its TM fractions (`tm`) carries the pair
+in its grooves' basis, the component along them taking the TE fractions and
+the one across them the TM ones, as the f64 tracer does; how a conical mount
+mixes the two is left out, and the report names it. A crystal retarder
+delays both its waves by its fast wave's slab against free space,
+`k₀d(√(n_f² − n₀² sin²θ) − n₀ cos θ)`, on top of its retardance, as a plate
+does (finding 5: the retardance alone does not say where an interferometer's
+fringes sit); an ideal retarder has its retardance alone, and the report
+says so. At an LCoS, the component the chain does not follow is reflected as
+its own beam is, on a copy of the job's state, and what the device absorbs of
+it is measured on it (Q14), not taken from the followed beam's share. A
+coating met by a field of two components reports how far its s and p
+amplitudes vary over the field's directions (Q13). Elements in different planes of incidence are so carried
 through in turn, the s of one becoming a mix of the next one's s and p. Every
 plane wave of a planar step takes its own angle's amplitude for its
 polarization; that the plane waves off the plane of incidence see s and p
@@ -727,6 +744,10 @@ These are acceptance case C53, in `crates/oc-wave/tests/path.rs`.
 | `two_polarizers_pass_unpolarized_light_as_malus_s_law_says` | Malus [27]: `cos²θ/2` at 0°, 30°, 60°, 90°; crossed sheets of extinction ε pass ε [26] | 1e-9; 1e-6, relative | 1.0e-14; 2.0e-14 |
 | `a_retarder_between_crossed_polarizers_passes_half_sin2_2phi_sin2_half_delta` | `sin²2φ·sin²(δ/2)/2` [26], [27] at five (φ, δ); circular light from a quarter-wave plate at 45°, `1/4` through any analyzer | 1e-9 | 9.6e-15; 4.8e-15 |
 | `tilted_crossed_polarizers_leak_as_the_ray_tracer_says` | crossed at ±45° to the plane of incidence, met at 40°: the f64 tracer's polarized trace of the chief ray, bare and in glass of 1.5 (one model, two implementations); bare, `(sin²θ/(1 + cos²θ))²/2` from the axes' projection | 1e-6; 1e-9 | 1.8e-14 and 3.5e-14; 1.9e-14 |
+| `a_polarized_source_through_polarizers_and_a_quarter_wave_plate_agrees_with_the_ray_tracer` | R15 of the expert review: a source linear at 30° through polarizers at 0° and 60°, `cos²30°·cos²60°` (Malus [27]); right circular (`(1, i)/√2`, e^{−iωt}) through a quarter-wave plate on `x̂`, linear at −45° [26]: an analyzer there passes all, at +45° none, and left circular the reverse; each against the f64 tracer launching the source's own rays | 1e-6 | 3.7e-15; 1.8e-14; 3.4e-32; 1.8e-14 |
+| `a_linearly_polarized_source_keeps_the_half_wave_plate_mach_zehnder_s_fringes_at_cos_40` | R15 and finding 4: light polarized along a half-wave plate's axis reference, the plate at 20° in one arm: the X port `(1 − cos 40°·cos Δφ)/2` [27] | 1e-6 | 7.7e-8 |
+| `a_crystal_retarder_delays_its_arm_by_its_slab_and_an_ideal_one_does_not` | finding 5: a zero-order quartz half-wave plate in one arm, lit along its fast axis, delays it by `k₀d(n_o − 1)`: the X port `(1 − cos φ)/2` at Δφ = 0; an ideal one delays nothing and says so | 1e-6 | −2.3e-10; 3.4e-16 |
+| `a_grating_takes_its_tm_efficiency_across_its_grooves` | η_TE 0.6, η_TM 0.3 into the order: light along the grooves, across them, unpolarized (0.45); each against the f64 tracer | 1e-6 | −2.1e-7, −1.1e-7, −1.6e-7; the tracer the same |
 | `a_half_wave_plate_in_one_arm_of_a_mach_zehnder_takes_its_fringes_away_and_a_polarizer_brings_them_back` | Fresnel–Arago [27]: half the launched in the X port at every Δφ; behind an analyzer at β, `1/4 − cos Δφ·cos 2(θ − β)/4` [26], θ = 20°, β = 20°, 50°, 65° | 1e-6 | 4.9e-8 |
 | `a_dmd_s_orders_cross_a_singlet_each_about_its_own_direction` | the orders of a DMD whose blaze lies between two of them, through an N-BK7 singlet (R ±8 mm): each crosses each face about its own direction [10], [17]; the chief ray lies 27 mrad from the nearest | steepest departure 0.54 mrad; rms and spectral departure 5.4 mrad; `numerical` 1e-6 | 0.29 mrad; 3.3 and 3.8 mrad (the weak orders folded at the window's band edge; the difference across two samples read 0.36 by folding their steps); 5.9e-9 (resampling 9.9e-3 at the DMD's take-up) |
 | `crossed_polarizers_before_a_lens_leave_it_a_dark_field_to_carry` | the chain is geometry: behind crossed polarizers a singlet carries an all-zero field, the ledger closed | 1e-12 | detected 1.7e-33 |

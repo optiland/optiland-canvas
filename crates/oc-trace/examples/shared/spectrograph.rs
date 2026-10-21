@@ -3139,6 +3139,7 @@ fn lamp_arm(s: &mut Scene3, lamp: &Lamp, ls: &LampSlit, glass: oc_core::material
             sequence: SamplingSequence::Sobol,
         },
         coherence: None,
+        polarization: None,
     });
     vec![sid]
 }
@@ -3242,6 +3243,7 @@ fn reflector_lamp(s: &mut Scene3, lamp: &Lamp, coil: Vec3, rim: f64, depth: f64,
                     sequence: SamplingSequence::Sobol,
                 },
                 coherence: None,
+                polarization: None,
             });
             sid
         })

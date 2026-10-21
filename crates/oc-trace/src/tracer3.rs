@@ -250,16 +250,22 @@ pub fn launch_from_source(source: &oc_core::scene3::Source3) -> Vec<LaunchRay3> 
 }
 
 /// Pass `pass` of a source's launch rays ([`Source3::emit_pass`](oc_core::scene3::Source3::emit_pass)).
+///
+/// A source that declares a polarization launches each ray in that state, on
+/// the source's frame turned square to the ray
+/// ([`SourcePolarization::frame_x`](oc_core::scene3::SourcePolarization::frame_x));
+/// one that declares none, or `Unpolarized`, launches unpolarized light.
 pub fn launch_from_source_pass(source: &oc_core::scene3::Source3, pass: u32) -> Vec<LaunchRay3> {
+    use oc_core::scene3::SourcePolarization;
     source
         .emit_pass(pass)
         .into_iter()
         .map(|e| LaunchRay3 {
+            pol: source.polarization.filter(|p| p.jones().is_some()).map(|p| PolRay { stokes: p.stokes(e.flux), x: SourcePolarization::frame_x(&source.transform, e.ray.dir) }),
             ray: e.ray,
             lambda_um: e.lambda_um,
             flux: e.flux,
             source: Some(e.source),
-            pol: None,
         })
         .collect()
 }

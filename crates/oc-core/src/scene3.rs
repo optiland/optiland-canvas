@@ -1804,6 +1804,88 @@ pub struct Source3 {
     /// then left out on save.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coherence: Option<CoherentBeam>,
+    /// The polarization the source emits ([`SourcePolarization`]), in its own
+    /// frame. Absent, it emits unpolarized light, and is left out on save.
+    /// The f64 tracer launches its rays in this state and the wave path its
+    /// beam; the f32 preview stays unpolarized.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub polarization: Option<SourcePolarization>,
+}
+
+/// The polarization a source emits, written in its own transverse frame:
+/// `x̂` along the source's local `+Y`, turned square to each ray it emits,
+/// and `ŷ = d̂ × x̂`. The time convention is `e^{−iωt}`, so the Jones vector
+/// `(1, i)/√2` turns from `x̂` toward `ŷ` with time, the handedness
+/// [`crate::polarization::Stokes::circular`] calls right (`S₃ > 0`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum SourcePolarization {
+    /// Unpolarized light, as a source that declares nothing emits.
+    Unpolarized,
+    /// Linear, `angle_deg` from `x̂` toward `ŷ`.
+    Linear { angle_deg: f64 },
+    /// Circular, right-handed (the field turning from `x̂` toward `ŷ`) or
+    /// left.
+    Circular { right: bool },
+    /// Any pure state, its Jones vector's `x̂` and `ŷ` components as
+    /// `[re, im]`; normalized on use.
+    Jones { x: [f64; 2], y: [f64; 2] },
+}
+
+impl SourcePolarization {
+    /// The state's unit Jones vector `(E_x, E_y)` on `x̂`, `ŷ`; `None` for
+    /// unpolarized light.
+    pub fn jones(&self) -> Option<[crate::Cx; 2]> {
+        use crate::Cx;
+        let (x, y) = match *self {
+            SourcePolarization::Unpolarized => return None,
+            SourcePolarization::Linear { angle_deg } => {
+                let (s, c) = angle_deg.to_radians().sin_cos();
+                (Cx::real(c), Cx::real(s))
+            }
+            SourcePolarization::Circular { right } => (Cx::real(1.0), Cx::new(0.0, if right { 1.0 } else { -1.0 })),
+            SourcePolarization::Jones { x, y } => (Cx::new(x[0], x[1]), Cx::new(y[0], y[1])),
+        };
+        let n = (x.norm_sqr() + y.norm_sqr()).sqrt();
+        Some([x * (1.0 / n), y * (1.0 / n)])
+    }
+
+    /// The state's Stokes vector at `flux`, on `x̂`, `ŷ`.
+    pub fn stokes(&self, flux: f64) -> crate::polarization::Stokes {
+        match self.jones() {
+            None => crate::polarization::Stokes::unpolarized(flux),
+            Some([x, y]) => crate::polarization::Stokes::from_jones(x, y).scaled(flux),
+        }
+    }
+
+    /// The frame's `x̂` for a ray along `dir` from a source placed by
+    /// `transform`: the local `+Y` turned square to the ray (the local `+Z`
+    /// where the ray runs along `+Y`).
+    pub fn frame_x(transform: &Isometry3, dir: Vec3) -> Vec3 {
+        let d = dir.normalize();
+        for local in [Vec3::Y, Vec3::Z] {
+            let a = transform.rotate(local);
+            let x = a - d * d.dot(a);
+            if x.length() > 1e-9 {
+                return x.normalize();
+            }
+        }
+        crate::polarization::any_perpendicular(d)
+    }
+
+    /// Why the state cannot be emitted, if it cannot.
+    pub fn check(&self) -> Result<(), String> {
+        match *self {
+            SourcePolarization::Linear { angle_deg } if !angle_deg.is_finite() => Err(format!("a linear polarization needs a finite angle, not {angle_deg}")),
+            SourcePolarization::Jones { x, y } => {
+                if !x.iter().chain(&y).all(|v| v.is_finite()) || x.iter().chain(&y).all(|v| *v == 0.0) {
+                    Err(format!("a Jones vector needs finite components, not all zero: {x:?}, {y:?}"))
+                } else {
+                    Ok(())
+                }
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 /// A coherent beam's profile at its source, for the wave path.
@@ -3015,6 +3097,9 @@ impl Scene3 {
                 field: field.to_string(),
                 reason: reason.to_string(),
             };
+            if let Some(pol) = &s.polarization {
+                pol.check().map_err(|e| range("polarization", &e))?;
+            }
             if let Some(beam) = &s.coherence {
                 beam.check().map_err(|e| range("coherence", &e))?;
             }

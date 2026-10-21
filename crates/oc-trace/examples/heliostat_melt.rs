@@ -430,6 +430,7 @@ fn add_lamp_module(s: &mut Scene3, sample: Vec3, lamp: Option<&LampModel>) -> Ve
                     sequence: SamplingSequence::Sobol,
                 },
                 coherence: None,
+                polarization: None,
             });
             ids.push(sid);
         }

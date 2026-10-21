@@ -3030,3 +3030,164 @@ fn a_sphere_narrower_than_the_beam_is_refused_by_name() {
         assert!(matches!(&refused, Err(oc_wave::WaveError::OutOfRange(m)) if m.contains("faces meet") && m.contains("partly in the glass")), "kR {kr}: {refused:?}");
     }
 }
+
+/// What one of V02's comparisons measured.
+struct HuygensCompare {
+    /// The Strehl ratio as the oracle reads it (the grid's largest sample).
+    strehl: f64,
+    strehl_oracle: f64,
+    /// The rms difference over the grid, of the oracle's own peak there.
+    rms_of_peak: f64,
+    /// The sums over the grid, canvas over oracle.
+    sums: f64,
+    /// Whether the report says the field after a face is undersampled.
+    undersampled: bool,
+}
+
+/// One of V02's singlets against Optiland's HuygensPSF (the fixture
+/// `name`): the canvas's PSF on the oracle's points, normalized as the
+/// oracle's (the ideal peak of a perfect spherical wave filling the exit
+/// pupil), on a canvas window of `grid_n` samples.
+fn singlet_against_huygens(name: &str, grid_n: usize) -> HuygensCompare {
+    use oc_core::build3::SingletGeom;
+    use oc_trace::{trace3, LaunchRay3, TraceConfig3};
+    let path = format!("{}/tests/fixtures/{name}.json", env!("CARGO_MANIFEST_DIR"));
+    let fx: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let num = |k: &str| fx[k].as_f64().unwrap();
+    let (lam, epd, image, fld) = (num("lambda_um"), num("epd_mm"), num("image_distance_from_back_vertex_mm"), num("field_deg"));
+    let (r1, r2, t) = (num("r1_mm"), num("r2_mm"), num("thickness_mm"));
+    let centre: Vec<f64> = fx["centre_mm"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+    let grid: Vec<f64> = fx["grid_mm"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+    let psf: Vec<Vec<f64>> = fx["psf_rows_y_then_x"].as_array().unwrap().iter().map(|r| r.as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect()).collect();
+    let n_img = grid.len();
+    let spacing = grid[1] - grid[0];
+    eprintln!("oracle for {name}: {}", fx["oracle"]);
+    // The lens: front vertex at 100 − t/2, the stop t/40 before it (0.1 mm
+    // at full size: clear of the slab the tilted beam crosses the face in,
+    // which starts 25 µm before the vertex; Optiland's stop is the vertex
+    // plane, and the 2° beam's footprint moves 3.5 µm, 0.14% of its radius),
+    // the source's axial ray through the stop's centre at the field angle.
+    let mut s = Scene3::new();
+    let (front, back) = (100.0 - 0.5 * t, 100.0 + 0.5 * t);
+    let stop = front - t / 40.0;
+    let th = fld.to_radians();
+    let d = Vec3::new(th.cos(), th.sin(), 0.0);
+    let src = s.add_collimated_beam(Vec3::new(stop, 0.0, 0.0) - d * 0.1, 1.0, 1.0, 1, Spectrum::Monochromatic(lam));
+    if fld != 0.0 {
+        let q = glam::DQuat::from_rotation_arc(Vec3::X, d);
+        let pos = s.sources[0].transform.pos;
+        s.sources[0].transform = oc_core::Isometry3::new(pos, [q.x, q.y, q.z, q.w]).unwrap();
+    }
+    // The rim just short of where the faces would meet: past the window's
+    // corners, so that no ray the face is traced along meets the edge.
+    let a_max = (r1 * r1 - (r1.abs() - 0.5 * t).powi(2)).sqrt();
+    let g = SingletGeom { r1_mm: r1, r2_mm: r2, thickness_mm: t, semi_aperture_mm: 0.95 * a_max, conic1: 0.0, conic2: 0.0 };
+    s.add_singlet(Vec3::new(100.0, 0.0, 0.0), g, 1.5168, 64.17);
+    s.add_aperture(Vec3::new(stop, 0.0, 0.0), 0.5 * epd, 0.0);
+    s.apertures.last_mut().unwrap().shape.clear_opening = oc_core::scene3::PlanarShape2::Disc { radius_mm: 0.5 * epd };
+    let width = n_img as f64 * spacing;
+    // The oracle's grid: its centre (Optiland's y is the canvas's y), the
+    // detector square to the axis at the paraxial focus.
+    let det = s.add_area_detector(Vec3::new(back + image, centre[1], centre[0]), -Vec3::X, 0.5 * width, 0.5 * width, [n_img, n_img]);
+    s.validate().unwrap();
+    let half = 0.5 * epd / th.cos();
+    let mut sp = spec(src, det, 0.3, grid_n, 2.2 * 1.15 * half);
+    sp.beam = BeamProfile::TopHat { radius_mm: 1.15 * half };
+    sp.readout = Readout::Diffracted { samples_per_pixel: 1 };
+    let r = wave_path(&s, &sp, 1).unwrap();
+    // The ideal peak: P·π·sin²α/λ², α the half-angle the exit pupil
+    // subtends at the oracle's centre (traced as in the f/10 test).
+    let mut lens = s.clone();
+    lens.sources.clear();
+    lens.apertures.clear();
+    lens.detectors.clear();
+    let last = |o: Vec3, d: Vec3| {
+        let ray = oc_core::vec3::Ray3::new(o, d.normalize()).unwrap();
+        let tr = trace3(&lens, &[LaunchRay3 { ray, lambda_um: lam, flux: 1.0, source: None, pol: None }], &TraceConfig3 { ghosts: false, polarization: false, ..TraceConfig3::default() });
+        let l = *tr.segments.iter().max_by(|a, b| a.opl0_mm.partial_cmp(&b.opl0_mm).unwrap()).unwrap();
+        (l.a, (l.b - l.a).normalize())
+    };
+    let (pc, dc) = last(Vec3::new(stop, 0.0, 0.0), Vec3::new(1.0, 1e-3, 0.0));
+    let x_xp = pc.x - pc.y / dc.y * dc.x;
+    let (pm, dm) = last(Vec3::new(stop - 10.0 * t, 0.5 * epd, 0.0), Vec3::X);
+    let h_xp = (pm.y + (x_xp - pm.x) * dm.y / dm.x).abs();
+    let na = h_xp / h_xp.hypot(back + image - x_xp);
+    let lam_mm = lam / 1000.0;
+    let i0 = r.arriving * std::f64::consts::PI * na * na / (lam_mm * lam_mm) * th.cos();
+    let pix = spacing * spacing;
+    // The canvas's pixels on the oracle's rows (its y, the canvas's) and
+    // columns (its x, the canvas's z), whichever way the detector's own axes run.
+    let dt = s.detectors.iter().find(|x| x.id() == det).unwrap().common.transform;
+    let (eu, ev) = (dt.rotate(Vec3::X), dt.rotate(Vec3::Y));
+    let half_n = (n_img as f64 - 1.0) / 2.0;
+    let mut canvas = vec![0.0; n_img * n_img];
+    for j in 0..n_img {
+        for i in 0..n_img {
+            let w = eu * ((i as f64 - half_n) * spacing) + ev * ((j as f64 - half_n) * spacing);
+            let (row, col) = ((w.y / spacing + half_n).round() as usize, (w.z / spacing + half_n).round() as usize);
+            canvas[row * n_img + col] = 100.0 * r.power[j * n_img + i] / pix / i0;
+        }
+    }
+    // Strehl as the oracle reads it: the largest sample of the grid.
+    let peak_oracle = psf.iter().flatten().cloned().fold(0.0, f64::max);
+    let (strehl, strehl_oracle) = (canvas.iter().cloned().fold(0.0, f64::max) / 100.0, num("strehl"));
+    let mut sq = 0.0;
+    for j in 0..n_img {
+        for i in 0..n_img {
+            sq += (canvas[j * n_img + i] - psf[j][i]).powi(2);
+        }
+    }
+    let rms = (sq / (n_img * n_img) as f64).sqrt();
+    let (sc, so): (f64, f64) = (canvas.iter().sum(), psf.iter().flatten().sum());
+    let undersampled = r.report.warnings.iter().any(|w| matches!(w, SamplingWarning::Undersampled { what, .. } if what.contains("after face")));
+    HuygensCompare { strehl, strehl_oracle, rms_of_peak: rms / peak_oracle, sums: sc / so, undersampled }
+}
+
+#[test]
+fn stronger_na_and_off_axis_singlets_against_optiland_huygens_psf() {
+    // V02 of the expert review: the f/10 comparison above says nothing of a
+    // stronger NA or a field off the axis. Against Optiland's HuygensPSF at
+    // the paraxial focus (fixtures of tools/fixtures/huygens_singlet.py
+    // --v02; a verification against an independent Huygens integral over
+    // the exit pupil, not a measurement):
+    // - the singlet at f/10 two degrees off axis, its coma along y: the PSF
+    //   on the oracle's grid must agree as on the axis;
+    // - the singlet at f/4 on and off axis, on a 2048-sample window: the
+    //   sphere the lens makes converges at 218 cycles/mm at the window's
+    //   edge, which its 7.6 µm samples cannot hold (Nyquist 66/mm), and the
+    //   report must say so; the PSF it then reads is recorded, not claimed
+    //   (holding the sphere would take some 8192 samples across, the cap).
+    // The f/2 cases, on 4096 samples, are the ignored test below.
+    let f10 = singlet_against_huygens("huygens_singlet_f10_2deg", 2048);
+    measured(&format!("V02, f/10 at 2°: Strehl, canvas {:.5} against Optiland {:.5}", f10.strehl, f10.strehl_oracle), f10.strehl - f10.strehl_oracle);
+    measured("V02, f/10 at 2°: rms difference over the image grid, of the oracle's peak", f10.rms_of_peak);
+    measured("V02, f/10 at 2°: sums over the grid, canvas over Optiland", f10.sums);
+    assert!(!f10.undersampled && f10.rms_of_peak < 2e-3 && (f10.strehl / f10.strehl_oracle - 1.0).abs() < 0.02 && (f10.sums - 1.0).abs() < 1e-2, "{:?}", (f10.strehl, f10.strehl_oracle, f10.rms_of_peak, f10.sums));
+    for (name, label) in [("huygens_singlet_f4_0deg", "f/4 on the axis"), ("huygens_singlet_f4_2deg", "f/4 at 2°")] {
+        let c = singlet_against_huygens(name, 2048);
+        measured(&format!("V02, {label}, 2048 samples: Strehl, canvas {:.5} against Optiland {:.5}", c.strehl, c.strehl_oracle), c.strehl - c.strehl_oracle);
+        measured(&format!("V02, {label}, 2048 samples: rms difference over the image grid, of the oracle's peak"), c.rms_of_peak);
+        measured(&format!("V02, {label}, 2048 samples: sums over the grid, canvas over Optiland"), c.sums);
+        assert!(c.undersampled, "{label}: an undersampled field must be reported");
+    }
+}
+
+#[test]
+#[ignore = "two paths on 4096² windows: minutes and gigabytes; run with --ignored"]
+fn an_f2_singlet_against_optiland_huygens_psf_on_4096_samples() {
+    // V02 at f/2: a singlet a tenth the size (R ±5 mm, 1.6 mm thick), whose
+    // converging sphere a 3.1 mm window of 4096 samples holds (417 cycles/mm
+    // at its edge, Nyquist 658/mm), on and off the axis, against Optiland's
+    // HuygensPSF at the paraxial focus: the PSF's centre, at half the
+    // diffraction scale, where the spherical aberration leaves a Strehl
+    // ratio of about 0.01.
+    for (name, label) in [("huygens_singlet_f2_0deg_tenth", "f/2 on the axis"), ("huygens_singlet_f2_2deg_tenth", "f/2 at 2°")] {
+        let c = singlet_against_huygens(name, 4096);
+        measured(&format!("V02, {label}, 4096 samples: Strehl, canvas {:.5} against Optiland {:.5}", c.strehl, c.strehl_oracle), c.strehl - c.strehl_oracle);
+        measured(&format!("V02, {label}, 4096 samples: rms difference over the image grid, of the oracle's peak"), c.rms_of_peak);
+        measured(&format!("V02, {label}, 4096 samples: sums over the grid, canvas over Optiland"), c.sums);
+        // Loose marks on the measured curve: 1.8% and 7.8% in the Strehl
+        // ratio, 2.0e-3 and 5.0e-3 of the peak in rms, on and off the axis.
+        assert!(!c.undersampled && c.rms_of_peak < 1e-2 && (c.strehl / c.strehl_oracle - 1.0).abs() < 0.1 && (c.sums - 1.0).abs() < 0.03, "{label}: {:?}", (c.strehl, c.strehl_oracle, c.rms_of_peak, c.sums));
+    }
+}

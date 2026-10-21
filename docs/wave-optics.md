@@ -182,8 +182,14 @@ Physically the cell transmits `f·|U|²ΔA`, but the sample `f·U` carries only
 error of the sampled edge: the norm the cell average discards. It is booked
 as `subcell_projection`, separately from the `absorbed_aperture` of the
 opaque part. It is not the same claim as "beyond the grid's band": a cell
-average is not a band projector, and the norm the band cannot hold is a
-separate measurement, not made here.
+average is not a band projector (Q3 of the expert review). `edge_budget`
+measures the two apart: the mask laid `s` times finer, its cells tiling the
+grid's, its spectrum taken on the grid's own frequencies, and what the band
+holds of it subtracted from the open area. For a 0.2 mm strip whose edges sit
+on cell boundaries the sub-cell error is nought and 1.0% of the power still
+lies beyond a 10 µm grid's band; a quarter into a cell the two are 1.9% and
+1.0%; both halve with the cell (R19, test below). The samples keep the
+coherent amplitude `f·U`; `√f·U` would close the power and change the field.
 
 The thin lens warns `Undersampled` when its chirp changes by more than π
 between neighbouring samples at the window edge.
@@ -769,6 +775,8 @@ These are acceptance case C53, in `crates/oc-wave/tests/path.rs`.
 | `a_gaussian_through_a_singlet_waists_where_self_predicts` | Self [14] with the singlet's focal length and principal planes traced by the f64 tracer (an N-BK7 equiconvex lens, R ±50 mm, 4 mm) | 1e-3 | waist position 2.5e-4 of its Rayleigh range (2.9 µm); radius 5.1e-5 |
 | `a_tilted_plate_displaces_the_beam_where_the_rays_say` | the chief ray's landing point behind a plate at 30° | 0.05 pixel | 5.2e-5 mm |
 | `a_singlet_psf_matches_optiland_huygens_psf` | Optiland's `HuygensPSF` of the same singlet at f/10, at its paraxial focus (oracle, below) | Strehl ±0.01; rms 1e-2 of the ideal peak | Strehl 0.8622 against 0.8642; rms 2.8e-4 |
+| `stronger_na_and_off_axis_singlets_against_optiland_huygens_psf` | V02 of the expert review: Optiland's `HuygensPSF` (fixtures of `huygens_singlet.py --v02`) of the singlet at f/10 two degrees off axis; and at f/4 on and off axis on a 2048-sample window, whose 7.6 µm samples cannot hold the converging sphere (218 cycles/mm at the edge, Nyquist 66/mm) | f/10 at 2°: Strehl ±2%, rms 2e-3 of the oracle's peak, sums ±1%; f/4: the report must say the field after the face is undersampled | f/10 at 2°: 0.6119 against 0.6183, rms 6.1e-4, sums 1.002; f/4: flagged (6.6 rad between samples), the PSF's centre within 2% (0.0138 against 0.0141, at 2° 0.0108 against 0.0101) but the halo 5.6 times too faint (sums over the grid 0.18) |
+| `an_f2_singlet_against_optiland_huygens_psf_on_4096_samples` (ignored by default: minutes and gigabytes) | V02 at f/2: a singlet a tenth the size (R ±5 mm, 1.6 mm thick) on a 3.1 mm window of 4096 samples, which holds its sphere (417 cycles/mm, Nyquist 658/mm), on and off axis | Strehl ±10%, rms 1e-2 of the oracle's peak, sums ±3% | on the axis 0.01151 against 0.01130, rms 2.0e-3, sums 1.015; at 2° 0.00877 against 0.00952, rms 5.0e-3, sums 1.009 |
 | `a_tilted_detector_reads_the_beam_on_its_own_plane` | Kogelnik–Li [13] on a face tilted 30°, times the obliquity: each pixel's power against the 8 × 8 sub-pixel mean of the law, and the power caught | 2e-3 of the peak; power on the face 3e-3 | 8.4e-4; 1.8e-8 (−1.9e-3 under the bilinear spectrum reading before E3) |
 | `an_aperture_whose_outer_extent_the_beam_passes_beyond_leaves_it_alone` | the tracer's aperture: light beyond the outer extent passes; against an open aperture at the same plane | bit-identical | identical |
 | `an_annular_stop_whose_centre_blocks_the_axial_ray_lets_the_arago_spot_through` | R18 of the expert review: a top-hat beam 1 µm before an annulus 0.1 < r < 0.3 mm, whose centre stops the axial ray; on the axis 15, 25 and 40 mm behind it, Heurtley's exact field [5] taken for each edge by Babinet, `(z/R_in) e^{ikR_in} − (z/R_out) e^{ikR_out}`; the report names the stopped axial ray | 1e-2 of `max(|U/U₀|², 1)` | 1.8e-4, 3.5e-3, 3.5e-3 on 1.55, 3.97, 3.75 |
@@ -960,6 +968,7 @@ run them with `-- --nocapture` to print the measured values.
 | `the_on_axis_field_of_a_circular_aperture_matches_heurtley` | the exact on-axis Rayleigh–Sommerfeld field [5], Fresnel numbers 10 to 0.25 | 5e-3 at a/Δx = 256; error ratio > 3 on halving Δx; Richardson-extrapolated 3e-4 | 2.6e-3 → 1.6e-6 across the range; ratio 4.04–4.05 (second order); extrapolated 3.9e-5 (N_F 10) to 2.6e-8 (N_F 0.25). Band-limited ASM 2.2e-3 at N_F 10; `Auto` (impulse response) 9.4e-5 to 5.8e-6 in the far field |
 | `the_angular_spectrum_converges_on_exact_fields_as_each_sampling_is_refined` | R11 of the expert review: a Gaussian (w₀ 50 µm) 20 mm on against its continuous angular spectrum summed by quadrature [1], [33]; a circular aperture on its axis against Heurtley [5]; pitch, window, padding and output sampling refined one at a time | each refinement no worse; Gaussian 1e-9 of the peak, output sampling 1e-12; Heurtley second order in the pitch (each halving > 3×) | Gaussian, pitch 32 → 8 µm: 1.3e-3, 8.7e-12, 8.6e-13; window 0.256 → 1.024 mm: 0.62, 2.7e-12, 8.6e-13; pad 1 → 4: 1.1e-5, 2.7e-12, 1.4e-12; output pitch 4 → 1 µm: 4.6e-15 apart. Heurtley, a/Δx 64 → 256: 4.2e-2, 1.1e-2, 3.3e-3; window 4a → 16a: 4.22e-2 to 4.27e-2; pad 1 → 4: 7.8e-2, 4.2e-2, 4.3e-2 |
 | `a_square_aperture_fresnel_pattern_matches_the_fresnel_integrals` | Fresnel diffraction of a square through C and S [1], [15] | 1.5e-3 at 201 samples across; ratio > 3 | 3.5e-3 → 8.4e-4 (ratio 4.2), each method in its regime |
+| `an_edge_s_subcell_error_and_its_power_beyond_the_band_are_different_things` | R19 and Q3 of the expert review: a 0.2 mm strip, its edges on a cell boundary, a quarter in and at a cell's centre, on 10, 5 and 2.5 µm grids (`edge_budget`, the mask nine times finer): what the area passes, what the samples carry, the sub-cell error, the power beyond the band, the coherent error in the band | the area and `carried + subcell` to 1e-12; no sub-cell error on a boundary, a band cut all the same; each halves with the cell (±0.05, ±0.2); 9 against 27 times finer within 5% | 1e-16 sub-cell, 1.0e-2 beyond the band on a boundary at 10 µm; quarter: 1.9e-2 and 1.0e-2; ratios 2.000, 1.999; coherent error 3.6e-2 → 1.8e-2; 1.1% |
 | `a_gaussian_beam_spreads_as_kogelnik_and_li_say` | `w(z)`, the complex field, Gouy phase [13] | 1e-5 | radius 3.5e-7; field 2.3e-7 of peak |
 | `a_thin_lens_focuses_a_gaussian_where_self_predicts` | Self's waist position and size [14], cross-checked through the q-parameter | 1e-4 | waist 8.1e-10; wavefront flat to 2.9e-5 rad at w₀″ |
 | `a_cosine_grating_reimages_at_the_exact_talbot_distance` | `z_T = λ/(1 − √(1 − λ²/p²))` and the half-period shift at `z_T/2` [12] | 1e-10 (the absolute phase `k·z_T ≈ 1.3e5` rad puts round-off near 1e-11) | 5.1e-12; 2.6e-12 |
@@ -1024,6 +1033,22 @@ Two things about the oracle itself. Its value is converged in pupil rays
 `strehl_ratio()` is the largest sample of the image grid, and an even grid has
 no sample on the axis: on 64 points it reads 0.8503, on 65 the 0.8642 above.
 The fixture uses an odd grid.
+
+**Stronger NA and off axis (V02 of the expert review).** With `--v02` the
+same script writes five more fixtures, `huygens_singlet_<tag>.json`: the
+singlet at f/10 two degrees off axis, at f/4 on and off axis, and a lens a
+tenth the size (R ±5 mm, made 1.6 mm thick so that its pupil fits well inside
+where its faces meet) at f/2 on and off axis. Each records the image grid's
+centre, which `HuygensPSF` takes as the mean of a six-ray trace, not the chief
+ray; away from f/10 the grid holds the PSF's centre at half the diffraction
+scale, not the whole blur, and 384 pupil rays. The canvas places its stop a
+fortieth of the lens's thickness before the vertex (Optiland's is the vertex
+plane), clear of the slab a tilted beam crosses the face in; the 2° beam's
+footprint moves 0.14% of its radius. Its Strehl ratio is read as the oracle's,
+the grid's largest sample. Measured: f/10 at 2° agrees as on the axis; f/2
+agrees on a window of 4096 samples, which holds its converging sphere; f/4 at
+full size does not, and the path says its field is undersampled (above, and
+What it does not do).
 
 **Which Optiland.** The oracle is Optiland's current development line, not a
 release: [github.com/optiland/optiland](https://github.com/optiland/optiland)
@@ -1097,6 +1122,14 @@ carries the light beside a body as an arm of its own.
   rays follow the beam's paraxial wavefront, not the field's own: a field that
   departs from it (aberrations, a hologram's orders inside one lattice cell)
   is traced along it, and the report gives the departure.
+- **A converging beam it cannot sample.** The samples carry the field's
+  whole phase but for a linear carrier, so a lens's converging sphere must be
+  resolved by the window across it: a singlet at f/4 and 12 mm across needs
+  some 8192 samples, which the path does not reach; it reports the field
+  undersampled and its PSF's halo comes out several times too faint (V02,
+  above). No NA claim is made past the cases measured there: f/10 on and two
+  degrees off the axis, and f/2 on a lens small enough for its window to
+  hold its sphere.
 - **A body narrower than the beam.** The light outside a lens's rim is
   stopped there, as by a mount; a body whose two faces meet across the window
   (a sphere) is refused. The Mie comparison of the bundle's B40 is not run

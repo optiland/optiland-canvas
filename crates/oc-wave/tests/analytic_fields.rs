@@ -526,3 +526,58 @@ fn the_angular_spectrum_converges_on_exact_fields_as_each_sampling_is_refined() 
     assert!((ew[1] - ew[2]).abs() <= (ew[0] - ew[2]).abs() + 1e-12 && (ew[2] / ep[0] - 1.0).abs() < 0.5, "{ew:?} {ep:?}");
     assert!((eq[1] - eq[2]).abs() <= (eq[0] - eq[2]).abs() + 1e-12, "{eq:?}");
 }
+
+#[test]
+fn an_edge_s_subcell_error_and_its_power_beyond_the_band_are_different_things() {
+    // R19 and Q3 of the expert review. A strip 0.2 mm wide on a uniform
+    // field, its edges moved across a cell (on a cell boundary, a quarter in,
+    // at the centre), and the grid refined (10, 5, 2.5 µm across a 0.64 mm
+    // window). Reported apart: what the open area passes, what the samples
+    // carry (each cell's covered fraction f times the field, the coherent
+    // amplitude kept: never √f), the sub-cell projection error Σ(f − f²)ΔA
+    // between them, the power the true mask holds beyond the grid's band
+    // (the mask laid nine times finer, its spectrum on the grid's own
+    // frequencies), and the coherent error in the band. The two losses are
+    // not one: on a cell boundary the sub-cell error is nought and the band
+    // still cuts the edge's spectrum; both fall with the cell, as Δx.
+    use oc_wave::elements::edge_budget;
+    let mut fft = Fft2::new();
+    let w = 0.1;
+    let mut by_dx: Vec<(f64, f64, f64, f64)> = Vec::new();
+    for dx in [0.01f64, 0.005, 0.0025] {
+        let n = (0.64 / dx).round() as usize;
+        let g = Grid2::new([n, 4], [dx, dx], [0.0, 0.0]).unwrap();
+        for (name, offset) in [("on a cell boundary", 0.5), ("a quarter into a cell", 0.25), ("at a cell's centre", 0.0)] {
+            let strip = Shape::Rect { c: [offset * dx, 0.0], h: [w, 1.0] };
+            let b = edge_budget(&strip, &g, 9, &mut fft).unwrap();
+            let area = 2.0 * w * 4.0 * dx;
+            measured(&format!("edge sweep, Δx = {dx} mm, edges {name}: the power beyond the band, of the transmitted"), b.band_cut / b.transmitted);
+            println!("    transmitted {:.6e}, carried {:.6e}, sub-cell {:.3e}, beyond the band {:.3e}, coherent in band {:.3e}", b.transmitted, b.carried, b.subcell / b.transmitted, b.band_cut / b.transmitted, b.coherent_in_band);
+            assert!((b.transmitted - area).abs() < 1e-12 * area, "{name}: {} vs {area}", b.transmitted);
+            assert!((b.transmitted - b.carried - b.subcell).abs() < 1e-12 * area);
+            assert!(b.band_cut > 0.0);
+            if offset == 0.5 {
+                // f is 0 or 1 in every cell: no sub-cell error, a band cut all the same.
+                assert!(b.subcell.abs() < 1e-15 * area && b.band_cut > 1e-3 * area, "{b:?}");
+            } else {
+                assert!((b.subcell - b.band_cut).abs() > 0.1 * b.band_cut, "{name}: {b:?}");
+            }
+            if offset == 0.25 {
+                by_dx.push((dx, b.subcell / area, b.band_cut / area, b.coherent_in_band));
+            }
+        }
+    }
+    // Both losses fall as Δx: halving the cell halves each.
+    for pair in by_dx.windows(2) {
+        let (r_sub, r_cut) = (pair[0].1 / pair[1].1, pair[0].2 / pair[1].2);
+        measured(&format!("edge sweep, Δx {} → {} mm: the beyond-band power's ratio", pair[0].0, pair[1].0), r_cut);
+        println!("    sub-cell ratio {r_sub:.4}, beyond-band ratio {r_cut:.4}, coherent in band {:.3e} → {:.3e}", pair[0].3, pair[1].3);
+        assert!((r_sub - 2.0).abs() < 0.05 && (r_cut - 2.0).abs() < 0.2, "{r_sub} {r_cut}");
+    }
+    // The finer mask converges: nine and twenty-seven times finer agree.
+    let g = Grid2::new([64, 4], [0.01, 0.01], [0.0, 0.0]).unwrap();
+    let strip = Shape::Rect { c: [0.0025, 0.0], h: [w, 1.0] };
+    let (a, b) = (edge_budget(&strip, &g, 9, &mut fft).unwrap(), edge_budget(&strip, &g, 27, &mut fft).unwrap());
+    measured("edge sweep: beyond-band power with the mask 9 against 27 times finer, relative", (a.band_cut - b.band_cut) / b.band_cut);
+    assert!(((a.band_cut - b.band_cut) / b.band_cut).abs() < 0.05, "{a:?} {b:?}");
+}

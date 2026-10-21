@@ -478,6 +478,72 @@ pub fn apply_transmittance(u: &mut Field2, t: &[Cx], report: &mut WaveReport) ->
     Ok(())
 }
 
+/// What a sharp-edged mask does to a uniform unit field on `grid`, read four
+/// ways apart (Q3 and R19 of the expert review of the wave engine).
+///
+/// The samples carry the mask as each cell's covered fraction `f` times the
+/// field, the coherent amplitude this crate lays on every edge. So the power
+/// they carry, `Σ f² ΔA`, falls short of what the open area passes, `Σ f ΔA`,
+/// by the sub-cell projection error `Σ (f − f²) ΔA` (`subcell_projection` on
+/// a path), exactly. That error is not the power beyond the grid's band: a
+/// cell average is not a band projection, and an edge on a cell boundary has
+/// `f` of 0 or 1 everywhere and still a spectrum without end. The power the
+/// true mask holds beyond the band is measured here apart: the mask laid `s`
+/// times finer per axis (its cells tiling the grid's exactly), its spectrum
+/// taken on the grid's own frequencies, and what the band holds of it
+/// subtracted from the open area.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EdgeBudget {
+    /// What the open area passes: `Σ f ΔA`, the area itself.
+    pub transmitted: f64,
+    /// What the grid's samples carry: `Σ f² ΔA`.
+    pub carried: f64,
+    /// The sub-cell projection error, `Σ (f − f²) ΔA`.
+    pub subcell: f64,
+    /// The power the mask holds beyond the grid's band: the open area less
+    /// the finer mask's power on the grid's own frequencies.
+    pub band_cut: f64,
+    /// The coherent error in the band: the grid's spectrum against the finer
+    /// mask's on the grid's frequencies, over the latter's norm there.
+    pub coherent_in_band: f64,
+}
+
+/// [`EdgeBudget`] of `shape` on `grid`, the finer mask `s` times finer per
+/// axis (`s ≥ 3`).
+pub fn edge_budget(shape: &Shape, grid: &Grid2, s: usize, fft: &mut crate::Fft2) -> Result<EdgeBudget, WaveError> {
+    if s < 3 {
+        return Err(WaveError::OutOfRange("the finer mask must be at least three times finer".into()));
+    }
+    let [dx, dy] = grid.pitch_mm;
+    let da = dx * dy;
+    let t = coverage(grid, shape)?;
+    let transmitted: f64 = t.iter().sum::<f64>() * da;
+    let carried: f64 = t.iter().map(|f| f * f).sum::<f64>() * da;
+    let subcell: f64 = t.iter().map(|f| f - f * f).sum::<f64>() * da;
+    // The finer grid: the same window, its cells tiling the grid's, so its
+    // centre sits (s − 1)/(2s) of a cell off the grid's.
+    let sh = |d: f64| -(s as f64 - 1.0) / (2.0 * s as f64) * d;
+    let fine = Grid2::new([grid.n[0] * s, grid.n[1] * s], [dx / s as f64, dy / s as f64], [grid.center_mm[0] + sh(dx), grid.center_mm[1] + sh(dy)])?;
+    let tf = coverage(&fine, shape)?;
+    let mut uc = Field2::zeros(*grid, 1.0)?;
+    for (z, f) in uc.data.iter_mut().zip(&t) {
+        *z = Cx::real(*f);
+    }
+    let mut uf = Field2::zeros(fine, 1.0)?;
+    for (z, f) in uf.data.iter_mut().zip(&tf) {
+        *z = Cx::real(*f);
+    }
+    // The grid's own frequencies, both spectra in absolute coordinates.
+    let df = [grid.freq_pitch(0), grid.freq_pitch(1)];
+    let f0 = [-((grid.n[0] / 2) as f64) * df[0], -((grid.n[1] / 2) as f64) * df[1]];
+    let sc = crate::czt::czt2(&uc, f0, df, grid.n, fft);
+    let sf = crate::czt::czt2(&uf, f0, df, grid.n, fft);
+    let dfa = df[0] * df[1];
+    let in_band: f64 = sf.iter().map(|z| z.norm_sqr()).sum::<f64>() * dfa;
+    let diff: f64 = sc.iter().zip(&sf).map(|(a, b)| (*a - *b).norm_sqr()).sum::<f64>() * dfa;
+    Ok(EdgeBudget { transmitted, carried, subcell, band_cut: transmitted - in_band, coherent_in_band: (diff / in_band.max(f64::MIN_POSITIVE)).sqrt() })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

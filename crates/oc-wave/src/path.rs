@@ -1292,7 +1292,7 @@ impl ChainJob {
             let exit = h.point + d_out * (s_max + 1e-3);
             if (entry - resume).dot(d_in) <= 0.0 || (next_point - exit).dot(d_out) <= 0.0 {
                 return Err(WaveError::OutOfRange(format!(
-                    "#{} ({}): the surface where the beam meets it is too close to the next one on the path for a plane to fit between them",
+                    "#{} ({}): the surface where the beam meets it is too close to the next one on the path for a plane to fit between them (a body whose faces meet across the window, as a sphere's do at its equator, is not carried: the field on a plane through it would lie partly in the glass and partly beside it)",
                     h.object.0, h.label
                 )));
             }

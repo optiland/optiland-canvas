@@ -2995,3 +2995,38 @@ fn an_off_centre_window_leaves_a_mirror_and_a_dmd_where_its_light_goes() {
     }
     measured("DMD, a window on the chief ray: resampling at the take-up, of the launched", on.resampling / on.launched);
 }
+
+#[test]
+fn a_sphere_narrower_than_the_beam_is_refused_by_name() {
+    // B40 of the wave-optics bundle asks for the wave path's curved-surface
+    // approximation against the Mie solution (tests/mie.rs) for a sphere of
+    // index 1.5 under a plane wave, kR = 1000 and 100 at 550 nm. The path
+    // cannot carry that case, and says so rather than run something else:
+    // a plane wave wider than the sphere puts light both through it and
+    // beside it, so a plane through the sphere holds a field partly in the
+    // glass and partly in air, which one field of one medium cannot be; and
+    // the sphere's two faces meet at its equator, leaving no plane between
+    // them. (A body narrower than the beam otherwise stops the light outside
+    // its rim, as a lens's mount does; a sphere has no mount.)
+    use oc_core::id::LayerId;
+    use oc_core::scene3::{Body3, ObjectCommon, SolidGeometry3, SurfaceProps3};
+    let lam = 0.55;
+    let k = 2.0 * std::f64::consts::PI / (lam / 1000.0);
+    for kr in [1000.0, 100.0] {
+        let r = kr / k;
+        let mut s = Scene3::new();
+        let src = s.add_collimated_beam(Vec3::ZERO, 1.0, 1.0, 1, Spectrum::Monochromatic(lam));
+        let id = s.alloc_object_id();
+        let mut common = ObjectCommon::new(id, LayerId(0));
+        common.transform = oc_core::Isometry3::from_pos(Vec3::new(1.0, 0.0, 0.0));
+        // Index 1.5 at any wavelength: an Abbe number past any glass's.
+        s.bodies.push(Body3 { common, geometry: SolidGeometry3::Sphere { radius_mm: r }, material: oc_core::material::Material::AbbePoint { nd: 1.5, vd: 1e9 }, absorption: Default::default(), surface: SurfaceProps3::default(), priority: 0 });
+        perfect_ar(&mut s);
+        let det = s.add_area_detector(Vec3::new(1.0 + 2.0 * r, 0.0, 0.0), -Vec3::X, 1.5 * r, 1.5 * r, [64, 64]);
+        s.validate().unwrap();
+        let mut sp = spec(src, det, 0.1, 1024, 5.0 * r);
+        sp.beam = BeamProfile::TopHat { radius_mm: 2.0 * r };
+        let refused = oc_wave::path::wave_path(&s, &sp, 1).map(|_| ());
+        assert!(matches!(&refused, Err(oc_wave::WaveError::OutOfRange(m)) if m.contains("faces meet") && m.contains("partly in the glass")), "kR {kr}: {refused:?}");
+    }
+}

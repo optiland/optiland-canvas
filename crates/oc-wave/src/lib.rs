@@ -39,6 +39,7 @@ pub mod error;
 pub mod fft;
 pub mod field;
 pub mod grid;
+pub mod mie;
 pub mod modulator;
 #[cfg(feature = "scene")]
 pub mod path;

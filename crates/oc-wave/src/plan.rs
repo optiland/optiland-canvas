@@ -19,6 +19,9 @@
 //! asks for a choice the plan does not hold there. Outside a job (a
 //! propagator called on its own) `decide` simply runs the choice.
 
+// The recorder serves the wave path, which builds with the `scene` feature.
+#![cfg_attr(not(feature = "scene"), allow(dead_code))]
+
 use std::any::Any;
 use std::cell::RefCell;
 use std::fmt;

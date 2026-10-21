@@ -840,6 +840,11 @@ frozen fixtures in the canvas's units (acceptance case C63,
 | `b10_a_gaussian_through_a_circular_hole_passes_one_minus_e_to_the_minus_half` | B10, M34: `1 − e^{−2a²/w²}` for w = 0.1 mm, a = 0.05 mm, through exact cell coverage: what the mask does not stop | 1e-4, and second order in the spacing | −4.4e-5 at 2 µm, −1.1e-5 at 1 µm (the boundary quadrature of a sampled field; the bundle's 2e-10 is for a quadrature of the continuum) |
 | `a_sinusoidal_phase_mask_puts_j_m_squared_into_its_orders` | M14: `e^{iβ cos Gx}` has coefficients `i^m J_m(β)` (Jacobi–Anger, DLMF 10.12.1 [15]); β = 2, orders to ±12, power and phase | 1e-10; 1e-7 rad | 1.8e-15; 1.2e-8 rad (the Gaussian cut at four radii) |
 | `two_slits_make_the_far_field_of_m35` | M35: two slits' far field `2a sinc(aq/2) cos(dq/2)` [1], the sampled mask's cell factor `(πfΔx)/sin(πfΔx)` carried | 1e-9 of peak | 8.5e-16 |
+| `the_efficiencies_match_du_s_table` (`tests/mie.rs`) | B30: the Mie efficiencies against Du's Table 1 [35], thirteen spheres, `x` 0.055 to 10⁴, `m` 0.75 to 10 + 10i | half a unit of the seventh digit | 0.99 of it at worst (x = 100, m = 1.33 + 10⁻⁵i) |
+| `the_exterior_fields_match_an_independent_implementation_at_the_bundle_s_points` (same) | B30: the total exterior `E` and `H` and the efficiencies against miepython 3.3.0 [37] at the bundle's 36 points, index 1 and 1.5, kR = 10, 100, 1000 | fields 1e-8 of the incident; efficiencies 1e-10 | 1.5e-9; 5.1e-13 |
+| `the_series_converges_and_the_fields_obey_maxwell_s_equations` (same) | B30: the fields at 1.2R with Wiscombe's terms + 16 against + 32 [36]; Faraday's law `∇ × E = iH` (these units) by central differences | 1e-12; 1e-6 | 0 to 3.5e-13; 1.9e-9 |
+| `no_contrast_scatters_nothing_and_a_lossless_sphere_extinguishes_what_it_scatters` (unit test) | B30: every coefficient zero at m = 1; `Re a_n = \|a_n\|²` and `Q_ext = Q_sca` for m = 1.5 [34] | 1e-12; 2e-10; 1e-10 | 0; 7.7e-15; 1e-14 |
+| `a_sphere_narrower_than_the_beam_is_refused_by_name` (`tests/path.rs`) | B40: a sphere of index 1.5, kR = 1000 and 100 at 550 nm, under a top-hat twice its radius: refused, the reason named | refused | refused |
 
 The propagation tests of W8 (acceptance case C57, `crates/oc-wave/tests/propagate.rs`):
 
@@ -1037,6 +1042,42 @@ cd crates/oc-py && VIRTUAL_ENV=<that venv> <that venv>/Scripts/python -m maturin
 The coating fixtures keep their own pin, `optiland==0.6.1`
 (`tests/requirements-oracles.txt`), because they were generated with it.
 
+**A sphere: the Mie reference** (`oc_wave::mie`; the bundle's B30, V03 of the
+expert review). The exact scattering of a plane wave by a homogeneous sphere
+[34]: the coefficients `a_n`, `b_n`, the efficiencies, the amplitudes `S₁`,
+`S₂`, and the total exterior `E` and `H` at any point outside, with
+`e^{−iωt}`, the wave along `+z`, `E` along `+x`, and `H` in units where the
+incident `H` is 1 along `+y`. The coefficients are written through
+logarithmic derivatives, each by the recurrence in which it is stable
+(`D_n(mx)`, `D_n(x)` downward, `ξ_n′/ξ_n` and `ψ_n/ξ_n` upward), so the orders
+past `x`, whose coefficients are tiny but multiply Hankel functions that grow
+fast near the sphere, are as accurate as the first. The downward start lies
+`16 + 8|mx|^{1/3}` orders above `max(N, |mx|)`: its error falls only as
+`exp(−(2√2/3)Δ^{3/2}/|mx|^{1/2})` past the turning point, so BHMIE's fixed 15
+left `5e-5` in the fields at `kR = 100` and `2.6e-4` in `Q_ext` at `x = 10⁴`.
+The series starts at Wiscombe's `⌈x + 4x^{1/3} + 2⌉` terms [36] and grows by
+16 until the efficiencies hold, at most eight times, or is refused.
+
+Two independent checks. Du's Table 1 [35]: thirteen spheres, absorbing and
+not, `x` from 0.055 to 10⁴, `Q_ext` and `Q_sca` within half a unit of the
+table's seventh digit. And miepython 3.3.0 [37], written apart from this one:
+`tools/fixtures/mie_reference.py` freezes its efficiencies and its total
+exterior `E` and `H` at the bundle's 36 points a case (r/R = 1.2, 2, 5; θ = 15°
+to 135°; φ = 0°, 45°, 90°) for index 1 and 1.5 at kR = 10, 100 and 1000, in
+`crates/oc-wave/tests/fixtures/mie_b30.json`; the two agree to 1.5e-9 of the
+incident field. Run it with an interpreter that has miepython (a virtual
+environment of its own), `python tools/fixtures/mie_reference.py`.
+
+**The wave path against Mie (the bundle's B40) is not run.** A plane wave
+wider than a sphere puts light both through it and beside it, so a plane
+through the sphere holds a field partly in the glass and partly in air,
+which the path's field (one medium per field) cannot be; and the sphere's two
+faces meet at its equator, leaving no plane between them. The path refuses
+the case by name (test below). For a lens narrower than the beam it stops the
+light outside the rim, as a mount would; a sphere has no mount, so that
+model would not be the sphere's either. The reference waits for a path that
+carries the light beside a body as an arm of its own.
+
 ## What it does not do
 
 - **Scalar diffraction.** No vector diffraction and no high-NA focusing: the
@@ -1056,6 +1097,10 @@ The coating fixtures keep their own pin, `optiland==0.6.1`
   rays follow the beam's paraxial wavefront, not the field's own: a field that
   departs from it (aberrations, a hologram's orders inside one lattice cell)
   is traced along it, and the report gives the departure.
+- **A body narrower than the beam.** The light outside a lens's rim is
+  stopped there, as by a mount; a body whose two faces meet across the window
+  (a sphere) is refused. The Mie comparison of the bundle's B40 is not run
+  for that reason.
 - **On a wave path, the beam follows the chief ray.** Under a modulator's
   orders model each followed order is a chain of its own; elsewhere steering
   onto a chosen diffraction order is W7. Arms that recombine are added once: a cavity's
@@ -1129,5 +1174,9 @@ entry says so.
 31. P. J. Beatty, D. G. Nishimura, J. M. Pauly, "Rapid gridding reconstruction with a minimal oversampling ratio," *IEEE Trans. Med. Imaging* 24(6), 799–808 (2005), doi:10.1109/TMI.2005.848376. (The kernel's shape parameter for a width and an oversampling, Eq. (5).)
 32. L. Greengard, J.-Y. Lee, "Accelerating the nonuniform fast Fourier transform," *SIAM Rev.* 46(3), 443–454 (2004), doi:10.1137/S003614450343200X. (The same step as the interpolation of a type-2 non-uniform FFT.)
 33. M. Abramowitz, I. A. Stegun, *Handbook of Mathematical Functions*, National Bureau of Standards (1964), Table 25.4. (The ten-point Gauss–Legendre nodes and weights the Gaussian's reference quadrature uses.)
+34. C. F. Bohren, D. R. Huffman, *Absorption and Scattering of Light by Small Particles* (Wiley, 1983), ch. 4: Eqs. 4.45, 4.50, 4.53, 4.61, 4.62, 4.74; §4.8 (the logarithmic derivative's downward recurrence).
+35. H. Du, "Mie-scattering calculation," *Appl. Opt.* 43(9), 1951–1956 (2004), doi:10.1364/AO.43.001951, Table 1 (values as reproduced in the scattnlay test suite, `tests/test_py.py`, retrieved 2026-10-21).
+36. W. J. Wiscombe, *Mie Scattering Calculations: Advances in Technique and Fast, Vector-Speed Computer Codes*, NCAR Technical Note NCAR/TN-140+STR (1979; revised 1996). (The number of terms.)
+37. S. Prahl, miepython 3.3.0, https://github.com/scottprahl/miepython (installed 2026-10-21 with numpy 2.5.4 and scipy 1.18.1). An independent implementation, used as an oracle for the efficiencies and the near fields.
 
 The FFT is `rustfft` 6.4.1 (MIT OR Apache-2.0).

@@ -6,7 +6,7 @@
 
 import type { Canvas } from "../../pkg/oc_wasm.js";
 import { createCardManager, type CardManager, type V2 } from "../cards";
-import { commitAperture, commitLink, fieldChanged, renderAperture, renderLink } from "../card-extras";
+import { commitAperture, commitGlass, commitLink, fieldChanged, renderAperture, renderGlass, renderLink } from "../card-extras";
 
 export type SceneObject = {
   id: number;
@@ -51,7 +51,7 @@ export function createScene3Cards(opts: {
     if (JSON.parse(scene.singletGeomJSON(id))) {
       scene.setSingletGeom(id, num("r1"), num("r2"), num("thickness"), num("semiAperture"), num("conic1"), num("conic2"));
     }
-    if (JSON.parse(scene.bodyGlassJSON(id))) scene.setBodyGlassAbbe(id, num("nd"), num("vd"));
+    commitGlass(scene, id, root, num);
     commitAperture(scene, id, root);
     commitLink(scene, id, root);
     if (o && !o.body && o.kind !== "source") {
@@ -90,9 +90,7 @@ export function createScene3Cards(opts: {
         setV("r1", g.r1); setV("r2", g.r2); setV("thickness", g.thickness);
         setV("semiAperture", g.semiAperture); setV("conic1", g.conic1); setV("conic2", g.conic2);
       }
-      const glass = JSON.parse(scene.bodyGlassJSON(id));
-      q(".c3-glass").style.display = glass ? "block" : "none";
-      if (glass) { setV("nd", glass.nd); setV("vd", glass.vd); }
+      renderGlass(scene, id, root, setV);
       renderAperture(scene, id, root);
       renderLink(scene, id, root, opts.objects());
       const block = q(".c3-surface");

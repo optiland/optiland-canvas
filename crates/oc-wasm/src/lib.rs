@@ -4082,6 +4082,82 @@ impl Canvas {
         }
     }
 
+    /// A body's glass as an index field shows it, catalog glass included:
+    /// `{nd, vd, name}` with `name` a catalog glass's name or `null` for an
+    /// Abbe point; `null` for a mirror, an absorber or a non-body. Writing
+    /// `setBodyGlassAbbe` replaces a catalog glass with an Abbe point.
+    #[wasm_bindgen(js_name = bodyIndexJSON)]
+    pub fn body_index_json(&self, id: f64) -> String {
+        let Some(scene) = &self.scene3 else {
+            return "null".into();
+        };
+        match scene.body_index(id as u64) {
+            Some((nd, vd, name)) => serde_json::json!({ "nd": nd, "vd": vd, "name": name }).to_string(),
+            None => "null".into(),
+        }
+    }
+
+    /// A body's material exactly, as JSON, for `setBodyMaterialJSON` to put
+    /// back (a preview that replaced a catalog glass); `null` for a non-body.
+    #[wasm_bindgen(js_name = bodyMaterialJSON)]
+    pub fn body_material_json(&self, id: f64) -> String {
+        self.scene3
+            .as_ref()
+            .and_then(|s| s.body_material(id as u64))
+            .and_then(|m| serde_json::to_string(m).ok())
+            .unwrap_or_else(|| "null".into())
+    }
+
+    /// Put back a material `bodyMaterialJSON` gave. False (scene unchanged)
+    /// for a non-body, JSON that is not a material, or a catalog glass the
+    /// scene does not hold. Bumps the revision on success.
+    #[wasm_bindgen(js_name = setBodyMaterialJSON)]
+    pub fn set_body_material_json(&mut self, id: f64, json: &str) -> bool {
+        let Ok(m) = serde_json::from_str(json) else {
+            return false;
+        };
+        let Some(scene) = self.scene3.as_mut() else {
+            return false;
+        };
+        if scene.set_body_material(id as u64, m).is_ok() {
+            self.bump();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// A taper's (or light pipe's) wall as JSON `{wall: [[x, r], …]}`, in mm in
+    /// its own frame, input face first; `null` if `id` is not one
+    /// (`oc_core::taper`).
+    #[wasm_bindgen(js_name = taperJSON)]
+    pub fn taper_json(&self, id: f64) -> String {
+        match self.scene3.as_ref().and_then(|s| s.taper_geom(id as u64)) {
+            Some(g) => serde_json::json!({ "wall": g.wall.iter().map(|&(x, r)| [x, r]).collect::<Vec<_>>() }).to_string(),
+            None => "null".into(),
+        }
+    }
+
+    /// Give taper `id` a new wall, `[x0, r0, x1, r1, …]`. Returns `""` on
+    /// success (the revision bumps) or why it was refused (scene unchanged).
+    #[wasm_bindgen(js_name = setTaper)]
+    pub fn set_taper(&mut self, id: f64, wall: &[f64]) -> String {
+        let Some(scene) = self.scene3.as_mut() else {
+            return "no 3D scene".into();
+        };
+        if wall.len() % 2 != 0 {
+            return "the wall is (x, r) pairs".into();
+        }
+        let g = oc_core::taper::TaperGeom { wall: wall.chunks(2).map(|p| (p[0], p[1])).collect() };
+        match scene.set_taper_geom(id as u64, &g) {
+            Ok(()) => {
+                self.bump();
+                String::new()
+            }
+            Err(e) => e,
+        }
+    }
+
     /// Replace a singlet body's geometry, keeping its aspheric terms. Refuses
     /// (returns `false`, scene unchanged) if `id` is not a singlet or the
     /// geometry is not revolvable — a bad card edit never corrupts the scene.

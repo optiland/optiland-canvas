@@ -41,14 +41,14 @@ test.describe("3D model view — orbit camera over the same Scene3", () => {
     await drawn(page);
 
     const before = await frameHash(page);
-    // Drag on empty space to orbit — bottom-centre, clear of the side panels and
-    // away from the body at the view centre (so it orbits, not drags the lens).
+    // Right-drag to orbit — bottom-centre, clear of the side panels and away
+    // from the body at the view centre.
     const box = (await page.locator("#view").boundingBox())!;
     const sx = box.x + box.width / 2, sy = box.y + box.height - 120;
     await page.mouse.move(sx, sy);
-    await page.mouse.down();
+    await page.mouse.down({ button: "right" });
     await page.mouse.move(sx + 220, sy - 90, { steps: 12 });
-    await page.mouse.up();
+    await page.mouse.up({ button: "right" });
     await drawn(page);
 
     expect(await litGpu(page)).toBeGreaterThan(100);

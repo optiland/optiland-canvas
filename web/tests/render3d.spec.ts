@@ -98,24 +98,22 @@ test.describe("GPU 3D view", () => {
     expect(s.raySegments).toBeGreaterThan(100);
   });
 
-  test("orbit, pan, and wheel zoom move the camera; reset restores it", async ({ page }) => {
+  test("right-drag orbits, left-drag on empty space pans, the wheel zooms; reset restores it", async ({ page }) => {
     await open3d(page);
     const start = await camera(page);
     const p = await emptySpot(page);
 
     await page.mouse.move(p.x, p.y);
-    await page.mouse.down();
+    await page.mouse.down({ button: "right" });
     await page.mouse.move(p.x + 120, p.y - 40, { steps: 6 });
-    await page.mouse.up();
+    await page.mouse.up({ button: "right" });
     const orbited = await camera(page);
     expect(orbited.yaw).not.toBeCloseTo(start.yaw);
 
-    await page.keyboard.down("Shift");
     await page.mouse.move(p.x, p.y);
     await page.mouse.down();
     await page.mouse.move(p.x + 80, p.y + 30, { steps: 4 });
     await page.mouse.up();
-    await page.keyboard.up("Shift");
     const panned = await camera(page);
     expect(panned.yaw).toBeCloseTo(orbited.yaw);
     expect(Math.hypot(panned.target.x - orbited.target.x, panned.target.y - orbited.target.y, panned.target.z - orbited.target.z)).toBeGreaterThan(1);
@@ -175,6 +173,36 @@ test.describe("GPU 3D view", () => {
     const after = await renderNow(page);
     // A move is a transform: no geometry was rebuilt for it.
     expect(after.meshBuilds).toBe(before.meshBuilds);
+  });
+
+  test("a click on empty space drops the selection; a pan or an orbit keeps it", async ({ page }) => {
+    await open3d(page);
+    const selected = () => page.evaluate(() => (window as any).__ocDebug.render3d.selected());
+    const lens = (await objects(page)).find((o) => o.kind === "profile")!;
+    const at = await project(page, { x: 0, y: 0, z: 0 });
+    const onLens = { x: at.x + 2, y: at.y + 25 };
+    const p = await emptySpot(page);
+
+    await page.mouse.click(onLens.x, onLens.y);
+    await expect.poll(selected).toBe(lens.id);
+    const cam = await camera(page);
+    await page.mouse.click(p.x, p.y);
+    await expect.poll(selected).toBe(-1);
+    // The click neither moved a part nor the camera.
+    expect((await objects(page)).find((o) => o.id === lens.id)!.pos).toEqual(lens.pos);
+    expect(await camera(page)).toEqual(cam);
+
+    await page.mouse.click(onLens.x, onLens.y);
+    await expect.poll(selected).toBe(lens.id);
+    await page.mouse.move(p.x, p.y);
+    await page.mouse.down();
+    await page.mouse.move(p.x + 60, p.y + 20, { steps: 4 });
+    await page.mouse.up();
+    expect(await selected()).toBe(lens.id);
+    await page.mouse.down({ button: "right" });
+    await page.mouse.move(p.x + 120, p.y, { steps: 4 });
+    await page.mouse.up({ button: "right" });
+    expect(await selected()).toBe(lens.id);
   });
 
   test("double-click opens the card, and the selection survives a 2D/3D switch", async ({ page }) => {
@@ -401,9 +429,9 @@ test.describe("GPU 3D view", () => {
     // Orbiting reads no geometry.
     const p = await emptySpot(page);
     await page.mouse.move(p.x, p.y);
-    await page.mouse.down();
+    await page.mouse.down({ button: "right" });
     await page.mouse.move(p.x + 90, p.y - 30, { steps: 5 });
-    await page.mouse.up();
+    await page.mouse.up({ button: "right" });
     expect(await builds()).toBe(base + 1);
   });
 

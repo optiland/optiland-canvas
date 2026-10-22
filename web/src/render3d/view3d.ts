@@ -701,10 +701,18 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
     return g.on ? Math.round(v / g.spacing) * g.spacing : v;
   };
 
+  // Right-drag orbits. A left press on a part moves the part; on empty space it
+  // pans, and a click there that does not drag drops the selection. Middle-drag,
+  // Shift or Space pans, even with a part under the pointer. A finger has no
+  // right button, so a touch on empty space orbits.
+  const CLICK_PX = 4;
+  let pressAt: V2 | null = null;
+  view.addEventListener("contextmenu", (e) => { if (owns()) e.preventDefault(); });
+
   view.addEventListener("pointerdown", (e) => {
-    if (!owns() || e.button === 2) return;
+    if (!owns() || e.button > 2) return;
     last = { x: e.clientX, y: e.clientY };
-    // Middle-drag, Shift or Space pans, even with a part under the pointer.
+    pressAt = null;
     const panning = e.button === 1 || e.shiftKey || panKeyHeld();
     const hit = e.button === 0 && !panning ? pick(e.clientX, e.clientY) : null;
     if (hit) {
@@ -713,10 +721,11 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
       select(hit.id);
       dragStart = { x: hit.pos[0], y: hit.pos[1], z: hit.pos[2] };
       grab = { x: e.clientX, y: e.clientY };
-    } else if (panning) {
-      mode = "pan";
-    } else {
+    } else if (e.button === 2 || (e.pointerType === "touch" && !panning)) {
       mode = "orbit";
+    } else {
+      mode = "pan";
+      if (!panning) pressAt = { x: e.clientX, y: e.clientY };
     }
     view.setPointerCapture(e.pointerId);
     view.style.cursor = "grabbing";
@@ -733,6 +742,7 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
     }
     const dx = e.clientX - last.x, dy = e.clientY - last.y;
     last = { x: e.clientX, y: e.clientY };
+    if (pressAt && Math.hypot(e.clientX - pressAt.x, e.clientY - pressAt.y) > CLICK_PX) pressAt = null;
     if (mode === "orbit") {
       rig.orbit(dx, dy);
     } else if (mode === "pan") {
@@ -754,6 +764,10 @@ export function initView3dThree(opts: View3dOptions): View3dThree {
     try { view.releasePointerCapture(e.pointerId); } catch { /* ignore */ }
     view.style.cursor = "";
     quality.end();
+    // A click on empty space drops the selection. Unlike Escape, it leaves the
+    // cards open.
+    if (pressAt && e.type === "pointerup") clearSelection();
+    pressAt = null;
     if (settled) {
       retrace(false);
       refreshObjects();

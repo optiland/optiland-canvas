@@ -1183,6 +1183,11 @@ struct RayWork {
     from: ObjectRef3,
     /// Hits on `TraceConfig3::count_hits_on` since launch.
     counted: u32,
+    /// The medium this branch was sent into: the side of the face it left by,
+    /// as the interaction that made it saw it (`None` is the ambient). The
+    /// look-ahead in [`trace_one`] decides the medium wherever containment can
+    /// answer; this decides it where containment cannot.
+    region: Option<usize>,
 }
 
 impl RayWork {
@@ -1345,10 +1350,11 @@ fn trace_one(
         ghost: false,
         from: ObjectRef3::Source,
         counted: 0,
+        region: region_at(scene, objs, lr.ray.origin + medium_eps * lr.ray.dir, tol),
     });
 
     let mut branches = 0u64;
-    while let Some(w) = stack.pop() {
+    while let Some(mut w) = stack.pop() {
         branches += 1;
         if branches > cfg.max_branches {
             // Deposit the popped branch and everything still queued, so the cap
@@ -1382,8 +1388,14 @@ fn trace_one(
 
         // The medium this branch travels through: containment + priority, sampled
         // just ahead of the origin so a ray leaving a surface reads the medium it
-        // is entering.
-        let here = region_at(scene, objs, w.ray.origin + medium_eps * w.ray.dir, tol);
+        // is entering. A branch that leaves its face within asin(1/8) of grazing
+        // (7.2°, TIR along a light pipe's wall) has that point less than
+        // `medium_abs_mm` off the face, in the band where containment cannot
+        // say; there the side it left into, which its interaction recorded,
+        // decides.
+        let here = region_ahead(scene, objs, w.ray.origin + medium_eps * w.ray.dir, tol)
+            .unwrap_or(w.region);
+        w.region = here;
         let n_here = region_index(scene, here, w.lambda);
         let alpha = match region_absorption(scene, here, w.lambda) {
             Ok(a) => a,
@@ -1506,10 +1518,17 @@ fn trace_one(
                 patch,
             } => {
                 let (before, n0) = (r.ledger, stack.len());
-                interact_body(
+                let far = interact_body(
                     scene, objs, &mut stack, r, cfg, tol, &w, body, ev.point, outward, patch, here,
                     n_here, flux_at, opl_at, medium_eps, min_flux,
                 );
+                // A child that turns back from the face (a reflection, TIR)
+                // stays in `here`; one that crosses it is in `far`. The drawn
+                // face decides, as it does for `far` itself.
+                let back = if w.ray.dir.dot(outward) < 0.0 { outward } else { -outward };
+                for c in &mut stack[n0..] {
+                    c.region = if c.ray.dir.dot(back) > 0.0 { here } else { far };
+                }
                 after_interaction(r, cfg, &mut stack[n0..], ObjectRef3::Body(body, patch.0), &w, flux_at, &before, ev.point);
             }
         }
@@ -1809,22 +1828,51 @@ fn region_at(
     point: Vec3,
     tol: &ToleranceContext,
 ) -> Option<usize> {
-    let mut best: Option<(usize, i32, u64)> = None;
+    containment_at(scene, objs, point, tol).0.map(|(i, _)| i)
+}
+
+/// [`region_at`], or `None` when `point` lies in the boundary band of a body
+/// that would decide the medium were it inside: that close to a face, the
+/// point is neither in nor out, and its answer would be a guess.
+fn region_ahead(
+    scene: &Scene3,
+    objs: &EventObjects,
+    point: Vec3,
+    tol: &ToleranceContext,
+) -> Option<Option<usize>> {
+    match containment_at(scene, objs, point, tol) {
+        (best, None) => Some(best.map(|(i, _)| i)),
+        (Some((i, key)), Some(band)) if key > band => Some(Some(i)),
+        _ => None,
+    }
+}
+
+/// The highest-priority body `point` is inside, and the highest priority among
+/// the bodies whose boundary band it is in, each as `(priority, id)`.
+#[allow(clippy::type_complexity)]
+fn containment_at(
+    scene: &Scene3,
+    objs: &EventObjects,
+    point: Vec3,
+    tol: &ToleranceContext,
+) -> (Option<(usize, (i32, u64))>, Option<(i32, u64)>) {
+    let mut best: Option<(usize, (i32, u64))> = None;
+    let mut band: Option<(i32, u64)> = None;
     for (i, b) in scene.bodies.iter().enumerate() {
         if !b.is_3d() || !objs.body_boxes[i].contains_point(point) {
             continue;
         }
-        let inside =
-            b.geometry
-                .contains_prepared(&objs.body_preps[i], point, &b.common.transform, tol);
-        if inside == Containment::Inside {
-            let key = (b.priority, b.common.id.0);
-            if best.map_or(true, |(_, p, id)| key > (p, id)) {
-                best = Some((i, b.priority, b.common.id.0));
-            }
+        let key = (b.priority, b.common.id.0);
+        match b
+            .geometry
+            .contains_prepared(&objs.body_preps[i], point, &b.common.transform, tol)
+        {
+            Containment::Inside if best.map_or(true, |(_, k)| key > k) => best = Some((i, key)),
+            Containment::Boundary if band.map_or(true, |k| key > k) => band = Some(key),
+            _ => {}
         }
     }
-    best.map(|(i, _, _)| i)
+    (best, band)
 }
 
 fn region_index(scene: &Scene3, region: Option<usize>, lambda: f64) -> f64 {
@@ -1877,7 +1925,7 @@ fn interact_body(
     opl_at: f64,
     medium_eps: f64,
     min_flux: f64,
-) {
+) -> Option<usize> {
     let b = &scene.bodies[body];
     r.report.note_exact(match b.geometry {
         SolidGeometry3::Profile(_) => PhysicsFeature::ProfileBody,
@@ -1919,6 +1967,7 @@ fn interact_body(
         min_flux,
         film_temperature(scene, cfg, b.common.id.0),
     );
+    far
 }
 
 /// The normal a hit sees on a face with slope error `sigma` (radians RMS per
@@ -3071,6 +3120,10 @@ fn spawn(
         // The caller names the object once the interaction is over.
         from: parent.from,
         counted: parent.counted,
+        // The same medium unless the interaction says otherwise: a
+        // zero-thickness surface has the same medium on both sides (§6.6), and
+        // a body's interaction sets each child's side after it.
+        region: parent.region,
     });
     Some(path_id)
 }
@@ -3129,6 +3182,7 @@ fn continue_probe(
             ghost: w.ghost,
             from: w.from,
             counted: w.counted,
+            region: w.region,
         });
     }
 }

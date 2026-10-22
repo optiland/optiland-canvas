@@ -58,6 +58,8 @@ pub mod planar_reduce;
 pub mod polarization;
 #[cfg(feature = "scene3")]
 pub mod profile2;
+#[cfg(feature = "scene3")]
+pub mod taper;
 pub mod scene;
 #[cfg(feature = "scene3")]
 pub mod scene3;

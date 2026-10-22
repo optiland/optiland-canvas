@@ -2333,13 +2333,65 @@ impl Scene3 {
             Some(b) => b.material = Material::AbbePoint { nd, vd },
             None => return false,
         }
+        self.readapt_face_coatings(id);
+        true
+    }
+
+    /// Re-synthesize each face coating of body `id` whose design adapts to its
+    /// substrate, for the glass the body has now.
+    fn readapt_face_coatings(&mut self, id: u64) {
         for face in [BodyFace::Front, BodyFace::Back] {
             let adapted = self.body_face_coating(id, face).and_then(|c| c.design).filter(|d| d.adapt.is_some());
             if let Some(d) = adapted {
                 self.set_body_face_coating(id, face, Some(d));
             }
         }
-        true
+    }
+
+    /// A body's glass as an index field shows it: its Abbe point `(nd, vd)`,
+    /// and a catalog glass's name. None for a mirror, an absorber, a catalog
+    /// glass with no dispersion, or a non-body id.
+    pub fn body_index(&self, id: u64) -> Option<(f64, f64, Option<String>)> {
+        let m = &self.bodies.iter().find(|b| b.common.id.0 == id)?.material;
+        let (nd, vd) = m.abbe(&self.catalog)?;
+        let name = match m {
+            Material::Catalog(g) => self.catalog.get(*g).map(|g| g.name.clone()),
+            _ => None,
+        };
+        Some((nd, vd, name))
+    }
+
+    /// A body's material, exactly: what [`Scene3::set_body_material`] puts back.
+    pub fn body_material(&self, id: u64) -> Option<&Material> {
+        self.bodies.iter().find(|b| b.common.id.0 == id).map(|b| &b.material)
+    }
+
+    /// Set a body's material, as [`Scene3::body_material`] gave it. Refused
+    /// (scene unchanged) for a non-body id or a material the scene does not
+    /// validate, such as a catalog glass it does not hold. Adapted face
+    /// coatings are re-synthesized as [`Scene3::set_body_glass_abbe`] does.
+    pub fn set_body_material(&mut self, id: u64, m: Material) -> Result<(), String> {
+        match &m {
+            Material::Catalog(g) if self.catalog.get(*g).is_none() => {
+                return Err(format!("the catalog holds no glass {}", g.0));
+            }
+            Material::AbbePoint { nd, vd } if !(nd.is_finite() && vd.is_finite()) => {
+                return Err("an Abbe point needs a finite nd and vd".into());
+            }
+            _ => {}
+        }
+        let Some(b) = self.bodies.iter_mut().find(|b| b.common.id.0 == id) else {
+            return Err(format!("#{id} is not a body"));
+        };
+        let was = std::mem::replace(&mut b.material, m);
+        if let Err(e) = self.validate() {
+            if let Some(b) = self.bodies.iter_mut().find(|b| b.common.id.0 == id) {
+                b.material = was;
+            }
+            return Err(e.to_string());
+        }
+        self.readapt_face_coatings(id);
+        Ok(())
     }
 
     /// Delete any object or source by id. Returns false if nothing matched.

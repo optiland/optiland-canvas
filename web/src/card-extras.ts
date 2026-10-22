@@ -244,3 +244,33 @@ export function fieldChanged(root: HTMLElement, name: string, actual: number): b
   const v = Number(el.value);
   return Number.isFinite(v) && Math.abs(v - Number(actual.toFixed(4))) > 1e-9;
 }
+
+// --- glass ---------------------------------------------------------------------
+
+type BodyIndex = { nd: number; vd: number; name: string | null };
+
+/** Show a body's glass (catalog glasses too, by name), or hide the block for a
+ *  body with none. */
+export function renderGlass(scene: Canvas, id: number, root: HTMLElement, setV: (name: string, v: number | null) => void) {
+  const glass: BodyIndex | null = JSON.parse(scene.bodyIndexJSON(id));
+  (root.querySelector(".c3-glass") as HTMLElement).style.display = glass ? "block" : "none";
+  if (!glass) return;
+  setV("nd", glass.nd);
+  setV("vd", glass.vd);
+  const name = root.querySelector(".c3-glassname") as HTMLElement | null;
+  if (name) {
+    name.textContent = glass.name ? `${glass.name} (catalog)` : "Abbe point";
+    name.title = glass.name
+      ? "a catalog glass with its own dispersion curve; typing nd or Vd replaces it with an Abbe point"
+      : "an Abbe point: Cauchy dispersion through nd and Vd";
+  }
+}
+
+/** Write nd and Vd, only when one of them was changed: a catalog glass written
+ *  back as its own Abbe point would lose its dispersion curve. */
+export function commitGlass(scene: Canvas, id: number, root: HTMLElement, num: (name: string) => number) {
+  const glass: BodyIndex | null = JSON.parse(scene.bodyIndexJSON(id));
+  if (!glass || !(fieldChanged(root, "nd", glass.nd) || fieldChanged(root, "vd", glass.vd))) return;
+  const nd = num("nd"), vd = num("vd");
+  if (nd >= 1 && vd > 0) scene.setBodyGlassAbbe(id, nd, vd);
+}

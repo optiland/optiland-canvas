@@ -5,6 +5,7 @@
 // so an edit made anywhere shows here and an edit made here shows everywhere.
 // Each kind of element has its own editor:
 //   a singlet: its profile (lens-editor.ts);
+//   a taper or light pipe: its wall and its glass (taper-editor.ts);
 //   a Fresnel lens: its recipe (fresnel-editor.ts);
 //   a flat surface: its coating (coating-editor.ts);
 //   an aperture: its opening, face on;
@@ -23,6 +24,7 @@ import { createDetectorView } from "./detector-view";
 import { createFresnelEditor } from "./fresnel-editor";
 import type { InsetContent } from "./inset";
 import { createLensEditor } from "./lens-editor";
+import { createTaperEditor } from "./taper-editor";
 import { createPolarizationEditor } from "./polarization-editor";
 import { createGratingEditor } from "./grating-editor";
 import {
@@ -50,7 +52,7 @@ export type ComponentView = InsetContent & {
   debug: () => { id: number; kind: string; note: string; handles: { key: string; x: number; y: number }[] };
 };
 
-type EditorKind = "lens" | "fresnel" | "coating" | "polarizing" | "grating" | "aperture" | "detector" | "source" | "summary" | "none";
+type EditorKind = "lens" | "taper" | "fresnel" | "coating" | "polarizing" | "grating" | "aperture" | "detector" | "source" | "summary" | "none";
 
 export function createComponentView(opts: {
   scene: Canvas;
@@ -136,6 +138,10 @@ export function createComponentView(opts: {
     // A Fresnel lens is a revolved glass body too, but its facets follow from
     // a recipe, so it has an editor of its own.
     if (JSON.parse(scene.fresnelLensJSON(id))) return "fresnel";
+    // A taper or light pipe: flat faces joined by a straight-stepped wall. Its
+    // faces are lines, never a singlet's conics, so asking first only keeps a
+    // taper with coated faces in its own editor.
+    if (JSON.parse(scene.taperJSON(id))) return "taper";
     // A coated plate is a glass body, so it would read as a lens by its shape,
     // and its film is the thing you came to edit. But a coated *lens* is still
     // a lens: what tells them apart is curvature, since a plate is flat on both
@@ -192,6 +198,7 @@ export function createComponentView(opts: {
     const ctx = context(id);
     switch (kind) {
       case "lens": editor = createLensEditor(ctx, () => { readObjects(); return objectOf(id); }); break;
+      case "taper": editor = createTaperEditor(ctx); break;
       case "fresnel": editor = createFresnelEditor(ctx); break;
       case "coating": editor = createCoatingEditor(ctx); break;
       case "polarizing": editor = createPolarizationEditor(ctx); break;
@@ -213,8 +220,11 @@ export function createComponentView(opts: {
   function subtitle(id: number, kind: EditorKind) {
     const o = objectOf(id);
     if (!o || kind === "none") return "nothing selected";
+    const taper = kind === "taper" ? JSON.parse(scene.taperJSON(id))?.wall : null;
     const what = kind === "lens"
       ? "singlet"
+      : taper
+      ? (taper[0][1] === taper[taper.length - 1][1] ? "light pipe" : "taper")
       : kind === "fresnel"
       ? "Fresnel lens"
       // "surface" says nothing a user wants; name the part.
@@ -624,8 +634,10 @@ function summaryView(ctx: EditorContext, o: SceneObject): Editor {
   return {
     hint: "no shape editor for this kind yet; its card (double-click it) has its fields",
     refresh() {
-      const glass = JSON.parse(scene.bodyGlassJSON(id));
-      const g = glass ? ` · glass n<sub>d</sub> <b>${fmt(glass.nd, 4)}</b> V<sub>d</sub> <b>${fmt(glass.vd, 1)}</b>` : "";
+      const glass = JSON.parse(scene.bodyIndexJSON(id));
+      const g = glass
+        ? ` · glass ${glass.name ? `${glass.name} ` : ""}n<sub>d</sub> <b>${fmt(glass.nd, 4)}</b> V<sub>d</sub> <b>${fmt(glass.vd, 1)}</b>`
+        : "";
       ctx.read.innerHTML = `${o.kind === "profile" ? o.construction : o.kind} at (${o.pos.map((v) => fmt(v, 1)).join(", ")}) mm${g}`;
     },
     draw(c) {

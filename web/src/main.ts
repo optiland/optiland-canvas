@@ -534,30 +534,40 @@ async function main() {
   let committed3d: Glass | null = null;
   const glassTarget = () => (slice3d?.active() ? selectedBody3d() : -1);
   const readGlass3d = (id: number): Glass | null => {
-    const g = JSON.parse(scene.bodyGlassJSON(id));
-    return g ? { name: "custom", nd: g.nd, vd: g.vd } : null;
+    const g = JSON.parse(scene.bodyIndexJSON(id));
+    return g ? { name: g.name ?? "custom", nd: g.nd, vd: g.vd } : null;
   };
+  // The body's material exactly as it was when a preview over the map began,
+  // so leaving the map puts a catalog glass back, not the Abbe point nearest it.
+  let previewFrom: string | null = null;
   // The glass marker to draw on the map: the selected 3D body's, or the v1 lens'.
   const curCommitted = (): Glass => (slice3d?.active() && committed3d ? committed3d : committed);
 
   // Live preview as the cursor moves over the map.
   function previewGlass(nd: number, vd: number) {
     const id = glassTarget();
-    if (id >= 0) { scene.setBodyGlassAbbe(id, nd, vd); refreshActive3d(); }
-    else scene.setElementAbbe(lensId, nd, vd);
+    if (id >= 0) {
+      if (previewFrom == null) previewFrom = scene.bodyMaterialJSON(id);
+      scene.setBodyGlassAbbe(id, nd, vd);
+      refreshActive3d();
+    } else scene.setElementAbbe(lensId, nd, vd);
     renderView();
   }
   // Commit the clicked glass.
   function commitGlass(g: Glass) {
     const id = glassTarget();
+    previewFrom = null;
     if (id >= 0) { scene.setBodyGlassAbbe(id, g.nd, g.vd); committed3d = { ...g }; refreshActive3d(); }
     else applyGlass(g);
   }
-  // Revert the preview to the committed glass when the cursor leaves.
+  // Revert the preview to the glass the body had when the cursor leaves.
   function revertGlass() {
     const id = glassTarget();
-    if (id >= 0) { if (committed3d) scene.setBodyGlassAbbe(id, committed3d.nd, committed3d.vd); refreshActive3d(); }
-    else applyGlass(committed);
+    const from = previewFrom;
+    previewFrom = null;
+    if (id >= 0) {
+      if (from != null) { scene.setBodyMaterialJSON(id, from); refreshActive3d(); }
+    } else applyGlass(committed);
   }
 
   abbe.addEventListener("pointermove", (e) => {

@@ -17,7 +17,7 @@ import type { FastPreview } from "./fastpreview";
 import type { Reference, StandIn } from "./reference";
 import type { RayLayout } from "./rays";
 import { panKeyHeld } from "./pan-key";
-import { commitAperture, commitLink, fieldChanged, renderAperture, renderLink } from "./card-extras";
+import { commitAperture, commitGlass, commitLink, fieldChanged, renderAperture, renderGlass, renderLink } from "./card-extras";
 
 type V2 = { x: number; y: number };
 
@@ -596,9 +596,7 @@ export function initSlice3d(opts: {
     if (JSON.parse(scene.singletGeomJSON(id))) {
       scene.setSingletGeom(id, num("r1"), num("r2"), num("thickness"), num("semiAperture"), num("conic1"), num("conic2"));
     }
-    if (JSON.parse(scene.bodyGlassJSON(id))) {
-      scene.setBodyGlassAbbe(id, num("nd"), num("vd"));
-    }
+    commitGlass(scene, id, root, num);
     commitAperture(scene, id, root);
     commitLink(scene, id, root);
     const pick = (n: string) => (root.querySelector(`select[data-name="${n}"]`) as HTMLSelectElement)?.value;
@@ -705,14 +703,12 @@ export function initSlice3d(opts: {
       setV("y", o.pos[1]);
       setV("rot", o.rotZ); // tilt: body Z-rotation or surface normal angle
       const g = JSON.parse(scene.singletGeomJSON(id));
-      const glass = JSON.parse(scene.bodyGlassJSON(id));
       q(".c3-singlet").style.display = g ? "block" : "none";
       if (g) {
         setV("r1", g.r1); setV("r2", g.r2); setV("thickness", g.thickness);
         setV("semiAperture", g.semiAperture); setV("conic1", g.conic1); setV("conic2", g.conic2);
       }
-      q(".c3-glass").style.display = glass ? "block" : "none"; // any glass body (singlet, prism)
-      if (glass) { setV("nd", glass.nd); setV("vd", glass.vd); }
+      renderGlass(scene, id, root, setV); // any glass body (singlet, prism, taper)
       renderAperture(scene, id, root);
       renderLink(scene, id, root, objList);
       renderSurfaceCard(id, root, o);

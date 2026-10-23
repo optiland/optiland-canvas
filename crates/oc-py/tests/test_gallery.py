@@ -29,7 +29,7 @@ import pytest
 
 import optiland_canvas as oc
 
-optiland = pytest.importorskip("optiland")
+pytest.importorskip("optiland")
 gallery = pytest.importorskip("optiland_canvas.gallery")
 
 GALLERY = Path(__file__).resolve().parents[3] / "web" / "public" / "gallery"
@@ -199,10 +199,10 @@ def test_aimed_designs_get_a_beam_per_field_and_an_exact_stop():
 
 def test_the_committed_gallery_is_what_the_generator_writes(tmp_path):
     index = json.loads((GALLERY / "index.json").read_text(encoding="utf-8"))
-    if index["optiland"] != optiland.__version__:
+    if index["optiland"] != gallery.optiland_version():
         pytest.skip(
             f"the gallery was written with Optiland {index['optiland']}, and this is "
-            f"{optiland.__version__}; regenerate it with python -m optiland_canvas.gallery"
+            f"{gallery.optiland_version()}; regenerate it with python -m optiland_canvas.gallery"
         )
     _quiet(gallery.build, str(tmp_path))
     for name in ["index.json", "checks.json"] + [

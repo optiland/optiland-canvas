@@ -108,6 +108,14 @@ NAMES = {
 CHECK_PUPIL = ((0.0, 0.0), (0.0, 1.0), (0.0, -1.0), (1.0, 0.0))
 
 
+def optiland_version() -> str:
+    """The installed Optiland's version, from its package metadata. Not
+    ``optiland.__version__``: Optiland 0.6.3 has none, and 0.6.2's said 0.6.1."""
+    from importlib.metadata import version
+
+    return version("optiland")
+
+
 def samples():
     """Every sample design as ``(module, class)``, modules in gallery order
     and classes in the order their module defines them."""
@@ -127,8 +135,6 @@ def samples():
 
 def build(out_dir: str, *, rays_per_field: int = 64, pixels: int = 64) -> dict:
     """Write the gallery to ``out_dir`` and return its index."""
-    import optiland
-
     os.makedirs(out_dir, exist_ok=True)
     designs = []
     checks = []
@@ -177,13 +183,13 @@ def build(out_dir: str, *, rays_per_field: int = 64, pixels: int = 64) -> dict:
 
     index = {
         "generator": "optiland_canvas.gallery",
-        "optiland": optiland.__version__,
+        "optiland": optiland_version(),
         "designs": designs,
     }
     _write_json(os.path.join(out_dir, "index.json"), index)
     _write_json(
         os.path.join(out_dir, "checks.json"),
-        {"optiland": optiland.__version__, "designs": checks},
+        {"optiland": optiland_version(), "designs": checks},
     )
     return index
 

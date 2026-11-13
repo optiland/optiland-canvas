@@ -110,10 +110,14 @@ def test_optiland_puts_the_rhomb_phase_on_the_growing_branch():
     version the fixtures were generated with. On any other version it is
     skipped with a message: an upstream fix must be noticed by a person, not
     turned silently into a failure or a pass."""
-    optiland = pytest.importorskip("optiland")
-    if optiland.__version__ != PINNED_OPTILAND:
+    pytest.importorskip("optiland")
+    from importlib.metadata import version
+
+    # The package's own version: Optiland 0.6.3 has no __version__.
+    installed = version("optiland")
+    if installed != PINNED_OPTILAND:
         pytest.skip(
-            f"Optiland {optiland.__version__} is not the pinned {PINNED_OPTILAND}: revisit this "
+            f"Optiland {installed} is not the pinned {PINNED_OPTILAND}: revisit this "
             "known divergence (spec R9) before re-pinning"
         )
     from optiland.materials import IdealMaterial

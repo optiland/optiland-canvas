@@ -12,10 +12,11 @@ silently.
 
 ``--check`` is the scheduled job's half. It regenerates every file twice and
 requires the two runs to be byte-identical, then compares the result with the
-committed files: the metadata exactly, the numbers to ``CHECK_ATOL``. Not byte
-for byte, because the oracles run on numpy's complex ``libm``, which is allowed
-to differ in the last place between platforms, and a fixture written on one
-machine is checked on another.
+committed files: the metadata exactly but for the date, the numbers to
+``CHECK_ATOL``. Not byte for byte, because the oracles run on numpy's complex
+``libm``, which is allowed to differ in the last place between platforms, and a
+fixture written on one machine is checked on another (where it is written again
+with that day's date).
 
 The oracle versions are pinned in ``requirements-oracles.txt``; a version bump
 is a deliberate regeneration, reviewed like any other change to a reference.
@@ -78,8 +79,6 @@ def _optiland(case_stack, lambdas, angles, n0, nf) -> dict:
     """Optiland's own numbers, in its own convention (Macleod's). Amplitudes
     past the critical angle are ``None``: Optiland's exit medium sits on the
     growing branch there (spec §9), and the reconciliation is CF-06's."""
-    import optiland
-
     crit = coating_cases.critical_deg(n0, nf)
     out = {k: [] for k in ("Rs", "Rp", "Ts", "Tp", "rs", "rp", "ts", "tp")}
     for lam in lambdas:
@@ -95,7 +94,7 @@ def _optiland(case_stack, lambdas, angles, n0, nf) -> dict:
                 rows[f"t{pol}"].append(None if past else _c(complex(o["t"][0][0])))
         for k in out:
             out[k].append(rows[k])
-    return {"name": "optiland.thin_film", "version": optiland.__version__, **out}
+    return {"name": "optiland.thin_film", "version": _dist_version("optiland"), **out}
 
 
 def _dist_version(name: str) -> str:
@@ -197,7 +196,12 @@ def check() -> int:
             problems.append(f"{name}: not committed")
             continue
         new, old = json.loads(text), json.loads(path.read_text(encoding="utf-8"))
-        problems += [f"{name}{m}" for m in _numbers_close(new, old)][:5]
+        # The date says when a file was written, not what it holds. A file
+        # whose numbers differ here in the last place is written again with
+        # today's date, and that is no difference.
+        for doc in (new, old):
+            doc.get("generator", {}).pop("date", None)
+        problems +=[f"{name}{m}" for m in _numbers_close(new, old)][:5]
     for p in problems:
         print(p)
     print("fixtures up to date" if not problems else f"{len(problems)} problem(s)")

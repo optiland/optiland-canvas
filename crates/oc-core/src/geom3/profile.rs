@@ -431,8 +431,8 @@ impl EdgeYIndex {
                 continue;
             }
             let (a, b) = (ix.bucket(r.0), ix.bucket(r.1));
-            for k in a..=b {
-                ix.buckets[k].push(i as u32);
+            for bucket in ix.buckets.iter_mut().take(b + 1).skip(a) {
+                bucket.push(i as u32);
             }
         }
         ix.ranges = ranges;
@@ -452,8 +452,8 @@ impl EdgeYIndex {
     fn candidates(&self, lo: f64, hi: f64) -> Vec<u32> {
         let mut out = self.always.clone();
         let (a, b) = (self.bucket(lo), self.bucket(hi));
-        for k in a..=b {
-            out.extend_from_slice(&self.buckets[k]);
+        for bucket in self.buckets.iter().take(b + 1).skip(a) {
+            out.extend_from_slice(bucket);
         }
         out.sort_unstable();
         out.dedup();

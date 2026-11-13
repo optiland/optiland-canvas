@@ -513,6 +513,14 @@ impl SpectralSums3 {
         self.moments().map(|m| (m[0] + m[1]).sqrt())
     }
 
+    /// The RMS spot size along each of the face's axes, `[u, v]`, mm: the
+    /// spread of `u` and of `v` about the centroid. The two add in quadrature
+    /// to [`rms_radius`](Self::rms_radius). A cylindrical lens spreads or
+    /// squeezes the spot along one axis only, which a radius hides.
+    pub fn rms_uv(&self) -> Option<[f64; 2]> {
+        self.moments().map(|m| [m[0].sqrt(), m[1].sqrt()])
+    }
+
     /// The RMS spread of the slopes about their mean: for small angles, the
     /// RMS angular spread in radians. What is left of a collimated beam's
     /// divergence at this line.
@@ -530,6 +538,19 @@ impl SpectralSums3 {
         let m = self.moments()?;
         let spread = m[2] + m[3];
         (spread > 1e-18).then(|| -(m[4] + m[5]) / spread)
+    }
+
+    /// [`best_focus_mm`](Self::best_focus_mm) along each of the face's axes
+    /// on its own, `[u, v]`, mm: where the spot is narrowest in `u`, at
+    /// `-cov(u,a) / var a`, and in `v`, at `-cov(v,b) / var b`, from the same
+    /// sums. A cylindrical lens, or any astigmatic beam, focuses the two at
+    /// different planes, and the single focus is only their mean weighted by
+    /// each axis's `var`. An axis whose rays are all parallel focuses nowhere
+    /// and is `None`; so is the whole line with no flux.
+    pub fn best_focus_uv_mm(&self) -> Option<[Option<f64>; 2]> {
+        let m = self.moments()?;
+        let axis = |cov: f64, var: f64| (var > 1e-18).then(|| -cov / var);
+        Some([axis(m[4], m[2]), axis(m[5], m[3])])
     }
 }
 

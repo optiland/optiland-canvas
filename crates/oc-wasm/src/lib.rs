@@ -2108,6 +2108,25 @@ impl Canvas {
         pack_world(&oc_gpu::cpu3::trace_segments(&job, self.depth3()))
     }
 
+    /// Keep a mesh that stops light, under an id: flat positions, 9 floats a triangle, mm (`oc_trace::solids`). Stays across
+    /// scenes: a file's mesh does not change.
+    #[wasm_bindgen(js_name = defineSolidMesh)]
+    pub fn define_solid_mesh(&mut self, id: u32, positions: &[f32]) {
+        oc_trace::solids::define_mesh(id, positions);
+    }
+
+    /// Where the solids stand now: mesh id, flags (1: lets a ray bound for a detector through), position, quaternion `xyzw`,
+    /// for each. The next settled trace meets them; the fast path does not. `false`, and nothing changes, on an unknown mesh
+    /// or a bad pose.
+    #[wasm_bindgen(js_name = setSolids)]
+    pub fn set_solids(&mut self, instances: &[f64]) -> bool {
+        let ok = oc_trace::solids::set_instances(instances);
+        if ok {
+            self.bump();
+        }
+        ok
+    }
+
     /// CV-C: rigidly move a batch of loaded-scene objects by one delta —
     /// the wasm face of [`Scene3::transform_objects`]. `ids` are raw object
     /// ids (bodies, standalone surfaces, apertures, detectors, sources, in

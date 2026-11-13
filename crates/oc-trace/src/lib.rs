@@ -17,6 +17,8 @@ pub mod result3;
 #[cfg(feature = "trace3")]
 pub mod sequence3;
 #[cfg(feature = "trace3")]
+pub mod solids;
+#[cfg(feature = "trace3")]
 pub mod seq_export;
 #[cfg(feature = "trace3")]
 pub mod tracer3;

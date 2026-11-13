@@ -1222,6 +1222,8 @@ struct EventObjects {
     body_boxes: Vec<Aabb3>,
     /// What each body's intersection reuses from step to step, by body index.
     body_preps: Vec<SolidPrep>,
+    /// The parts' 3D models, as they stood when the trace began (`solids`).
+    solids: Option<std::sync::Arc<crate::solids::Solids>>,
 }
 
 enum ObjKind {
@@ -1276,6 +1278,7 @@ impl EventObjects {
             scene_aabb,
             body_boxes,
             body_preps: scene.bodies.iter().map(|b| b.geometry.prepare()).collect(),
+            solids: crate::solids::current(),
         }
     }
 }
@@ -1306,6 +1309,8 @@ enum EventKind {
         uv: Vec2,
         dir_local: Vec3,
     },
+    /// Something solid that is no optic (`solids`).
+    Solid,
 }
 
 // ---------------------------------------------------------------------------
@@ -1479,6 +1484,11 @@ fn trace_one(
                     // Probe: the flux continues, unchanged, just past the face.
                     continue_probe(&mut stack, &w, ev.point, opl_at, flux_at, skip);
                 }
+            }
+            EventKind::Solid => {
+                // As an aperture with no opening.
+                r.ledger.blocked_aperture += flux_at;
+                r.terminations.record(TerminationReason::ApertureBlocked);
             }
             EventKind::ApertureBlocked { ap } => {
                 r.ledger.blocked_aperture += flux_at;
@@ -1798,6 +1808,12 @@ fn nearest_event(
         bvh.nearest(&w.ray, skip, cfg.bounds_mm, &mut visit);
     }
 
+    if let Some(solids) = &objs.solids {
+        let to_detector = matches!(best.as_ref().map(|b| &b.kind), Some(EventKind::Detector { .. }));
+        if let Some(t) = solids.first_hit(&w.ray, best.as_ref().map(|b| b.t), cfg.bounds_mm, w.depth == 0, to_detector) {
+            return Some(Event { t, point: w.ray.at(t), kind: EventKind::Solid });
+        }
+    }
     best
 }
 
@@ -1808,6 +1824,7 @@ fn event_object(scene: &Scene3, kind: &EventKind) -> u64 {
         EventKind::Surface { surf, .. } => scene.surfaces[*surf].common.id.0,
         EventKind::ApertureBlocked { ap } => scene.apertures[*ap].common.id.0,
         EventKind::Detector { det, .. } => scene.detectors[*det].common.id.0,
+        EventKind::Solid => u64::MAX,
     }
 }
 

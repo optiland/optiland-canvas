@@ -639,6 +639,43 @@ fn interact_surface(
                 go(stack, dir, flux_end * e0 / over);
             }
         }
+        GpuResponse::IdealMirror { px, py } => {
+            // The flat reflection, then a bend across it (mirrors tracer3's f64
+            // branch).
+            let rt = s.rot.transpose();
+            let pl = rt * (point - s.pos);
+            let dl = rt * w.d;
+            let axis = Vec3::new(dl.x, dl.y, -dl.z);
+            let along = pl.dot(axis);
+            let across = pl - axis * along;
+            let slope = |h: f32, p: f32| {
+                let left = 1.0 - along * p;
+                if left.abs() < 1e-6 { 0.0 } else { h * p / left }
+            };
+            let square_x = Vec3::new(1.0, 0.0, 0.0) - axis * axis.x;
+            let dir = if square_x.length() < 1e-5 {
+                s.rot * axis
+            } else {
+                let e_x = square_x.normalize();
+                let e_y = axis.cross(e_x);
+                s.rot * (axis - e_x * slope(across.dot(e_x), *px) - e_y * slope(across.dot(e_y), *py)).normalize()
+            };
+            push(
+                stack,
+                Work {
+                    o: point + dir * EPS,
+                    d: dir,
+                    flux: flux_end,
+                    depth: w.depth + 1,
+                    gdepth: w.gdepth,
+                    medium_n: w.medium_n,
+                    medium_alpha: w.medium_alpha,
+                    flags: w.flags & !SEG_TIR,
+                },
+                max_depth,
+                min_flux,
+            );
+        }
         GpuResponse::ThinLens { f } => {
             // Ideal-lens slope law u' = u − h/f in the surface's local frame
             // (direction-aware; mirrors tracer3's f64 branch). Full

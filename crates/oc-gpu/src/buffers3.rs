@@ -390,6 +390,8 @@ fn encode_response(resp: &GpuResponse, verts: &mut Vec<Vert3Buf>) -> Response3Bu
             (RESP_EXPLICIT_RT, r, encode_spectral(t, verts), zero)
         }
         GpuResponse::ThinLens { f } => (RESP_THIN_LENS, constant(*f), zero, zero),
+        // The WebGPU preview has no bend for it yet: it draws a flat mirror.
+        GpuResponse::IdealMirror { .. } => (RESP_MIRROR, constant(1.0), zero, zero),
         GpuResponse::Grating { k, eta, zero: z0, .. } => {
             let r = encode_spectral(eta, verts);
             (RESP_GRATING, r, encode_spectral(z0, verts), constant(*k))

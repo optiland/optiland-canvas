@@ -2560,6 +2560,7 @@ pub fn response_kind(r: &SurfaceResponse) -> &'static str {
         SurfaceResponse::Retarder { .. } => "retarder",
         SurfaceResponse::DielectricFresnel { .. } => "refract",
         SurfaceResponse::ThinLens { .. } => "thin-lens",
+        SurfaceResponse::IdealMirror { .. } => "ideal-mirror",
         SurfaceResponse::Grating { .. } => "grating",
     }
 }

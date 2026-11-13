@@ -1166,6 +1166,9 @@ fn classify_surface(r: &TwoSidedSurfaceResponse) -> Result<u32, String> {
         SurfaceResponse::ThinLens { .. } => {
             Err("thin lens on a body patch (only standalone surfaces carry it)".into())
         }
+        SurfaceResponse::IdealMirror { .. } => {
+            Err("ideal mirror on a body patch (only standalone surfaces carry it)".into())
+        }
         SurfaceResponse::Grating { .. } => {
             Err("grating on a body patch (only standalone surfaces carry one)".into())
         }
@@ -1351,6 +1354,12 @@ pub enum GpuResponse {
     ThinLens {
         f: f32,
     },
+    /// Ideal mirror; its powers are in NORMALIZED units (`power × norm.scale`),
+    /// to work directly on normalized hit heights.
+    IdealMirror {
+        px: f32,
+        py: f32,
+    },
     /// A diffraction grating, grooves along the surface's local Y: `k` is
     /// the order times the groove density per micrometre, `eta` and `zero`
     /// the fractions sent into that order and the zero order.
@@ -1484,6 +1493,10 @@ fn compile_response(
         SurfaceResponse::Absorber => GpuResponse::Absorber,
         SurfaceResponse::ThinLens { focal_length_mm } => GpuResponse::ThinLens {
             f: (focal_length_mm / scale) as f32,
+        },
+        SurfaceResponse::IdealMirror { power_x_per_mm, power_y_per_mm } => GpuResponse::IdealMirror {
+            px: (power_x_per_mm * scale) as f32,
+            py: (power_y_per_mm * scale) as f32,
         },
         // Directions do not depend on the scene's scale: the shift in a ray's
         // direction cosine is per micrometre of wavelength.

@@ -596,6 +596,18 @@ pub enum SurfaceResponse {
     ThinLens {
         focal_length_mm: f64,
     },
+    /// An ideal mirror: it reflects as a flat mirror on its plane does, then
+    /// bends the ray toward a focus on the reflected axis, at every angle of
+    /// incidence, so it has no astigmatism and no coma: what it is asked to do
+    /// and nothing more. A power is 1/f per mm, 0 for flat in that direction;
+    /// `power_x` acts across the reflected ray along local `X`, `power_y` along
+    /// local `Y`, and two equal powers make one point focus. Full reflection,
+    /// no dispersion, no added path length. Only meaningful on a standalone
+    /// planar surface; a body patch authoring it is rejected by the tracer.
+    IdealMirror {
+        power_x_per_mm: f64,
+        power_y_per_mm: f64,
+    },
     /// A plane diffraction grating: the grooves run along the surface's local
     /// `Y`. Every ray leaves in `order` by the grating equation, exactly, and
     /// in the zero order; the fractions going into each are declared, not
@@ -800,6 +812,12 @@ impl SurfaceResponse {
             Self::ThinLens { focal_length_mm } => {
                 if !focal_length_mm.is_finite() || *focal_length_mm == 0.0 {
                     return Err(range("focal_length_mm", "must be finite and nonzero"));
+                }
+                Ok(())
+            }
+            Self::IdealMirror { power_x_per_mm, power_y_per_mm } => {
+                if !power_x_per_mm.is_finite() || !power_y_per_mm.is_finite() {
+                    return Err(range("power", "must be finite"));
                 }
                 Ok(())
             }

@@ -2746,6 +2746,7 @@ impl Canvas {
                 } => (constant(reflectance), constant(transmittance)),
                 SurfaceResponse::Absorber => ("0".into(), "0".into()),
                 SurfaceResponse::ThinLens { .. } => ("0".into(), "1".into()),
+                SurfaceResponse::IdealMirror { .. } => ("1".into(), "0".into()),
                 SurfaceResponse::DielectricFresnel { .. } => ("null".into(), "null".into()),
                 // A film has no constant R or T: both depend on the angle, and
                 // reporting a number here would be the very thing this is meant
@@ -2833,6 +2834,7 @@ impl Canvas {
                 } => (reflectance.sample(um), transmittance.sample(um)),
                 SurfaceResponse::Absorber => (Some(0.0), Some(0.0)),
                 SurfaceResponse::ThinLens { .. } => (Some(0.0), Some(1.0)),
+                SurfaceResponse::IdealMirror { .. } => (Some(1.0), Some(0.0)),
                 SurfaceResponse::DielectricFresnel { .. } => (None, None),
                 SurfaceResponse::Coating { coating } => {
                     let cos_i = aoi_deg.to_radians().cos();

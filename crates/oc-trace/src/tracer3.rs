@@ -2107,6 +2107,49 @@ fn interact_surface(
         push_event(r, cfg, w, point, opl_at, lens_interact(children));
         return;
     }
+    // An ideal mirror's outgoing direction depends on where it was hit, as a
+    // thin lens's does: handled here, in the surface's frame.
+    if let SurfaceResponse::IdealMirror { power_x_per_mm, power_y_per_mm } = response {
+        r.report.note_exact(PhysicsFeature::Mirror);
+        let t = &s.common.transform;
+        let p = t.inverse_transform_point(point);
+        let d = t.quat().inverse() * w.ray.dir;
+        // The flat reflection, then a bend across it. Heights are measured from
+        // the reflected axis through the surface's origin, and the slope is
+        // height over the distance left to the focus (f less how far along the
+        // axis this hit already is), so a parallel bundle meets in one point.
+        let axis = Vec3::new(d.x, d.y, -d.z);
+        let along = p.dot(axis);
+        let across = p - axis * along;
+        let slope = |h: f64, power: f64| {
+            let left = 1.0 - along * power;
+            if left.abs() < 1e-12 { 0.0 } else { h * power / left }
+        };
+        let square_x = Vec3::new(1.0, 0.0, 0.0) - axis * axis.x;
+        let dir = if square_x.length() < 1e-9 {
+            t.quat() * axis
+        } else {
+            let e_x = square_x.normalize();
+            let e_y = axis.cross(e_x);
+            let bent = axis - e_x * slope(across.dot(e_x), *power_x_per_mm) - e_y * slope(across.dot(e_y), *power_y_per_mm);
+            t.quat() * bent.normalize()
+        };
+        // Full reflection, as a thin lens is full transmission: no polarization
+        // action, the frame carried across by the shortest rotation.
+        let pol = PolRay {
+            stokes: w.state_at(flux_at),
+            x: polarization::transport_frame(w.pol.x, w.ray.dir, dir),
+        };
+        let child = spawn(
+            stack, r, cfg, w, point, dir, pol, opl_at, false, false, min_flux,
+        );
+        let children = child
+            .map(|id| (ChildRole::Reflect, id))
+            .into_iter()
+            .collect();
+        push_event(r, cfg, w, point, opl_at, lens_interact(children));
+        return;
+    }
     // A grating sends light along its grating vector, which is a direction in
     // the element like a lens's axes: handled here, in the surface's frame.
     if let SurfaceResponse::Grating {
@@ -3053,6 +3096,7 @@ fn apply_response(
         // surfaces intercept all three in `interact_surface`; anything else
         // refuses rather than picking an axis.
         SurfaceResponse::ThinLens { .. }
+        | SurfaceResponse::IdealMirror { .. }
         | SurfaceResponse::Grating { .. }
         | SurfaceResponse::Polarizer { .. }
         | SurfaceResponse::Retarder { .. } => {

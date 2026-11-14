@@ -1180,3 +1180,44 @@ fn thin_lens_validates_focal_length() {
     scene.surfaces[0].response_back = lens;
     scene.validate().expect("diverging thin lens is valid");
 }
+
+#[test]
+fn ideal_mirror_validates_powers_and_keeps_its_scene_format() {
+    use oc_core::scene3::{PlanarShape2, SurfaceGeometry3, SurfaceObject3, SurfaceResponse};
+
+    let mut scene = Scene3::new();
+    let id = scene.alloc_object_id();
+    let mirror = |px: f64, py: f64| SurfaceResponse::IdealMirror {
+        power_x_per_mm: px,
+        power_y_per_mm: py,
+    };
+    scene.surfaces.push(SurfaceObject3 {
+        common: ObjectCommon::new(id, oc_core::id::LayerId(0)),
+        geometry: SurfaceGeometry3::Plane {
+            shape: PlanarShape2::Disc { radius_mm: 10.0 },
+        },
+        response_front: mirror(0.01, 0.01),
+        response_back: SurfaceResponse::Absorber,
+    });
+    scene.validate().expect("a focusing ideal mirror is valid");
+    // Flat, diverging, and different along the two axes are all mirrors.
+    for (px, py) in [(0.0, 0.0), (-0.02, -0.02), (0.01, 0.025), (0.0, 0.05)] {
+        scene.surfaces[0].response_front = mirror(px, py);
+        scene.validate().unwrap_or_else(|e| panic!("({px}, {py}): {e:?}"));
+    }
+    for (px, py) in [(f64::NAN, 0.0), (0.0, f64::INFINITY)] {
+        scene.surfaces[0].response_front = mirror(px, py);
+        let err = scene.validate().expect_err("a power must be finite");
+        assert!(matches!(err, SceneError::OutOfRange { .. }), "{err:?}");
+    }
+
+    // What a scene file carries, written out: the shape other tools write.
+    let r = mirror(0.01, 0.025);
+    let json = serde_json::to_value(&r).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({ "IdealMirror": { "power_x_per_mm": 0.01, "power_y_per_mm": 0.025 } })
+    );
+    assert_eq!(serde_json::from_value::<SurfaceResponse>(json).unwrap(), r);
+    assert_eq!(oc_core::build3::response_kind(&r), "ideal-mirror");
+}

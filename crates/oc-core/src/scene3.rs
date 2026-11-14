@@ -597,13 +597,16 @@ pub enum SurfaceResponse {
         focal_length_mm: f64,
     },
     /// An ideal mirror: it reflects as a flat mirror on its plane does, then
-    /// bends the ray toward a focus on the reflected axis, at every angle of
-    /// incidence, so it has no astigmatism and no coma: what it is asked to do
-    /// and nothing more. A power is 1/f per mm, 0 for flat in that direction;
-    /// `power_x` acts across the reflected ray along local `X`, `power_y` along
-    /// local `Y`, and two equal powers make one point focus. Full reflection,
-    /// no dispersion, no added path length. Only meaningful on a standalone
-    /// planar surface; a body patch authoring it is rejected by the tracer.
+    /// bends the ray toward a focus on the reflected axis through the
+    /// surface's origin, at every angle of incidence, so it has no astigmatism
+    /// and no coma: what it is asked to do and nothing more. A power is 1/f
+    /// per mm, positive converging, negative diverging from a virtual focus
+    /// behind the surface, and 0 flat in that direction; `power_x` acts across
+    /// the reflected ray along local `X`, `power_y` along local `Y`, and two
+    /// equal powers make one point focus. Both zero is a `Mirror` of
+    /// reflectivity 1. Full reflection, no dispersion, no added path length.
+    /// Only meaningful on a standalone planar surface; a body patch authoring
+    /// it is rejected by the tracer. See `docs/ideal-mirror.md`.
     IdealMirror {
         power_x_per_mm: f64,
         power_y_per_mm: f64,

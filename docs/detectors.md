@@ -233,6 +233,20 @@ pool adds them up like every other number. From them, per line:
   light travels. Each ray's position there is `u + s·a`, so the spot's
   variance is a parabola in `s` with its least point at
   `s = −(cov(u,a) + cov(v,b)) / (var a + var b)`. Axial colour.
+- **spot and focus per axis**: the same two along `u` and `v` each on its
+  own, from the same sums. The spot along `u` is `√var u`, and the two add in
+  quadrature to the radius. The plane where the spot is narrowest along `u`
+  is `s_u = −cov(u,a) / var a`, and along `v` likewise; the one focus above
+  is their mean, each weighted by its axis's `var`. A cylindrical lens
+  focuses one axis and leaves the other's rays parallel, which then has no
+  focus; crossed cylinders, or any astigmatic beam, focus the two at
+  different planes, and the one focus lands at neither.
+
+The readout (`detectorResultJSON`, `spectral`) gives each line as
+`{nm, hits, flux, centroid, rms, rmsUv, angle, spread, focus, focusUv, sums}`.
+Lengths are mm and angles radians. `rmsUv` is `[u, v]`, `focusUv` is
+`[u, v]` with `null` for an axis whose rays are parallel, both along the
+face's local axes: `u` is the detector's local X and `v` its local Y.
 
 The plot shows the chosen one against wavelength, each point in its line's
 colour, and the readout sets the numbers against each other: how far the
@@ -346,6 +360,18 @@ For colour and the analysis rays:
   records there is the one the sums predicted to `1e-9` mm, and is smaller
   than 0.3 mm either side. Blue focuses before red.
 - **A collimated beam has no focus**, zero spread, and the beam's angle.
+- **Each axis finds its own line focus.** Sums built from rays through a line
+  focus at 12.5 mm in `u` and another at −3.25 mm in `v` give both back to
+  `1e-9` mm, and the one focus is their mean weighted by each axis's slope
+  variance. An axis of parallel rays has none.
+- **Crossed cylinders focus each axis where paraxial optics puts it.** A
+  3 mm collimated beam through an N-BK7 plano-convex cylinder of 100 mm
+  curved in Y and one of 50 mm curved in Z focuses Y at `x = 108 − 8/n` and
+  Z at `x = 64 − 4/n`, both read within 0.1 mm (0.032 mm short, the
+  lenses' spherical aberration). Moved to each plane, that axis's spot is the
+  one its sums predict to `1e-9` mm and is wider 0.3 mm either side. One
+  cylinder leaves the other axis at the beam's width with no focus. In every
+  case the two spot sizes add in quadrature to the radius, to `1e-12`.
 - **More rays for the numbers leave the picture as it was**: the numbers are
   the denser scene's to the bit and the picture is the plain scene's, segment
   for segment and in order, traced whole or shared out to a pool.

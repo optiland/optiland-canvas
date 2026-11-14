@@ -36,6 +36,9 @@ js-sys = "0.3"
 # metrics come from here, never the f32 interactive path (§4.1). `trace3` adds the
 # f64 full-3D reference path (PR 3D-04), the authority behind the 3D preview.
 oc-trace = { path = "../oc-trace", default-features = false, features = ["trace3"] }
+# Analyses read off the f64 reference, run as steppable jobs (ADR 0003).
+# It drives `oc-trace` through its public API; the transport is the one above.
+oc-analysis = { path = "../oc-analysis" }
 # The openUC2 adapter (§5.2): catalogue, setup, and placement. oc-core and the
 # tracers stay domain-free; everything openUC2-shaped lives behind this.
 oc-openuc2 = { path = "../oc-openuc2" }

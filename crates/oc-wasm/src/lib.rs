@@ -49,6 +49,8 @@ mod fidelity_ui;
 mod catalog_ui;
 mod coating_ui;
 mod grating_ui;
+// The analysis job (ADR 0003): `oc-analysis` stepped from a worker.
+mod analysis_ui;
 
 /// The Fresnel lens: add one, read its recipe, rebuild it from an edited one.
 mod fresnel;
@@ -178,6 +180,8 @@ pub struct Canvas {
     /// This worker's share of a reference a pool of workers traces
     /// ([`Canvas::pool_prepare`]).
     pool: std::cell::RefCell<Option<Pool3>>,
+    /// The analysis job in hand ([`Canvas::analysis_begin`]).
+    analysis: std::cell::RefCell<analysis_ui::AnalysisSlot>,
 }
 
 /// One f64 reference trace, and what it was traced for.
@@ -264,6 +268,7 @@ impl Canvas {
             reference: std::cell::RefCell::new(None),
             reference_job: std::cell::RefCell::new(None),
             pool: std::cell::RefCell::new(None),
+            analysis: Default::default(),
         }
     }
 

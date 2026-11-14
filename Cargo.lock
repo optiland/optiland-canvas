@@ -670,6 +670,7 @@ name = "oc-wasm"
 version = "0.0.1"
 dependencies = [
  "js-sys",
+ "oc-analysis",
  "oc-core",
  "oc-fit",
  "oc-gpu",

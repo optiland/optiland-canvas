@@ -674,6 +674,20 @@ impl TracePart3 {
         &self.acc.result.segments
     }
 
+    /// The block's detector readouts so far, read in place. For a caller that
+    /// wants each block's numbers on their own, before the part goes to a
+    /// [`TraceMerge3`]: the analysis crate reads them to tell one pass of a
+    /// trace from the next, which is where its standard errors come from.
+    pub fn detectors(&self) -> &[DetectorResult3] {
+        &self.acc.result.detectors
+    }
+
+    /// The block's energy ledger so far, read in place, like
+    /// [`TracePart3::detectors`].
+    pub fn ledger(&self) -> &EnergyLedger {
+        &self.acc.result.ledger
+    }
+
     /// Whether this block alone recorded `max_records` hits on every detector
     /// (see [`TraceBlocks3::part`]).
     pub fn records_full(&self, max_records: usize) -> bool {

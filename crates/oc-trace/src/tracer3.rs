@@ -2107,6 +2107,86 @@ fn interact_surface(
         push_event(r, cfg, w, point, opl_at, lens_interact(children));
         return;
     }
+    // An ideal mirror's outgoing direction depends on where it was hit, as a
+    // thin lens's does: handled here, in the surface's frame.
+    if let SurfaceResponse::IdealMirror { power_x_per_mm, power_y_per_mm } = response {
+        r.report.note_exact(PhysicsFeature::Mirror);
+        // First the flat mirror of reflectivity 1, exactly as `apply_response`
+        // traces `Mirror`: the same reflection about the same (possibly
+        // figure-error leaned) normal, the state written on the plane of
+        // incidence, and the same note when polarized light makes the
+        // equal-s-and-p model matter. With both powers zero, that is all.
+        let flat = reflect3(w.ray.dir, n_oppose);
+        let s_hat = polarization::incidence_axis(w.ray.dir, n_oppose).unwrap_or(w.pol.x);
+        let stokes_in = w
+            .state_at(flux_at)
+            .rotated(polarization::frame_angle(w.ray.dir, w.pol.x, s_hat));
+        if cfg.polarized() && stokes_in.dop() > 1e-12 {
+            r.report.note_approx(
+                PhysicsFeature::Mirror,
+                "ideal reflector: equal s and p, no retardance",
+            );
+        }
+        let m = Mueller::attenuator(1.0);
+        let stokes = if cfg.polarized() {
+            m.apply(&stokes_in)
+        } else {
+            Stokes::unpolarized(m.unpolarized_gain() * flux_at)
+        };
+        r.ledger.absorbed_surface += flux_at - stokes.s0;
+        // Then the bend, in the surface's frame. The axis is the flat
+        // reflection through the surface's origin, and the focus sits on it at
+        // f = 1/power. A ray reflected at `p` runs parallel to that axis,
+        // `across` off it and already `along` down it, so the line from `p` to
+        // the focus has the slope `across / (f − along)`, written with the
+        // power so a zero power is no bend at all. Every ray of a parallel
+        // bundle is aimed at the one point, at any angle of incidence: no
+        // astigmatism and no coma, by construction. The two powers act along
+        // local X and Y, carried onto the plane square to the axis.
+        let dir = if *power_x_per_mm == 0.0 && *power_y_per_mm == 0.0 {
+            flat
+        } else {
+            let q = s.common.transform.quat();
+            let p = s.common.transform.inverse_transform_point(point);
+            let axis = q.inverse() * flat;
+            let along = p.dot(axis);
+            let across = p - axis * along;
+            let slope = |h: f64, power: f64| {
+                let left = 1.0 - along * power;
+                // A hit already at the focus distance: aim straight on.
+                if left.abs() < 1e-12 { 0.0 } else { h * power / left }
+            };
+            let square_x = Vec3::X - axis * axis.x;
+            if square_x.length() < 1e-9 {
+                // The reflection runs along local X itself, grazing the
+                // surface: there is no plane across it to bend in.
+                flat
+            } else {
+                let e_x = square_x.normalize();
+                let e_y = axis.cross(e_x);
+                let bent = axis
+                    - e_x * slope(across.dot(e_x), *power_x_per_mm)
+                    - e_y * slope(across.dot(e_y), *power_y_per_mm);
+                q * bent.normalize()
+            }
+        };
+        // The bend is not a reflection, so it has no plane of incidence; the
+        // frame is carried across it by the shortest rotation, as through a
+        // thin lens. No bend leaves it on `s_hat`.
+        let pol = PolRay {
+            stokes,
+            x: polarization::transport_frame(s_hat, flat, dir),
+        };
+        let child = spawn(
+            stack, r, cfg, w, point, dir, pol, opl_at, false, false, min_flux,
+        );
+        let children = child
+            .map(|id| (ChildRole::Reflect, id))
+            .into_iter()
+            .collect();
+        push_event(r, cfg, w, point, opl_at, lens_interact(children));
+        return;
+    }
     // A grating sends light along its grating vector, which is a direction in
     // the element like a lens's axes: handled here, in the surface's frame.
     if let SurfaceResponse::Grating {
@@ -3046,13 +3126,15 @@ fn apply_response(
             }
             push_event(r, cfg, w, point, opl_at, interact(children));
         }
-        // A thin lens on a body patch has no meaning: the bend depends on the
-        // hit position in a lens plane the patch does not define. A polarizer or
-        // a retarder on one has none either: their axis is a direction in the
-        // element, and a curved patch of a solid does not define one. Standalone
-        // surfaces intercept all three in `interact_surface`; anything else
-        // refuses rather than picking an axis.
+        // A thin lens or an ideal mirror on a body patch has no meaning: the
+        // bend depends on the hit position in a plane the patch does not
+        // define. A grating, a polarizer or a retarder on one has none either:
+        // their axis is a direction in the element, and a curved patch of a
+        // solid does not define one. Standalone surfaces intercept all of these
+        // in `interact_surface`; anything else refuses rather than picking an
+        // axis.
         SurfaceResponse::ThinLens { .. }
+        | SurfaceResponse::IdealMirror { .. }
         | SurfaceResponse::Grating { .. }
         | SurfaceResponse::Polarizer { .. }
         | SurfaceResponse::Retarder { .. } => {

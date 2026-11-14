@@ -180,6 +180,9 @@ const RESP_THIN_LENS: u32 = 4u;
 // A diffraction grating: `r` the working order's efficiency, `t` the zero
 // order's, `ar.value` the order times the groove density per um.
 const RESP_GRATING: u32 = 6u;
+// An ideal mirror: `r.value` and `t.value` its normalized powers along local X
+// and Y.
+const RESP_IDEAL_MIRROR: u32 = 7u;
 const RESP_COATING: u32 = 5u;
 // Response.flags: the reflection is stray light (an AR coat's residual), so a
 // ghost like bare glass's. Must match buffers3::RESP_FLAG_STRAY.
@@ -1331,6 +1334,32 @@ fn interact_body(w: Work, ev: Event, point: vec3<f32>, flux_end: f32, lambda: f3
     }
 }
 
+// The ideal mirror's bend, applied to its flat reflection `flat` at `point`:
+// heights from the reflected axis through the surface's origin, a slope of
+// height over the distance left to the focus, local X and Y carried onto the
+// plane square to the axis. cpu3's `ideal_mirror_bend`, line for line.
+fn ideal_mirror_slope(h: f32, power: f32, along: f32) -> f32 {
+    let left = 1.0 - along * power;
+    if (abs(left) < 1e-6) { return 0.0; }
+    return h * power / left;
+}
+
+fn ideal_mirror_bend(s: Surface, point: vec3<f32>, flat: vec3<f32>, px: f32, py: f32) -> vec3<f32> {
+    if (px == 0.0 && py == 0.0) { return flat; }
+    let srot = surface_rot(s);
+    let rt = transpose(srot);
+    let p = rt * (point - s.pos.xyz);
+    let axis = rt * flat;
+    let along = dot(p, axis);
+    let across = p - axis * along;
+    let square_x = vec3<f32>(1.0, 0.0, 0.0) - axis * axis.x;
+    if (length(square_x) < 1e-5) { return flat; }
+    let e_x = normalize(square_x);
+    let e_y = cross(axis, e_x);
+    let bent = axis - e_x * ideal_mirror_slope(dot(across, e_x), px, along) - e_y * ideal_mirror_slope(dot(across, e_y), py, along);
+    return normalize(srot * bent);
+}
+
 fn interact_surface(w: Work, ev: Event, point: vec3<f32>, flux_end: f32, lambda: f32, min_flux: f32) {
     let s = surfaces[ev.idx];
     let from_front = dot(w.d, ev.n) < 0.0;
@@ -1353,6 +1382,12 @@ fn interact_surface(w: Work, ev: Event, point: vec3<f32>, flux_end: f32, lambda:
         if (abs(dl.z) > 1e-6 && fl != 0.0) {
             dir = srot * normalize(vec3<f32>(dl.x - abs(dl.z) * pl.x / fl, dl.y - abs(dl.z) * pl.y / fl, dl.z));
         }
+        push(Work(point + dir * EPS, dir, flux_end, w.depth + 1u, w.gdepth, w.medium_n, w.medium_alpha, w.flags & ~SEG_TIR), min_flux);
+    } else if (kind == RESP_IDEAL_MIRROR) {
+        // The flat mirror of reflectivity 1, then the bend toward the focus on
+        // its reflected axis (mirrors cpu3 and tracer3). Full reflection.
+        let flat = reflect3(w.d, n_oppose);
+        let dir = ideal_mirror_bend(s, point, flat, resp.r.value, resp.t.value);
         push(Work(point + dir * EPS, dir, flux_end, w.depth + 1u, w.gdepth, w.medium_n, w.medium_alpha, w.flags & ~SEG_TIR), min_flux);
     } else if (kind == RESP_GRATING) {
         // The grating equation in the surface's frame (mirrors tracer3): the

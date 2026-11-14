@@ -1150,3 +1150,44 @@ fn a_grating_matches_cpu() {
         );
     }
 }
+
+/// The ideal mirror's bend in the shader against the CPU mirror: at 45°, with
+/// two different powers, one, a diverging one and none, for rays hitting off
+/// the axis in both directions and a skew ray, onto a detector down the
+/// reflected axis.
+#[test]
+fn an_ideal_mirror_matches_cpu() {
+    let Some(tracer) = tracer_or_skip() else {
+        return;
+    };
+    for (px, py) in [(0.01, 0.025), (0.02, 0.02), (-0.01, 0.0), (0.0, 0.0)] {
+        let mut scene = Scene3::new();
+        let normal = Vec3::new(-1.0, 1.0, 0.0).normalize();
+        let x = Vec3::Z.cross(normal);
+        let q = glam::DQuat::from_mat3(&glam::DMat3::from_cols(x, normal.cross(x), normal));
+        add_surface(
+            &mut scene,
+            Vec3::ZERO,
+            normal,
+            15.0,
+            SurfaceResponse::IdealMirror {
+                power_x_per_mm: px,
+                power_y_per_mm: py,
+            },
+        );
+        scene.surfaces[0].common.transform = Isometry3::new(Vec3::ZERO, [q.x, q.y, q.z, q.w]).unwrap();
+        add_rect_detector(&mut scene, Vec3::new(0.0, 60.0, 0.0), -Vec3::Y, 20.0, 20.0, [4, 4]);
+        scene.validate().unwrap();
+        assert_gpu_matches_cpu(
+            &tracer,
+            &scene,
+            &[
+                (Vec3::new(-30.0, 0.0, 0.0), Vec3::X),
+                (Vec3::new(-30.0, 4.0, 0.0), Vec3::X),
+                (Vec3::new(-30.0, 0.0, -4.0), Vec3::X),
+                (Vec3::new(-30.0, -3.0, 3.5), Vec3::X),
+                (Vec3::new(-30.0, 2.0, 1.0), Vec3::new(1.0, 0.05, -0.04).normalize()),
+            ],
+        );
+    }
+}

@@ -957,6 +957,69 @@ fn a_thin_lens_matches_f64_for_skew_rays() {
     assert_landing_matches(&scene, &rays);
 }
 
+/// An ideal mirror at 45°, local X in the plane of incidence, its two powers
+/// different, with a detector square to the reflected axis 60 mm down it.
+fn ideal_mirror_scene(px: f64, py: f64) -> Scene3 {
+    let mut scene = Scene3::new();
+    let normal = Vec3::new(-1.0, 1.0, 0.0).normalize();
+    let x = Vec3::Z.cross(normal);
+    let q = glam::DQuat::from_mat3(&glam::DMat3::from_cols(x, normal.cross(x), normal));
+    let id = add_surface(
+        &mut scene,
+        Vec3::ZERO,
+        normal,
+        15.0,
+        SurfaceResponse::IdealMirror {
+            power_x_per_mm: px,
+            power_y_per_mm: py,
+        },
+    );
+    let s = scene.surfaces.iter_mut().find(|s| s.common.id == id).unwrap();
+    s.common.transform = Isometry3::new(Vec3::ZERO, [q.x, q.y, q.z, q.w]).unwrap();
+    add_rect_detector(&mut scene, Vec3::new(0.0, 60.0, 0.0), -Vec3::Y, 20.0, 20.0, [4, 4]);
+    scene.validate().unwrap();
+    scene
+}
+
+#[test]
+fn an_ideal_mirror_bends_like_f64_for_skew_rays() {
+    // The bend is what is checked: at 4 mm off the axis a 100 mm focal length
+    // turns a ray by 0.04 rad, forty times the direction tolerance, so a
+    // preview that drew the mirror flat fails here.
+    for (px, py) in [(0.01, 0.025), (0.02, 0.02), (-0.01, 0.0), (0.0, 0.0)] {
+        let scene = ideal_mirror_scene(px, py);
+        let rays = [
+            (Vec3::new(-30.0, 0.0, 0.0), Vec3::X),
+            (Vec3::new(-30.0, 4.0, 0.0), Vec3::X),
+            (Vec3::new(-30.0, 0.0, -4.0), Vec3::X),
+            (Vec3::new(-30.0, -3.0, 3.5), Vec3::X),
+            (Vec3::new(-30.0, 2.0, 1.0), Vec3::new(1.0, 0.05, -0.04).normalize()),
+        ];
+        assert_landing_matches(&scene, &rays);
+    }
+}
+
+#[test]
+fn an_ideal_mirror_on_a_body_patch_is_rejected_by_the_preview() {
+    let mut scene = Scene3::new();
+    let id = push_body(
+        &mut scene,
+        SolidGeometry3::Box {
+            half_extents_mm: Vec3::new(5.0, 10.0, 10.0),
+        },
+        glass(1.5),
+    );
+    scene.bodies[0].surface.default.from_outside = SurfaceResponse::IdealMirror {
+        power_x_per_mm: 0.01,
+        power_y_per_mm: 0.01,
+    };
+    scene.validate().unwrap();
+    let gpu = GpuScene3::build(&scene, BuildOpts::default());
+    assert_eq!(gpu.rejected.len(), 1, "{:?}", gpu.rejected);
+    assert_eq!(gpu.rejected[0].object, id.0);
+    assert!(gpu.bodies.is_empty(), "no body should be traced");
+}
+
 // ---------------------------------------------------------------------------
 // Beam splitters and dichroics: explicit R/T, constant and tabulated
 // ---------------------------------------------------------------------------

@@ -48,6 +48,9 @@ pub const RESP_COATING: u32 = 5;
 /// A diffraction grating: `r` its working order's efficiency, `t` the zero
 /// order's, and `ar.value` the order times the groove density per µm.
 pub const RESP_GRATING: u32 = 6;
+/// An ideal mirror: `r.value` and `t.value` its normalized powers along the
+/// surface's local X and Y, always constant.
+pub const RESP_IDEAL_MIRROR: u32 = 7;
 /// `Response3Buf::flags`: the reflection is stray light, an AR coat's
 /// residual, and so a ghost rather than a designed path. Must match the
 /// shader's `RESP_FLAG_STRAY`.
@@ -373,7 +376,7 @@ thread_local! {
 }
 
 /// Encode one side's response. A thin lens carries its normalized focal length
-/// in the `r` slot.
+/// in the `r` slot, an ideal mirror its two normalized powers in `r` and `t`.
 fn encode_response(resp: &GpuResponse, verts: &mut Vec<Vert3Buf>) -> Response3Buf {
     let zero = constant(0.0);
     let flags = match resp {
@@ -390,6 +393,7 @@ fn encode_response(resp: &GpuResponse, verts: &mut Vec<Vert3Buf>) -> Response3Bu
             (RESP_EXPLICIT_RT, r, encode_spectral(t, verts), zero)
         }
         GpuResponse::ThinLens { f } => (RESP_THIN_LENS, constant(*f), zero, zero),
+        GpuResponse::IdealMirror { px, py } => (RESP_IDEAL_MIRROR, constant(*px), constant(*py), zero),
         GpuResponse::Grating { k, eta, zero: z0, .. } => {
             let r = encode_spectral(eta, verts);
             (RESP_GRATING, r, encode_spectral(z0, verts), constant(*k))
@@ -798,6 +802,15 @@ mod tests {
         let b = encode_response(&GpuResponse::ThinLens { f: -0.75 }, &mut verts);
         assert_eq!(b.kind, RESP_THIN_LENS);
         assert_eq!(b.r, constant(-0.75));
+        assert!(verts.is_empty());
+    }
+
+    #[test]
+    fn an_ideal_mirror_keeps_its_powers_in_the_r_and_t_slots() {
+        let mut verts = Vec::new();
+        let b = encode_response(&GpuResponse::IdealMirror { px: 0.5, py: -0.25 }, &mut verts);
+        assert_eq!(b.kind, RESP_IDEAL_MIRROR);
+        assert_eq!((b.r, b.t, b.ar), (constant(0.5), constant(-0.25), constant(0.0)));
         assert!(verts.is_empty());
     }
 }

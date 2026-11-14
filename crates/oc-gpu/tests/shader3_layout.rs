@@ -281,3 +281,34 @@ fn the_coating_grid_constants_agree() {
     assert_eq!(rhs, oc_gpu::scene3::COAT_THETA_MAX);
     assert!((f64::from(rhs) - 0.999f64.sqrt().asin()).abs() < 1e-6);
 }
+
+/// The value of a `const NAME: u32 = Nu;` line in the shader.
+fn shader_u32(name: &str) -> u32 {
+    let key = format!("const {name}:");
+    let at = SRC.find(&key).unwrap_or_else(|| panic!("{name} is missing from the shader"));
+    let line = &SRC[at..SRC[at..].find('\n').map(|e| at + e).unwrap_or(SRC.len())];
+    let rhs = line.split('=').nth(1).expect("a value").trim().trim_end_matches(';');
+    rhs.trim_end_matches('u').parse().unwrap_or_else(|_| panic!("{name}: {rhs}"))
+}
+
+/// The host tags each surface side with a response kind and the shader
+/// branches on it, so a kind numbered differently on the two sides traces as
+/// some other response. Each one is pinned by value.
+#[test]
+fn the_response_kinds_agree() {
+    use oc_gpu::buffers3 as b;
+    for (name, host) in [
+        ("RESP_ABSORBER", b::RESP_ABSORBER),
+        ("RESP_MIRROR", b::RESP_MIRROR),
+        ("RESP_DIELECTRIC", b::RESP_DIELECTRIC),
+        ("RESP_EXPLICIT_RT", b::RESP_EXPLICIT_RT),
+        ("RESP_THIN_LENS", b::RESP_THIN_LENS),
+        ("RESP_COATING", b::RESP_COATING),
+        ("RESP_GRATING", b::RESP_GRATING),
+        ("RESP_IDEAL_MIRROR", b::RESP_IDEAL_MIRROR),
+        ("RESP_FLAG_STRAY", b::RESP_FLAG_STRAY),
+        ("RESP_FLAG_TRANSMIT", b::RESP_FLAG_TRANSMIT),
+    ] {
+        assert_eq!(shader_u32(name), host, "{name}");
+    }
+}

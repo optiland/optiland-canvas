@@ -469,6 +469,35 @@ fn interact_body(
     }
 }
 
+/// The ideal mirror's bend, applied to the flat reflection `flat` at `point`
+/// (normalized units, powers `px`, `py` per normalized length). The f32 twin of
+/// tracer3's: heights from the reflected axis through the surface's origin, a
+/// slope of height over the distance left to the focus, and local X and Y
+/// carried onto the plane square to the axis. The shader's
+/// `ideal_mirror_bend` is this line for line.
+fn ideal_mirror_bend(s: &GpuSurface3, point: Vec3, flat: Vec3, px: f32, py: f32) -> Vec3 {
+    if px == 0.0 && py == 0.0 {
+        return flat;
+    }
+    let rt = s.rot.transpose();
+    let p = rt * (point - s.pos);
+    let axis = rt * flat;
+    let along = p.dot(axis);
+    let across = p - axis * along;
+    let slope = |h: f32, power: f32| {
+        let left = 1.0 - along * power;
+        if left.abs() < 1e-6 { 0.0 } else { h * power / left }
+    };
+    let square_x = Vec3::X - axis * axis.x;
+    if square_x.length() < 1e-5 {
+        return flat;
+    }
+    let e_x = square_x.normalize();
+    let e_y = axis.cross(e_x);
+    let bent = axis - e_x * slope(across.dot(e_x), px) - e_y * slope(across.dot(e_y), py);
+    (s.rot * bent).normalize()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn interact_surface(
     scene: &GpuScene3,
@@ -640,26 +669,11 @@ fn interact_surface(
             }
         }
         GpuResponse::IdealMirror { px, py } => {
-            // The flat reflection, then a bend across it (mirrors tracer3's f64
-            // branch).
-            let rt = s.rot.transpose();
-            let pl = rt * (point - s.pos);
-            let dl = rt * w.d;
-            let axis = Vec3::new(dl.x, dl.y, -dl.z);
-            let along = pl.dot(axis);
-            let across = pl - axis * along;
-            let slope = |h: f32, p: f32| {
-                let left = 1.0 - along * p;
-                if left.abs() < 1e-6 { 0.0 } else { h * p / left }
-            };
-            let square_x = Vec3::new(1.0, 0.0, 0.0) - axis * axis.x;
-            let dir = if square_x.length() < 1e-5 {
-                s.rot * axis
-            } else {
-                let e_x = square_x.normalize();
-                let e_y = axis.cross(e_x);
-                s.rot * (axis - e_x * slope(across.dot(e_x), *px) - e_y * slope(across.dot(e_y), *py)).normalize()
-            };
+            // The flat mirror of reflectivity 1, then a bend toward the focus
+            // on its reflected axis (mirrors tracer3's f64 branch; the powers
+            // are in normalized units).
+            let flat = reflect(w.d, n_oppose);
+            let dir = ideal_mirror_bend(s, point, flat, *px, *py);
             push(
                 stack,
                 Work {

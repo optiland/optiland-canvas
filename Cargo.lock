@@ -593,6 +593,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "oc-analysis"
+version = "0.0.1"
+dependencies = [
+ "oc-core",
+ "oc-trace",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "oc-core"
 version = "0.0.1"
 dependencies = [

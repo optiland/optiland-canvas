@@ -29,8 +29,8 @@ This is the reference trace's rule (`referenceBegin` / `referenceStep`).
 
 `analysisBegin` throws, with the reason, for a request this build cannot run
 or this scene cannot answer: an unknown kind, an unknown field, a detector
-the scene does not have, a pass count that does not divide the kernel's 64
-blocks.
+or a source the scene does not have, a pass count that does not divide the
+kernel's 64 blocks.
 
 ## The request
 
@@ -85,3 +85,93 @@ standard error. `u` and `v` are the detector's local X and Y, as in the
   (error / stderr)² stays near the t-distribution's.
 - Cancelling, a scene edit and a ghost toggle drop the job; a bad request
   throws and keeps nothing.
+
+## channels
+
+What each channel passes, and how much of the other sources' light leaks
+into it. For a scene of several sources, such as the DAPI, EGFP and mCherry
+lines of a fluorescence microscope, and a detector per channel.
+
+```json
+{"kind": "channels", "rays": 60000, "passes": 16, "params": {"channels": [
+  {"name": "EGFP", "detector": 6, "sources": [2], "bandUm": [0.5, 0.55]}]}}
+```
+
+A channel has:
+
+| Field | Meaning |
+|---|---|
+| `name` | Its name, unique in the request (optional; the detector's label, or `detector <id>`). |
+| `detector` | The detector it reads, by id. |
+| `sources` | The sources it is meant to see, by id (optional; every source). |
+| `bandUm` | `[low, high]` in µm: only light detected in this band counts (optional; every wavelength). |
+
+With no `params`, there is one channel per detector, seeing every source,
+with no band.
+
+The job traces each source alone, one after the other, so the light on a
+detector is known by the source it came from. Each trace is the scene with
+that one source, under the whole scene's settings. `rays` is split across
+the sources as their own counts are: every source is sampled by the same
+factor, so a source that emits four times the rays of another still does.
+Each source traces the same `passes`.
+
+A band is read off the detector's wavelength bins (5 nm wide below 1 µm). A
+bin counts when its flux-weighted mean wavelength is in the band, ends
+included, so a line counts exactly by its own wavelength, and a continuous
+spectrum is cut to the nearest bin. Light past a detector's 256th bin is in
+no band.
+
+The result has:
+
+- `sources`: per source its id, the launch `rays` it traced and the flux it
+  `launched`.
+- `channels`: per channel its `name`, `detector`, `label`, own `sources` and
+  `bandUm`, and
+  - `signal`: the flux from its own sources, in band;
+  - `leak`: the flux from every other source, in band;
+  - `ratio`: leak over signal, `null` when there is no signal. Its standard
+    error is the first-order one.
+- `crosstalk`: the table of `sources` by `channels`. `flux[s][c]` is the flux
+  source `s` puts on channel `c`'s detector, in its band.
+
+Every flux is the incident flux (W), not the detector's response-weighted
+signal. Every number is `{"value", "stderr"}`. The sources are traced
+independently, so a pass's signal is the sum of its sources' readings in
+that pass, and the spread of those sums is the signal's error.
+
+```json
+"result": {
+  "sources": [{"source": 1, "rays": 1024, "launched": 1.0},
+              {"source": 2, "rays": 1024, "launched": 1.0}],
+  "channels": [{"name": "red", "detector": 7, "label": "", "sources": [2],
+                "bandUm": null,
+                "signal": {"value": 0.5, "stderr": 0.0},
+                "leak":   {"value": 0.5, "stderr": 0.0},
+                "ratio":  {"value": 1.0, "stderr": 0.0}}],
+  "crosstalk": {"sources": [1, 2], "channels": ["red"],
+                "flux": [[{"value": 0.5, "stderr": 0.0}],
+                         [{"value": 0.5, "stderr": 0.0}]]}
+}
+```
+
+`analysisBegin` also throws for a channel with no sources, a source listed
+twice, a band that is not `0 < low < high`, two channels of one name, or an
+empty channel list.
+
+### What is checked
+
+- Stepping one ray, 37, 1000 or all at once gives the same JSON.
+- Each table entry equals the reference trace of that source alone, to the
+  bit; a signal of every source is the column's sum, to the bit.
+- Two beams side by side, each onto its own detector, read a signal of 1 and
+  a leak of 0, both with no noise.
+- A blue and a red beam split 50/50: behind an ideal short-pass the blue
+  channel reads no leak; behind a long-pass that passes both, the red
+  channel leaks the blue half, a ratio of 1. A band on the red line takes
+  that leak out again.
+- Two beams onto a detector smaller than both: over 40 seeds the standard
+  errors of the signal, the leak and the ratio are calibrated, as for
+  `detectorStats`.
+- `rays` splits across sources as their own counts do.
+- Each bad request throws and keeps nothing.

@@ -8,11 +8,12 @@
 //! what it caught, and the object ledger ([`oc_trace::ObjectLedger3`]) for
 //! where, part by part, the light was lost.
 //!
-//! The totals and the detectors carry standard errors, from each block's
-//! ledger and readout ([`oc_trace::TracePart3::ledger`]). The parts do not:
-//! the kernel books a block's object ledger but does not hand it out before
-//! the merge, so only the pooled table is known. The parts' figures are the
-//! pooled ones, as plain numbers.
+//! Every figure carries a standard error from the passes: the totals from
+//! each block's ledger ([`oc_trace::TracePart3::ledger`]), the detectors from
+//! its readouts, and the parts, faces included, from its object ledger
+//! ([`oc_trace::TracePart3::objects`]). The values themselves are the pooled
+//! ones, read off the merged result; the passes give only the spread. A
+//! part's `hits` is a plain count.
 //!
 //! The sinks partition what was launched, so the totals close: launched less
 //! their sum is the kernel's own residual, which is rounding. The parts close
@@ -21,7 +22,9 @@
 use std::collections::BTreeMap;
 
 use oc_core::scene3::{DetectorTermination, Scene3};
-use oc_trace::{DetectorResult3, EnergyLedger, ObjectLedger3, ObjectRef3, TraceResult3};
+use oc_trace::{
+    DetectorResult3, EnergyLedger, ObjectEntry3, ObjectLedger3, ObjectRef3, TraceResult3,
+};
 use serde_json::{json, Value};
 
 use crate::request::BudgetParams;
@@ -57,6 +60,8 @@ struct PassReading {
     sinks: [f64; 7],
     /// Each detector's incident flux, in scene order.
     detectors: Vec<f64>,
+    /// The object ledger, part by part.
+    parts: BTreeMap<PartKey, Part>,
 }
 
 /// The per-pass sums of a `budget` job.
@@ -84,6 +89,7 @@ impl Budget {
         let blank = PassReading {
             sinks: [0.0; 7],
             detectors: vec![0.0; scene.detectors.len()],
+            parts: BTreeMap::new(),
         };
         Ok(Self {
             by_source: p.by_source,
@@ -105,8 +111,13 @@ impl Budget {
         pass: usize,
         ledger: &EnergyLedger,
         detectors: &[DetectorResult3],
+        objects: impl Iterator<Item = ObjectEntry3>,
     ) {
+        let by_source = self.by_source;
         let r = &mut self.passes[trace][pass];
+        for e in objects {
+            book(&mut r.parts, by_source, trace, &e);
+        }
         for (a, b) in r.sinks.iter_mut().zip(sinks(ledger)) {
             *a += b;
         }
@@ -187,7 +198,25 @@ impl Budget {
         let parts_removed = parts.iter().fold(0.0, |a, (_, p)| a + p.ledger.removed());
         let mut rows: Vec<(f64, Value)> = parts
             .iter()
-            .map(|(key, p)| (lost(&p.ledger), part_json(scene, *key, p, &share)))
+            .map(|(key, p)| {
+                // The part in each pass, the traces `of` added up in order; a
+                // pass that never met it read nothing.
+                let passes: Vec<Part> = (0..m)
+                    .map(|pass| {
+                        let mut sum = Part::default();
+                        for &t in of {
+                            if let Some(q) = self.passes[t][pass].parts.get(key) {
+                                sum.add(q);
+                            }
+                        }
+                        sum
+                    })
+                    .collect();
+                (
+                    lost(&p.ledger),
+                    part_json(scene, *key, p, &passes, k, &share),
+                )
+            })
             .collect();
         // Largest loss first; a tie keeps the scene's order.
         rows.sort_by(|a, b| b.0.total_cmp(&a.0));
@@ -244,21 +273,36 @@ impl Budget {
         let mut parts: BTreeMap<PartKey, Part> = BTreeMap::new();
         for &t in of {
             for e in &totals[t].objects {
-                let (key, face) = match e.object {
-                    ObjectRef3::Source => ((0, if self.by_source { t } else { usize::MAX }), None),
-                    ObjectRef3::Surface(i) => ((1, i), None),
-                    ObjectRef3::Body(i, patch) => ((2, i), Some(patch)),
-                    ObjectRef3::Aperture(i) => ((3, i), None),
-                    ObjectRef3::Detector(i) => ((4, i), None),
-                };
-                let p = parts.entry(key).or_default();
-                p.ledger.add(&e.ledger);
-                if let Some(f) = face {
-                    p.faces.entry(f).or_default().add(&e.ledger);
-                }
+                book(&mut parts, self.by_source, t, e);
             }
         }
         parts
+    }
+}
+
+impl Part {
+    fn add(&mut self, o: &Part) {
+        self.ledger.add(&o.ledger);
+        for (f, l) in &o.faces {
+            self.faces.entry(*f).or_default().add(l);
+        }
+    }
+}
+
+/// Book one row of trace `trace`'s object ledger under its part, and its face
+/// for a body.
+fn book(parts: &mut BTreeMap<PartKey, Part>, by_source: bool, trace: usize, e: &ObjectEntry3) {
+    let (key, face) = match e.object {
+        ObjectRef3::Source => ((0, if by_source { trace } else { usize::MAX }), None),
+        ObjectRef3::Surface(i) => ((1, i), None),
+        ObjectRef3::Body(i, patch) => ((2, i), Some(patch)),
+        ObjectRef3::Aperture(i) => ((3, i), None),
+        ObjectRef3::Detector(i) => ((4, i), None),
+    };
+    let p = parts.entry(key).or_default();
+    p.ledger.add(&e.ledger);
+    if let Some(f) = face {
+        p.faces.entry(f).or_default().add(&e.ledger);
     }
 }
 
@@ -267,29 +311,43 @@ fn lost(l: &ObjectLedger3) -> f64 {
     l.absorbed_surface + l.absorbed_volume + l.blocked
 }
 
-fn ledger_json(l: &ObjectLedger3) -> serde_json::Map<String, Value> {
-    let v = json!({
-        "hits": l.hits,
-        "arrived": l.incident,
-        "lost": lost(l),
-        "absorbedSurface": l.absorbed_surface,
-        "absorbedVolume": l.absorbed_volume,
-        "blocked": l.blocked,
-        "detected": l.detected,
-        "escaped": l.escaped,
-        "truncated": l.truncated,
-        "numerical": l.numerical,
-    });
-    match v {
-        Value::Object(m) => m,
-        _ => unreachable!("a ledger is an object"),
+/// One flux of an object ledger, by the name the result gives it.
+type Field = (&'static str, fn(&ObjectLedger3) -> f64);
+
+/// A ledger's figures, each with its standard error from the same ledger in
+/// each pass, `passes`, a pass's figure scaled by `k` (the passes) to be that
+/// pass's own estimate of the whole.
+fn ledger_json(
+    l: &ObjectLedger3,
+    passes: &[&ObjectLedger3],
+    k: f64,
+) -> serde_json::Map<String, Value> {
+    let fields: [Field; 9] = [
+        ("arrived", |l| l.incident),
+        ("lost", lost),
+        ("absorbedSurface", |l| l.absorbed_surface),
+        ("absorbedVolume", |l| l.absorbed_volume),
+        ("blocked", |l| l.blocked),
+        ("detected", |l| l.detected),
+        ("escaped", |l| l.escaped),
+        ("truncated", |l| l.truncated),
+        ("numerical", |l| l.numerical),
+    ];
+    let mut m = serde_json::Map::new();
+    m.insert("hits".into(), json!(l.hits));
+    for (name, f) in fields {
+        let per_pass: Vec<f64> = passes.iter().map(|p| k * f(p)).collect();
+        m.insert(name.into(), json!(Estimate::new(f(l), &per_pass)));
     }
+    m
 }
 
 fn part_json(
     scene: &Scene3,
     (kind, i): PartKey,
     p: &Part,
+    passes: &[Part],
+    k: f64,
     share: &dyn Fn(f64) -> Option<f64>,
 ) -> Value {
     let (kind, common) = match kind {
@@ -316,16 +374,22 @@ fn part_json(
     row.insert("object".into(), id);
     row.insert("kind".into(), json!(kind));
     row.insert("label".into(), label);
-    row.extend(ledger_json(&p.ledger));
+    let ledgers: Vec<&ObjectLedger3> = passes.iter().map(|q| &q.ledger).collect();
+    row.extend(ledger_json(&p.ledger, &ledgers, k));
     row.insert("lostShare".into(), json!(share(lost(&p.ledger))));
     if kind == "body" {
         let faces: Vec<Value> = p
             .faces
             .iter()
             .map(|(patch, l)| {
+                let none = ObjectLedger3::default();
+                let faces: Vec<&ObjectLedger3> = passes
+                    .iter()
+                    .map(|q| q.faces.get(patch).unwrap_or(&none))
+                    .collect();
                 let mut f = serde_json::Map::new();
                 f.insert("patch".into(), json!(patch));
-                f.extend(ledger_json(l));
+                f.extend(ledger_json(l, &faces, k));
                 Value::Object(f)
             })
             .collect();

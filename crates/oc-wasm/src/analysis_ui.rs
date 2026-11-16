@@ -353,7 +353,10 @@ mod tests {
         let b = &r["result"];
         assert!(b["closure"]["relative"].as_f64().unwrap() < 1e-12, "{}", b["closure"]);
         assert!(b["totals"]["detected"]["stderr"].is_number());
-        assert!(!b["parts"].as_array().unwrap().is_empty());
+        let parts = b["parts"].as_array().unwrap();
+        assert!(!parts.is_empty());
+        assert!(parts[0]["lost"]["value"].is_number() && parts[0]["lost"]["stderr"].is_number());
+        assert!(parts[0]["hits"].is_u64(), "hits are a plain count");
         let scene = c.scene3.clone().unwrap();
         let mut job = oc_trace::TraceJob3::with_passes(scene, 2, None, c.cfg3());
         while !job.step(usize::MAX) {}

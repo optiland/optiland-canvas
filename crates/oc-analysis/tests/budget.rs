@@ -6,9 +6,12 @@
 //!   by source;
 //! - the sinks add up to the launched flux, to rounding, and so do the parts;
 //!   the totals are the kernel's own ledger, to the bit;
+//! - the parts' values are the kernel's own object ledger, to the bit, each
+//!   with a standard error from the passes;
 //! - an ideal absorbing filter of known transmission reads its absorption
-//!   and the detected rest, with no noise; a beam partly outside a stop reads
-//!   the share the stop blocks; a beam that misses everything escapes whole;
+//!   and the detected rest, with no noise, part by part too; a beam partly
+//!   outside a stop reads the share the stop blocks, with noise; a beam that
+//!   misses everything escapes whole;
 //! - a request the scene cannot answer is refused with the reason.
 
 use oc_analysis::{sampled_for, AnalysisJob, AnalysisRequest};
@@ -16,7 +19,7 @@ use oc_core::build3::SingletGeom;
 use oc_core::scene::Spectrum;
 use oc_core::scene3::{AbsorptionModel, SamplingSequence, Scene3};
 use oc_core::vec3::Vec3;
-use oc_trace::{TraceConfig3, TraceJob3};
+use oc_trace::{ObjectLedger3, ObjectRef3, TraceConfig3, TraceJob3};
 use serde_json::Value;
 
 /// The rounding the sinks may leave against the launched flux, relative.
@@ -157,7 +160,7 @@ fn stepped_one_ray_at_a_time_is_stepped_all_at_once() {
 /// the same rays (the object ledger changes nothing else).
 #[test]
 fn the_sinks_close_and_are_the_kernels_ledger() {
-    let (scene, _) = train();
+    let (scene, ids) = train();
     let c = TraceConfig3 {
         ghosts: true,
         max_depth: 3,
@@ -202,9 +205,91 @@ fn the_sinks_close_and_are_the_kernels_ledger() {
         .as_array()
         .unwrap()
         .iter()
-        .map(|p| num(&p["lost"]))
+        .map(|p| num(&p["lost"]["value"]))
         .collect();
     assert!(lost.windows(2).all(|w| w[0] >= w[1]), "{lost:?}");
+
+    // The parts are the kernel's object ledger for the same rays, both bands
+    // and a body's faces added up in the ledger's order.
+    let mut job = TraceJob3::with_passes(
+        sampled_for(&scene, 1024),
+        4,
+        None,
+        TraceConfig3 {
+            object_ledger: true,
+            ..c
+        },
+    );
+    while !job.step(usize::MAX) {}
+    let objects = job.finish().objects;
+    let kernel = |of: &dyn Fn(ObjectRef3) -> bool| {
+        let mut l = ObjectLedger3::default();
+        for e in objects.iter().filter(|e| of(e.object)) {
+            l.add(&e.ledger);
+        }
+        l
+    };
+    type Field = (&'static str, fn(&ObjectLedger3) -> f64);
+    let fields: [Field; 8] = [
+        ("arrived", |l| l.incident),
+        ("absorbedSurface", |l| l.absorbed_surface),
+        ("absorbedVolume", |l| l.absorbed_volume),
+        ("blocked", |l| l.blocked),
+        ("detected", |l| l.detected),
+        ("escaped", |l| l.escaped),
+        ("truncated", |l| l.truncated),
+        ("numerical", |l| l.numerical),
+    ];
+    let (lens, stop, f, d) = (ids[0], ids[1], ids[2], ids[3]);
+    for (kind, id, want) in [
+        (
+            "body",
+            lens,
+            kernel(&|o| matches!(o, ObjectRef3::Body(0, _))),
+        ),
+        ("aperture", stop, kernel(&|o| o == ObjectRef3::Aperture(0))),
+        ("surface", f, kernel(&|o| o == ObjectRef3::Surface(0))),
+        ("detector", d, kernel(&|o| o == ObjectRef3::Detector(0))),
+    ] {
+        let p = part(b, kind, id);
+        assert_eq!(p["hits"], want.hits, "{kind} hits are a plain count");
+        for (k, f) in fields {
+            assert_eq!(
+                num(&p[k]["value"]).to_bits(),
+                f(&want).to_bits(),
+                "{kind} {k}"
+            );
+        }
+        let lost = want.absorbed_surface + want.absorbed_volume + want.blocked;
+        assert_eq!(
+            num(&p["lost"]["value"]).to_bits(),
+            lost.to_bits(),
+            "{kind} lost"
+        );
+    }
+    let faces = part(b, "body", lens)["faces"].as_array().unwrap();
+    assert!(!faces.is_empty(), "the lens has faces");
+    for face in faces {
+        let patch = face["patch"].as_u64().unwrap();
+        let want = kernel(&|o| o == ObjectRef3::Body(0, patch));
+        for (k, f) in fields {
+            assert_eq!(
+                num(&face[k]["value"]).to_bits(),
+                f(&want).to_bits(),
+                "face {patch} {k}"
+            );
+        }
+    }
+    // Noise: a ray-traced loss has a spread from pass to pass.
+    let lens_row = part(b, "body", lens);
+    for k in ["arrived", "absorbedVolume", "lost"] {
+        assert!(
+            num(&lens_row[k]["stderr"]) > 0.0,
+            "lens {k}: {}",
+            lens_row[k]
+        );
+    }
+    assert!(num(&part(b, "aperture", stop)["blocked"]["stderr"]) > 0.0);
 }
 
 #[test]
@@ -229,15 +314,16 @@ fn an_ideal_filter_absorbs_its_known_share() {
     }
     exact(&b["detectors"][0]["flux"], 0.3, "on the detector");
     assert_eq!(b["detectors"][0]["detector"], d);
+    // Part by part, with no noise either.
     let p = part(b, "surface", f);
-    assert!(
-        (num(&p["lost"]) - 0.7).abs() < 1e-12 && (num(&p["arrived"]) - 1.0).abs() < 1e-12,
-        "{p}"
-    );
+    exact(&p["lost"], 0.7, "the filter's loss");
+    exact(&p["absorbedSurface"], 0.7, "the filter's absorption");
+    exact(&p["arrived"], 1.0, "at the filter");
+    assert_eq!(p["hits"], 64 * 8, "hits are a plain count");
     assert_eq!(b["parts"][0]["object"], f, "the filter loses most");
     let pd = part(b, "detector", d);
-    assert!((num(&pd["detected"]) - 0.3).abs() < 1e-12, "{pd}");
-    assert_eq!(pd["lost"], 0.0);
+    exact(&pd["detected"], 0.3, "the detector's");
+    exact(&pd["lost"], 0.0, "the detector's loss");
     // Nothing is lost before the filter: the launch books no row.
     assert!(b["parts"]
         .as_array()
@@ -267,10 +353,17 @@ fn a_stop_blocks_the_share_outside_it() {
     );
     assert!((v + num(&b["totals"]["detected"]["value"]) - 1.0).abs() < CLOSURE);
     let p = part(b, "aperture", stop);
-    assert_eq!(num(&p["blocked"]).to_bits(), v.to_bits());
+    assert_eq!(num(&p["blocked"]["value"]).to_bits(), v.to_bits());
     assert!(
-        (num(&p["arrived"]) - v).abs() < 1e-12,
+        (num(&p["arrived"]["value"]) - v).abs() < 1e-12,
         "a stop's arrivals are what it blocked"
+    );
+    // The stop is the only thing that blocks, so its noise is the total's.
+    let pse = num(&p["blocked"]["stderr"]);
+    assert!(
+        pse > 0.0 && (pse - se).abs() < 1e-12,
+        "{} vs {se}",
+        p["blocked"]
     );
     assert!((num(&b["shares"]["blocked"]) - v).abs() < 1e-15);
 }
@@ -288,10 +381,9 @@ fn a_beam_that_misses_everything_escapes() {
     exact(&b["totals"]["detected"], 0.0, "detected");
     exact(&b["detectors"][0]["flux"], 0.0, "on the detector");
     let p = part(b, "source", src);
-    assert_eq!(
-        (p["label"].as_str(), num(&p["escaped"]), num(&p["lost"])),
-        (Some("launch"), 1.0, 0.0)
-    );
+    assert_eq!(p["label"].as_str(), Some("launch"));
+    exact(&p["escaped"], 1.0, "escaped from the launch");
+    exact(&p["lost"], 0.0, "lost at the launch");
     assert_eq!(b["branches"]["escaped"], 64 * 4);
 }
 
@@ -326,8 +418,12 @@ fn by_source_each_source_has_its_own_budget() {
     exact(&src[0]["totals"]["absorbedSurface"], 0.7, "a absorbed");
     exact(&src[0]["totals"]["escaped"], 0.0, "a escaped");
     exact(&src[1]["totals"]["escaped"], 1.0, "b escaped");
-    assert_eq!(part(&src[1], "source", b)["escaped"], 1.0);
-    assert_eq!(part(all, "source", b)["escaped"], 1.0);
+    exact(&part(&src[1], "source", b)["escaped"], 1.0, "b's launch");
+    exact(
+        &part(all, "source", b)["escaped"],
+        1.0,
+        "b's launch, in all",
+    );
     // Without bySource there is no per-source table.
     let whole = run(&s, r#"{"kind":"budget","passes":4}"#, u64::MAX);
     assert!(whole["result"].get("sources").is_none());

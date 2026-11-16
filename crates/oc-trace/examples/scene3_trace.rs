@@ -319,6 +319,7 @@ mod tests {
         let mut scene = Scene3::new();
         let sid = scene.alloc_source_id();
         scene.sources.push(Source3 {
+            window: Default::default(),
             id: sid,
             transform: Isometry3::from_pos(Vec3::new(-10.0, 0.0, 0.0)),
             spatial: SpatialDistribution3::Disc { radius_mm: 2.0 },

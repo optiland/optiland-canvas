@@ -1799,6 +1799,35 @@ pub struct Source3 {
     /// source is explicitly calibrated, and nothing here calibrates one.
     pub flux: f64,
     pub samples: SourceSampling,
+    /// The part of the sampling domain the source emits over; the whole of
+    /// it by default. Not part of a scene file: an analysis sets it on a
+    /// copy of a scene ([`SampleWindow`]).
+    #[serde(skip)]
+    pub window: SampleWindow,
+}
+
+/// A part of a source's sampling domain: a rectangle of the unit square its
+/// origins are drawn from, and one of the unit square its directions are.
+///
+/// Every area origin and every spread of directions is the image of the
+/// unit square under a map that keeps the source's own measure (area for a
+/// rectangle or a disc, solid angle for a cone, projected solid angle for a
+/// Lambertian, power for a sun or a radial profile). So a window of area `a`
+/// holds exactly a fraction `a` of the light, and a source with a window
+/// emits its `flux` over the window alone: a copy of a source cut into
+/// windows, each with its share of the flux, emits the source's light.
+///
+/// A window applies where the source has a square to cut
+/// ([`Source3::window_dims`]): origins from a rectangle or a disc, and
+/// directions in a cone, a Lambertian, a sun or a radial profile. A point, a
+/// single direction and the v1 legacy line and fan ignore it.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SampleWindow {
+    /// `[[u low, u high], [v low, v high]]` of the origins' unit square;
+    /// the whole square when `None`.
+    pub spatial: Option<[[f64; 2]; 2]>,
+    /// The same of the directions' unit square.
+    pub angular: Option<[[f64; 2]; 2]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]

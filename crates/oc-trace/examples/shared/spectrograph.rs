@@ -3121,6 +3121,7 @@ fn lamp_arm(s: &mut Scene3, lamp: &Lamp, ls: &LampSlit, glass: oc_core::material
     let power: f64 = lamp.radiance.iter().map(|b| b.1).sum();
     let sid = s.alloc_source_id();
     s.sources.push(Source3 {
+        window: Default::default(),
         id: sid,
         // Local X along the light, local Y along the slit: the rectangle's
         // width is along the slit, its height across.
@@ -3223,6 +3224,7 @@ fn reflector_lamp(s: &mut Scene3, lamp: &Lamp, coil: Vec3, rim: f64, depth: f64,
             let nrm = y * ang.cos() + z * ang.sin();
             let sid = s.alloc_source_id();
             s.sources.push(Source3 {
+                window: Default::default(),
                 id: sid,
                 transform: frame_x(coil + nrm * apothem, nrm, x),
                 spatial: SpatialDistribution3::Rectangle {

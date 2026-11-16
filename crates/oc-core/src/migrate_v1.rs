@@ -244,6 +244,7 @@ fn migrate_source(s: &Source, scene3: &mut Scene3, report: &mut MigrationReport)
         ),
     };
     Source3 {
+        window: Default::default(),
         id,
         transform: isometry2_to_3(s.transform),
         spatial,

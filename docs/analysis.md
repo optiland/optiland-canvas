@@ -343,10 +343,12 @@ The result has:
   that passed through.
 - `parts`: per part `object` (its id), `kind` (`surface`, `body`,
   `aperture`, `detector`, or `source` for the launch), `label`, and what it
-  did to the light: `hits`, `arrived` (the flux arriving at it), `lost`
-  (absorbed or blocked there) and its `lostShare`, and the light it removed
-  every way: `absorbedSurface`, `absorbedVolume`, `blocked`, `detected`,
-  `escaped`, `truncated`, `numerical`. Sorted by `lost`, largest first.
+  did to the light: `hits` (a count), `arrived` (the flux arriving at it),
+  `lost` (absorbed or blocked there) and its `lostShare`, and the light it
+  removed every way: `absorbedSurface`, `absorbedVolume`, `blocked`,
+  `detected`, `escaped`, `truncated`, `numerical`. Each flux is
+  `{"value", "stderr"}`; `hits` and `lostShare` are plain numbers. Sorted
+  by `lost`'s value, largest first.
 - `branches`: the branches that ended in each way, as counts.
 - `sources`, with `bySource` only: per source its `source` id and `rays`,
   and the same budget for that source alone.
@@ -363,10 +365,12 @@ only one, else `null`.
 by its `patch`. `arrived` and `hits` for a body are summed over its faces,
 so light through a lens arrives twice: once at each face.
 
-**Errors.** The totals and the detectors carry batch-means errors. The parts
-are the pooled values, plain numbers with no error: the kernel keeps a
-block's object ledger but does not hand it out before the merge, so a part's
-spread between passes is not known.
+**Errors.** The totals, the detectors and the parts, faces included, carry
+batch-means errors. A part's error comes from each block's object ledger,
+added up pass by pass the same way the totals come from each block's
+ledger; a pass that never met the part reads 0 for it. The values are the
+pooled ones from the merged trace, the same to the bit as without the
+errors.
 
 **Along a path.** `arrived` is the flux that reached each part, from any
 direction and by any route, ghosts included. The kernel does not book the
@@ -395,15 +399,22 @@ transmits 30% and onto a detector, ghosts on:
                  "flux": {"value": 0.22789, "stderr": 0.00019}, "share": 0.22789}],
   "parts": [
     {"object": 7, "kind": "surface", "label": "", "hits": 17161,
-     "arrived": 0.75962, "lost": 0.53174, "lostShare": 0.53174,
-     "absorbedSurface": 0.53174, "absorbedVolume": 0.0, "blocked": 0.0,
-     "detected": 0.0, "escaped": 0.0, "truncated": 2.3e-8, "numerical": 0.0},
-    {"object": 6, "kind": "aperture", "arrived": 0.09015, "lost": 0.09015, "blocked": 0.09015, ...},
-    {"object": 5, "kind": "body", "arrived": 1.92219, "lost": 0.07452,
-     "absorbedVolume": 0.07452, "escaped": 0.07570, ...,
-     "faces": [{"patch": 1, "arrived": 1.03478, "absorbedVolume": 0.07168, "escaped": 0.07569, ...},
-               {"patch": 3, "arrived": 0.88741, "absorbedVolume": 0.00284, ...}]},
-    {"object": 8, "kind": "detector", "arrived": 0.22789, "lost": 0.0, "detected": 0.22789, ...}],
+     "arrived":         {"value": 0.75962, "stderr": 0.00063},
+     "lost":            {"value": 0.53174, "stderr": 0.00044},
+     "lostShare": 0.53174,
+     "absorbedSurface": {"value": 0.53174, "stderr": 0.00044},
+     "absorbedVolume":  {"value": 0.0,     "stderr": 0.0},
+     "blocked":         {"value": 0.0,     "stderr": 0.0},
+     "detected":        {"value": 0.0,     "stderr": 0.0},
+     "escaped":         {"value": 0.0,     "stderr": 0.0},
+     "truncated":       {"value": 2.3e-8,  "stderr": 3.3e-10},
+     "numerical":       {"value": 0.0,     "stderr": 0.0}},
+    {"object": 6, "kind": "aperture", "lost": {"value": 0.09015, "stderr": 0.00064}, ...},
+    {"object": 5, "kind": "body", "arrived": {"value": 1.92219, "stderr": 0.0000066},
+     "lost": {"value": 0.07452, "stderr": 0.0000063}, ...,
+     "faces": [{"patch": 1, "arrived": {"value": 1.03478, "stderr": 0.00000041}, ...},
+               {"patch": 3, "arrived": {"value": 0.88741, "stderr": 0.0000062}, ...}]},
+    {"object": 8, "kind": "detector", "detected": {"value": 0.22789, "stderr": 0.00019}, ...}],
   "branches": {"detector": 16535, "blocked": 24496, "escaped": 56647,
                "fluxThreshold": 17010, "maxDepth": 0, ...}
 }
@@ -419,11 +430,15 @@ that is not true or false, besides what it throws for every kind.
 - With ghosts on and a depth limit of 3, so every sink but `numerical` is in
   play, the sinks and the parts close to 1e-12 of launched, the stopping
   detectors add up to `detected`, and each total equals the reference
-  trace's ledger to the bit.
+  trace's ledger to the bit. Each part's values, and the lens's faces',
+  equal the reference trace's object ledger to the bit, and the lens's and
+  the stop's losses have a non-zero error.
 - An ideal filter that transmits 30% reads 0.7 absorbed at it and 0.3
-  detected, with no noise; it heads the parts.
+  detected, with no noise, in the totals and part by part; it heads the
+  parts.
 - A square beam of half-width 4 mm through a stop of radius 2 mm reads
-  `blocked` 1 − π/16 within 5 standard errors, all of it at the stop.
+  `blocked` 1 − π/16 within 5 standard errors, all of it at the stop,
+  whose error is the total's.
 - A beam that misses everything reads `escaped` 1, booked to the launch.
 - By source, each source closes on its own, and the scene's budget is
   theirs added up.

@@ -22,7 +22,7 @@
 use serde::Deserialize;
 
 /// The analyses this build runs, by the name a request gives.
-pub const KINDS: [&str; 3] = ["detectorStats", "channels", "uniformity"];
+pub const KINDS: [&str; 4] = ["detectorStats", "channels", "uniformity", "budget"];
 
 /// Passes when a request names none. Sixteen passes put the standard error
 /// itself within about a fifth of its true value.
@@ -47,6 +47,7 @@ pub enum Kind {
     DetectorStats(DetectorStatsParams),
     Channels(ChannelsParams),
     Uniformity(UniformityParams),
+    Budget(BudgetParams),
 }
 
 impl Kind {
@@ -56,6 +57,7 @@ impl Kind {
             Kind::DetectorStats(_) => "detectorStats",
             Kind::Channels(_) => "channels",
             Kind::Uniformity(_) => "uniformity",
+            Kind::Budget(_) => "budget",
         }
     }
 }
@@ -128,6 +130,16 @@ pub struct UniformityTarget {
     pub stderr: f64,
 }
 
+/// `budget`: where the light went.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct BudgetParams {
+    /// Trace each source alone, and give each its own budget beside the
+    /// scene's. False when absent.
+    #[serde(default)]
+    pub by_source: bool,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Envelope {
@@ -171,6 +183,9 @@ impl AnalysisRequest {
             "uniformity" => Kind::Uniformity(
                 serde_json::from_value(params)
                     .map_err(|err| format!("uniformity params: {err}"))?,
+            ),
+            "budget" => Kind::Budget(
+                serde_json::from_value(params).map_err(|err| format!("budget params: {err}"))?,
             ),
             other => {
                 return Err(format!(
@@ -225,6 +240,14 @@ mod tests {
     }
 
     #[test]
+    fn a_budget_request_reads_by_source() {
+        let r = AnalysisRequest::from_json(r#"{"kind":"budget","params":{"bySource":true}}"#).unwrap();
+        assert_eq!(r.kind, Kind::Budget(BudgetParams { by_source: true }));
+        let bare = AnalysisRequest::from_json(r#"{"kind":"budget"}"#).unwrap();
+        assert_eq!(bare.kind, Kind::Budget(BudgetParams::default()));
+    }
+
+    #[test]
     fn a_bad_request_is_refused_with_its_reason() {
         let bad = |s: &str| AnalysisRequest::from_json(s).unwrap_err();
         assert!(bad(r#"{"kind":"psf"}"#).contains("detectorStats"));
@@ -239,5 +262,7 @@ mod tests {
         assert!(bad(r#"{"kind":"uniformity","params":{"detector":1}}"#).contains("cells"));
         assert!(bad(r#"{"kind":"uniformity"}"#).contains("uniformity params"));
         assert!(bad(r#"{"kind":"uniformity","params":{"detector":1,"cells":[4,4],"region":[[0,1],[0,1]]}}"#).contains("unknown field"));
+        assert!(bad(r#"{"kind":"budget","params":{"perSource":true}}"#).contains("unknown field"));
+        assert!(bad(r#"{"kind":"budget","params":{"bySource":1}}"#).contains("budget params"));
     }
 }

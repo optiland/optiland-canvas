@@ -258,4 +258,47 @@ mod tests {
         let flux = r["result"]["detectors"][0]["flux"]["value"].as_f64().unwrap();
         assert_eq!(flux.to_bits(), t.detectors[0].total_incident.to_bits());
     }
+
+    /// `channels` runs behind the same calls: each source traced alone under
+    /// the canvas settings, its entry the reference readout of that source
+    /// alone; and a bad channel throws and keeps nothing.
+    #[test]
+    fn a_channels_job_traces_each_source_alone() {
+        let mut c = canvas();
+        let scene = c.scene3.as_mut().unwrap();
+        let mut red = scene.sources[0].clone();
+        red.id = scene.alloc_source_id();
+        red.spectrum = oc_core::scene::Spectrum::Monochromatic(0.65);
+        red.samples.seed += 7;
+        scene.sources.push(red);
+        let (blue, red) = (scene.sources[0].id.0, scene.sources[1].id.0);
+        let det = scene.detectors[0].common.id.0;
+        c.bump();
+
+        let bad = format!(r#"{{"kind":"channels","params":{{"channels":[{{"detector":{det},"sources":[999]}}]}}}}"#);
+        assert!(c.begin_analysis(&bad).unwrap_err().contains("no source has id 999"));
+        assert_eq!(progress(&c)["state"], "idle");
+
+        let req = format!(
+            r#"{{"kind":"channels","passes":2,"params":{{"channels":[{{"name":"red","detector":{det},"sources":[{red}]}}]}}}}"#
+        );
+        c.begin_analysis(&req).unwrap();
+        while c.analysis_step(1000) < 1.0 {}
+        assert_eq!(progress(&c)["kind"], "channels");
+        let r: serde_json::Value = serde_json::from_str(&c.analysis_result_json()).unwrap();
+        assert_eq!(r["kind"], "channels");
+        let ch = &r["result"]["channels"][0];
+        assert_eq!(ch["sources"], json!([red]));
+        assert!(ch["leak"]["stderr"].is_number());
+        assert_eq!(r["result"]["crosstalk"]["sources"], json!([blue, red]));
+        let scene = c.scene3.clone().unwrap();
+        for s in 0..2 {
+            let alone = oc_analysis::source_alone(&scene, s);
+            let mut job = oc_trace::TraceJob3::with_passes(alone, 2, None, c.cfg3());
+            while !job.step(usize::MAX) {}
+            let t = job.finish();
+            let v = r["result"]["crosstalk"]["flux"][s][0]["value"].as_f64().unwrap();
+            assert_eq!(v.to_bits(), t.detectors[0].total_incident.to_bits(), "source {s}");
+        }
+    }
 }

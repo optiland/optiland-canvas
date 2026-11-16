@@ -688,6 +688,18 @@ impl TracePart3 {
         &self.acc.result.ledger
     }
 
+    /// The block's object ledger so far, read in place, like
+    /// [`TracePart3::detectors`]: the rows [`TraceResult3::objects`] would
+    /// hold for this block alone, in the same order. Empty unless the trace
+    /// keeps an object ledger ([`TraceConfig3::object_ledger`]).
+    pub fn objects(&self) -> impl Iterator<Item = ObjectEntry3> + '_ {
+        self.acc
+            .result
+            .objects
+            .iter()
+            .map(|(&(object, in_band), &ledger)| ObjectEntry3 { object, in_band, ledger })
+    }
+
     /// Whether this block alone recorded `max_records` hits on every detector
     /// (see [`TraceBlocks3::part`]).
     pub fn records_full(&self, max_records: usize) -> bool {

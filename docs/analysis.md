@@ -394,3 +394,148 @@ not above 0, a `sampling` other than the two, `pilotRays` without
 - `"sampling": "forward"` reads as the request without it, to the bit, and
   a focused job with nothing to cut reads forward's numbers to the bit.
 - A box in the wrong corner loses no light.
+
+## budget
+
+Where the light went: every launched watt by the sink it ended in, each
+detector's catch, and the parts that lost it.
+
+```json
+{"kind": "budget", "rays": 16384, "passes": 8, "params": {"bySource": false}}
+```
+
+| Field | Meaning |
+|---|---|
+| `bySource` | Trace each source alone, and give each its own budget beside the scene's (optional; false). Costs no extra rays: `rays` is split across the sources as for `channels`. |
+
+The numbers are the kernel's ledgers, read as they are. The job turns on the
+object ledger, which books each removal against the part where it happened;
+it changes no other number, so the totals equal the reference trace's
+ledger to the bit.
+
+The result has:
+
+- `launched`: the flux launched (W).
+- `totals`: the seven sinks, each `{"value", "stderr"}`. They do not
+  overlap, and together they are everything that left the light:
+
+| Sink | What ended there |
+|---|---|
+| `detected` | Light a stopping detector caught. A probe detector lets light on and is no sink. |
+| `absorbedSurface` | Absorbed at a face: a filter, a coating, a black face, a beam splitter's loss. |
+| `absorbedVolume` | Absorbed in a body's bulk, or in an absorbing medium. |
+| `blocked` | Stopped by an aperture's mask. |
+| `escaped` | Left the scene bounds. |
+| `truncated` | Culled by a limit: depth, ghost depth, branch count or the flux threshold. `branches` says which by count. |
+| `numerical` | Lost to a numerical failure. |
+
+- `shares`: each sink over `launched`.
+- `closure`: `accounted`, the sum of the sinks; `residual`, launched less
+  that; `relative`, its size over launched; `parts` and `partsResidual`, the
+  same for the parts' removals. The kernel books every removal once, so both
+  close to rounding (under 1e-12 of launched in the tests).
+- `detectors`: per detector its id, `label`, `terminates`, `hits`, the
+  incident `flux` with its error, and its `share`. A probe's flux is light
+  that passed through.
+- `parts`: per part `object` (its id), `kind` (`surface`, `body`,
+  `aperture`, `detector`, or `source` for the launch), `label`, and what it
+  did to the light: `hits` (a count), `arrived` (the flux arriving at it),
+  `lost` (absorbed or blocked there) and its `lostShare`, and the light it
+  removed every way: `absorbedSurface`, `absorbedVolume`, `blocked`,
+  `detected`, `escaped`, `truncated`, `numerical`. Each flux is
+  `{"value", "stderr"}`; `hits` and `lostShare` are plain numbers. Sorted
+  by `lost`'s value, largest first.
+- `branches`: the branches that ended in each way, as counts.
+- `sources`, with `bySource` only: per source its `source` id and `rays`,
+  and the same budget for that source alone.
+
+**Who a loss is booked to.** Absorption at a face is booked to that face,
+a block to its stop, a catch to its detector. Light that leaves the scene,
+is culled, or is absorbed in a bulk on the way is booked to the part it last
+left, so the bulk of a lens is the lens's, and a ghost that leaves the scene
+is the face that reflected it. Light that meets nothing is booked to the
+launch, the `source` row: its source's id when it was traced alone or is the
+only one, else `null`.
+
+**A body's faces.** A body's row adds its faces up, and `faces` gives each
+by its `patch`. `arrived` and `hits` for a body are summed over its faces,
+so light through a lens arrives twice: once at each face.
+
+**Errors.** The totals, the detectors and the parts, faces included, carry
+batch-means errors. A part's error comes from each block's object ledger,
+added up pass by pass the same way the totals come from each block's
+ledger; a pass that never met the part reads 0 for it. The values are the
+pooled ones from the merged trace, the same to the bit as without the
+errors.
+
+**Along a path.** `arrived` is the flux that reached each part, from any
+direction and by any route, ghosts included. The kernel does not book the
+order the light met the parts in, so the budget gives no sequence. The
+event log has it, ray by ray, but a job does not keep it.
+
+A beam through an absorbing lens, a stop of 2 mm radius, a filter that
+transmits 30% and onto a detector, ghosts on:
+
+```json
+"result": {
+  "launched": 1.0,
+  "totals": {
+    "detected":        {"value": 0.22789,  "stderr": 0.00019},
+    "absorbedSurface": {"value": 0.53174,  "stderr": 0.00044},
+    "absorbedVolume":  {"value": 0.07452,  "stderr": 0.0000063},
+    "blocked":         {"value": 0.09015,  "stderr": 0.00064},
+    "escaped":         {"value": 0.07570,  "stderr": 0.00000082},
+    "truncated":       {"value": 1.32e-7,  "stderr": 2.5e-10},
+    "numerical":       {"value": 0.0,      "stderr": 0.0}},
+  "shares": {"detected": 0.22789, "absorbedSurface": 0.53174, ...},
+  "closure": {"accounted": 0.9999999999999997, "residual": 3.3e-16,
+              "relative": 3.3e-16, "parts": 0.9999999999999997,
+              "partsResidual": 3.3e-16},
+  "detectors": [{"detector": 8, "label": "", "terminates": true, "hits": 16535,
+                 "flux": {"value": 0.22789, "stderr": 0.00019}, "share": 0.22789}],
+  "parts": [
+    {"object": 7, "kind": "surface", "label": "", "hits": 17161,
+     "arrived":         {"value": 0.75962, "stderr": 0.00063},
+     "lost":            {"value": 0.53174, "stderr": 0.00044},
+     "lostShare": 0.53174,
+     "absorbedSurface": {"value": 0.53174, "stderr": 0.00044},
+     "absorbedVolume":  {"value": 0.0,     "stderr": 0.0},
+     "blocked":         {"value": 0.0,     "stderr": 0.0},
+     "detected":        {"value": 0.0,     "stderr": 0.0},
+     "escaped":         {"value": 0.0,     "stderr": 0.0},
+     "truncated":       {"value": 2.3e-8,  "stderr": 3.3e-10},
+     "numerical":       {"value": 0.0,     "stderr": 0.0}},
+    {"object": 6, "kind": "aperture", "lost": {"value": 0.09015, "stderr": 0.00064}, ...},
+    {"object": 5, "kind": "body", "arrived": {"value": 1.92219, "stderr": 0.0000066},
+     "lost": {"value": 0.07452, "stderr": 0.0000063}, ...,
+     "faces": [{"patch": 1, "arrived": {"value": 1.03478, "stderr": 0.00000041}, ...},
+               {"patch": 3, "arrived": {"value": 0.88741, "stderr": 0.0000062}, ...}]},
+    {"object": 8, "kind": "detector", "detected": {"value": 0.22789, "stderr": 0.00019}, ...}],
+  "branches": {"detector": 16535, "blocked": 24496, "escaped": 56647,
+               "fluxThreshold": 17010, "maxDepth": 0, ...}
+}
+```
+
+`analysisBegin` throws for an unknown field in `params` or a `bySource`
+that is not true or false, besides what it throws for every kind.
+
+### What is checked
+
+- Stepping one ray, 37, 1000 or all at once gives the same JSON, whole and
+  by source.
+- With ghosts on and a depth limit of 3, so every sink but `numerical` is in
+  play, the sinks and the parts close to 1e-12 of launched, the stopping
+  detectors add up to `detected`, and each total equals the reference
+  trace's ledger to the bit. Each part's values, and the lens's faces',
+  equal the reference trace's object ledger to the bit, and the lens's and
+  the stop's losses have a non-zero error.
+- An ideal filter that transmits 30% reads 0.7 absorbed at it and 0.3
+  detected, with no noise, in the totals and part by part; it heads the
+  parts.
+- A square beam of half-width 4 mm through a stop of radius 2 mm reads
+  `blocked` 1 − π/16 within 5 standard errors, all of it at the stop,
+  whose error is the total's.
+- A beam that misses everything reads `escaped` 1, booked to the launch.
+- By source, each source closes on its own, and the scene's budget is
+  theirs added up.
+- Each bad request throws and keeps nothing.

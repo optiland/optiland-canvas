@@ -334,4 +334,36 @@ mod tests {
         assert!(b["mean"]["stderr"].is_number());
         assert_eq!(c.analysis_step(1), 1.0);
     }
+
+    /// `budget` runs behind the same calls: its totals are the canvas
+    /// trace's own ledger, they close on the launched flux, and a bad
+    /// request throws and keeps nothing.
+    #[test]
+    fn a_budget_job_reads_the_canvas_ledger() {
+        let c = canvas();
+        let bad = r#"{"kind":"budget","params":{"bySource":"yes"}}"#;
+        assert!(c.begin_analysis(bad).unwrap_err().contains("budget params"));
+        assert_eq!(progress(&c)["state"], "idle");
+
+        c.begin_analysis(r#"{"kind":"budget","passes":2}"#).unwrap();
+        while c.analysis_step(1000) < 1.0 {}
+        assert_eq!(progress(&c)["kind"], "budget");
+        let r: serde_json::Value = serde_json::from_str(&c.analysis_result_json()).unwrap();
+        assert_eq!(r["kind"], "budget");
+        let b = &r["result"];
+        assert!(b["closure"]["relative"].as_f64().unwrap() < 1e-12, "{}", b["closure"]);
+        assert!(b["totals"]["detected"]["stderr"].is_number());
+        let parts = b["parts"].as_array().unwrap();
+        assert!(!parts.is_empty());
+        assert!(parts[0]["lost"]["value"].is_number() && parts[0]["lost"]["stderr"].is_number());
+        assert!(parts[0]["hits"].is_u64(), "hits are a plain count");
+        let scene = c.scene3.clone().unwrap();
+        let mut job = oc_trace::TraceJob3::with_passes(scene, 2, None, c.cfg3());
+        while !job.step(usize::MAX) {}
+        let l = job.finish().ledger;
+        let v = |k: &str| b["totals"][k]["value"].as_f64().unwrap().to_bits();
+        assert_eq!(v("detected"), l.detected_incident.to_bits());
+        assert_eq!(v("escaped"), l.escaped.to_bits());
+        assert_eq!(b["launched"].as_f64().unwrap().to_bits(), l.launched.to_bits());
+    }
 }

@@ -25,7 +25,9 @@ mod detector_stats;
 pub mod job;
 pub mod request;
 pub mod stats;
+mod uniformity;
 
 pub use job::{launch_count, sampled_for, source_alone, AnalysisJob, Progress};
-pub use request::{AnalysisRequest, ChannelSpec, ChannelsParams, DetectorStatsParams, Kind, DEFAULT_PASSES, KINDS, MAX_PASS_RAYS};
+pub use request::{AnalysisRequest, ChannelSpec, ChannelsParams, DetectorStatsParams, Kind, UniformityParams, UniformityTarget, DEFAULT_PASSES, KINDS, MAX_PASS_RAYS};
 pub use stats::{standard_error, Estimate};
+pub use uniformity::MAX_UNIFORMITY_CELLS;

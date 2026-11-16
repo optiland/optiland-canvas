@@ -22,7 +22,7 @@
 use serde::Deserialize;
 
 /// The analyses this build runs, by the name a request gives.
-pub const KINDS: [&str; 2] = ["detectorStats", "channels"];
+pub const KINDS: [&str; 3] = ["detectorStats", "channels", "uniformity"];
 
 /// Passes when a request names none. Sixteen passes put the standard error
 /// itself within about a fifth of its true value.
@@ -46,6 +46,7 @@ pub struct AnalysisRequest {
 pub enum Kind {
     DetectorStats(DetectorStatsParams),
     Channels(ChannelsParams),
+    Uniformity(UniformityParams),
 }
 
 impl Kind {
@@ -54,6 +55,7 @@ impl Kind {
         match self {
             Kind::DetectorStats(_) => "detectorStats",
             Kind::Channels(_) => "channels",
+            Kind::Uniformity(_) => "uniformity",
         }
     }
 }
@@ -97,6 +99,35 @@ pub struct ChannelSpec {
     pub band_um: Option<[f64; 2]>,
 }
 
+/// `uniformity`: how even the light is over a region of one detector, read
+/// on a grid of cells.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct UniformityParams {
+    /// The detector read, by id.
+    pub detector: u64,
+    /// Cells across the region, `[along u, along v]`.
+    pub cells: [u64; 2],
+    /// `[[u low, u high], [v low, v high]]` in mm, in the detector's local
+    /// frame; the face's whole grid when absent.
+    #[serde(default)]
+    pub region_mm: Option<[[f64; 2]; 2]>,
+    /// Stop once this metric's standard error is this small; trace every ray
+    /// when absent.
+    #[serde(default)]
+    pub target: Option<UniformityTarget>,
+}
+
+/// The noise a `uniformity` job traces down to.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UniformityTarget {
+    /// `"cv"` or `"minMax"`.
+    pub metric: String,
+    /// The standard error to reach, in the metric's own unit (a fraction).
+    pub stderr: f64,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Envelope {
@@ -137,6 +168,10 @@ impl AnalysisRequest {
             "channels" => Kind::Channels(
                 serde_json::from_value(params).map_err(|err| format!("channels params: {err}"))?,
             ),
+            "uniformity" => Kind::Uniformity(
+                serde_json::from_value(params)
+                    .map_err(|err| format!("uniformity params: {err}"))?,
+            ),
             other => {
                 return Err(format!(
                     "unknown analysis kind {other:?}; this build runs {}",
@@ -176,6 +211,20 @@ mod tests {
     }
 
     #[test]
+    fn a_uniformity_request_reads_its_region_and_target() {
+        let r = AnalysisRequest::from_json(
+            r#"{"kind":"uniformity","rays":64000,"passes":64,"params":{"detector":6,"cells":[20,10],
+                "regionMm":[[-5,5],[-2.5,2.5]],"target":{"metric":"cv","stderr":0.005}}}"#,
+        )
+        .unwrap();
+        let Kind::Uniformity(p) = r.kind else { panic!("{:?}", r.kind) };
+        assert_eq!((p.detector, p.cells), (6, [20, 10]));
+        assert_eq!(p.region_mm, Some([[-5.0, 5.0], [-2.5, 2.5]]));
+        let t = p.target.unwrap();
+        assert_eq!((t.metric.as_str(), t.stderr), ("cv", 0.005));
+    }
+
+    #[test]
     fn a_bad_request_is_refused_with_its_reason() {
         let bad = |s: &str| AnalysisRequest::from_json(s).unwrap_err();
         assert!(bad(r#"{"kind":"psf"}"#).contains("detectorStats"));
@@ -187,5 +236,8 @@ mod tests {
         assert!(bad(r#"{"kind":"channels","params":{"channels":[{"sources":[1]}]}}"#).contains("detector"));
         assert!(bad(r#"{"kind":"channels","params":{"channels":[{"detector":1,"band":[0.4,0.5]}]}}"#).contains("unknown field"));
         assert!(bad(r#"{"kind":"channels","params":{"channels":[{"detector":1,"bandUm":[0.4]}]}}"#).contains("channels params"));
+        assert!(bad(r#"{"kind":"uniformity","params":{"detector":1}}"#).contains("cells"));
+        assert!(bad(r#"{"kind":"uniformity"}"#).contains("uniformity params"));
+        assert!(bad(r#"{"kind":"uniformity","params":{"detector":1,"cells":[4,4],"region":[[0,1],[0,1]]}}"#).contains("unknown field"));
     }
 }

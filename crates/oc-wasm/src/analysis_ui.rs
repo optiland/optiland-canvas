@@ -301,4 +301,37 @@ mod tests {
             assert_eq!(v.to_bits(), t.detectors[0].total_incident.to_bits(), "source {s}");
         }
     }
+
+    /// `uniformity` runs behind the same calls: its cells are the kernel's
+    /// pixels on the canvas's own trace, a target stops it at a checkpoint
+    /// with `analysisStep` at 1, and a bad region throws and keeps nothing.
+    #[test]
+    fn a_uniformity_job_reads_the_canvas_trace_and_stops_on_its_target() {
+        let c = canvas();
+        let det = c.scene3.as_ref().unwrap().detectors[0].common.id.0;
+        let bad = format!(r#"{{"kind":"uniformity","params":{{"detector":{det},"cells":[4,4],"regionMm":[[0,1e6],[0,1]]}}}}"#);
+        assert!(c.begin_analysis(&bad).unwrap_err().contains("off the face"));
+        assert_eq!(progress(&c)["state"], "idle");
+
+        let req = format!(
+            r#"{{"kind":"uniformity","passes":64,"params":{{"detector":{det},"cells":[3,3],"target":{{"metric":"minMax","stderr":10}}}}}}"#
+        );
+        let rays = c.begin_analysis(&req).unwrap();
+        let mut f = 0.0;
+        while f < 1.0 {
+            f = c.analysis_step(1000);
+        }
+        let p = progress(&c);
+        assert_eq!((p["state"].as_str(), p["kind"].as_str(), p["passesDone"].as_u64()), (Some("done"), Some("uniformity"), Some(8)));
+        assert!(p["traced"].as_f64().unwrap() < rays, "stopped at the first check");
+        let r: serde_json::Value = serde_json::from_str(&c.analysis_result_json()).unwrap();
+        assert_eq!(r["kind"], "uniformity");
+        let b = &r["result"];
+        assert_eq!(b["stop"]["reached"], true);
+        assert_eq!(b["stop"]["passes"], 8);
+        assert_eq!(r["sampling"]["passes"], 8);
+        assert_eq!(b["irradiance"]["value"].as_array().unwrap().len(), 9);
+        assert!(b["mean"]["stderr"].is_number());
+        assert_eq!(c.analysis_step(1), 1.0);
+    }
 }

@@ -14,6 +14,12 @@
 //! whole runs of blocks, so its per-pass readings do not either: a job stepped
 //! one ray at a time gives the result a job stepped all at once gives, to the
 //! bit (`tests/job.rs`).
+//!
+//! A job may stop before its last ray: one with a noise target
+//! (`uniformity`) checks it as each checkpoint's last pass is merged, and
+//! stops there once the target is met. A check reads whole passes only, so a
+//! job stops at the same pass however it was stepped, and its result is the
+//! same to the bit.
 
 use oc_core::scene3::{Scene3, SpatialDistribution3};
 use oc_trace::{TraceBlocks3, TraceConfig3, TraceMerge3, TracePart3, TraceResult3};
@@ -23,6 +29,7 @@ use serde_json::{json, Value};
 use crate::channels::Channels;
 use crate::detector_stats::DetectorStats;
 use crate::request::{AnalysisRequest, Kind, MAX_PASS_RAYS};
+use crate::uniformity::Uniformity;
 
 /// What a job has traced so far.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -41,6 +48,7 @@ pub struct Progress {
 enum Analysis {
     DetectorStats(DetectorStats),
     Channels(Channels),
+    Uniformity(Uniformity),
 }
 
 /// One trace of a job: a scene traced in passes, a block at a time.
@@ -50,8 +58,9 @@ struct Run {
     /// The blocks added up so far; taken when the last one is in.
     merge: Option<TraceMerge3>,
     blocks_per_pass: usize,
-    /// Launch rays in the blocks already merged.
+    /// Launch rays in the blocks already merged, and the blocks.
     merged_rays: u64,
+    merged_blocks: usize,
     /// The merged trace, once every block is in.
     total: Option<TraceResult3>,
 }
@@ -75,6 +84,7 @@ impl Run {
             merge: Some(merge),
             blocks_per_pass,
             merged_rays: 0,
+            merged_blocks: 0,
             total: None,
         })
     }
@@ -93,8 +103,13 @@ impl Run {
     }
 
     fn passes_done(&self) -> usize {
-        let blocks_in = self.merge.as_ref().map_or(self.blocks.blocks(), TraceMerge3::next_block);
-        blocks_in / self.blocks_per_pass
+        self.merged_blocks / self.blocks_per_pass
+    }
+
+    /// Launch rays in the blocks merged: every ray once the run is done,
+    /// unless it stopped early.
+    fn merged(&self) -> u64 {
+        self.merged_rays
     }
 }
 
@@ -173,6 +188,7 @@ impl AnalysisJob {
         let analysis = match &request.kind {
             Kind::DetectorStats(p) => Analysis::DetectorStats(DetectorStats::new(&traced, p, passes)?),
             Kind::Channels(p) => Analysis::Channels(Channels::new(&traced, p, passes)?),
+            Kind::Uniformity(p) => Analysis::Uniformity(Uniformity::new(&traced, p, passes)?),
         };
         let cfg = TraceConfig3 {
             record_detector_hits: false,
@@ -187,6 +203,7 @@ impl AnalysisJob {
         let scenes = match &analysis {
             Analysis::DetectorStats(_) => vec![traced.clone()],
             Analysis::Channels(_) => (0..traced.sources.len()).map(|i| source_alone(&traced, i)).collect(),
+            Analysis::Uniformity(u) => vec![u.traced_scene(&traced)],
         };
         let runs = scenes
             .into_iter()
@@ -227,6 +244,7 @@ impl AnalysisJob {
     /// and go on to the next run.
     fn advance(&mut self) {
         while let Some(run) = self.runs.get_mut(self.current) {
+            let mut stopped = false;
             let Some(merge) = run.merge.as_mut() else {
                 self.current += 1;
                 continue;
@@ -241,13 +259,24 @@ impl AnalysisJob {
                 match &mut self.analysis {
                     Analysis::DetectorStats(a) => a.add_block(pass, run.part.detectors()),
                     Analysis::Channels(a) => a.add_block(self.current, pass, run.part.detectors()),
+                    Analysis::Uniformity(a) => a.add_block(pass, run.part.detectors()),
                 }
                 let next = (block + 1).min(run.blocks.blocks() - 1);
                 let part = std::mem::replace(&mut run.part, run.blocks.part(next, false));
                 run.merged_rays += part.progress().1 as u64;
+                run.merged_blocks += 1;
                 merge.add(part).expect("the job adds its blocks in order");
+                // A pass is complete: a job with a target may stop on it.
+                if run.merged_blocks % run.blocks_per_pass == 0 {
+                    if let Analysis::Uniformity(a) = &mut self.analysis {
+                        if a.stop_after(run.merged_blocks / run.blocks_per_pass) {
+                            stopped = true;
+                            break;
+                        }
+                    }
+                }
             }
-            if !merge.done() {
+            if !merge.done() && !stopped {
                 return;
             }
             run.total = run.merge.take().map(TraceMerge3::finish);
@@ -297,6 +326,10 @@ impl AnalysisJob {
                 let rays: Vec<u64> = self.runs.iter().map(Run::rays).collect();
                 a.result(&self.scene, &totals, &rays)
             }
+            Analysis::Uniformity(a) => {
+                let run = &self.runs[0];
+                a.result(&self.scene, first, run.merged(), run.rays())
+            }
         };
         let stamp = &first.fidelity;
         let mut approximated = Vec::new();
@@ -314,7 +347,10 @@ impl AnalysisJob {
                 }
             }
         }
-        let rays: u64 = self.runs.iter().map(Run::rays).sum();
+        // The rays and passes traced: all of them, unless the job stopped on
+        // its target.
+        let rays: u64 = self.runs.iter().map(Run::merged).sum();
+        let passes = self.runs.iter().map(Run::passes_done).min().unwrap_or(0) as u64;
         Some(json!({
             "kind": self.request.kind.name(),
             "revision": first.revision,
@@ -329,8 +365,8 @@ impl AnalysisJob {
             "rejected": rejected,
             "sampling": {
                 "rays": rays,
-                "passes": self.request.passes,
-                "raysPerPass": rays / self.request.passes as u64,
+                "passes": passes,
+                "raysPerPass": rays / passes.max(1),
                 "stderr": "batchMeans",
             },
             "result": body,

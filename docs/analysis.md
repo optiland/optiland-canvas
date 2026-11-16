@@ -53,7 +53,8 @@ Every result carries, beside its own numbers:
   and the profile's approximations;
 - `approximations` and `rejected`: what the capability report says this
   scene's features were traced with, or could not be;
-- `sampling`: rays, passes, rays per pass, and how the noise was estimated.
+- `sampling`: the rays and passes traced, rays per pass, and how the noise
+  was estimated. A job that stops on a noise target states where it stopped.
 
 A number with noise is `{"value": ..., "stderr": ...}`. `stderr` is the
 standard error from the passes (batch means, `s / √m`): 0 for a number with
@@ -174,4 +175,126 @@ empty channel list.
   errors of the signal, the leak and the ratio are calibrated, as for
   `detectorStats`.
 - `rays` splits across sources as their own counts do.
+- Each bad request throws and keeps nothing.
+
+## uniformity
+
+How even the light is over a region of one detector, read on a grid of
+cells, with a noise target to trace down to.
+
+```json
+{"kind": "uniformity", "rays": 2000000, "passes": 64, "params": {
+  "detector": 6, "cells": [20, 20], "regionMm": [[-5, 5], [-5, 5]],
+  "target": {"metric": "cv", "stderr": 0.005}}}
+```
+
+| Field | Meaning |
+|---|---|
+| `detector` | The detector read, by id. |
+| `cells` | `[across u, across v]`, at most 1024 along an axis and 65,536 in all. |
+| `regionMm` | `[[u low, u high], [v low, v high]]` in the detector's local mm (optional; the face's whole grid). |
+| `target` | `{"metric": "cv" or "minMax", "stderr": ...}`: stop once that metric's standard error is this small (optional; trace every ray). |
+
+`passes` must be at least 4. With a target, `rays` is the ray limit; ask for
+64 passes, so the job has checks to stop at.
+
+**Cells are the kernel's pixels.** The job traces the scene with the
+detector's pixel grid set so each cell is a whole number of pixels: the
+cells themselves for the whole face, and for a region a finer grid, up to
+1024 pixels along an axis, whose edges land on the region's to within a
+thousandth of a cell, or as near as 1024 pixels allow. `regionMm` in the
+result is the region read; `regionAskedMm` the one asked for. A pixel grid
+bins hits and moves no ray. A cell's irradiance is its flux over its area on
+the face (flux per mm², relative unless the source is calibrated). A cell
+off a round face is `null` and counts in no metric.
+
+**Noise in, noise out.** Noise makes cells look less even than the light
+is: their spread is wider, and the least and most of them lie further out.
+So the passes are split into the even and the odd ones, whose noise is
+independent:
+
+- `cv`, the coefficient of variation across cells: its variance is the mean
+  product of a cell's deviation in one half with its deviation in the other,
+  over the product of the halves' means. Noise does not bias it. The CV is
+  the root, 0 if noise leaves the variance at or below 0; its `stderr` is
+  the distance up to the root of the variance plus one standard error, so an
+  even field reads 0 with the noise it could hide.
+- `minMax`: the least and most lit cells picked in one half and their ratio
+  read in the other, both ways round, the mean of the two. Its error is
+  conditional on the cells picked. When noise swamps the contrast the cells
+  picked are not the true extremes, and it reads nearer 1 than the light.
+
+The other numbers are the pooled ones from every pass traced, with
+batch-means errors:
+
+- `mean`: the mean irradiance over the cells;
+- `falloff.edge` and `falloff.corner`: the mean irradiance of the border
+  cells and of the four corners over that of the centre cells (the middle
+  one, or the two or four of an even count). `null` under 3 × 3 cells.
+
+**A cell with few hits says so.** The kernel counts hits per detector, not
+per cell. `irradiance` holds, row-major with `u` fastest, each cell's
+`value`, `stderr` and `litPasses`, the passes that put any light in it. A
+cell lit in some passes and not all has too few hits per pass for its error
+to be trusted; `cellsSparse` counts those, `cellsDark` the cells no pass
+lit, and `medianCellRelStderr` is the typical cell's relative error.
+
+**Stopping on the target.** A job with a target checks it after 8, 16 and
+32 passes (powers of two, short of the last): if the metric's standard error
+is at or below the target, the job stops there and its result is that of
+the passes traced. A check reads whole passes only, so a job stops at the
+same pass however it is stepped, and gives the same JSON. Few checks keep it
+from stopping on a lucky low reading. `analysisStep` returns 1 when it
+stops; `sampling` states the rays and passes traced.
+
+A beam 24 mm square over a 20 mm square face, `rays` 256,000 in 64
+passes, a target of 0.05 on the CV: met at the first check.
+
+```json
+"sampling": {"rays": 32000, "passes": 8, "raysPerPass": 4000, "stderr": "batchMeans"},
+"result": {
+  "detector": 1, "label": "", "hits": 22265,
+  "cells": [8, 8], "regionMm": [[-10.0, 10.0], [-10.0, 10.0]],
+  "regionAskedMm": null, "cellSizeMm": [2.5, 2.5],
+  "irradiance": {"value": [0.001775, 0.00171, 0.00174, ...],
+                 "stderr": [0.0000501, 0.0000344, 0.0000414, ...],
+                 "litPasses": [8, 8, 8, ...]},
+  "mean":   {"value": 0.0017395, "stderr": 0.0000035},
+  "minMax": {"value": 0.9972, "stderr": 0.0374},
+  "cv":     {"value": 0.0054, "stderr": 0.0118},
+  "falloff": {"edge":   {"value": 1.0232, "stderr": 0.0145},
+              "corner": {"value": 1.0448, "stderr": 0.0225}},
+  "minCell": [2, 7], "maxCell": [7, 7],
+  "cellsOnFace": 64, "cellsDark": 0, "cellsSparse": 0,
+  "medianCellRelStderr": 0.0189,
+  "stop": {"metric": "cv", "target": 0.05, "stderr": 0.0118,
+           "reached": true, "passes": 8, "rays": 32000, "rayLimit": 256000}
+}
+```
+
+`stop` is `null` without a target; `reached` is false when the ray limit
+came first, and `stderr` is then the noise at the limit.
+
+`analysisBegin` also throws for fewer than 4 passes, a cell count of 0 or
+past the limits, a region off the face's grid or not `low < high`, a region
+with no cell on the face, a target on another metric, or a target that is
+not above 0.
+
+### What is checked
+
+- Stepping one ray, 7, 37, 1000 or all at once gives the same JSON, with a
+  target or without, stopped early or at the limit.
+- Over the whole face, each cell's irradiance is the kernel's pixel flux
+  over its area, to the bit.
+- A beam wider than the face reads a CV of 0 and a min/max of 1, and edge
+  and corner falloffs of 1, within 3 standard errors; four times the rays
+  bring the errors down by half or more (the sampling is stratified).
+- A beam over half the region reads a CV of 1, a min/max of 0 with no
+  noise, and half the beam's irradiance.
+- A beam edge through a cell's middle: over 30 seeds the CV's standard
+  error is calibrated, as for `detectorStats`.
+- A loose target stops at 8 of 64 passes with `reached: true`; an
+  impossible one runs every ray with `reached: false`.
+- A tile of the face is read on a grid snapped to its edges.
+- A sparse field counts the cells some pass missed.
 - Each bad request throws and keeps nothing.

@@ -28,6 +28,7 @@ use serde_json::{json, Value};
 
 use crate::channels::Channels;
 use crate::detector_stats::DetectorStats;
+use crate::focus::{Pilot, DEFENSIVE_SHARE, MAX_PILOT_RAYS, MIN_PILOT_RAYS};
 use crate::request::{AnalysisRequest, Kind, MAX_PASS_RAYS};
 use crate::uniformity::Uniformity;
 
@@ -123,6 +124,12 @@ pub struct AnalysisJob {
     current: usize,
     /// The scene as traced, for labels in the result.
     scene: Scene3,
+    /// The settings every trace of the job runs under.
+    cfg: TraceConfig3,
+    /// The pilot of a focused job, traced before the runs.
+    pilot: Option<Pilot>,
+    /// What the pilot cut, once it is done.
+    focus: Option<Value>,
 }
 
 /// The launch rays one pass of `scene` emits: every origin with every
@@ -209,13 +216,30 @@ impl AnalysisJob {
             .into_iter()
             .map(|s| Run::new(s, passes, cfg))
             .collect::<Result<Vec<_>, _>>()?;
+        // A focused job traces its pilot first, on the scene as traced.
+        let pilot = match &analysis {
+            Analysis::Uniformity(u) => u.focused.map(|rays| {
+                // A quarter of the job's own rays, unless the request says.
+                let budget = rays.unwrap_or_else(|| {
+                    (launch_count(&traced) * passes as u64 / 4).clamp(MIN_PILOT_RAYS, MAX_PILOT_RAYS)
+                });
+                Pilot::new(&u.traced_scene(&traced), cfg, budget)
+            }),
+            _ => None,
+        };
         let mut job = Self {
             request,
             analysis,
             runs,
             current: 0,
             scene: traced,
+            cfg,
+            pilot,
+            focus: None,
         };
+        if job.pilot.as_ref().is_some_and(Pilot::done) {
+            job.focus_runs();
+        }
         job.advance();
         Ok(job)
     }
@@ -230,9 +254,21 @@ impl AnalysisJob {
     pub fn step(&mut self, rays: u64) -> bool {
         let mut left = rays.max(1);
         while left > 0 && !self.done() {
+            if let (Some(pilot), Analysis::Uniformity(u)) = (self.pilot.as_mut(), &self.analysis) {
+                if !pilot.done() {
+                    left = left.saturating_sub(pilot.step(left, u));
+                    if pilot.done() {
+                        self.focus_runs();
+                    }
+                    continue;
+                }
+            }
             let run = &mut self.runs[self.current];
-            let before = run.part.progress().0 as u64;
-            run.blocks.step(&mut run.part, left.min(usize::MAX as u64) as usize);
+            let (before, each) = run.part.progress();
+            let before = before as u64;
+            // No more than the block holds, so the kernel's count of rays to
+            // trace cannot overflow.
+            run.blocks.step(&mut run.part, left.min(each as u64 - before) as usize);
             left = left.saturating_sub(run.part.progress().0 as u64 - before);
             self.advance();
         }
@@ -284,16 +320,41 @@ impl AnalysisJob {
         }
     }
 
+    /// The pilot is done: trace the scene it found in place of the one the
+    /// job began with, unless it cut nothing.
+    fn focus_runs(&mut self) {
+        let Some(pilot) = &self.pilot else { return };
+        let (scene, mut report) = pilot.focused();
+        let cut = report
+            .as_array()
+            .is_some_and(|r| r.iter().any(|s| s["focused"] == true));
+        if cut {
+            match Run::new(scene, self.request.passes, self.cfg) {
+                Ok(run) => self.runs[0] = run,
+                Err(_) => {
+                    // Too few rays for the pieces to split into the passes:
+                    // the job traces the sources as they are.
+                    for s in report.as_array_mut().into_iter().flatten() {
+                        *s = json!({ "source": s["source"], "focused": false, "reason": "too few rays to cut" });
+                    }
+                }
+            }
+        }
+        self.focus = Some(report);
+        self.advance();
+    }
+
     /// Whether every ray is traced.
     pub fn done(&self) -> bool {
-        self.current >= self.runs.len()
+        self.pilot.as_ref().map_or(true, Pilot::done) && self.current >= self.runs.len()
     }
 
     pub fn progress(&self) -> Progress {
         let passes_done = self.runs.iter().map(Run::passes_done).sum::<usize>() / self.runs.len().max(1);
+        let (pilot_traced, pilot_rays) = self.pilot.as_ref().map_or((0, 0), |p| (p.traced(), p.total()));
         Progress {
-            traced: self.runs.iter().map(Run::traced).sum(),
-            rays: self.runs.iter().map(Run::rays).sum(),
+            traced: pilot_traced + self.runs.iter().map(Run::traced).sum::<u64>(),
+            rays: pilot_rays + self.runs.iter().map(Run::rays).sum::<u64>(),
             passes_done: passes_done as u32,
             passes: self.request.passes,
         }
@@ -351,6 +412,22 @@ impl AnalysisJob {
         // its target.
         let rays: u64 = self.runs.iter().map(Run::merged).sum();
         let passes = self.runs.iter().map(Run::passes_done).min().unwrap_or(0) as u64;
+        let mut sampling = json!({
+            "rays": rays,
+            "passes": passes,
+            "raysPerPass": rays / passes.max(1),
+            "stderr": "batchMeans",
+        });
+        if let Some(pilot) = &self.pilot {
+            // A focused job: what its pilot traced and what it cut. The
+            // pilot's light is in no number: `rays` are the job's own.
+            let s = sampling.as_object_mut().expect("an object");
+            s.insert("mode".into(), json!("focused"));
+            s.insert("pilotRays".into(), json!(pilot.traced()));
+            s.insert("pilot".into(), pilot.report());
+            s.insert("defensiveShare".into(), json!(DEFENSIVE_SHARE));
+            s.insert("focus".into(), self.focus.clone().unwrap_or(Value::Null));
+        }
         Some(json!({
             "kind": self.request.kind.name(),
             "revision": first.revision,
@@ -363,12 +440,7 @@ impl AnalysisJob {
             },
             "approximations": approximated,
             "rejected": rejected,
-            "sampling": {
-                "rays": rays,
-                "passes": passes,
-                "raysPerPass": rays / passes.max(1),
-                "stderr": "batchMeans",
-            },
+            "sampling": sampling,
             "result": body,
         }))
     }

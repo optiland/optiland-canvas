@@ -116,6 +116,14 @@ pub struct UniformityParams {
     /// when absent.
     #[serde(default)]
     pub target: Option<UniformityTarget>,
+    /// `"forward"` (the default) traces the sources as they are;
+    /// `"focused"` traces a pilot first and spends most of the rays on the
+    /// part of each source's domain that reaches the region.
+    #[serde(default)]
+    pub sampling: Option<String>,
+    /// Launch rays the pilot of a `"focused"` job traces (optional).
+    #[serde(default)]
+    pub pilot_rays: Option<u64>,
 }
 
 /// The noise a `uniformity` job traces down to.
@@ -222,6 +230,13 @@ mod tests {
         assert_eq!(p.region_mm, Some([[-5.0, 5.0], [-2.5, 2.5]]));
         let t = p.target.unwrap();
         assert_eq!((t.metric.as_str(), t.stderr), ("cv", 0.005));
+        assert_eq!((p.sampling, p.pilot_rays), (None, None));
+        let r = AnalysisRequest::from_json(
+            r#"{"kind":"uniformity","params":{"detector":6,"cells":[2,2],"sampling":"focused","pilotRays":8192}}"#,
+        )
+        .unwrap();
+        let Kind::Uniformity(p) = r.kind else { panic!("{:?}", r.kind) };
+        assert_eq!((p.sampling.as_deref(), p.pilot_rays), (Some("focused"), Some(8192)));
     }
 
     #[test]

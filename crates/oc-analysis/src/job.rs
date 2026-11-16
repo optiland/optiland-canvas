@@ -6,7 +6,7 @@
 //! merged trace and the per-pass readings once every ray is traced.
 //!
 //! Most analyses trace the scene once. One that must tell the sources apart
-//! (`channels`) traces it once per source, each trace the scene with that
+//! (`channels`, and `budget` by source) traces it once per source, each trace the scene with that
 //! source alone, one after the other. Each trace is its own run of blocks.
 //!
 //! The kernel cuts a trace into blocks and adds them up in block order, so a
@@ -26,6 +26,7 @@ use oc_trace::{TraceBlocks3, TraceConfig3, TraceMerge3, TracePart3, TraceResult3
 use serde::Serialize;
 use serde_json::{json, Value};
 
+use crate::budget::Budget;
 use crate::channels::Channels;
 use crate::detector_stats::DetectorStats;
 use crate::request::{AnalysisRequest, Kind, MAX_PASS_RAYS};
@@ -49,6 +50,7 @@ enum Analysis {
     DetectorStats(DetectorStats),
     Channels(Channels),
     Uniformity(Uniformity),
+    Budget(Budget),
 }
 
 /// One trace of a job: a scene traced in passes, a block at a time.
@@ -189,12 +191,15 @@ impl AnalysisJob {
             Kind::DetectorStats(p) => Analysis::DetectorStats(DetectorStats::new(&traced, p, passes)?),
             Kind::Channels(p) => Analysis::Channels(Channels::new(&traced, p, passes)?),
             Kind::Uniformity(p) => Analysis::Uniformity(Uniformity::new(&traced, p, passes)?),
+            Kind::Budget(p) => Analysis::Budget(Budget::new(&traced, p, passes)?),
         };
         let cfg = TraceConfig3 {
             record_detector_hits: false,
             record_events: false,
             // No segment is as bright as infinity: nothing is drawn.
             segment_floor: f64::INFINITY,
+            // Where the light was lost, part by part: changes no other number.
+            object_ledger: matches!(analysis, Analysis::Budget(_)),
             ..cfg
         };
         // The scenes traced: the scene, or each source alone. Each is traced
@@ -204,6 +209,10 @@ impl AnalysisJob {
             Analysis::DetectorStats(_) => vec![traced.clone()],
             Analysis::Channels(_) => (0..traced.sources.len()).map(|i| source_alone(&traced, i)).collect(),
             Analysis::Uniformity(u) => vec![u.traced_scene(&traced)],
+            Analysis::Budget(b) if b.by_source() => {
+                (0..traced.sources.len()).map(|i| source_alone(&traced, i)).collect()
+            }
+            Analysis::Budget(_) => vec![traced.clone()],
         };
         let runs = scenes
             .into_iter()
@@ -260,6 +269,9 @@ impl AnalysisJob {
                     Analysis::DetectorStats(a) => a.add_block(pass, run.part.detectors()),
                     Analysis::Channels(a) => a.add_block(self.current, pass, run.part.detectors()),
                     Analysis::Uniformity(a) => a.add_block(pass, run.part.detectors()),
+                    Analysis::Budget(a) => {
+                        a.add_block(self.current, pass, run.part.ledger(), run.part.detectors())
+                    }
                 }
                 let next = (block + 1).min(run.blocks.blocks() - 1);
                 let part = std::mem::replace(&mut run.part, run.blocks.part(next, false));
@@ -329,6 +341,10 @@ impl AnalysisJob {
             Analysis::Uniformity(a) => {
                 let run = &self.runs[0];
                 a.result(&self.scene, first, run.merged(), run.rays())
+            }
+            Analysis::Budget(a) => {
+                let rays: Vec<u64> = self.runs.iter().map(Run::rays).collect();
+                a.result(&self.scene, &totals, &rays)
             }
         };
         let stamp = &first.fidelity;

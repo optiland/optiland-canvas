@@ -23,6 +23,7 @@
 mod budget;
 mod channels;
 mod detector_stats;
+mod focus;
 pub mod job;
 pub mod request;
 pub mod stats;

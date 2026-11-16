@@ -6211,6 +6211,7 @@ mod scene3_tests {
         // it focuses in the Z=0 slice.
         let src = scene.alloc_source_id();
         scene.sources.push(Source3 {
+            window: Default::default(),
             id: src,
             transform: Isometry3::from_pos(Vec3::new(-30.0, 0.0, 0.0)),
             spatial: SpatialDistribution3::Rectangle {
@@ -6306,6 +6307,7 @@ mod scene3_tests {
         // A collimated beam along +X in the Z=0 plane.
         let src = scene.alloc_source_id();
         scene.sources.push(Source3 {
+            window: Default::default(),
             id: src,
             transform: Isometry3::from_pos(Vec3::new(-20.0, 0.0, 0.0)),
             spatial: SpatialDistribution3::Rectangle {

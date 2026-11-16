@@ -119,6 +119,7 @@ impl Source3 {
             self.samples.sequence,
             self.samples.seed,
             pass,
+            self.window.spatial,
         );
 
         let mut out = Vec::with_capacity(spectral.len() * n_spatial * n_angular);
@@ -131,6 +132,7 @@ impl Source3 {
                 self.samples.seed ^ ANGULAR_SALT,
                 pass,
                 *lambda,
+                self.window.angular,
             );
             let flux_each = self.flux * weight / (n_spatial * n_angular) as f64;
             for o_local in &origins_local {
@@ -141,6 +143,29 @@ impl Source3 {
             }
         }
         out
+    }
+
+    /// Which of `[origins, directions]` a [`SampleWindow`](crate::scene3::SampleWindow) cuts: those drawn
+    /// from a unit square through a map that keeps the source's measure.
+    pub fn window_dims(&self) -> [bool; 2] {
+        let spatial = matches!(
+            self.spatial,
+            SpatialDistribution3::Rectangle { .. } | SpatialDistribution3::Disc { .. }
+        );
+        let angular = matches!(
+            self.angular,
+            AngularDistribution3::UniformConeSolidAngle { .. }
+                | AngularDistribution3::LambertianHemisphere
+                | AngularDistribution3::Sun { .. }
+                | AngularDistribution3::RadialProfile { .. }
+        );
+        [spatial, angular]
+    }
+
+    /// Whether this source gives every ray its own origin and direction
+    /// (see [`Source3::emit`]) rather than every origin every direction.
+    pub fn pairs_rays(&self) -> bool {
+        self.spectrum.is_continuum() || self.spreads_both()
     }
 
     /// Does this source spread both its origins and its directions, over more
@@ -156,8 +181,11 @@ impl Source3 {
     fn emit_paired(&self, pass: u32) -> Vec<EmittedRay3> {
         let n = (self.samples.spatial_samples.max(1) as usize) * (self.samples.angular_samples.max(1) as usize);
         let (seq, seed) = (self.samples.sequence, self.samples.seed);
-        let origins = spatial_samples(&self.spatial, n, seq, seed, pass);
-        let dirs = unit_square(n, seq, seed ^ ANGULAR_SALT, pass);
+        let origins = spatial_samples(&self.spatial, n, seq, seed, pass, self.window.spatial);
+        let mut dirs = unit_square(n, seq, seed ^ ANGULAR_SALT, pass);
+        if self.window_dims()[1] {
+            in_window(&mut dirs, self.window.angular);
+        }
         let spectral = self.spectrum.samples();
         let mut out = Vec::with_capacity(n * self.spectrum.ray_multiplicity());
         let ray = |out: &mut Vec<EmittedRay3>, i: usize, d: usize, lambda: f64, flux: f64| {
@@ -251,19 +279,45 @@ fn shuffle(n: usize, seed: u64) -> Vec<usize> {
 // Spatial sampling — local origins in the YZ aperture plane
 // ---------------------------------------------------------------------------
 
+/// Map points of the unit square into `window`, keeping their evenness: the
+/// points themselves, untouched, when there is none.
+fn in_window(points: &mut [(f64, f64)], window: Option<[[f64; 2]; 2]>) {
+    let Some([[u0, u1], [v0, v1]]) = window else {
+        return;
+    };
+    for (u, v) in points {
+        *u = u0 + *u * (u1 - u0);
+        *v = v0 + *v * (v1 - v0);
+    }
+}
+
+/// `n` points of the unit square in `window`.
+fn window_square(
+    n: usize,
+    seq: SamplingSequence,
+    seed: u64,
+    pass: u32,
+    window: Option<[[f64; 2]; 2]>,
+) -> Vec<(f64, f64)> {
+    let mut points = unit_square(n, seq, seed, pass);
+    in_window(&mut points, window);
+    points
+}
+
 fn spatial_samples(
     dist: &SpatialDistribution3,
     n: usize,
     seq: SamplingSequence,
     seed: u64,
     pass: u32,
+    window: Option<[[f64; 2]; 2]>,
 ) -> Vec<Vec3> {
     match dist {
         SpatialDistribution3::Point => vec![Vec3::ZERO; n],
         SpatialDistribution3::Rectangle {
             half_width_mm,
             half_height_mm,
-        } => unit_square(n, seq, seed, pass)
+        } => window_square(n, seq, seed, pass, window)
             .into_iter()
             .map(|(u, v)| {
                 Vec3::new(
@@ -273,7 +327,7 @@ fn spatial_samples(
                 )
             })
             .collect(),
-        SpatialDistribution3::Disc { radius_mm } => unit_square(n, seq, seed, pass)
+        SpatialDistribution3::Disc { radius_mm } => window_square(n, seq, seed, pass, window)
             .into_iter()
             .map(|(u, v)| {
                 let (dy, dz) = concentric_disc(u, v);
@@ -299,6 +353,7 @@ fn angular_samples(
     seed: u64,
     pass: u32,
     lambda_um: f64,
+    window: Option<[[f64; 2]; 2]>,
 ) -> Vec<Vec3> {
     match dist {
         AngularDistribution3::Direction { local_dir } => {
@@ -312,7 +367,7 @@ fn angular_samples(
                 Vec3::new(ang.cos(), ang.sin(), 0.0)
             })
             .collect(),
-        _ => unit_square(n, seq, seed, pass)
+        _ => window_square(n, seq, seed, pass, window)
             .into_iter()
             .map(|(u, v)| angular_dir(dist, u, v, lambda_um))
             .collect(),
@@ -559,7 +614,7 @@ mod tests {
 
     use super::*;
     use crate::scene::Spectrum;
-    use crate::scene3::SourceSampling;
+    use crate::scene3::{SampleWindow, SourceSampling};
     use crate::vec3::Isometry3;
 
     fn source(
@@ -568,6 +623,7 @@ mod tests {
         samples: SourceSampling,
     ) -> Source3 {
         Source3 {
+            window: Default::default(),
             id: SourceId(0),
             transform: Isometry3::IDENTITY,
             spatial,
@@ -737,6 +793,7 @@ mod tests {
         // Aim down -Y by rotating +X onto -Y, and offset the origin.
         let q = glam::DQuat::from_rotation_arc(Vec3::X, -Vec3::Y);
         let s = Source3 {
+            window: Default::default(),
             transform: Isometry3::new(Vec3::new(1.0, 2.0, 3.0), [q.x, q.y, q.z, q.w]).unwrap(),
             ..source(
                 SpatialDistribution3::Point,
@@ -833,7 +890,7 @@ mod tests {
             sampling(1, 16, SamplingSequence::Sobol, 0),
         );
         let rays = s.emit();
-        let expect = angular_samples(&s.angular, 16, SamplingSequence::Sobol, ANGULAR_SALT, 0, 0.5);
+        let expect = angular_samples(&s.angular, 16, SamplingSequence::Sobol, ANGULAR_SALT, 0, 0.5, None);
         assert_eq!(rays.len(), 16);
         for (r, d) in rays.iter().zip(&expect) {
             assert!((r.ray.dir - *d).length() < 1e-15);
@@ -862,5 +919,71 @@ mod tests {
             let mean = rays.iter().map(|r| r.ray.dir.x).sum::<f64>() / rays.len() as f64;
             assert!((mean - expect).abs() < 1e-5, "pass {pass}: {mean} vs {expect}");
         }
+    }
+
+    #[test]
+    fn a_window_cuts_the_square_its_points_come_from() {
+        let rect = SpatialDistribution3::Rectangle {
+            half_width_mm: 4.0,
+            half_height_mm: 2.0,
+        };
+        let mut s = source(
+            rect,
+            AngularDistribution3::LambertianHemisphere,
+            sampling(64, 4, SamplingSequence::Sobol, 3),
+        );
+        assert_eq!(s.window_dims(), [true, true]);
+        assert!(s.pairs_rays());
+        s.window = SampleWindow {
+            spatial: Some([[0.25, 0.5], [0.5, 1.0]]),
+            angular: Some([[0.0, 0.19], [0.0, 0.25]]),
+        };
+        for pass in [0, 5] {
+            let rays = s.emit_pass(pass);
+            assert_eq!(rays.len(), 256);
+            let total: f64 = rays.iter().map(|r| r.flux).sum();
+            assert!((total - 1.0).abs() < 1e-12, "the flux is over the window");
+            for r in &rays {
+                let (o, d) = (r.ray.origin, r.ray.dir);
+                assert!((-2.0 - 1e-12..=1e-12).contains(&o.y) && (-1e-12..=2.0 + 1e-12).contains(&o.z), "{o:?}");
+                // cos θ = √(1 − u) ≥ 0.9, and the azimuth in the first quarter.
+                assert!(d.x >= 0.9 - 1e-12 && d.y >= -1e-12 && d.z >= -1e-12, "{d:?}");
+            }
+        }
+        // A window where there is no square to cut changes nothing.
+        let mut p = source(
+            SpatialDistribution3::Point,
+            AngularDistribution3::Direction { local_dir: Vec3::X },
+            sampling(1, 8, SamplingSequence::Stratified, 1),
+        );
+        assert_eq!(p.window_dims(), [false, false]);
+        let plain = p.emit_pass(2);
+        p.window = SampleWindow {
+            spatial: Some([[0.0, 0.5], [0.0, 0.5]]),
+            angular: Some([[0.0, 0.5], [0.0, 0.5]]),
+        };
+        assert_eq!(p.emit_pass(2), plain);
+    }
+
+    /// A disc cut into four windows, each with a quarter of the flux, is the
+    /// disc: the flux-weighted second moment of its origins is the disc's,
+    /// r²/4 along each axis.
+    #[test]
+    fn a_source_cut_into_windows_emits_the_sources_light() {
+        let whole = source(
+            SpatialDistribution3::Disc { radius_mm: 2.0 },
+            AngularDistribution3::Direction { local_dir: Vec3::X },
+            sampling(4096, 1, SamplingSequence::Sobol, 0),
+        );
+        let moment = |rays: &[EmittedRay3]| rays.iter().map(|r| r.flux * r.ray.origin.y * r.ray.origin.y).sum::<f64>();
+        let mut cut = 0.0;
+        for (u, v) in [(0.0, 0.0), (0.5, 0.0), (0.0, 0.5), (0.5, 0.5)] {
+            let mut w = whole.clone();
+            w.flux = 0.25;
+            w.window.spatial = Some([[u, u + 0.5], [v, v + 0.5]]);
+            cut += moment(&w.emit());
+        }
+        assert!((cut - 1.0).abs() < 2e-3, "cut {cut}");
+        assert!((moment(&whole.emit()) - 1.0).abs() < 2e-3);
     }
 }

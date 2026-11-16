@@ -370,6 +370,7 @@ fn extruded_prism(s: &mut Scene3, nd: f64) {
 fn collimated_source(s: &mut Scene3, y: f64, half_width: f64, rays: u32) {
     let id = s.alloc_source_id();
     s.sources.push(Source3 {
+        window: Default::default(),
         id,
         transform: Isometry3::from_pos(Vec3::new(-30.0, y, 0.0)),
         spatial: SpatialDistribution3::LineLegacy {
@@ -495,6 +496,7 @@ fn a_cone_source_is_refused() {
     let mut s = Scene3::new();
     let id = s.alloc_source_id();
     s.sources.push(Source3 {
+        window: Default::default(),
         id,
         transform: Isometry3::from_pos(Vec3::new(-10.0, 0.0, 0.0)),
         spatial: SpatialDistribution3::Point,

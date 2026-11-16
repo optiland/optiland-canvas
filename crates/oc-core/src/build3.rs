@@ -476,6 +476,7 @@ impl Scene3 {
     ) -> SourceId {
         let id = self.alloc_source_id();
         self.sources.push(Source3 {
+            window: Default::default(),
             id,
             transform: Isometry3::from_pos(pos),
             spatial: SpatialDistribution3::Rectangle {

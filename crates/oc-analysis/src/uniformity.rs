@@ -35,6 +35,7 @@ use oc_core::scene3::{DetectorMeasure, Scene3};
 use oc_trace::{DetectorResult3, TraceResult3};
 use serde_json::{json, Value};
 
+use crate::focus::{MAX_PILOT_RAYS, MIN_PILOT_RAYS};
 use crate::request::UniformityParams;
 use crate::stats::{standard_error, Estimate};
 
@@ -138,6 +139,9 @@ pub(crate) struct Uniformity {
     /// Where the job stopped on its target, in passes, and the standard
     /// error it read there.
     stopped: Option<(usize, f64)>,
+    /// For a focused job, the pilot rays it asked for, if it named them;
+    /// `None` for a forward one.
+    pub(crate) focused: Option<Option<u64>>,
 }
 
 fn bad(what: String) -> String {
@@ -244,7 +248,29 @@ impl Uniformity {
                 Some((metric, t.stderr))
             }
         };
+        let focused = match (p.sampling.as_deref(), p.pilot_rays) {
+            (None | Some("forward"), None) => None,
+            (None | Some("forward"), Some(_)) => {
+                return Err(bad(
+                    "pilotRays is for \"sampling\": \"focused\" alone".into(),
+                ))
+            }
+            (Some("focused"), rays) => {
+                if let Some(r) = rays.filter(|r| !(MIN_PILOT_RAYS..=MAX_PILOT_RAYS).contains(r)) {
+                    return Err(bad(format!(
+                        "pilotRays must be from {MIN_PILOT_RAYS} to {MAX_PILOT_RAYS}, not {r}"
+                    )));
+                }
+                Some(rays)
+            }
+            (Some(other), _) => {
+                return Err(bad(format!(
+                    "sampling is \"forward\" or \"focused\", not {other:?}"
+                )))
+            }
+        };
         Ok(Self {
+            focused,
             det,
             u,
             v,
@@ -277,6 +303,15 @@ impl Uniformity {
         for_each_pixel(&self.u, &self.v, self.cells, |pixel, cell| {
             sums[cell] += flux[pixel]
         });
+    }
+
+    /// The light one block's readouts put into the region, for the pilot of
+    /// a focused job.
+    pub(crate) fn region_flux(&self, detectors: &[DetectorResult3]) -> f64 {
+        let flux = &detectors[self.det].incident_flux;
+        let mut sum = 0.0;
+        for_each_pixel(&self.u, &self.v, self.cells, |pixel, _| sum += flux[pixel]);
+        sum
     }
 
     /// Whether a job with a target stops after `done` whole passes: at a

@@ -605,6 +605,7 @@ impl Scene3 {
         }
         let id = self.alloc_source_id();
         self.sources.push(Source3 {
+            window: Default::default(),
             id,
             transform: Isometry3::IDENTITY,
             spatial: SpatialDistribution3::Disc { radius_mm: 100.0 },

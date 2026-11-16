@@ -194,6 +194,8 @@ cells, with a noise target to trace down to.
 | `cells` | `[across u, across v]`, at most 1024 along an axis and 65,536 in all. |
 | `regionMm` | `[[u low, u high], [v low, v high]]` in the detector's local mm (optional; the face's whole grid). |
 | `target` | `{"metric": "cv" or "minMax", "stderr": ...}`: stop once that metric's standard error is this small (optional; trace every ray). |
+| `sampling` | `"forward"` or `"focused"` (optional; `"forward"`). See *Focused sampling* below. |
+| `pilotRays` | The most rays a focused job's pilot traces, 4,096 to 16,777,216 (optional; a quarter of the job's `rays`, within those). Only with `"focused"`. |
 
 `passes` must be at least 4. With a target, `rays` is the ray limit; ask for
 64 passes, so the job has checks to stop at.
@@ -275,10 +277,93 @@ passes, a target of 0.05 on the CV: met at the first check.
 `stop` is `null` without a target; `reached` is false when the ray limit
 came first, and `stderr` is then the noise at the limit.
 
+### Focused sampling
+
+On a small region, forward tracing puts few rays in each cell: a tile a
+twentieth of the face across, behind a lens, may get a handful of hits per
+cell from millions of rays. `"sampling": "focused"` traces a pilot first,
+finds the part of each source's sampling domain that sends light into the
+region, and spends most of the rays there, each ray carrying the flux of
+the part it samples, so the numbers mean what forward's do.
+
+**The domain.** A source draws its origins from a unit square and its
+directions from another, each through a map that keeps the source's own
+measure: area for a rectangle or a disc, solid angle for a cone, projected
+solid angle for a Lambertian, power for a sun or a radial profile. A
+rectangle of either square holds exactly its area's share of the light.
+The origins of a point and a single direction have no square to cut, nor
+do the v1 legacy line and fan; a source with neither is traced as it is.
+
+**The pilot.** For each source, rounds alternate between its directions and
+its origins, two of each, directions first (the optics take a narrow cone
+of a wide source, wherever the region is). A round cuts the box so far
+8 × 8 and traces the 64 windows with equal rays, the scene with that source
+alone, one window per kernel block, so each block's readout is one window's
+light into the region. It repeats with twice the rays until the region has
+seen about 32 hits (a source's first round) or 128 (the others); then the
+windows holding all but a thousandth of the light, widened by one window on
+each side, are the new box. The pilot stops where it is when its budget
+(`pilotRays`) cannot hold the next repeat. Its light only chooses the
+boxes: it is in no number of the result.
+
+**The trace.** Each cut source is traced as a partition of its domain: the
+box (origins' box × directions' box) and the rest cut into up to eight
+rectangles. Every piece is a source over its window with `flux × measure`,
+spread evenly over its rays. The box takes nine tenths of the rays; the
+rest, a tenth between them by measure and at least 16 each. The pieces
+cover the domain once, so the estimate's expectation is forward's: no light
+is lost and none counted twice, whatever the pilot found. Each pass shifts
+every piece's points afresh, as forward does, so the standard errors come
+from the passes as before.
+
+**What could go wrong.** Bias, no: a box that misses light leaves that
+light to the rest's tenth of the rays, so it is noisier, not lost (a test
+puts the box in the wrong corner and reads the right flux). The risk is
+noise. A ray in the rest carries about `9 × (1 − share) / share` times the
+flux of one in the box (`share` is `domainShare`), so light the pilot
+missed comes as rare, heavy hits; if it is rare enough that no pass sees
+it, the standard errors do not show it either, as with forward on light it
+rarely samples. The pilot keeps that unlikely: it reads enough hits per
+round, keeps all but a thousandth of the light seen, and widens each box by
+a window.
+
+**What it costs and gains.** The pilot's first round needs about 32 hits in
+the region from the whole domain: some 32 over the share of the light that
+reaches it. On a 1 mm tile of a 24 mm beam, 262,144 rays in all (a quarter
+to the pilot) give cell errors 7 to 10 times smaller than forward's, the
+error forward reaches with 50 to 90 times the rays. On a 2 mm tile of a
+lens imaging a Lambertian disc, 524,288 rays in all give errors 3.3 to 4.2
+times smaller (11 to 17 times the rays). Rays through the optics cost more
+to trace than rays that miss them, so time gains less than rays.
+
+`sampling` in the result says what was done:
+
+```json
+"sampling": {"rays": 393248, "passes": 16, "raysPerPass": 24578, "stderr": "batchMeans",
+  "mode": "focused", "pilotRays": 98304, "defensiveShare": 0.1,
+  "pilot": {"rays": 98304, "budget": 131072, "budgetSpent": false,
+            "rounds": [{"source": 0, "dimension": "angular", "repeats": 3, "hits": 42.0,
+                        "box": [[0.0, 0.25], [0.0, 1.0]]}, ...]},
+  "focus": [{"source": 0, "focused": true,
+             "spatial": [[0.0, 0.875], [0.0, 1.0]], "angular": [[0.0, 0.0625], [0.0, 1.0]],
+             "domainShare": 0.0547, "rayShare": 0.9, "pieces": 3}]}
+```
+
+`rays` are the job's own, the pilot's apart. `spatial` and `angular` are the
+boxes on the unit squares (`null` where the source has none to cut);
+`domainShare` is the share of the source's light they hold, `rayShare` the
+share of its rays they get. A source not cut says why, as `"reason"`:
+`"nothing to cut"`, `"the whole domain reaches the region"`, `"the pilot ran
+out of rays before it saw enough light"` or `"too few rays to cut"`. With no
+source cut, the job's numbers are forward's to the bit. While the pilot
+runs, `analysisProgressJSON`'s `rays` counts its budget; once it is done,
+the rays it traced. A focused job stops on a target as a forward one does.
+
 `analysisBegin` also throws for fewer than 4 passes, a cell count of 0 or
 past the limits, a region off the face's grid or not `low < high`, a region
-with no cell on the face, a target on another metric, or a target that is
-not above 0.
+with no cell on the face, a target on another metric, a target that is
+not above 0, a `sampling` other than the two, `pilotRays` without
+`"focused"`, or `pilotRays` out of its range.
 
 ### What is checked
 
@@ -298,6 +383,17 @@ not above 0.
 - A tile of the face is read on a grid snapped to its edges.
 - A sparse field counts the cells some pass missed.
 - Each bad request throws and keeps nothing.
+- Focused and forward read the same mean, cells, CV and min/max within
+  their combined errors, on a beam over a small tile and on a lens imaging a
+  Lambertian disc onto one; on the beam the cells also read the beam's
+  known irradiance. Focused's cell errors are over 3 and 2 times smaller for
+  the same rays, the pilot's included (7 to 10 and 3.3 to 4.2 times over 12
+  seeds).
+- A focused job gives the same JSON stepped one ray, 37, 1000, all at once
+  or unevenly; so does one whose pilot is too small to see the tile.
+- `"sampling": "forward"` reads as the request without it, to the bit, and
+  a focused job with nothing to cut reads forward's numbers to the bit.
+- A box in the wrong corner loses no light.
 
 ## budget
 

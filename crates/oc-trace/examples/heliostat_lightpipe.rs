@@ -954,6 +954,7 @@ fn bench(slit: Vec3, rows: &[[f64; 2]], gain: &[(f64, f64)], lo_um: f64, hi_um: 
     let (hw, hh) = (0.5 * spec.pickoff_size.0 + 2.0, 0.5 * spec.pickoff_size.1 + 0.5 + spec.pickoff_bow);
     let id = s.alloc_source_id();
     s.sources.push(Source3 {
+        window: Default::default(),
         id,
         // Local X along the tube, local Y (the width) along the strip.
         transform: spectrograph::frame_x(spec.pickoff - Vec3::X * (spec.pickoff_depth + 20.0), Vec3::X, spec.pickoff_along),

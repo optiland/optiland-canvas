@@ -20,11 +20,12 @@
 //!
 //! [ADR 0003]: ../../docs/architecture/adr/0003-analysis-crate.md
 
+mod channels;
 mod detector_stats;
 pub mod job;
 pub mod request;
 pub mod stats;
 
-pub use job::{launch_count, sampled_for, AnalysisJob, Progress};
-pub use request::{AnalysisRequest, DetectorStatsParams, Kind, DEFAULT_PASSES, KINDS, MAX_PASS_RAYS};
+pub use job::{launch_count, sampled_for, source_alone, AnalysisJob, Progress};
+pub use request::{AnalysisRequest, ChannelSpec, ChannelsParams, DetectorStatsParams, Kind, DEFAULT_PASSES, KINDS, MAX_PASS_RAYS};
 pub use stats::{standard_error, Estimate};

@@ -270,7 +270,13 @@ impl AnalysisJob {
                     Analysis::Channels(a) => a.add_block(self.current, pass, run.part.detectors()),
                     Analysis::Uniformity(a) => a.add_block(pass, run.part.detectors()),
                     Analysis::Budget(a) => {
-                        a.add_block(self.current, pass, run.part.ledger(), run.part.detectors())
+                        a.add_block(
+                            self.current,
+                            pass,
+                            run.part.ledger(),
+                            run.part.detectors(),
+                            run.part.objects(),
+                        )
                     }
                 }
                 let next = (block + 1).min(run.blocks.blocks() - 1);

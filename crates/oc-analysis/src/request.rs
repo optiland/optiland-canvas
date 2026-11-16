@@ -22,7 +22,7 @@
 use serde::Deserialize;
 
 /// The analyses this build runs, by the name a request gives.
-pub const KINDS: [&str; 1] = ["detectorStats"];
+pub const KINDS: [&str; 2] = ["detectorStats", "channels"];
 
 /// Passes when a request names none. Sixteen passes put the standard error
 /// itself within about a fifth of its true value.
@@ -45,6 +45,7 @@ pub struct AnalysisRequest {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Kind {
     DetectorStats(DetectorStatsParams),
+    Channels(ChannelsParams),
 }
 
 impl Kind {
@@ -52,6 +53,7 @@ impl Kind {
     pub fn name(&self) -> &'static str {
         match self {
             Kind::DetectorStats(_) => "detectorStats",
+            Kind::Channels(_) => "channels",
         }
     }
 }
@@ -63,6 +65,36 @@ impl Kind {
 pub struct DetectorStatsParams {
     #[serde(default)]
     pub detectors: Option<Vec<u64>>,
+}
+
+/// `channels`: the channels to read; one per detector, seeing every source,
+/// when `None`.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelsParams {
+    #[serde(default)]
+    pub channels: Option<Vec<ChannelSpec>>,
+}
+
+/// One channel: a detector, the sources it is meant to see, and the band of
+/// wavelengths it counts.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ChannelSpec {
+    /// The channel's name; the detector's label (or `detector <id>`) when
+    /// absent. Names are unique within a request.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// The detector the channel reads, by id.
+    pub detector: u64,
+    /// The sources whose light is the channel's signal, by id; every source
+    /// when absent. The light of any other source is leak.
+    #[serde(default)]
+    pub sources: Option<Vec<u64>>,
+    /// `[low, high]` in µm: only light detected at these wavelengths counts,
+    /// both ends included. Every wavelength when absent.
+    #[serde(default)]
+    pub band_um: Option<[f64; 2]>,
 }
 
 #[derive(Deserialize)]
@@ -102,6 +134,9 @@ impl AnalysisRequest {
                 serde_json::from_value(params)
                     .map_err(|err| format!("detectorStats params: {err}"))?,
             ),
+            "channels" => Kind::Channels(
+                serde_json::from_value(params).map_err(|err| format!("channels params: {err}"))?,
+            ),
             other => {
                 return Err(format!(
                     "unknown analysis kind {other:?}; this build runs {}",
@@ -125,6 +160,22 @@ mod tests {
     }
 
     #[test]
+    fn a_channels_request_reads_its_channels() {
+        let r = AnalysisRequest::from_json(
+            r#"{"kind":"channels","rays":9000,"passes":8,"params":{"channels":[
+                {"name":"EGFP","detector":6,"sources":[2],"bandUm":[0.5,0.55]},{"detector":7}]}}"#,
+        )
+        .unwrap();
+        let Kind::Channels(p) = r.kind else { panic!("{:?}", r.kind) };
+        let c = p.channels.unwrap();
+        assert_eq!(c[0].name.as_deref(), Some("EGFP"));
+        assert_eq!((c[0].detector, c[0].sources.as_deref(), c[0].band_um), (6, Some(&[2][..]), Some([0.5, 0.55])));
+        assert_eq!((c[1].name.as_deref(), c[1].sources.as_deref(), c[1].band_um), (None, None, None));
+        let bare = AnalysisRequest::from_json(r#"{"kind":"channels"}"#).unwrap();
+        assert_eq!(bare.kind, Kind::Channels(ChannelsParams::default()));
+    }
+
+    #[test]
     fn a_bad_request_is_refused_with_its_reason() {
         let bad = |s: &str| AnalysisRequest::from_json(s).unwrap_err();
         assert!(bad(r#"{"kind":"psf"}"#).contains("detectorStats"));
@@ -133,5 +184,8 @@ mod tests {
         assert!(bad(r#"{"kind":"detectorStats","ray":10}"#).contains("unknown field"));
         assert!(bad(r#"{"kind":"detectorStats","params":{"detector":[1]}}"#).contains("unknown field"));
         assert!(bad("[]").contains("not an analysis request"));
+        assert!(bad(r#"{"kind":"channels","params":{"channels":[{"sources":[1]}]}}"#).contains("detector"));
+        assert!(bad(r#"{"kind":"channels","params":{"channels":[{"detector":1,"band":[0.4,0.5]}]}}"#).contains("unknown field"));
+        assert!(bad(r#"{"kind":"channels","params":{"channels":[{"detector":1,"bandUm":[0.4]}]}}"#).contains("channels params"));
     }
 }

@@ -23,6 +23,7 @@
 mod budget;
 mod channels;
 mod detector_stats;
+mod fluorescence;
 mod focus;
 pub mod job;
 pub mod request;
@@ -30,6 +31,7 @@ pub mod stats;
 mod uniformity;
 
 pub use job::{launch_count, sampled_for, source_alone, AnalysisJob, Progress};
-pub use request::{AnalysisRequest, BudgetParams, ChannelSpec, ChannelsParams, DetectorStatsParams, Kind, UniformityParams, UniformityTarget, DEFAULT_PASSES, KINDS, MAX_PASS_RAYS};
+pub use fluorescence::{DEFAULT_VOXELS, MAX_VOXELS};
+pub use request::{AnalysisRequest, BudgetParams, ChannelSpec, ChannelsParams, DetectorStatsParams, DyeSpec, EmissionSpectrum, FluorescenceParams, Kind, UniformityParams, UniformityTarget, Voxels, DEFAULT_PASSES, KINDS, MAX_PASS_RAYS};
 pub use stats::{standard_error, Estimate};
 pub use uniformity::MAX_UNIFORMITY_CELLS;

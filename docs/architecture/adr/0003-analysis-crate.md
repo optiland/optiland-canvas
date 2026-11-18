@@ -119,6 +119,13 @@ hits, flux, centroid and RMS spot size along each axis.
 - A pass holds at most 524 288 launch rays, as a reference pass does; the
   rays a job traces are therefore capped at that times its passes, and the
   result states the count it traced.
+- `fluorescence` (2026-11-18) traces a scene's dyes in two stages, the
+  emission from ordinary point sources built from where the excitation was
+  absorbed, so it changes no transport. It reads one more thing from a
+  block: its deposits, taken out as the block comes in
+  (`TracePart3::take_deposits`), so a long trace holds one block's deposits
+  at a time rather than every one in the merge. Like the other accessors it
+  reads, it does not trace.
 - The figures this ADR admits that are not statistics (first-order, beam
   size, optimisation) still come from traces, and still carry the envelope.
   How each states its accuracy is decided when it is built.

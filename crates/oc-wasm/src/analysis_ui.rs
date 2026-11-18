@@ -366,4 +366,55 @@ mod tests {
         assert_eq!(v("escaped"), l.escaped.to_bits());
         assert_eq!(b["launched"].as_f64().unwrap().to_bits(), l.launched.to_bits());
     }
+
+    /// `fluorescence` runs behind the same calls: the canvas's lens, made a
+    /// dye, absorbs what the kernel deposits in it under the canvas settings
+    /// and emits its yield of that; a dye that names no body of the scene
+    /// throws and keeps nothing.
+    #[test]
+    fn a_fluorescence_job_excites_the_dye_and_traces_its_emission() {
+        let mut c = canvas();
+        let scene = c.scene3.as_mut().unwrap();
+        scene.bodies[0].absorption = oc_core::scene3::AbsorptionModel::Constant { alpha_per_mm: 0.05 };
+        let lens = scene.bodies[0].common.id.0;
+        c.bump();
+        let dye = |body: u64| {
+            format!(
+                r#"{{"kind":"fluorescence","rays":20000,"passes":2,"params":{{"dyes":[{{"body":{body},"quantumYield":0.5,"name":"lens","emission":{{"lambdaUm":[0.6,0.62],"weight":[1,1]}}}}],"voxels":4}}}}"#
+            )
+        };
+        assert!(c.begin_analysis(&dye(999)).unwrap_err().contains("no body has id 999"));
+        assert_eq!(progress(&c)["state"], "idle");
+
+        let rays = c.begin_analysis(&dye(lens)).unwrap();
+        assert!(rays > 0.0);
+        while c.analysis_step(1000) < 1.0 {}
+        let p = progress(&c);
+        assert_eq!((p["state"].as_str(), p["kind"].as_str()), (Some("done"), Some("fluorescence")));
+        assert_eq!(p["traced"], p["rays"]);
+        let r: serde_json::Value = serde_json::from_str(&c.analysis_result_json()).unwrap();
+        assert_eq!(r["kind"], "fluorescence");
+        let d = &r["result"]["dyes"][0];
+        let absorbed = d["absorbed"]["value"].as_f64().unwrap();
+        let emitted = d["emitted"]["value"].as_f64().unwrap();
+        assert!(absorbed > 0.0 && (emitted - 0.5 * absorbed).abs() < 1e-12 * absorbed);
+        assert!(r["result"]["detectors"][0]["emission"]["flux"]["stderr"].is_number());
+        assert!(r["result"]["detectors"][0]["excitation"]["flux"]["value"].as_f64().unwrap() > 0.0);
+        assert!(r["sampling"]["emission"]["rays"].as_u64().unwrap() > 0);
+
+        // The absorbed light is the kernel's deposit in the lens, at the
+        // same rays, under the canvas settings.
+        let scene = c.scene3.clone().unwrap();
+        let traced = oc_analysis::sampled_for(&scene, 5000);
+        let cfg = oc_trace::TraceConfig3 { deposit_bodies: [0, 1], ..c.cfg3() };
+        let mut job = oc_trace::TraceJob3::with_passes(oc_analysis::source_alone(&traced, 0), 2, None, cfg);
+        while !job.step(usize::MAX) {}
+        let want = job
+            .finish()
+            .deposits
+            .iter()
+            .filter(|x| x.layer == oc_trace::DepositLayer::Bulk)
+            .fold(0.0, |a, x| a + x.flux);
+        assert_eq!(absorbed.to_bits(), want.to_bits());
+    }
 }

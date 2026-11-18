@@ -700,6 +700,16 @@ impl TracePart3 {
             .map(|(&(object, in_band), &ledger)| ObjectEntry3 { object, in_band, ledger })
     }
 
+    /// The block's deposits so far ([`TraceResult3::deposits`]), taken out of
+    /// the part, in the order the block traced them, like
+    /// [`TracePart3::detectors`] read in place. For a caller that bins them as
+    /// each block comes in, rather than holding every deposit of a long trace
+    /// in the merge: the analysis crate's `fluorescence` does. A merge of the
+    /// part then holds none of them; it changes nothing else.
+    pub fn take_deposits(&mut self) -> Vec<Deposit3> {
+        std::mem::take(&mut self.acc.result.deposits)
+    }
+
     /// Whether this block alone recorded `max_records` hits on every detector
     /// (see [`TraceBlocks3::part`]).
     pub fn records_full(&self, max_records: usize) -> bool {

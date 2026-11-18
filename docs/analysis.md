@@ -539,3 +539,240 @@ that is not true or false, besides what it throws for every kind.
 - By source, each source closes on its own, and the scene's budget is
   theirs added up.
 - Each bad request throws and keeps nothing.
+
+## fluorescence
+
+What a dye in the scene absorbs of the excitation, what it emits, and what
+of that emission each detector receives through the real optics, beside the
+excitation that reaches each detector directly.
+
+```json
+{"kind": "fluorescence", "rays": 64000, "passes": 16, "params": {
+  "dyes": [{"name": "FITC", "body": 5, "quantumYield": 0.92,
+            "emission": {"lambdaUm": [0.51, 0.52, 0.53, 0.54, 0.55],
+                         "weight": [0.6, 1.0, 0.8, 0.5, 0.25]}}],
+  "voxels": [16, 16, 16], "emissionShare": 0.5}}
+```
+
+| Field | Meaning |
+|---|---|
+| `dyes` | The dyes, at least one. Each fills a body of the scene. |
+| `dyes[].body` | The body, by object id. What it absorbs is its own absorption model: for a dye, `ln 10 · ε(λ) · c` per mm. A body with none is refused. |
+| `dyes[].quantumYield` | Watts emitted per watt absorbed, in (0, 1]. |
+| `dyes[].emission` | `{"lambdaUm": [...], "weight": [...]}`: the relative power emitted at each wavelength, as many weights as wavelengths, at least one, none below 0 and not all 0. Several wavelengths are a continuous spectrum: each emitted ray draws one, as often as its weight says. |
+| `dyes[].name` | Its name, unique in the request (optional; the body's label, or `body <id>`). |
+| `voxels` | The grid the absorbed light is binned on before it is emitted again: one count for every axis, or `[x, y, z]`, over the body's world bounding box; 1 to 1024 along an axis and 65,536 in all (optional; 16 a side). |
+| `emissionShare` | The share of `rays` the emission traces take, strictly between 0 and 1 (optional; ½). |
+
+The dyes are given in the request, not in the scene file: a scene holds a
+body and its absorption, and the request says which bodies fluoresce and how.
+
+### The physics
+
+Excitation light enters a dye body. The dye absorbs it along its excitation
+spectrum, by Beer–Lambert with the body's absorption. Each absorbed watt
+gives `quantumYield` watts of emission, at the point of absorption, the same
+in every direction over 4π, unpolarized, with the dye's emission spectrum.
+That emission is traced on through the optics like any other light: lenses,
+filters, dichroics, stops and the camera.
+
+### Two stages, and why they are one trace
+
+Linear fluorescence is a sum over the points where light is absorbed. The
+emission from a point is proportional to the power absorbed there, and how
+it travels on does not depend on how the excitation got there. So tracing
+the excitation and re-emitting at every absorption in one trace, and
+tracing the two apart, as below, have the same expectation:
+
+1. **Excitation.** Each source is traced alone, so what each puts into each
+   dye, and what each leaks onto each detector, is known by source. The
+   kernel records where each dye body absorbs, and each block's absorption is
+   binned, pass by pass, on the dye's voxels as the block comes in.
+2. **Emission.** Once every excitation block is in, each pass of each dye
+   becomes a scene of its own: the scene with its sources replaced by one
+   point source per lit voxel, at the flux-weighted centroid of what the
+   voxel absorbed, emitting over the whole sphere (a cone of half-angle π),
+   with the dye's spectrum and a flux of what the voxel absorbed times the
+   quantum yield. The excitation sources are not in it. The rays a pass of
+   a dye gets go to its voxels by power, at least one each and a square
+   number each, so every ray carries about the same flux and each voxel's
+   directions are a full stratified grid of the sphere.
+
+A point inside a body starts in that body's medium, so the dye's own
+absorption takes its share of the emission on the way out, as it takes its
+share of the excitation on the way in: the inner-filter effect, in both
+stages. Nothing about transport changes: the emission is traced from
+ordinary sources.
+
+The excitation's ray count is `rays × (1 − emissionShare)`, split across
+the sources as for `channels`; the emission's is `rays × emissionShare`,
+split evenly across the dyes, and then across each dye's lit voxels. Without
+`rays`, the excitation traces the scene's own count and the emission
+`emissionShare / (1 − emissionShare)` times that.
+
+**The errors include both stages.** Emission pass `p` is built from
+excitation pass `p`'s own absorption, so each pass is an independent
+estimate of the whole chain, and the batch-means standard error of anything
+emitted carries the excitation's noise as well as the emission's. `sampling`
+says so: `"stderrIncludesExcitation": true`.
+
+### What is ignored
+
+- **Re-emission.** Emission absorbed again by a dye (its own or another) is
+  lost: it is not emitted a second time. With a small Stokes shift and a
+  dense dye this underestimates the emission.
+- **Dipole orientation and polarization memory.** Every emission is
+  isotropic and unpolarized; a dye that remembers the excitation's
+  polarization, or emits with its dipole's pattern, is not modelled.
+- **Saturation and photobleaching.** The response is linear: twice the
+  excitation gives twice the emission, at any power, for any time.
+- **Emission near an interface.** A dipole close to a surface emits
+  differently (into the denser medium, and into evanescent waves); here a
+  point emits the same into every direction wherever it is.
+
+### Where the emission starts: the binning
+
+The one approximation the stages add is where in its voxel the light is
+emitted: at the centroid of the absorption, not spread over where each
+watt was taken. Every voxel emits exactly its own absorbed power, so the
+emitted total is exact; only the start of the light moves, by less than a
+voxel. A number that depends smoothly on where the light starts (the flux
+into a detector, say) is off by the second order in the voxel's size.
+
+Measured on a 10 mm bar of dye lit evenly along its length, with a 5 mm
+square detector 1.5 mm from it beside its first half (a severe case: the
+detector's solid angle changes fast along the bar), against the analytic
+answer, 160,000 rays in 8 passes:
+
+| Voxels along the bar | Voxel | Bias | ± |
+|---|---|---|---|
+| 1 | 10 mm | +12.8% | 0.4% |
+| 2 | 5 mm | +6.6% | 0.2% |
+| 4 | 2.5 mm | +2.2% | 0.3% |
+| 8 | 1.25 mm | +0.2% | 0.2% |
+| 16 | 0.625 mm | −0.2% | 0.3% |
+| 32 | 0.31 mm | −0.1% | 0.2% |
+| 64 | 0.16 mm | −0.1% | 0.2% |
+
+A voxel under the distance from the dye to what reads it leaves a bias
+below the noise. For a dye seen through an objective, a voxel under the
+depth of field and the field of one camera pixel keeps the image's light
+where it belongs.
+
+**The kernel's steps.** The kernel books a segment's bulk absorption at the
+middles of four equal steps along it. So along one long path through the
+dye, the emission starts at those four points, however fine the voxels:
+down a 10 mm bar lit end-on, at 1.25, 3.75, 6.25 and 8.75 mm. Beside that
+bar the job reads +2.6% over a continuous line, which is what emission from
+the four points gives. A path of a millimetre or less through the dye (a
+thin sample, a sheet crossing it) puts the steps a quarter of a millimetre
+apart or less. Finer steps would take a kernel option; the job does not
+change how the kernel deposits.
+
+### The result
+
+- `dyes`: per dye its `name`, `body`, `label`, `quantumYield`, and
+  - `absorbed`: the excitation power it absorbed (W);
+  - `emitted`: the emission power launched, `quantumYield × absorbed` pass
+    by pass;
+  - `bySource`: per source its `source` id, what it `absorbed` of that
+    source, and `lines`, by wavelength bin (`lambdaUm`, `meanLambdaUm`,
+    `absorbed`);
+  - `voxels`, `voxelSizeMm`, `voxelsLitPerPass`, and the `emissionRays`
+    its emission traced.
+- `sources`: per source its id, the launch `rays` it traced and the flux it
+  `launched`.
+- `detectors`: per detector its id, `label`, and
+  - `emission`: the emission received, every dye's: the incident `flux`,
+    the response-weighted `signal` (the detector's QE), `hits`, and `lines`
+    by wavelength bin (`lambdaUm`, `meanLambdaUm`, `flux`);
+  - `excitation`: the excitation that reached it directly, every source's:
+    its `flux`, `signal` and `hits`. The leak through the filters.
+- `emission`: the table of `dyes` by `detectors`: `flux[d][j]` and
+  `signal[d][j]`, what dye `d`'s emission puts on detector `j`.
+- `excitation`: the table of `sources` by `detectors`: `flux[s][j]` and
+  `signal[s][j]`, the excitation of source `s` on detector `j`.
+
+The two tables have the shape of `channels`' crosstalk, so a step that reads
+channels over fluorescence takes them as they are. Every flux is
+`{"value", "stderr"}`; `hits` are counts. A dye that absorbed nothing in a
+pass traces no emission for it, and reads zero there.
+
+`sampling` covers both stages: `rays` and `raysPerPass` are their sum,
+`excitation` and `emission` each give their own `rays` and `raysPerPass`
+(and the emission its `traces` and `voxelSources`, summed over passes), and
+`stderrIncludesExcitation` is true. `analysisProgressJSON` counts both
+stages' rays, the emission's as planned once the excitation is in; its
+`passesDone` is the mean of the two stages'.
+
+A 2 mm beam at 488 nm through a 1 mm slab of dye (α 0.4 per mm, quantum
+yield 0.8), a camera behind it on the axis (detector 2) and a detector
+beside the slab (3), 16,000 rays in 4 passes, `"voxels": [4, 8, 8]`:
+
+```json
+"sampling": {"rays": 16126, "passes": 4, "raysPerPass": 4031, "stderr": "batchMeans",
+  "excitation": {"rays": 8000, "raysPerPass": 2000, "traces": 1},
+  "emission": {"rays": 8126, "raysPerPass": 2031, "traces": 4, "voxelSources": 256, "dyes": 1},
+  "stderrIncludesExcitation": true},
+"result": {
+  "dyes": [{"name": "dye", "body": 1, "label": "", "quantumYield": 0.8,
+            "absorbed": {"value": 0.32967995, "stderr": 0.0},
+            "emitted":  {"value": 0.26374396, "stderr": 4.8e-17},
+            "bySource": [{"source": 0, "absorbed": {"value": 0.32967995, "stderr": 0.0},
+                          "lines": [{"lambdaUm": 0.4875, "meanLambdaUm": 0.488,
+                                     "absorbed": {"value": 0.32967995, "stderr": 0.0}}]}],
+            "voxels": [4, 8, 8], "voxelSizeMm": [0.25, 0.75, 0.75],
+            "voxelsLitPerPass": 64.0, "emissionRays": 8126}],
+  "sources": [{"source": 0, "rays": 8000, "launched": 1.0}],
+  "detectors": [
+    {"detector": 2, "label": "",
+     "emission": {"flux":   {"value": 0.0045776, "stderr": 0.00039},
+                  "signal": {"value": 0.0045776, "stderr": 0.00039}, "hits": 142,
+                  "lines": [{"lambdaUm": 0.5425, "meanLambdaUm": 0.54,
+                             "flux": {"value": 0.0011988, "stderr": 0.00028}}, ...]},
+     "excitation": {"flux":   {"value": 0.67032, "stderr": 0.0},
+                    "signal": {"value": 0.67032, "stderr": 0.0}, "hits": 8000}},
+    {"detector": 3, "label": "",
+     "emission": {"flux": {"value": 0.017625, "stderr": 0.00068}, ...},
+     "excitation": {"flux": {"value": 0.0, "stderr": 0.0}, ...}}],
+  "emission": {"dyes": ["dye"], "detectors": [2, 3],
+               "flux": [[{"value": 0.0045776, "stderr": 0.00039},
+                         {"value": 0.017625,  "stderr": 0.00068}]],
+               "signal": [[...]]},
+  "excitation": {"sources": [0], "detectors": [2, 3],
+                 "flux": [[{"value": 0.67032, "stderr": 0.0},
+                           {"value": 0.0,     "stderr": 0.0}]],
+                 "signal": [[...]]}
+}
+```
+
+The slab absorbs 1 − e^−0.4 = 0.32968 of the beam, and passes the rest to
+the camera as leak; the beam is even and the slab flat, so neither has
+noise.
+
+`analysisBegin` also throws for no dyes, a dye on a body the scene does not
+have or one named twice, a body that absorbs nothing, a quantum yield out
+of (0, 1], an emission spectrum that is not as above, two dyes of one name,
+a voxel grid out of its limits, an `emissionShare` not strictly between 0
+and 1, or a scene with no detector.
+
+### What is checked
+
+- Stepping one ray, 37, 1000 or all at once gives the same JSON.
+- What a dye absorbed equals the kernel's bulk deposit in it, tracing the
+  source alone at the same rays, to the bit; what it emits is the quantum
+  yield times that, in value and in error, to rounding.
+- A slab 1 mm thick in a collimated beam absorbs `1 − exp(−αd)`, for α of
+  0.05, 0.4 and 2 per mm, and the rest reaches the camera as leak.
+- A dye 0.2 mm across, five detectors around it 20 mm off: each catches
+  the square's solid angle over 4π of the emission, within 5 standard
+  errors, at the emission's wavelengths, and no excitation.
+- A source off the dye's absorption band excites nothing: it absorbs 0 and,
+  alone, the dye emits 0 and no emission is traced.
+- A short-pass that blocks the emission band in front of the camera leaves
+  it no emission, while the excitation it passes is still read as leak; a
+  detector out of the filter's way still sees the emission.
+- The binning converges on the analytic answer as the voxels shrink, each
+  halving cutting the bias, and under the noise from 16 voxels along the bar
+  (the table above); end-on, the job reads the kernel's four deposit points.
+- Each bad request throws and keeps nothing; the same behind `analysisBegin`.

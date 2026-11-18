@@ -89,6 +89,7 @@ impl SolidMesh {
             });
             crossings % 2 == 1
         };
+        #[allow(clippy::approx_constant)] // fixed, unrelated directions; 0.7071 is not 1/√2 here
         let votes = [Vec3::new(0.5377, 0.2813, 0.7948), Vec3::new(-0.3119, 0.8347, 0.4537), Vec3::new(0.7071, -0.6113, -0.3559)]
             .into_iter()
             .filter(|d| inside(*d))

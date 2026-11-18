@@ -12,6 +12,8 @@
 //!   bit, hit records and segment order included;
 //! - each block's object ledger, read in place before the merge, adds up to
 //!   the merged trace's, row by row, to the bit;
+//! - each block's deposits, taken out before the merge, are the merged
+//!   trace's deposits in order, and a merge of taken parts holds none;
 //! - the nearest-first walk that passes over boxes beyond the nearest hit
 //!   finds the events the brute-force search finds, to the bit, on every
 //!   design in the gallery, with ghosts on the smaller ones.
@@ -555,4 +557,33 @@ fn a_blocks_object_ledger_adds_up_to_the_merged_one() {
     let mut part = off.part(0, true);
     while !off.step(&mut part, 1 << 20) {}
     assert_eq!(part.objects().count(), 0);
+}
+
+#[test]
+fn a_blocks_deposits_taken_out_are_the_merged_ones_in_order() {
+    let mut scene = design("cemented-achromat");
+    for b in &mut scene.bodies {
+        b.absorption = oc_core::scene3::AbsorptionModel::Constant { alpha_per_mm: 0.05 };
+    }
+    let on = TraceConfig3 {
+        deposit_bodies: [0, scene.bodies.len()],
+        ..cfg(&scene, true)
+    };
+    let whole = run(&scene, on, usize::MAX).deposits;
+    assert!(!whole.is_empty(), "the absorbing lens takes light");
+    let blocks = TraceBlocks3::new(scene.clone(), on);
+    let mut merge = TraceMerge3::new(&blocks);
+    let mut taken = Vec::new();
+    for b in 0..blocks.blocks() {
+        let mut part = blocks.part(b, true);
+        while !blocks.step(&mut part, 1 << 20) {}
+        taken.extend(part.take_deposits());
+        assert!(part.take_deposits().is_empty(), "taken once");
+        merge.add(part).unwrap();
+    }
+    assert_eq!(taken, whole);
+    let merged = merge.finish();
+    assert!(merged.deposits.is_empty(), "the merge holds none");
+    // Nothing else moved.
+    assert_eq!(numbers(&merged), numbers(&run(&scene, on, usize::MAX)));
 }

@@ -15,6 +15,12 @@
 //! one ray at a time gives the result a job stepped all at once gives, to the
 //! bit (`tests/job.rs`).
 //!
+//! A `fluorescence` job traces in two stages: each source alone to excite
+//! its dyes, and then, once every excitation block is in, one trace per pass
+//! and dye of the light they emit, each built from that pass's absorption
+//! ([`crate::fluorescence`]). The emission traces are built one at a time, as
+//! the job reaches each, so it holds one of them at once.
+//!
 //! A job may stop before its last ray: one with a noise target
 //! (`uniformity`) checks it as each checkpoint's last pass is merged, and
 //! stops there once the target is met. A check reads whole passes only, so a
@@ -29,6 +35,7 @@ use serde_json::{json, Value};
 use crate::budget::Budget;
 use crate::channels::Channels;
 use crate::detector_stats::DetectorStats;
+use crate::fluorescence::{emission_share, Fluorescence};
 use crate::focus::{Pilot, DEFENSIVE_SHARE, MAX_PILOT_RAYS, MIN_PILOT_RAYS};
 use crate::request::{AnalysisRequest, Kind, MAX_PASS_RAYS};
 use crate::uniformity::Uniformity;
@@ -52,6 +59,7 @@ enum Analysis {
     Channels(Channels),
     Uniformity(Uniformity),
     Budget(Budget),
+    Fluorescence(Fluorescence),
 }
 
 /// One trace of a job: a scene traced in passes, a block at a time.
@@ -132,6 +140,12 @@ pub struct AnalysisJob {
     pilot: Option<Pilot>,
     /// What the pilot cut, once it is done.
     focus: Option<Value>,
+    /// A fluorescence job's emission trace in hand, and the next one's
+    /// index: the emission traces follow the runs.
+    emission: Option<Run>,
+    next_emission: usize,
+    /// The settings the emission traces run under: no deposits.
+    emission_cfg: TraceConfig3,
 }
 
 /// The launch rays one pass of `scene` emits: every origin with every
@@ -193,12 +207,34 @@ impl AnalysisJob {
             .rays
             .map_or(own, |r| r.div_ceil(passes as u64))
             .min(MAX_PASS_RAYS);
+        // A fluorescence job splits the rays between its two stages; without
+        // a count, the excitation traces the scene's own.
+        let (per_pass, emission_per_pass) = match &request.kind {
+            Kind::Fluorescence(p) => {
+                let share = emission_share(p)?;
+                let exc = match request.rays {
+                    Some(r) => (r as f64 / passes as f64 * (1.0 - share)).round().max(1.0) as u64,
+                    None => own,
+                };
+                let em = match request.rays {
+                    Some(r) => (r as f64 / passes as f64 * share).round(),
+                    None => (own as f64 * share / (1.0 - share)).round(),
+                };
+                (exc.min(MAX_PASS_RAYS), (em.max(1.0) as u64).min(MAX_PASS_RAYS))
+            }
+            _ => (per_pass, 0),
+        };
         let traced = sampled_for(scene, per_pass);
         let analysis = match &request.kind {
             Kind::DetectorStats(p) => Analysis::DetectorStats(DetectorStats::new(&traced, p, passes)?),
             Kind::Channels(p) => Analysis::Channels(Channels::new(&traced, p, passes)?),
             Kind::Uniformity(p) => Analysis::Uniformity(Uniformity::new(&traced, p, passes)?),
             Kind::Budget(p) => Analysis::Budget(Budget::new(&traced, p, passes)?),
+            Kind::Fluorescence(p) => {
+                // Each dye's share of the emission rays of a pass.
+                let each = (emission_per_pass / p.dyes.len().max(1) as u64).max(1);
+                Analysis::Fluorescence(Fluorescence::new(&traced, p, passes, each)?)
+            }
         };
         let cfg = TraceConfig3 {
             record_detector_hits: false,
@@ -209,12 +245,23 @@ impl AnalysisJob {
             object_ledger: matches!(analysis, Analysis::Budget(_)),
             ..cfg
         };
+        let emission_cfg = cfg;
+        // A fluorescence job's excitation records where its dyes absorb.
+        let cfg = match &analysis {
+            Analysis::Fluorescence(f) => TraceConfig3 {
+                deposit_bodies: f.deposit_bodies(),
+                ..cfg
+            },
+            _ => cfg,
+        };
         // The scenes traced: the scene, or each source alone. Each is traced
         // under the settings of the whole scene (its bounds and depth come
         // in `cfg`), so a source alone travels exactly as among the others.
         let scenes = match &analysis {
             Analysis::DetectorStats(_) => vec![traced.clone()],
-            Analysis::Channels(_) => (0..traced.sources.len()).map(|i| source_alone(&traced, i)).collect(),
+            Analysis::Channels(_) | Analysis::Fluorescence(_) => {
+                (0..traced.sources.len()).map(|i| source_alone(&traced, i)).collect()
+            }
             Analysis::Uniformity(u) => vec![u.traced_scene(&traced)],
             Analysis::Budget(b) if b.by_source() => {
                 (0..traced.sources.len()).map(|i| source_alone(&traced, i)).collect()
@@ -245,6 +292,9 @@ impl AnalysisJob {
             cfg,
             pilot,
             focus: None,
+            emission: None,
+            next_emission: 0,
+            emission_cfg,
         };
         if job.pilot.as_ref().is_some_and(Pilot::done) {
             job.focus_runs();
@@ -271,6 +321,11 @@ impl AnalysisJob {
                     }
                     continue;
                 }
+            }
+            if self.current >= self.runs.len() {
+                // The runs are in: a fluorescence job's emission traces.
+                left = left.saturating_sub(self.step_emission(left));
+                continue;
             }
             let run = &mut self.runs[self.current];
             let (before, each) = run.part.progress();
@@ -314,6 +369,7 @@ impl AnalysisJob {
                             run.part.objects(),
                         )
                     }
+                    Analysis::Fluorescence(a) => a.add_excitation_block(self.current, pass, &mut run.part),
                 }
                 let next = (block + 1).min(run.blocks.blocks() - 1);
                 let part = std::mem::replace(&mut run.part, run.blocks.part(next, false));
@@ -336,6 +392,63 @@ impl AnalysisJob {
             run.total = run.merge.take().map(TraceMerge3::finish);
             self.current += 1;
         }
+        // Every excitation block is in: the emission traces are fixed.
+        if let Analysis::Fluorescence(f) = &mut self.analysis {
+            f.plan();
+            self.begin_emission();
+        }
+    }
+
+    /// Begin the next emission trace that has light to trace, unless one is
+    /// in hand. One with none (the dye absorbed nothing in that pass) is
+    /// passed over: it reads zero.
+    fn begin_emission(&mut self) {
+        let Analysis::Fluorescence(f) = &mut self.analysis else { return };
+        while self.emission.is_none() && self.next_emission < f.emission_traces() {
+            match f.emission_scene(self.next_emission, &self.scene) {
+                Some(scene) => {
+                    let run = Run::new(scene, 1, self.emission_cfg).expect("one pass divides any blocks");
+                    self.emission = Some(run);
+                }
+                None => self.next_emission += 1,
+            }
+        }
+    }
+
+    /// Trace up to `rays` launch rays of the emission trace in hand; the rays
+    /// traced. Blocks are added in order, as for a run.
+    fn step_emission(&mut self, rays: u64) -> u64 {
+        let Some(run) = self.emission.as_mut() else { return rays.max(1) };
+        let (before, each) = run.part.progress();
+        let before = before as u64;
+        run.blocks.step(&mut run.part, rays.min(each as u64 - before).max(1) as usize);
+        let traced = run.part.progress().0 as u64 - before;
+        let Analysis::Fluorescence(f) = &mut self.analysis else { return traced };
+        let k = self.next_emission;
+        let merge = run.merge.as_mut().expect("a trace in hand is not merged");
+        while run.part.done() && !merge.done() {
+            let block = merge.next_block();
+            f.add_emission_block(k, run.part.ledger(), run.part.detectors());
+            let next = (block + 1).min(run.blocks.blocks() - 1);
+            let part = std::mem::replace(&mut run.part, run.blocks.part(next, false));
+            run.merged_rays += part.progress().1 as u64;
+            run.merged_blocks += 1;
+            merge.add(part).expect("the job adds its blocks in order");
+        }
+        if merge.done() {
+            let total = run.merge.take().map(TraceMerge3::finish).expect("merged");
+            f.finish_emission(&total);
+            self.emission = None;
+            self.next_emission += 1;
+            self.begin_emission();
+        }
+        traced
+    }
+
+    /// The emission rays traced so far.
+    fn emission_traced(&self) -> u64 {
+        let Analysis::Fluorescence(f) = &self.analysis else { return 0 };
+        f.emission_rays_before(self.next_emission) + self.emission.as_ref().map_or(0, Run::traced)
     }
 
     /// The pilot is done: trace the scene it found in place of the one the
@@ -364,15 +477,33 @@ impl AnalysisJob {
 
     /// Whether every ray is traced.
     pub fn done(&self) -> bool {
-        self.pilot.as_ref().map_or(true, Pilot::done) && self.current >= self.runs.len()
+        let emitted = match &self.analysis {
+            Analysis::Fluorescence(f) => self.emission.is_none() && self.next_emission >= f.emission_traces(),
+            _ => true,
+        };
+        self.pilot.as_ref().map_or(true, Pilot::done) && self.current >= self.runs.len() && emitted
     }
 
     pub fn progress(&self) -> Progress {
         let passes_done = self.runs.iter().map(Run::passes_done).sum::<usize>() / self.runs.len().max(1);
         let (pilot_traced, pilot_rays) = self.pilot.as_ref().map_or((0, 0), |p| (p.traced(), p.total()));
+        // A fluorescence job: its emission traces too, a pass done once each
+        // dye's is, and the passes done the mean of its two stages'.
+        let (em_traced, em_rays, passes_done) = match &self.analysis {
+            Analysis::Fluorescence(f) => {
+                let dyes = (f.emission_traces() / self.request.passes as usize).max(1);
+                let em_done = if self.current >= self.runs.len() {
+                    (self.next_emission / dyes).min(self.request.passes as usize)
+                } else {
+                    0
+                };
+                (self.emission_traced(), f.emission_rays_total(), (passes_done + em_done) / 2)
+            }
+            _ => (0, 0, passes_done),
+        };
         Progress {
-            traced: pilot_traced + self.runs.iter().map(Run::traced).sum::<u64>(),
-            rays: pilot_rays + self.runs.iter().map(Run::rays).sum::<u64>(),
+            traced: pilot_traced + self.runs.iter().map(Run::traced).sum::<u64>() + em_traced,
+            rays: pilot_rays + self.runs.iter().map(Run::rays).sum::<u64>() + em_rays,
             passes_done: passes_done as u32,
             passes: self.request.passes,
         }
@@ -413,6 +544,10 @@ impl AnalysisJob {
                 let rays: Vec<u64> = self.runs.iter().map(Run::rays).collect();
                 a.result(&self.scene, &totals, &rays)
             }
+            Analysis::Fluorescence(a) => {
+                let rays: Vec<u64> = self.runs.iter().map(Run::rays).collect();
+                a.result(&self.scene, &totals, &rays)
+            }
         };
         let stamp = &first.fidelity;
         let mut approximated = Vec::new();
@@ -430,6 +565,19 @@ impl AnalysisJob {
                 }
             }
         }
+        if let Analysis::Fluorescence(f) = &self.analysis {
+            let (a, r) = f.reports();
+            for x in a {
+                if !approximated.contains(x) {
+                    approximated.push(x.clone());
+                }
+            }
+            for x in r {
+                if !rejected.contains(x) {
+                    rejected.push(x.clone());
+                }
+            }
+        }
         // The rays and passes traced: all of them, unless the job stopped on
         // its target.
         let rays: u64 = self.runs.iter().map(Run::merged).sum();
@@ -440,6 +588,23 @@ impl AnalysisJob {
             "raysPerPass": rays / passes.max(1),
             "stderr": "batchMeans",
         });
+        if let Analysis::Fluorescence(f) = &self.analysis {
+            // Both stages: `rays` is their sum, and each says its own. Each
+            // emission pass is built from its excitation pass, so the errors
+            // carry the noise of both.
+            let s = sampling.as_object_mut().expect("an object");
+            let excitation = rays;
+            let emission = f.sampling();
+            let all = excitation + emission["rays"].as_u64().unwrap_or(0);
+            s.insert("rays".into(), json!(all));
+            s.insert("raysPerPass".into(), json!(all / passes.max(1)));
+            s.insert(
+                "excitation".into(),
+                json!({ "rays": excitation, "raysPerPass": excitation / passes.max(1), "traces": self.runs.len() }),
+            );
+            s.insert("emission".into(), emission);
+            s.insert("stderrIncludesExcitation".into(), json!(true));
+        }
         if let Some(pilot) = &self.pilot {
             // A focused job: what its pilot traced and what it cut. The
             // pilot's light is in no number: `rays` are the job's own.

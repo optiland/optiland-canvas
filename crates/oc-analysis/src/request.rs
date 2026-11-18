@@ -22,7 +22,7 @@
 use serde::Deserialize;
 
 /// The analyses this build runs, by the name a request gives.
-pub const KINDS: [&str; 4] = ["detectorStats", "channels", "uniformity", "budget"];
+pub const KINDS: [&str; 5] = ["detectorStats", "channels", "uniformity", "budget", "fluorescence"];
 
 /// Passes when a request names none. Sixteen passes put the standard error
 /// itself within about a fifth of its true value.
@@ -48,6 +48,7 @@ pub enum Kind {
     Channels(ChannelsParams),
     Uniformity(UniformityParams),
     Budget(BudgetParams),
+    Fluorescence(FluorescenceParams),
 }
 
 impl Kind {
@@ -58,6 +59,7 @@ impl Kind {
             Kind::Channels(_) => "channels",
             Kind::Uniformity(_) => "uniformity",
             Kind::Budget(_) => "budget",
+            Kind::Fluorescence(_) => "fluorescence",
         }
     }
 }
@@ -148,6 +150,69 @@ pub struct BudgetParams {
     pub by_source: bool,
 }
 
+/// `fluorescence`: the dyes in the scene, and how the job splits its work
+/// between exciting them and tracing what they emit.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct FluorescenceParams {
+    /// The dyes, at least one; each a body of the scene.
+    pub dyes: Vec<DyeSpec>,
+    /// The grid each dye's absorbed light is binned on before it is
+    /// re-emitted: one count for every axis, or `[x, y, z]`, over the body's
+    /// world bounding box. [`crate::fluorescence::DEFAULT_VOXELS`] a side when
+    /// absent.
+    #[serde(default)]
+    pub voxels: Option<Voxels>,
+    /// The share of `rays` the emission traces take, the rest exciting;
+    /// one half when absent. Strictly between 0 and 1.
+    #[serde(default)]
+    pub emission_share: Option<f64>,
+}
+
+/// A voxel grid: the same count along every axis, or one per axis.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(untagged)]
+pub enum Voxels {
+    Cube(u32),
+    Grid([u32; 3]),
+}
+
+impl Voxels {
+    /// `[x, y, z]`.
+    pub fn counts(self) -> [u32; 3] {
+        match self {
+            Voxels::Cube(n) => [n; 3],
+            Voxels::Grid(g) => g,
+        }
+    }
+}
+
+/// One dye: the body it fills, how much of what it absorbs it emits, and at
+/// which wavelengths. What it absorbs is the body's own absorption model,
+/// `ln 10 · ε(λ) · c` per mm.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct DyeSpec {
+    /// The body, by object id.
+    pub body: u64,
+    /// Watts emitted per watt absorbed, in (0, 1].
+    pub quantum_yield: f64,
+    /// The emission spectrum.
+    pub emission: EmissionSpectrum,
+    /// The dye's name, unique in the request; the body's label, or
+    /// `body <id>`, when absent.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// A dye's emission spectrum: relative power at each wavelength (µm).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct EmissionSpectrum {
+    pub lambda_um: Vec<f64>,
+    pub weight: Vec<f64>,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Envelope {
@@ -194,6 +259,10 @@ impl AnalysisRequest {
             ),
             "budget" => Kind::Budget(
                 serde_json::from_value(params).map_err(|err| format!("budget params: {err}"))?,
+            ),
+            "fluorescence" => Kind::Fluorescence(
+                serde_json::from_value(params)
+                    .map_err(|err| format!("fluorescence params: {err}"))?,
             ),
             other => {
                 return Err(format!(
@@ -263,6 +332,27 @@ mod tests {
     }
 
     #[test]
+    fn a_fluorescence_request_reads_its_dyes() {
+        let r = AnalysisRequest::from_json(
+            r#"{"kind":"fluorescence","rays":64000,"passes":16,"params":{"dyes":[
+                {"body":5,"quantumYield":0.9,"emission":{"lambdaUm":[0.5,0.51],"weight":[1,2]},"name":"FITC"}],
+                "voxels":[8,8,2],"emissionShare":0.25}}"#,
+        )
+        .unwrap();
+        let Kind::Fluorescence(p) = r.kind else { panic!("{:?}", r.kind) };
+        assert_eq!((p.dyes[0].body, p.dyes[0].quantum_yield, p.dyes[0].name.as_deref()), (5, 0.9, Some("FITC")));
+        assert_eq!(p.dyes[0].emission.weight, vec![1.0, 2.0]);
+        assert_eq!(p.voxels.map(Voxels::counts), Some([8, 8, 2]));
+        assert_eq!(p.emission_share, Some(0.25));
+        let r = AnalysisRequest::from_json(
+            r#"{"kind":"fluorescence","params":{"dyes":[{"body":5,"quantumYield":1,"emission":{"lambdaUm":[0.5],"weight":[1]}}],"voxels":4}}"#,
+        )
+        .unwrap();
+        let Kind::Fluorescence(p) = r.kind else { panic!("{:?}", r.kind) };
+        assert_eq!((p.voxels.map(Voxels::counts), p.emission_share, p.dyes[0].name.as_deref()), (Some([4, 4, 4]), None, None));
+    }
+
+    #[test]
     fn a_bad_request_is_refused_with_its_reason() {
         let bad = |s: &str| AnalysisRequest::from_json(s).unwrap_err();
         assert!(bad(r#"{"kind":"psf"}"#).contains("detectorStats"));
@@ -279,5 +369,8 @@ mod tests {
         assert!(bad(r#"{"kind":"uniformity","params":{"detector":1,"cells":[4,4],"region":[[0,1],[0,1]]}}"#).contains("unknown field"));
         assert!(bad(r#"{"kind":"budget","params":{"perSource":true}}"#).contains("unknown field"));
         assert!(bad(r#"{"kind":"budget","params":{"bySource":1}}"#).contains("budget params"));
+        assert!(bad(r#"{"kind":"fluorescence"}"#).contains("fluorescence params"));
+        assert!(bad(r#"{"kind":"fluorescence","params":{"dyes":[{"body":1,"qy":1}]}}"#).contains("unknown field"));
+        assert!(bad(r#"{"kind":"fluorescence","params":{"dyes":[],"voxels":[1,2]}}"#).contains("fluorescence params"));
     }
 }

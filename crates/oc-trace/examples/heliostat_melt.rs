@@ -414,6 +414,7 @@ fn add_lamp_module(s: &mut Scene3, sample: Vec3, lamp: Option<&LampModel>) -> Ve
             let nrm = Vec3::X * ang.cos() + Vec3::Z * ang.sin();
             let sid = s.alloc_source_id();
             s.sources.push(Source3 {
+                window: Default::default(),
                 id: sid,
                 transform: sp::frame_x(f1 + nrm * apothem, nrm, Vec3::Y),
                 spatial: SpatialDistribution3::Rectangle {

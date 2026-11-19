@@ -195,8 +195,7 @@ fn cross_count(scene: &GpuScene, e: usize, pt: Vec2) -> u32 {
     let dir = Vec2::new(CONTAIN_DIR[0], CONTAIN_DIR[1]).normalize();
     let el = &scene.elems[e];
     let mut count = 0u32;
-    for pi in el.edge_start as usize..(el.edge_start + el.n_edges) as usize {
-        let pr = &scene.prims[pi];
+    for pr in &scene.prims[el.edge_start as usize..(el.edge_start + el.n_edges) as usize] {
         if pr.kind == KIND_LINE {
             if line_hit(
                 Vec2::new(pr.p[0], pr.p[1]),

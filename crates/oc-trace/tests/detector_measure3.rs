@@ -31,6 +31,7 @@ use std::f64::consts::TAU;
 fn point_source(scene: &mut Scene3, angular: AngularDistribution3, samples: u32) {
     let id = scene.alloc_source_id();
     scene.sources.push(Source3 {
+        window: Default::default(),
         id,
         transform: Isometry3::from_pos(Vec3::ZERO),
         spatial: SpatialDistribution3::Point,

@@ -3,7 +3,7 @@
 //! `rustfft` does the 1D transforms. It works on `num_complex::Complex<f64>`,
 //! and the kernel's complex type is [`Cx`]; the workspace allows no `unsafe`,
 //! so the two are bridged by one linear copy in and one out, into a buffer this
-//! struct keeps between calls. ADR 0003 records the choice and its measured
+//! struct keeps between calls. ADR 0004 records the choice and its measured
 //! cost.
 //!
 //! Sign and scale follow the crate's conventions (see the crate docs): the

@@ -59,7 +59,8 @@ pub(crate) fn layout_json(measure: &DetectorMeasure) -> String {
 
 /// A detector's hits by wavelength, as the colour diagnostic reads them: one
 /// object per wavelength bin, in order of wavelength, with
-/// `{nm, hits, flux, centroid: [u, v], rms, angle: [x, y], spread, focus, sums}`.
+/// `{nm, hits, flux, centroid: [u, v], rms, rmsUv: [u, v], angle: [x, y],
+/// spread, focus, focusUv: [u, v], sums}`.
 /// `nm` is the flux-weighted wavelength of the bin's hits. `sums` are the
 /// bin's raw sums (`SpectralSums3::to_array` after its first two fields), so
 /// a reader can merge bins exactly before taking any statistic.
@@ -67,7 +68,10 @@ pub(crate) fn layout_json(measure: &DetectorMeasure) -> String {
 /// normal in the `u` and `v` planes and `spread` the RMS angular spread about
 /// it, both radians. `focus` is how far along the normal, in the direction
 /// of travel, this line's spot is smallest, or `null` for rays that are all
-/// parallel.
+/// parallel. `rmsUv` and `focusUv` are `rms` and `focus` along the face's
+/// `u` and `v` axes each on its own, for light that focuses differently in
+/// the two (a cylindrical lens); `rms` is `hypot` of `rmsUv`, and either
+/// entry of `focusUv` is `null` when the rays are parallel in that plane.
 pub(crate) fn spectral_json(d: &oc_trace::DetectorResult3) -> String {
     let lines: Vec<String> = d
         .spectral
@@ -77,17 +81,23 @@ pub(crate) fn spectral_json(d: &oc_trace::DetectorResult3) -> String {
             let c = l.centroid().unwrap_or_default();
             let a = l.mean_slope().unwrap_or_default();
             format!(
-                "{{\"nm\":{},\"hits\":{},\"flux\":{},\"centroid\":[{},{}],\"rms\":{},\"angle\":[{},{}],\"spread\":{},\"focus\":{},\"sums\":[{}]}}",
+                "{{\"nm\":{},\"hits\":{},\"flux\":{},\"centroid\":[{},{}],\"rms\":{},\"rmsUv\":{},\"angle\":[{},{}],\"spread\":{},\"focus\":{},\"focusUv\":{},\"sums\":[{}]}}",
                 json_num(l.mean_lambda_um() * 1000.0),
                 l.hits,
                 json_num(l.flux),
                 json_num(c.x),
                 json_num(c.y),
                 l.rms_radius().map_or("null".into(), json_num),
+                l.rms_uv()
+                    .map_or("null".into(), |r| format!("[{},{}]", json_num(r[0]), json_num(r[1]))),
                 json_num(a.x.atan()),
                 json_num(a.y.atan()),
                 l.rms_slope().map_or("null".into(), json_num),
                 l.best_focus_mm().map_or("null".into(), json_num),
+                l.best_focus_uv_mm().map_or("null".into(), |f| {
+                    let axis = |s: Option<f64>| s.map_or("null".into(), json_num);
+                    format!("[{},{}]", axis(f[0]), axis(f[1]))
+                }),
                 l.to_array()[2..].iter().map(|v| json_num(*v)).collect::<Vec<_>>().join(","),
             )
         })
@@ -132,6 +142,33 @@ mod tests {
         let sum: f64 = lines.iter().map(|l| l["flux"].as_f64().unwrap()).sum();
         let total = json["totalIncident"].as_f64().unwrap();
         assert!((sum - total).abs() <= 1e-9 * total, "{sum} vs {total}");
+    }
+
+    /// Each line's spot and focus per axis: the spot sizes add in quadrature
+    /// to `rms`, and `focus` is the two axes' foci weighted by each one's
+    /// slope variance, both from the line's own `sums`.
+    #[test]
+    fn the_readout_gives_spot_and_focus_per_axis() {
+        let mut c = Canvas::new();
+        c.new_default_scene3();
+        let id = c.scene3.as_ref().unwrap().detectors[0].common.id.0 as f64;
+        let json: serde_json::Value = serde_json::from_str(&c.detector_result_json(id)).unwrap();
+        let lines = json["spectral"].as_array().unwrap();
+        assert!(!lines.is_empty());
+        for l in lines {
+            let f = |v: &serde_json::Value| v.as_f64().unwrap();
+            let [ru, rv] = [f(&l["rmsUv"][0]), f(&l["rmsUv"][1])];
+            let rms = f(&l["rms"]);
+            assert!((ru.hypot(rv) - rms).abs() <= 1e-12 * rms, "{ru}, {rv} against {rms}");
+            let [fu, fv] = [f(&l["focusUv"][0]), f(&l["focusUv"][1])];
+            let s: Vec<f64> = l["sums"].as_array().unwrap().iter().map(f).collect();
+            let w = s[1];
+            let var_a = s[8] / w - (s[6] / w).powi(2);
+            let var_b = s[9] / w - (s[7] / w).powi(2);
+            let mean = (var_a * fu + var_b * fv) / (var_a + var_b);
+            let focus = f(&l["focus"]);
+            assert!((mean - focus).abs() <= 1e-9 * focus.abs().max(1.0), "{mean} against {focus}");
+        }
     }
 
     #[test]

@@ -476,6 +476,7 @@ impl Scene3 {
     ) -> SourceId {
         let id = self.alloc_source_id();
         self.sources.push(Source3 {
+            window: Default::default(),
             id,
             transform: Isometry3::from_pos(pos),
             spatial: SpatialDistribution3::Rectangle {
@@ -2601,6 +2602,7 @@ pub fn response_kind(r: &SurfaceResponse) -> &'static str {
         SurfaceResponse::Retarder { .. } => "retarder",
         SurfaceResponse::DielectricFresnel { .. } => "refract",
         SurfaceResponse::ThinLens { .. } => "thin-lens",
+        SurfaceResponse::IdealMirror { .. } => "ideal-mirror",
         SurfaceResponse::Grating { .. } => "grating",
         SurfaceResponse::Modulator { device, .. } => match device.kind {
             crate::modulator::ModulatorKind::Dmd(_) => "dmd",

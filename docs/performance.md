@@ -200,7 +200,7 @@ cost it once per compile.
 
 ## Wave optics (`oc-wave`)
 
-The scalar wave kernel ([ADR 0003](architecture/adr/0003-scalar-wave-optics-engine.md),
+The scalar wave kernel ([ADR 0004](architecture/adr/0004-scalar-wave-optics-engine.md),
 [wave-optics.md](wave-optics.md)) runs in the app in a worker of its own (W5),
 off the page thread. Its native timings, single thread, release, AMD Ryzen 9
 9900X, measured 2026-10-19:
@@ -224,7 +224,7 @@ cargo run -p oc-wave --release --example bench_wave
 | 512² (1024²) | 52 ms |
 | 1024² (2048²) | 209 ms |
 
-ADR 0003 set a 15% ceiling on the bridge before the internals would switch
+ADR 0004 set a 15% ceiling on the bridge before the internals would switch
 type; it is under that everywhere. The plan's initial gate for a settled
 1024² step natively is 200 ms. At 209 ms it is just over: the cost is the
 per-sample transfer function (a square root and a sine-cosine pair over 4.2 M

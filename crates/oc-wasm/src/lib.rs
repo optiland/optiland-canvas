@@ -53,6 +53,8 @@ mod grating_ui;
 mod modulator_ui;
 /// The coherent wave path: a source's beam, and a wave job run in steps.
 mod wave_ui;
+// The analysis job (ADR 0003): `oc-analysis` stepped from a worker.
+mod analysis_ui;
 
 /// The Fresnel lens: add one, read its recipe, rebuild it from an edited one.
 mod fresnel;
@@ -186,6 +188,8 @@ pub struct Canvas {
     wave_job: std::cell::RefCell<Option<oc_wave::path::WaveJob>>,
     /// The last finished wave path.
     wave_result: std::cell::RefCell<Option<oc_wave::path::WavePathResult>>,
+    /// The analysis job in hand ([`Canvas::analysis_begin`]).
+    analysis: std::cell::RefCell<analysis_ui::AnalysisSlot>,
 }
 
 /// One f64 reference trace, and what it was traced for.
@@ -274,6 +278,7 @@ impl Canvas {
             pool: std::cell::RefCell::new(None),
             wave_job: std::cell::RefCell::new(None),
             wave_result: std::cell::RefCell::new(None),
+            analysis: Default::default(),
         }
     }
 
@@ -2772,6 +2777,7 @@ impl Canvas {
                 } => (constant(reflectance), constant(transmittance)),
                 SurfaceResponse::Absorber => ("0".into(), "0".into()),
                 SurfaceResponse::ThinLens { .. } => ("0".into(), "1".into()),
+                SurfaceResponse::IdealMirror { .. } => ("1".into(), "0".into()),
                 SurfaceResponse::DielectricFresnel { .. } => ("null".into(), "null".into()),
                 // A film has no constant R or T: both depend on the angle, and
                 // reporting a number here would be the very thing this is meant
@@ -2861,6 +2867,7 @@ impl Canvas {
                 } => (reflectance.sample(um), transmittance.sample(um)),
                 SurfaceResponse::Absorber => (Some(0.0), Some(0.0)),
                 SurfaceResponse::ThinLens { .. } => (Some(0.0), Some(1.0)),
+                SurfaceResponse::IdealMirror { .. } => (Some(1.0), Some(0.0)),
                 SurfaceResponse::DielectricFresnel { .. } => (None, None),
                 SurfaceResponse::Coating { coating } => {
                     let cos_i = aoi_deg.to_radians().cos();
@@ -6235,6 +6242,7 @@ mod scene3_tests {
         // it focuses in the Z=0 slice.
         let src = scene.alloc_source_id();
         scene.sources.push(Source3 {
+            window: Default::default(),
             id: src,
             transform: Isometry3::from_pos(Vec3::new(-30.0, 0.0, 0.0)),
             spatial: SpatialDistribution3::Rectangle {
@@ -6332,6 +6340,7 @@ mod scene3_tests {
         // A collimated beam along +X in the Z=0 plane.
         let src = scene.alloc_source_id();
         scene.sources.push(Source3 {
+            window: Default::default(),
             id: src,
             transform: Isometry3::from_pos(Vec3::new(-20.0, 0.0, 0.0)),
             spatial: SpatialDistribution3::Rectangle {

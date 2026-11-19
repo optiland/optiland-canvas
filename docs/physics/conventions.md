@@ -100,7 +100,7 @@ retardance past the critical angle is the negative of the true one).
 
 ## Fourier and propagation conventions
 
-The scalar wave optics in `oc-wave` (ADR 0003) uses the same time dependence,
+The scalar wave optics in `oc-wave` (ADR 0004) uses the same time dependence,
 `exp(-iωt)`, and so does its main reference, Goodman's *Introduction to Fourier
 Optics*, 4th ed. (W. H. Freeman/Macmillan Learning, 2017, ISBN
 978-1-319-11916-4). Everything below follows from it.

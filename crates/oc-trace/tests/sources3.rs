@@ -19,6 +19,7 @@ use oc_trace::{launch_from_scene, trace_scene3};
 fn collimated_disc(scene: &mut Scene3, at_x: f64, radius_mm: f64, samples: u32) {
     let id = scene.alloc_source_id();
     scene.sources.push(Source3 {
+        window: Default::default(),
         id,
         transform: Isometry3::from_pos(Vec3::new(at_x, 0.0, 0.0)),
         spatial: SpatialDistribution3::Disc { radius_mm },

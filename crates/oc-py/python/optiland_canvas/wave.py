@@ -1,4 +1,4 @@
-"""Scalar wave optics from Python: the ``oc-wave`` crate (ADR 0003).
+"""Scalar wave optics from Python: the ``oc-wave`` crate (ADR 0004).
 
 A field is a 2D ``numpy.complex128`` array indexed ``[y, x]``, sampled at
 ``pitch_mm`` about ``center_mm`` in its plane, with sample ``i`` at

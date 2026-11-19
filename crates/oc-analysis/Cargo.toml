@@ -1,0 +1,17 @@
+[package]
+name = "oc-analysis"
+description = "Optiland Canvas analyses: statistics read off the f64 reference trace, run as steppable jobs (ADR 0003)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+oc-core = { path = "../oc-core", features = ["scene3"] }
+# The one transport engine, driven through its public API. Serial (no rayon):
+# an analysis is stepped from a browser worker, and a job adds its blocks up
+# in a fixed order whatever the build.
+oc-trace = { path = "../oc-trace", default-features = false, features = ["trace3"] }
+serde.workspace = true
+serde_json.workspace = true

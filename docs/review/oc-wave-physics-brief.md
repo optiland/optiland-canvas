@@ -116,7 +116,7 @@ geometric ray tracer** (`oc-trace`). There a ray is a packet of flux with an
 optical path length (OPL), never a field amplitude. `oc-wave` adds a complex
 scalar field sampled on a plane, and the methods that move it.
 
-The coupling is fixed by architecture decision ADR 0003:
+The coupling is fixed by architecture decision ADR 0004:
 
 - **Rays for the layout, fields for the diffraction.** Rays and fields meet
   only through the optical path. A field never feeds a ray's flux. A ray
@@ -7460,7 +7460,7 @@ Found while this brief was written:
 ### 11.3 Documentation discrepancies found by the rerun
 
 The repository's docs (`docs/wave-optics.md`, `docs/dmd.md`, `docs/slm.md`,
-ADR 0003) differ from the code in these places. The brief uses the code and
+ADR 0004) differ from the code in these places. The brief uses the code and
 the rerun.
 
 - **Measured values that changed**, all still inside their gates:
@@ -7475,7 +7475,7 @@ the rerun.
 - **A false claim.** The docs say "`numerical`, round-off, is at most 7e-12
   of the launched power on every path the tests run". The DMD-and-singlet
   test gives 5.87e-9, against its gate of 1e-6.
-- **ADR 0003 is not amended.** Item 5 ("fields are scalar … Jones fields are
+- **ADR 0004 is not amended.** Item 5 ("fields are scalar … Jones fields are
   later work") is superseded by the two-component fields. Item 6 (the ledger
   "must close to 1e-12") is superseded by the finding that the closure is
   tautological (§8).

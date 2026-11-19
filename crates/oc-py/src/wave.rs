@@ -1,4 +1,4 @@
-//! Scalar wave optics across the Python boundary (`oc-wave`, ADR 0003).
+//! Scalar wave optics across the Python boundary (`oc-wave`, ADR 0004).
 //!
 //! The rest of this crate exchanges JSON. A field is a million complex numbers,
 //! so it crosses as `bytes` instead: interleaved little-endian `f64`, real part

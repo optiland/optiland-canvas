@@ -25,7 +25,7 @@ oc-core = { workspace = true, features = ["scene3"] }
 # traces exactly one launch ray, so parallel transport buys nothing here.
 oc-trace = { path = "../oc-trace", default-features = false, features = ["trace3"] }
 serde_json = { workspace = true }
-# Scalar wave optics (ADR 0003): fields cross as bytes, reports as JSON.
+# Scalar wave optics (ADR 0004): fields cross as bytes, reports as JSON.
 oc-wave = { workspace = true }
 
 [dependencies.pyo3]

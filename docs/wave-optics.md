@@ -3,7 +3,7 @@
 A complex scalar field sampled on a plane, and the methods that move it from
 one plane to another by diffraction. The crate sits beside the ray tracer, not
 inside it, and the two meet only through optical path length
-([ADR 0003](architecture/adr/0003-scalar-wave-optics-engine.md)). Everything is
+([ADR 0004](architecture/adr/0004-scalar-wave-optics-engine.md)). Everything is
 f64.
 
 **What exists today:**
@@ -213,7 +213,7 @@ between neighbouring samples at the window edge.
 from a source to a rectangular detector, along every chain by which the
 source's axial ray reaches it. The f64 tracer's chief ray decides where the
 beam goes; the field decides what arrives. This is the coupling
-ADR 0003 chose: rays for the layout, fields for the diffraction, joined by
+ADR 0004 chose: rays for the layout, fields for the diffraction, joined by
 optical path [17].
 
 ```rust
@@ -1188,7 +1188,7 @@ entry says so.
 14. S. A. Self, "Focusing of spherical Gaussian beams," *Appl. Opt.* 22(5), 658–661 (1983).
 15. NIST Digital Library of Mathematical Functions, ch. 7 (error functions and Fresnel integrals) and ch. 10 (Bessel functions), https://dlmf.nist.gov.
 16. M. Born, E. Wolf, *Principles of Optics*, 7th ed., Cambridge University Press (1999): the Airy pattern; the theory of stratified media, a single film and a plane-parallel plate's multiple-beam transmission. (Section numbers to confirm.)
-17. F. Wyrowski, M. Kuhn, "Introduction to field tracing," *J. Mod. Opt.* 58(5–6), 449–466 (2011), doi:10.1080/09500340.2010.532237. (The coupling of rays and fields; ADR 0003.)
+17. F. Wyrowski, M. Kuhn, "Introduction to field tracing," *J. Mod. Opt.* 58(5–6), 449–466 (2011), doi:10.1080/09500340.2010.532237. (The coupling of rays and fields; ADR 0004.)
 
 18. Optiland, https://github.com/optiland/optiland, `master` at `1e0513902c68948a727394c6226f3580c7261c65` (2026-10-14), cloned 2026-10-19: the oracle for C45.
 

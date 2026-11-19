@@ -626,6 +626,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "oc-analysis"
+version = "0.0.1"
+dependencies = [
+ "oc-core",
+ "oc-trace",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "oc-core"
 version = "0.0.1"
 dependencies = [
@@ -694,6 +704,7 @@ name = "oc-wasm"
 version = "0.0.1"
 dependencies = [
  "js-sys",
+ "oc-analysis",
  "oc-core",
  "oc-fit",
  "oc-gpu",

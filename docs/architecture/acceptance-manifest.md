@@ -253,7 +253,7 @@ work packages name theirs in their exit criteria.
 
 ## Wave cases C35 onward
 
-The scalar wave optics epic ([ADR 0003](adr/0003-scalar-wave-optics-engine.md),
+The scalar wave optics epic ([ADR 0004](adr/0004-scalar-wave-optics-engine.md),
 milestones W0–W8). Like the rest of this manifest, the cases are listed before
 the evidence exists. A row without ✅ is owed by the milestone it names, in the
 file it names.

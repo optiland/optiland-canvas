@@ -60,7 +60,7 @@ jobs:
         run: cargo clippy -p oc-gpu --features gpu3 --all-targets -- -D warnings
       - name: test (3D preview, CPU mirror)
         run: cargo test -p oc-gpu --features gpu3
-      # Scalar wave optics (ADR 0003). The workspace steps above cover its
+      # Scalar wave optics (ADR 0004). The workspace steps above cover its
       # default build; these turn on its optional features and prove the crate
       # still builds for the browser, which has no threads.
       - name: clippy (wave optics, all features)
@@ -258,7 +258,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [windows-latest, macos-14]
+        os: [windows-latest, macos-15]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

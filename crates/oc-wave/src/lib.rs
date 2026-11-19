@@ -6,7 +6,7 @@
 //! the propagators move it from one plane to another by diffraction theory.
 //! It lives beside the tracer, not inside it, and the two never mix units: a
 //! field does not feed ray flux, and a ray does not carry a phase it did not
-//! earn from its optical path length (ADR 0003).
+//! earn from its optical path length (ADR 0004).
 //!
 //! # Conventions
 //!

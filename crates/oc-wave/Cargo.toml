@@ -24,7 +24,7 @@ glam.workspace = true
 serde.workspace = true
 rayon = { workspace = true, optional = true }
 # The one FFT in the workspace, kept out of oc-core and oc-trace on purpose
-# (ADR 0003): the kernel crates stay at glam + serde(_json) + optional rayon.
+# (ADR 0004): the kernel crates stay at glam + serde(_json) + optional rayon.
 # Pure Rust, MIT OR Apache-2.0, builds for wasm32-unknown-unknown.
 rustfft = "6.4.1"
 

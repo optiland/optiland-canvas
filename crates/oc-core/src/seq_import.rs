@@ -869,6 +869,7 @@ impl Builder {
             }
         };
         self.scene.sources.push(Source3 {
+            window: Default::default(),
             id,
             transform,
             spatial,

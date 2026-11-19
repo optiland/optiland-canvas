@@ -1,4 +1,4 @@
-# ADR 0003: Scalar wave optics lives beside the ray tracer, in its own crate
+# ADR 0004: Scalar wave optics lives beside the ray tracer, in its own crate
 
 **Status:** Accepted, 2026-10-19
 **Baseline:** `main` at `b2ea503`

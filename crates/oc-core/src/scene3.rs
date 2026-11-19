@@ -600,6 +600,21 @@ pub enum SurfaceResponse {
     ThinLens {
         focal_length_mm: f64,
     },
+    /// An ideal mirror: it reflects as a flat mirror on its plane does, then
+    /// bends the ray toward a focus on the reflected axis through the
+    /// surface's origin, at every angle of incidence, so it has no astigmatism
+    /// and no coma: what it is asked to do and nothing more. A power is 1/f
+    /// per mm, positive converging, negative diverging from a virtual focus
+    /// behind the surface, and 0 flat in that direction; `power_x` acts across
+    /// the reflected ray along local `X`, `power_y` along local `Y`, and two
+    /// equal powers make one point focus. Both zero is a `Mirror` of
+    /// reflectivity 1. Full reflection, no dispersion, no added path length.
+    /// Only meaningful on a standalone planar surface; a body patch authoring
+    /// it is rejected by the tracer. See `docs/ideal-mirror.md`.
+    IdealMirror {
+        power_x_per_mm: f64,
+        power_y_per_mm: f64,
+    },
     /// A plane diffraction grating: the grooves run along the surface's local
     /// `Y`. Every ray leaves in `order` by the grating equation, exactly, and
     /// in the zero order; the fractions going into each are declared, not
@@ -820,6 +835,12 @@ impl SurfaceResponse {
             Self::ThinLens { focal_length_mm } => {
                 if !focal_length_mm.is_finite() || *focal_length_mm == 0.0 {
                     return Err(range("focal_length_mm", "must be finite and nonzero"));
+                }
+                Ok(())
+            }
+            Self::IdealMirror { power_x_per_mm, power_y_per_mm } => {
+                if !power_x_per_mm.is_finite() || !power_y_per_mm.is_finite() {
+                    return Err(range("power", "must be finite"));
                 }
                 Ok(())
             }
@@ -1814,6 +1835,35 @@ pub struct Source3 {
     /// beam; the f32 preview stays unpolarized.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub polarization: Option<SourcePolarization>,
+    /// The part of the sampling domain the source emits over; the whole of
+    /// it by default. Not part of a scene file: an analysis sets it on a
+    /// copy of a scene ([`SampleWindow`]).
+    #[serde(skip)]
+    pub window: SampleWindow,
+}
+
+/// A part of a source's sampling domain: a rectangle of the unit square its
+/// origins are drawn from, and one of the unit square its directions are.
+///
+/// Every area origin and every spread of directions is the image of the
+/// unit square under a map that keeps the source's own measure (area for a
+/// rectangle or a disc, solid angle for a cone, projected solid angle for a
+/// Lambertian, power for a sun or a radial profile). So a window of area `a`
+/// holds exactly a fraction `a` of the light, and a source with a window
+/// emits its `flux` over the window alone: a copy of a source cut into
+/// windows, each with its share of the flux, emits the source's light.
+///
+/// A window applies where the source has a square to cut
+/// ([`Source3::window_dims`]): origins from a rectangle or a disc, and
+/// directions in a cone, a Lambertian, a sun or a radial profile. A point, a
+/// single direction and the v1 legacy line and fan ignore it.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SampleWindow {
+    /// `[[u low, u high], [v low, v high]]` of the origins' unit square;
+    /// the whole square when `None`.
+    pub spatial: Option<[[f64; 2]; 2]>,
+    /// The same of the directions' unit square.
+    pub angular: Option<[[f64; 2]; 2]>,
 }
 
 /// The polarization a source emits, written in its own transverse frame:

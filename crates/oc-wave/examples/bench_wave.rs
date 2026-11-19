@@ -1,5 +1,5 @@
 //! Timings for docs/performance.md: the 2D transform, and the share of it
-//! spent bridging `Cx` to rustfft's complex type (ADR 0003 promised to measure
+//! spent bridging `Cx` to rustfft's complex type (ADR 0004 promised to measure
 //! this; above 15% the internals would switch type).
 //!
 //! `cargo run -p oc-wave --release --example bench_wave`

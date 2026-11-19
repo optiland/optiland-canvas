@@ -236,7 +236,7 @@ distributed rendering, differentiable tracing.
 
 Coherent (scalar) wave propagation and diffraction have since been taken up in
 their own epic, in the `oc-wave` crate beside the tracer rather than inside it:
-[ADR 0003](adr/0003-scalar-wave-optics-engine.md), milestones W0–W8, acceptance
+[ADR 0004](adr/0004-scalar-wave-optics-engine.md), milestones W0–W8, acceptance
 cases C35 onward in the [acceptance manifest](acceptance-manifest.md).
 
 Once the 3D reference path exists (PR 3D-04), physics features land in this

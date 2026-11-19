@@ -694,6 +694,42 @@ impl TracePart3 {
         &self.acc.result.segments
     }
 
+    /// The block's detector readouts so far, read in place. For a caller that
+    /// wants each block's numbers on their own, before the part goes to a
+    /// [`TraceMerge3`]: the analysis crate reads them to tell one pass of a
+    /// trace from the next, which is where its standard errors come from.
+    pub fn detectors(&self) -> &[DetectorResult3] {
+        &self.acc.result.detectors
+    }
+
+    /// The block's energy ledger so far, read in place, like
+    /// [`TracePart3::detectors`].
+    pub fn ledger(&self) -> &EnergyLedger {
+        &self.acc.result.ledger
+    }
+
+    /// The block's object ledger so far, read in place, like
+    /// [`TracePart3::detectors`]: the rows [`TraceResult3::objects`] would
+    /// hold for this block alone, in the same order. Empty unless the trace
+    /// keeps an object ledger ([`TraceConfig3::object_ledger`]).
+    pub fn objects(&self) -> impl Iterator<Item = ObjectEntry3> + '_ {
+        self.acc
+            .result
+            .objects
+            .iter()
+            .map(|(&(object, in_band), &ledger)| ObjectEntry3 { object, in_band, ledger })
+    }
+
+    /// The block's deposits so far ([`TraceResult3::deposits`]), taken out of
+    /// the part, in the order the block traced them, like
+    /// [`TracePart3::detectors`] read in place. For a caller that bins them as
+    /// each block comes in, rather than holding every deposit of a long trace
+    /// in the merge: the analysis crate's `fluorescence` does. A merge of the
+    /// part then holds none of them; it changes nothing else.
+    pub fn take_deposits(&mut self) -> Vec<Deposit3> {
+        std::mem::take(&mut self.acc.result.deposits)
+    }
+
     /// Whether this block alone recorded `max_records` hits on every detector
     /// (see [`TraceBlocks3::part`]).
     pub fn records_full(&self, max_records: usize) -> bool {
@@ -1205,6 +1241,11 @@ struct RayWork {
     from: ObjectRef3,
     /// Hits on `TraceConfig3::count_hits_on` since launch.
     counted: u32,
+    /// The medium this branch was sent into: the side of the face it left by,
+    /// as the interaction that made it saw it (`None` is the ambient). The
+    /// look-ahead in [`trace_one`] decides the medium wherever containment can
+    /// answer; this decides it where containment cannot.
+    region: Option<usize>,
 }
 
 impl RayWork {
@@ -1367,10 +1408,11 @@ fn trace_one(
         ghost: false,
         from: ObjectRef3::Source,
         counted: 0,
+        region: region_at(scene, objs, lr.ray.origin + medium_eps * lr.ray.dir, tol),
     });
 
     let mut branches = 0u64;
-    while let Some(w) = stack.pop() {
+    while let Some(mut w) = stack.pop() {
         branches += 1;
         if branches > cfg.max_branches {
             // Deposit the popped branch and everything still queued, so the cap
@@ -1404,8 +1446,14 @@ fn trace_one(
 
         // The medium this branch travels through: containment + priority, sampled
         // just ahead of the origin so a ray leaving a surface reads the medium it
-        // is entering.
-        let here = region_at(scene, objs, w.ray.origin + medium_eps * w.ray.dir, tol);
+        // is entering. A branch that leaves its face within asin(1/8) of grazing
+        // (7.2°, TIR along a light pipe's wall) has that point less than
+        // `medium_abs_mm` off the face, in the band where containment cannot
+        // say; there the side it left into, which its interaction recorded,
+        // decides.
+        let here = region_ahead(scene, objs, w.ray.origin + medium_eps * w.ray.dir, tol)
+            .unwrap_or(w.region);
+        w.region = here;
         let n_here = region_index(scene, here, w.lambda);
         let alpha = match region_absorption(scene, here, w.lambda) {
             Ok(a) => a,
@@ -1528,10 +1576,17 @@ fn trace_one(
                 patch,
             } => {
                 let (before, n0) = (r.ledger, stack.len());
-                interact_body(
+                let far = interact_body(
                     scene, objs, &mut stack, r, cfg, tol, &w, body, ev.point, outward, patch, here,
                     n_here, flux_at, opl_at, medium_eps, min_flux,
                 );
+                // A child that turns back from the face (a reflection, TIR)
+                // stays in `here`; one that crosses it is in `far`. The drawn
+                // face decides, as it does for `far` itself.
+                let back = if w.ray.dir.dot(outward) < 0.0 { outward } else { -outward };
+                for c in &mut stack[n0..] {
+                    c.region = if c.ray.dir.dot(back) > 0.0 { here } else { far };
+                }
                 after_interaction(r, cfg, &mut stack[n0..], ObjectRef3::Body(body, patch.0), &w, flux_at, &before, ev.point);
             }
         }
@@ -1833,22 +1888,51 @@ fn region_at(
     point: Vec3,
     tol: &ToleranceContext,
 ) -> Option<usize> {
-    let mut best: Option<(usize, i32, u64)> = None;
+    containment_at(scene, objs, point, tol).0.map(|(i, _)| i)
+}
+
+/// [`region_at`], or `None` when `point` lies in the boundary band of a body
+/// that would decide the medium were it inside: that close to a face, the
+/// point is neither in nor out, and its answer would be a guess.
+fn region_ahead(
+    scene: &Scene3,
+    objs: &EventObjects,
+    point: Vec3,
+    tol: &ToleranceContext,
+) -> Option<Option<usize>> {
+    match containment_at(scene, objs, point, tol) {
+        (best, None) => Some(best.map(|(i, _)| i)),
+        (Some((i, key)), Some(band)) if key > band => Some(Some(i)),
+        _ => None,
+    }
+}
+
+/// The highest-priority body `point` is inside, and the highest priority among
+/// the bodies whose boundary band it is in, each as `(priority, id)`.
+#[allow(clippy::type_complexity)]
+fn containment_at(
+    scene: &Scene3,
+    objs: &EventObjects,
+    point: Vec3,
+    tol: &ToleranceContext,
+) -> (Option<(usize, (i32, u64))>, Option<(i32, u64)>) {
+    let mut best: Option<(usize, (i32, u64))> = None;
+    let mut band: Option<(i32, u64)> = None;
     for (i, b) in scene.bodies.iter().enumerate() {
         if !b.is_3d() || !objs.body_boxes[i].contains_point(point) {
             continue;
         }
-        let inside =
-            b.geometry
-                .contains_prepared(&objs.body_preps[i], point, &b.common.transform, tol);
-        if inside == Containment::Inside {
-            let key = (b.priority, b.common.id.0);
-            if best.map_or(true, |(_, p, id)| key > (p, id)) {
-                best = Some((i, b.priority, b.common.id.0));
-            }
+        let key = (b.priority, b.common.id.0);
+        match b
+            .geometry
+            .contains_prepared(&objs.body_preps[i], point, &b.common.transform, tol)
+        {
+            Containment::Inside if best.map_or(true, |(_, k)| key > k) => best = Some((i, key)),
+            Containment::Boundary if band.map_or(true, |k| key > k) => band = Some(key),
+            _ => {}
         }
     }
-    best.map(|(i, _, _)| i)
+    (best, band)
 }
 
 fn region_index(scene: &Scene3, region: Option<usize>, lambda: f64) -> f64 {
@@ -1901,7 +1985,7 @@ fn interact_body(
     opl_at: f64,
     medium_eps: f64,
     min_flux: f64,
-) {
+) -> Option<usize> {
     let b = &scene.bodies[body];
     r.report.note_exact(match b.geometry {
         SolidGeometry3::Profile(_) => PhysicsFeature::ProfileBody,
@@ -1943,6 +2027,7 @@ fn interact_body(
         min_flux,
         film_temperature(scene, cfg, b.common.id.0),
     );
+    far
 }
 
 /// The normal a hit sees on a face with slope error `sigma` (radians RMS per
@@ -2099,6 +2184,86 @@ fn interact_surface(
             scene, stack, r, cfg, w, s, device, *ray_model, from_front, surface_ref, point, n_oppose, n_here,
             flux_at, opl_at, min_flux,
         );
+        return;
+    }
+    // An ideal mirror's outgoing direction depends on where it was hit, as a
+    // thin lens's does: handled here, in the surface's frame.
+    if let SurfaceResponse::IdealMirror { power_x_per_mm, power_y_per_mm } = response {
+        r.report.note_exact(PhysicsFeature::Mirror);
+        // First the flat mirror of reflectivity 1, exactly as `apply_response`
+        // traces `Mirror`: the same reflection about the same (possibly
+        // figure-error leaned) normal, the state written on the plane of
+        // incidence, and the same note when polarized light makes the
+        // equal-s-and-p model matter. With both powers zero, that is all.
+        let flat = reflect3(w.ray.dir, n_oppose);
+        let s_hat = polarization::incidence_axis(w.ray.dir, n_oppose).unwrap_or(w.pol.x);
+        let stokes_in = w
+            .state_at(flux_at)
+            .rotated(polarization::frame_angle(w.ray.dir, w.pol.x, s_hat));
+        if cfg.polarized() && stokes_in.dop() > 1e-12 {
+            r.report.note_approx(
+                PhysicsFeature::Mirror,
+                "ideal reflector: equal s and p, no retardance",
+            );
+        }
+        let m = Mueller::attenuator(1.0);
+        let stokes = if cfg.polarized() {
+            m.apply(&stokes_in)
+        } else {
+            Stokes::unpolarized(m.unpolarized_gain() * flux_at)
+        };
+        r.ledger.absorbed_surface += flux_at - stokes.s0;
+        // Then the bend, in the surface's frame. The axis is the flat
+        // reflection through the surface's origin, and the focus sits on it at
+        // f = 1/power. A ray reflected at `p` runs parallel to that axis,
+        // `across` off it and already `along` down it, so the line from `p` to
+        // the focus has the slope `across / (f − along)`, written with the
+        // power so a zero power is no bend at all. Every ray of a parallel
+        // bundle is aimed at the one point, at any angle of incidence: no
+        // astigmatism and no coma, by construction. The two powers act along
+        // local X and Y, carried onto the plane square to the axis.
+        let dir = if *power_x_per_mm == 0.0 && *power_y_per_mm == 0.0 {
+            flat
+        } else {
+            let q = s.common.transform.quat();
+            let p = s.common.transform.inverse_transform_point(point);
+            let axis = q.inverse() * flat;
+            let along = p.dot(axis);
+            let across = p - axis * along;
+            let slope = |h: f64, power: f64| {
+                let left = 1.0 - along * power;
+                // A hit already at the focus distance: aim straight on.
+                if left.abs() < 1e-12 { 0.0 } else { h * power / left }
+            };
+            let square_x = Vec3::X - axis * axis.x;
+            if square_x.length() < 1e-9 {
+                // The reflection runs along local X itself, grazing the
+                // surface: there is no plane across it to bend in.
+                flat
+            } else {
+                let e_x = square_x.normalize();
+                let e_y = axis.cross(e_x);
+                let bent = axis
+                    - e_x * slope(across.dot(e_x), *power_x_per_mm)
+                    - e_y * slope(across.dot(e_y), *power_y_per_mm);
+                q * bent.normalize()
+            }
+        };
+        // The bend is not a reflection, so it has no plane of incidence; the
+        // frame is carried across it by the shortest rotation, as through a
+        // thin lens. No bend leaves it on `s_hat`.
+        let pol = PolRay {
+            stokes,
+            x: polarization::transport_frame(s_hat, flat, dir),
+        };
+        let child = spawn(
+            stack, r, cfg, w, point, dir, pol, opl_at, false, false, min_flux,
+        );
+        let children = child
+            .map(|id| (ChildRole::Reflect, id))
+            .into_iter()
+            .collect();
+        push_event(r, cfg, w, point, opl_at, lens_interact(children));
         return;
     }
     // A grating sends light along its grating vector, which is a direction in
@@ -3400,13 +3565,15 @@ fn apply_response(
             }
             push_event(r, cfg, w, point, opl_at, interact(children));
         }
-        // A thin lens on a body patch has no meaning: the bend depends on the
-        // hit position in a lens plane the patch does not define. A polarizer or
-        // a retarder on one has none either: their axis is a direction in the
-        // element, and a curved patch of a solid does not define one. Standalone
-        // surfaces intercept all three in `interact_surface`; anything else
-        // refuses rather than picking an axis.
+        // A thin lens or an ideal mirror on a body patch has no meaning: the
+        // bend depends on the hit position in a plane the patch does not
+        // define. A grating, a polarizer or a retarder on one has none either:
+        // their axis is a direction in the element, and a curved patch of a
+        // solid does not define one. Standalone surfaces intercept all of these
+        // in `interact_surface`; anything else refuses rather than picking an
+        // axis.
         SurfaceResponse::ThinLens { .. }
+        | SurfaceResponse::IdealMirror { .. }
         | SurfaceResponse::Grating { .. }
         | SurfaceResponse::Polarizer { .. }
         | SurfaceResponse::Retarder { .. }
@@ -3475,6 +3642,10 @@ fn spawn(
         // The caller names the object once the interaction is over.
         from: parent.from,
         counted: parent.counted,
+        // The same medium unless the interaction says otherwise: a
+        // zero-thickness surface has the same medium on both sides (§6.6), and
+        // a body's interaction sets each child's side after it.
+        region: parent.region,
     });
     Some(path_id)
 }
@@ -3533,6 +3704,7 @@ fn continue_probe(
             ghost: w.ghost,
             from: w.from,
             counted: w.counted,
+            region: w.region,
         });
     }
 }

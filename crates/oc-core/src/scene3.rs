@@ -1383,6 +1383,10 @@ pub struct Detector3 {
     /// has no field here and reads power, which is what it always read.
     #[serde(default)]
     pub measure: DetectorMeasure,
+    /// Which side of the face counts. A document written before there was a
+    /// choice has no field here and counts both, which is what it always did.
+    #[serde(default, skip_serializing_if = "DetectorSides::is_both")]
+    pub sides: DetectorSides,
 }
 
 impl Detector3 {
@@ -1642,6 +1646,36 @@ pub enum DetectorResponse {
         interpolation: Interpolation,
         out_of_range: OutOfRangePolicy,
     },
+}
+
+/// Which light a detector counts.
+///
+/// The front is the side the face's local `+z` points to. Light arriving at
+/// the back of a front-only face goes on as if the face were not there:
+/// neither counted nor stopped, whatever its termination. A camera's sensor
+/// reads its front only; a probe in an arm that light crosses twice (out and
+/// back, as in a Michelson interferometer) counts each beam once this way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum DetectorSides {
+    /// Light arriving from either side.
+    #[default]
+    Both,
+    /// Only light arriving at the front, travelling against the local `+z`.
+    Front,
+}
+
+impl DetectorSides {
+    pub fn is_both(&self) -> bool {
+        matches!(self, Self::Both)
+    }
+
+    /// Does light travelling `dir_local` (in the face's frame) count here?
+    pub fn counts(&self, dir_local: Vec3) -> bool {
+        match self {
+            Self::Both => true,
+            Self::Front => dir_local.z < 0.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

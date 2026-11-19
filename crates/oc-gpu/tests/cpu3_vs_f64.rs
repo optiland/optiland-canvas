@@ -125,6 +125,7 @@ fn add_rect_detector(
         response: DetectorResponse::Unity,
         termination: DetectorTermination::Terminate,
         measure: oc_core::scene3::DetectorMeasure::Power,
+        sides: Default::default(),
     });
     id
 }
@@ -296,6 +297,26 @@ fn assert_landing_matches(f64_scene: &Scene3, origins_dirs: &[(Vec3, Vec3)]) {
 // ---------------------------------------------------------------------------
 // Parity fixtures
 // ---------------------------------------------------------------------------
+
+#[test]
+fn a_front_only_probe_in_an_arm_matches_f64() {
+    // Out through the probe's front, back from the mirror through its back (not there for
+    // it), onto the catcher.
+    let mut scene = Scene3::new();
+    let probe = add_rect_detector(&mut scene, Vec3::ZERO, Vec3::NEG_X, 5.0, 5.0, [4, 4]);
+    add_mirror(&mut scene, Vec3::new(10.0, 0.0, 0.0), Vec3::NEG_X, 8.0);
+    add_rect_detector(&mut scene, Vec3::new(-20.0, 0.0, 0.0), Vec3::X, 5.0, 5.0, [4, 4]);
+    let d = scene.detectors.iter_mut().find(|d| d.common.id == probe).unwrap();
+    d.termination = DetectorTermination::ProbeAndContinue;
+    d.sides = oc_core::scene3::DetectorSides::Front;
+    assert_landing_matches(
+        &scene,
+        &[
+            (Vec3::new(-10.0, 0.5, 0.0), Vec3::X),
+            (Vec3::new(-10.0, -1.0, 0.5), Vec3::X),
+        ],
+    );
+}
 
 #[test]
 fn a_glass_sphere_matches_f64_for_skew_rays() {

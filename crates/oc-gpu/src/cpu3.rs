@@ -912,8 +912,12 @@ fn surface_hit(s: &GpuSurface3, o: Vec3, d: Vec3) -> Option<(f32, Vec3)> {
         .then(|| (t, (s.rot * Vec3::Z).normalize()))
 }
 
-/// A detector face hit: `(t, local uv)`.
+/// A detector face hit: `(t, local uv)`. A front-only face is not there for
+/// light arriving at its back (travelling along its local `+z`).
 fn detector_hit(det: &GpuDetector3, o: Vec3, d: Vec3) -> Option<(f32, Vec2)> {
+    if det.front_only && det.rot.col(2).dot(d) >= 0.0 {
+        return None;
+    }
     let (t, uv) = plane_face(det.rot, det.pos, o, d)?;
     det.shape.contains(uv).then_some((t, uv))
 }

@@ -345,6 +345,7 @@ mod tests {
             bins: [16, 16],
             response: DetectorResponse::Unity,
             termination: DetectorTermination::Terminate,
+            sides: Default::default(),
         });
         scene
     }

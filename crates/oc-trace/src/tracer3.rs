@@ -3421,7 +3421,8 @@ fn detector_qe(scene: &Scene3, det: usize, lambda: f64) -> f64 {
 }
 
 /// Intersect a detector face (local `z = 0`), returning `(t, world point, uv,
-/// incident dir in local frame)`. Line probes have no area in 3D and are skipped.
+/// incident dir in local frame)`. Line probes have no area in 3D and are skipped,
+/// and a front-only face is not there for light arriving at its back.
 fn detector_hit(
     d: &Detector3,
     ray: &Ray3,
@@ -3431,11 +3432,14 @@ fn detector_hit(
     if matches!(d.geometry, DetectorGeometry3::LineProbeLegacy { .. }) {
         return None;
     }
+    let dir_local = d.common.transform.inv_rotate(ray.dir);
+    if !d.sides.counts(dir_local) {
+        return None;
+    }
     let (t, uv) = plane_face_hit(&d.common.transform, ray, tmin, tmax, |p| {
         detector_contains(d, p)
     })?;
     let point = ray.at(t);
-    let dir_local = d.common.transform.inv_rotate(ray.dir);
     Some((t, point, uv, dir_local))
 }
 

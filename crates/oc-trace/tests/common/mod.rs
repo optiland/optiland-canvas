@@ -14,8 +14,9 @@ use oc_core::profile2::{
 };
 use oc_core::scene3::{
     Aperture3, ApertureInteraction, ApertureShape3, Body3, Detector3, DetectorGeometry3,
-    DetectorMeasure, DetectorResponse, DetectorTermination, ObjectCommon, PlanarShape2, SolidGeometry3,
-    SpectralScalar, SurfaceGeometry3, SurfaceObject3, SurfaceProps3, SurfaceResponse,
+    DetectorMeasure, DetectorResponse, DetectorTermination, ObjectCommon, PlanarShape2,
+    SolidGeometry3, SpectralScalar, SurfaceGeometry3, SurfaceObject3, SurfaceProps3,
+    SurfaceResponse,
 };
 use oc_core::vec::Vec2;
 use oc_core::vec3::{Isometry3, Plane3, Ray3, Vec3};
@@ -429,6 +430,7 @@ fn add_detector(
         response: DetectorResponse::Unity,
         termination: DetectorTermination::Terminate,
         measure: DetectorMeasure::Power,
+        sides: Default::default(),
     });
     id
 }

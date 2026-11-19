@@ -30,7 +30,8 @@ use oc_core::material::{Cauchy, Material};
 use oc_core::profile2::{ClosedProfile2, ProfileConstruction3};
 use oc_core::scene3::{
     DetectorMeasure,
-    AbsorptionModel, Aperture3, Body3, Detector3, DetectorGeometry3, DetectorTermination,
+    AbsorptionModel, Aperture3, Body3, Detector3, DetectorGeometry3, DetectorSides,
+    DetectorTermination,
     Interpolation, OutOfRangePolicy, PlanarShape2, Scene3, SolidGeometry3, SpectralScalar,
     SurfaceGeometry3, SurfaceObject3, SurfaceResponse, TwoSidedSurfaceResponse,
 };
@@ -1870,6 +1871,9 @@ pub struct GpuDetector3 {
     pub shape: DetShape,
     pub bins: [usize; 2],
     pub terminate: bool,
+    /// It counts light arriving at its front only (`DetectorSides::Front`):
+    /// light reaching its back goes on as if it were not there.
+    pub front_only: bool,
     /// The face in physical millimetres, as the scene has it. What a flux
     /// density divides by is computed from this on demand, not on every
     /// compile: the preview recompiles every frame of a drag, and a round
@@ -1920,6 +1924,7 @@ fn compile_detector(d: &Detector3, norm: &Norm) -> Result<GpuDetector3, String> 
         shape,
         bins: d.bins,
         terminate: matches!(d.termination, DetectorTermination::Terminate),
+        front_only: matches!(d.sides, DetectorSides::Front),
         geometry: d.geometry.clone(),
         measure: d.measure,
         solid_angle_sr: d

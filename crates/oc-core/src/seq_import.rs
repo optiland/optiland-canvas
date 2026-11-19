@@ -640,6 +640,7 @@ impl Builder {
             response: DetectorResponse::Unity,
             termination: DetectorTermination::Terminate,
             measure: DetectorMeasure::Power,
+            sides: Default::default(),
         });
         crate::id::DetectorId(id.0)
     }

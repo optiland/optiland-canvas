@@ -25,8 +25,8 @@ use glam::{Mat3, Vec3};
 use oc_core::scene3::OutOfRangePolicy;
 
 use crate::scene3::{
-    DetShape, GpuAperture3, GpuBody3, GpuDetector3, GpuResponse, GpuScene3, GpuShape2, GpuSurface3,
-    RevFace, Spectral32,
+    DetShape, GpuAperture3, GpuBody3, GpuDetector3, GpuEdge2, GpuResponse, GpuScene3, GpuShape2,
+    GpuSurface3, RevFace, Spectral32, EDGE_CONIC, EDGE_LINE,
 };
 
 // Face-shape kinds (the finite region of a plane). Shared by surfaces, apertures,
@@ -136,7 +136,9 @@ pub struct Body3Buf {
     /// Extruded profile: `verts[poly_start .. poly_start+poly_count]` and Z limits.
     pub poly_start: u32,
     pub poly_count: u32,
-    /// Revolved profile: face range and containment-contour range.
+    /// Revolved profile: face range and containment-contour range. An extruded
+    /// profile with a conic edge: its edges at `verts[contour_start..]`, four
+    /// `vert`s each (`pack_edge`), `contour_count` of them.
     pub face_start: u32,
     pub face_count: u32,
     pub contour_start: u32,
@@ -453,15 +455,25 @@ fn pack_body(b: &GpuBody3, verts: &mut Vec<Vert3Buf>, faces: &mut Vec<Face3Buf>)
     let (rot0, rot1, rot2) = cols(&b.rot);
     let (mut poly_start, mut poly_count) = (0u32, 0u32);
     let (mut z_min, mut z_max) = (0.0f32, 0.0f32);
+    let (mut contour_start, mut contour_count) = (0u32, 0u32);
     if let Some(e) = &b.extrude {
         poly_start = verts.len() as u32;
         verts.extend(e.verts.iter().map(|p| [p.x, p.y]));
         poly_count = e.verts.len() as u32;
         z_min = e.z_min;
         z_max = e.z_max;
+        // A profile with a conic edge rides in the contour range an extruded
+        // body does not otherwise use: its edges, `pack_edge` each. See
+        // `extrude_edges_hit` in the shader.
+        if !e.edges.is_empty() {
+            contour_start = verts.len() as u32;
+            for edge in &e.edges {
+                verts.extend(pack_edge(edge));
+            }
+            contour_count = e.edges.len() as u32;
+        }
     }
     let (mut face_start, mut face_count) = (0u32, 0u32);
-    let (mut contour_start, mut contour_count) = (0u32, 0u32);
     if let Some(rev) = &b.revolve {
         face_start = faces.len() as u32;
         // A face's own response travels with the face, because a coated plate is
@@ -530,6 +542,26 @@ fn pack_body(b: &GpuBody3, verts: &mut Vec<Vert3Buf>, faces: &mut Vec<Face3Buf>)
             b.dp[0], b.dp[1], b.dp[2], b.dp[3], b.dp[4], b.dp[5], 0.0, 0.0,
         ],
         _pad: [0.0; 2],
+    }
+}
+
+/// An extruded profile's edge as four `vert`s: `(kind, c)`, `(k, half_ap)`, then
+/// a line's two ends, or a conic's vertex and unit axis.
+fn pack_edge(e: &GpuEdge2) -> [Vert3Buf; 4] {
+    match *e {
+        GpuEdge2::Line { a, b } => [[EDGE_LINE as f32, 0.0], [0.0, 0.0], [a.x, a.y], [b.x, b.y]],
+        GpuEdge2::Conic {
+            vertex,
+            axis,
+            c,
+            k,
+            half_ap,
+        } => [
+            [EDGE_CONIC as f32, c],
+            [k, half_ap],
+            [vertex.x, vertex.y],
+            [axis.x, axis.y],
+        ],
     }
 }
 

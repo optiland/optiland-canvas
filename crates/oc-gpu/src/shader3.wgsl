@@ -215,6 +215,14 @@ const OBJ_EXTRUDE: u32 = 3u;
 const OBJ_REVOLVE: u32 = 4u;
 const OBJ_TUBE: u32 = 5u;
 
+// An extruded profile with a conic edge carries its edges at
+// `verts[contour_start..]`, four each: `(kind, c)`, `(k, half_ap)`, then a line's
+// two ends or a conic's vertex and unit axis. Mirrors `pack_edge` (buffers3.rs).
+const EDGE_LINE: u32 = 0u;
+const EDGE_CONIC: u32 = 1u;
+// The probe of `edges_contain`, off every axis. Mirrors cpu3::PROBE.
+const PROBE: vec2<f32> = vec2<f32>(0.9986542, 0.0518573);
+
 // Body surface behaviour kinds.
 const SURF_DIELECTRIC: u32 = 0u;
 const SURF_ABSORBER: u32 = 1u;
@@ -361,6 +369,9 @@ fn body_contains(bi: u32, p: vec3<f32>) -> bool {
     } else if (b.kind == OBJ_CYLINDER) {
         return pl.x * pl.x + pl.y * pl.y <= b.params.x * b.params.x && abs(pl.z) <= b.params.y;
     } else if (b.kind == OBJ_EXTRUDE) {
+        if (b.contour_count > 0u) {
+            return extrude_edges_contains(b.contour_start, b.contour_count, b.z_min, b.z_max, pl);
+        }
         return extrude_contains(b.poly_start, b.poly_count, b.z_min, b.z_max, pl);
     } else if (b.kind == OBJ_REVOLVE) {
         return revolve_contains(b.contour_start, b.contour_count, b.poly_start, b.poly_count, pl);
@@ -549,16 +560,143 @@ fn tube_hit(o: vec3<f32>, d: vec3<f32>, p: vec3<f32>) -> Hit {
 
 // 2D ray `o + t·d` (d need not be unit) against segment `a–b`; `w` is 1 on a hit
 // with `t > EPS` on the segment, else 0. Returns `(t, unit edge normal, w)`.
-fn segment_hit(a: vec2<f32>, b: vec2<f32>, o: vec2<f32>, d: vec2<f32>) -> vec4<f32> {
+fn segment_hit(a: vec2<f32>, b: vec2<f32>, o: vec2<f32>, d: vec2<f32>, tmin: f32) -> vec4<f32> {
     let edge = b - a;
     let denom = cross2(d, edge);
     if (abs(denom) < 1e-20) { return vec4<f32>(0.0); }
     let ao = a - o;
     let t = cross2(ao, edge) / denom;
     let u = cross2(ao, d) / denom;
-    if (t <= EPS || u < 0.0 || u > 1.0) { return vec4<f32>(0.0); }
+    if (t <= tmin || u < 0.0 || u > 1.0) { return vec4<f32>(0.0); }
     let n = normalize(vec2<f32>(edge.y, -edge.x));
     return vec4<f32>(t, n.x, n.y, 1.0);
+}
+
+// Up to two hits of a 2D ray on one profile edge, `(t, n.x, n.y, 1)` each, or
+// zero. Mirrors cpu3::edge_hits.
+struct EdgeHits {
+    a: vec4<f32>,
+    b: vec4<f32>,
+};
+
+fn conic_sag(c: f32, k: f32, y: f32) -> f32 {
+    return c * y * y / (1.0 + sqrt(max(1.0 - (1.0 + k) * c * c * y * y, 0.0)));
+}
+
+// One root of `conic_edge_hits`, kept when it lies on the face: within
+// `span = (z_lo, z_hi, y_max)` in the edge frame `(p, axis)`.
+fn conic_root(t: f32, tmin: f32, y0: f32, z0: f32, dy: f32, dz: f32, p: vec2<f32>,
+              axis: vec2<f32>, c: f32, k1: f32, span: vec3<f32>) -> vec4<f32> {
+    if (t <= tmin) { return vec4<f32>(0.0); }
+    let y = y0 + t * dy;
+    let z = z0 + t * dz;
+    if (abs(y) > span.z || z < span.x || z > span.y) { return vec4<f32>(0.0); }
+    let n = normalize(p * (2.0 * c * y) + axis * (2.0 * c * k1 * z - 2.0));
+    return vec4<f32>(t, n.x, n.y, 1.0);
+}
+
+// The conic edge `vertex + sag(y)·axis + y·perp(axis)`, `|y| <= half_ap`, against
+// the 2D ray `o + t·d`. Mirrors cpu3::conic_edge_hits.
+fn conic_edge_hits(vertex: vec2<f32>, axis: vec2<f32>, c: f32, k: f32, ha: f32,
+                   o: vec2<f32>, d: vec2<f32>, tmin: f32) -> EdgeHits {
+    let p = vec2<f32>(-axis.y, axis.x);
+    let rel = o - vertex;
+    let y0 = dot(rel, p);
+    let z0 = dot(rel, axis);
+    let dy = dot(d, p);
+    let dz = dot(d, axis);
+    let k1 = 1.0 + k;
+    let rim = conic_sag(c, k, ha);
+    let z_tol = 1e-5 * (1.0 + ha);
+    let span = vec3<f32>(min(rim, 0.0) - z_tol, max(rim, 0.0) + z_tol, ha * (1.0 + 1e-6));
+    let aa = c * (dy * dy + k1 * dz * dz);
+    let bb = 2.0 * (c * (y0 * dy + k1 * z0 * dz) - dz);
+    let cc = c * (y0 * y0 + k1 * z0 * z0) - 2.0 * z0;
+    var hits = EdgeHits(vec4<f32>(0.0), vec4<f32>(0.0));
+    if (abs(aa) < 1e-12) {
+        if (abs(bb) > 1e-12) {
+            hits.a = conic_root(-cc / bb, tmin, y0, z0, dy, dz, p, axis, c, k1, span);
+        }
+        return hits;
+    }
+    let disc = bb * bb - 4.0 * aa * cc;
+    if (disc < 0.0) { return hits; }
+    let q = -0.5 * (bb + select(-1.0, 1.0, bb >= 0.0) * sqrt(disc));
+    hits.a = conic_root(q / aa, tmin, y0, z0, dy, dz, p, axis, c, k1, span);
+    if (abs(q) > 1e-12) {
+        hits.b = conic_root(cc / q, tmin, y0, z0, dy, dz, p, axis, c, k1, span);
+    }
+    return hits;
+}
+
+fn edge_hits(i: u32, o: vec2<f32>, d: vec2<f32>, tmin: f32) -> EdgeHits {
+    let r0 = verts[i];
+    let r1 = verts[i + 1u];
+    let r2 = verts[i + 2u];
+    let r3 = verts[i + 3u];
+    if (u32(r0.x) == EDGE_LINE) {
+        return EdgeHits(segment_hit(r2, r3, o, d, tmin), vec4<f32>(0.0));
+    }
+    return conic_edge_hits(r2, r3, r0.y, r1.x, r1.y, o, d, tmin);
+}
+
+// A point inside a profile with a conic edge: the probe's crossings, counted.
+// Mirrors cpu3::edges_contain.
+fn edges_contain(start: u32, count: u32, p: vec2<f32>) -> bool {
+    var crossings = 0u;
+    for (var e = 0u; e < count; e = e + 1u) {
+        let h = edge_hits(start + 4u * e, p, PROBE, 0.0);
+        crossings = crossings + u32(h.a.w > 0.5) + u32(h.b.w > 0.5);
+    }
+    return (crossings & 1u) == 1u;
+}
+
+fn extrude_edges_contains(start: u32, count: u32, z_min: f32, z_max: f32, p: vec3<f32>) -> bool {
+    return p.z >= z_min && p.z <= z_max && edges_contain(start, count, vec2<f32>(p.x, p.y));
+}
+
+// A side-face hit `h` of `extrude_edges_hit`, kept when nearer and within the Z
+// limits, its normal turned outward.
+fn extrude_edges_side(best: Hit, h: vec4<f32>, start: u32, count: u32, z_min: f32,
+                      z_max: f32, o: vec3<f32>, d: vec3<f32>) -> Hit {
+    if (h.w < 0.5) { return best; }
+    let t = h.x;
+    let z = o.z + t * d.z;
+    if (z < z_min || z > z_max || (best.hit && t >= best.t)) { return best; }
+    let p = o + d * t;
+    var n = vec3<f32>(h.y, h.z, 0.0);
+    if (extrude_edges_contains(start, count, z_min, z_max, p + n * EPS)) { n = -n; }
+    return Hit(true, t, n, 0u);
+}
+
+// Nearest hit on an extruded profile with a conic edge: side faces plus the two
+// end caps, with the outward local normal. Mirrors cpu3::extrude_hit.
+fn extrude_edges_hit(start: u32, count: u32, z_min: f32, z_max: f32, o: vec3<f32>,
+                     d: vec3<f32>) -> Hit {
+    var best = no_hit();
+    let o2 = vec2<f32>(o.x, o.y);
+    let d2 = vec2<f32>(d.x, d.y);
+    if (length(d2) > 1e-12) {
+        for (var e = 0u; e < count; e = e + 1u) {
+            let h = edge_hits(start + 4u * e, o2, d2, EPS);
+            best = extrude_edges_side(best, h.a, start, count, z_min, z_max, o, d);
+            best = extrude_edges_side(best, h.b, start, count, z_min, z_max, o, d);
+        }
+    }
+    if (abs(d.z) > 1e-12) {
+        var zc = array<f32, 2>(z_min, z_max);
+        var nz = array<f32, 2>(-1.0, 1.0);
+        for (var i = 0; i < 2; i = i + 1) {
+            let t = (zc[i] - o.z) / d.z;
+            if (t > EPS && (!best.hit || t < best.t)) {
+                let p = o + d * t;
+                if (edges_contain(start, count, vec2<f32>(p.x, p.y))) {
+                    best = Hit(true, t, vec3<f32>(0.0, 0.0, nz[i]), 0u);
+                }
+            }
+        }
+    }
+    return best;
 }
 
 // Nearest extruded-profile hit: ruled side faces plus the two end caps, with the
@@ -571,7 +709,7 @@ fn extrude_hit(start: u32, count: u32, z_min: f32, z_max: f32, o: vec3<f32>, d: 
         for (var i = 0u; i < count; i = i + 1u) {
             let a = verts[start + i];
             let b = verts[start + (i + 1u) % count];
-            let s = segment_hit(a, b, o2, d2);
+            let s = segment_hit(a, b, o2, d2, EPS);
             if (s.w > 0.5) {
                 let t = s.x;
                 let z = o.z + t * d.z;
@@ -939,7 +1077,11 @@ fn body_hit(bi: u32, o: vec3<f32>, d: vec3<f32>) -> Hit {
     } else if (b.kind == OBJ_CYLINDER) {
         h = cylinder_hit(ol, dl, b.params.x, b.params.y);
     } else if (b.kind == OBJ_EXTRUDE) {
-        h = extrude_hit(b.poly_start, b.poly_count, b.z_min, b.z_max, ol, dl);
+        if (b.contour_count > 0u) {
+            h = extrude_edges_hit(b.contour_start, b.contour_count, b.z_min, b.z_max, ol, dl);
+        } else {
+            h = extrude_hit(b.poly_start, b.poly_count, b.z_min, b.z_max, ol, dl);
+        }
     } else if (b.kind == OBJ_REVOLVE) {
         h = revolve_hit(b.face_start, b.face_count, b.contour_start, b.contour_count,
                         b.poly_start, b.poly_count, b.z_min, b.z_max, ol, dl, EPS);

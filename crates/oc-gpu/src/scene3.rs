@@ -90,13 +90,36 @@ impl Norm {
     }
 }
 
-/// A closed line-profile extruded through local Z, normalized.
+/// A closed profile extruded through local Z, normalized.
 #[derive(Debug, Clone)]
 pub struct GpuExtrude {
-    /// The closed polygon in the local `XY` plane, in loop order.
+    /// A line profile: the closed polygon in the local `XY` plane, in loop
+    /// order. Empty for a profile with a conic edge, which has `edges`.
     pub verts: Vec<Vec2>,
+    /// A profile with a conic edge: every edge, in loop order, each solved
+    /// exactly. Empty for a line profile.
+    pub edges: Vec<GpuEdge2>,
     pub z_min: f32,
     pub z_max: f32,
+}
+
+/// `GpuEdge2` kinds as the shader reads them (`buffers3::pack_edge`).
+pub const EDGE_LINE: u32 = 0;
+pub const EDGE_CONIC: u32 = 1;
+
+/// One edge of an extruded profile with a conic edge, normalized.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GpuEdge2 {
+    Line { a: Vec2, b: Vec2 },
+    /// The sag curve `vertex + sag(y)·axis + y·perp(axis)` for `|y| <= half_ap`
+    /// (`Curve2::Conic`); `axis` is unit.
+    Conic {
+        vertex: Vec2,
+        axis: Vec2,
+        c: f32,
+        k: f32,
+        half_ap: f32,
+    },
 }
 
 /// A body compiled for the preview: geometry, surface, and a rigid placement in
@@ -536,8 +559,10 @@ fn compile_body(
         ),
         SolidGeometry3::Profile(p) => match p.construction {
             ProfileConstruction3::ExtrudeLocalZ { z_min_mm, z_max_mm } => {
+                let (verts, edges) = extruded_profile(&p.profile, norm.scale)?;
                 extrude = Some(GpuExtrude {
-                    verts: line_polygon(&p.profile, norm.scale)?,
+                    verts,
+                    edges,
                     z_min: s(z_min_mm),
                     z_max: s(z_max_mm),
                 });
@@ -709,38 +734,61 @@ fn normalized_bounds(bb: &oc_core::vec3::Aabb3, norm: &Norm) -> (Vec3, Vec3) {
     )
 }
 
-/// The closed polygon of a line-only profile, normalized and in loop order, or
-/// the reason it is not extrudable in the f32 preview (a curved edge).
-fn line_polygon(
+/// An extruded profile, normalized: a line profile as its polygon, one with a
+/// conic edge as its edges. An aspheric, arc or sag-segment edge is rejected by
+/// name: the preview does not solve it yet, and a chord would be a lookalike.
+fn extruded_profile(
     profile: &oc_core::profile2::ClosedProfile2,
     scale: f64,
-) -> Result<Vec<Vec2>, String> {
+) -> Result<(Vec<Vec2>, Vec<GpuEdge2>), String> {
     use oc_core::profile2::Curve2;
+    let v = |p: oc_core::vec::Vec2| Vec2::new((p.x / scale) as f32, (p.y / scale) as f32);
     let mut verts = Vec::new();
+    let mut edges = Vec::new();
+    let mut curved = false;
     for e in &profile.edges {
         match &e.curve {
-            Curve2::Line { a, .. } => {
-                verts.push(Vec2::new((a.x / scale) as f32, (a.y / scale) as f32))
+            Curve2::Line { a, b } => {
+                verts.push(v(*a));
+                edges.push(GpuEdge2::Line { a: v(*a), b: v(*b) });
             }
             Curve2::Polyline { points } => {
                 for p in points.iter().take(points.len().saturating_sub(1)) {
-                    verts.push(Vec2::new((p.x / scale) as f32, (p.y / scale) as f32));
+                    verts.push(v(*p));
                 }
+                edges.extend(points.windows(2).map(|w| GpuEdge2::Line {
+                    a: v(w[0]),
+                    b: v(w[1]),
+                }));
             }
-            Curve2::Conic(_)
-            | Curve2::EvenAsphere { .. }
-            | Curve2::Arc { .. }
-            | Curve2::SagSegment { .. } => {
-                return Err(
-                    "extruded profile has a curved edge (not yet in the f32 preview)".into(),
-                )
+            Curve2::Conic(cp) => {
+                curved = true;
+                let axis = cp.axis.normalize();
+                edges.push(GpuEdge2::Conic {
+                    vertex: v(cp.vertex),
+                    axis: Vec2::new(axis.x as f32, axis.y as f32),
+                    c: (cp.c * scale) as f32,
+                    k: cp.k as f32,
+                    half_ap: (cp.half_ap / scale) as f32,
+                });
+            }
+            Curve2::EvenAsphere { .. } | Curve2::Arc { .. } | Curve2::SagSegment { .. } => {
+                return Err("extruded profile has an aspheric, arc or sag-segment edge \
+                            (not yet in the f32 preview)"
+                    .into())
             }
         }
+    }
+    if curved {
+        if edges.len() < 2 {
+            return Err("extruded profile has fewer than two edges".into());
+        }
+        return Ok((Vec::new(), edges));
     }
     if verts.len() < 3 {
         return Err("extruded profile has fewer than three vertices".into());
     }
-    Ok(verts)
+    Ok((verts, Vec::new()))
 }
 
 // ---------------------------------------------------------------------------
@@ -2032,27 +2080,21 @@ mod tests {
         assert_eq!(fast.runs.coating_model, CoatingModel::Nominal);
     }
 
-    #[test]
-    fn an_extrusion_with_a_curved_edge_is_rejected_by_name() {
-        // Extrusions revolve only line profiles; a curved edge needs the ruled
-        // side-surface solver that has not landed, so it is rejected, not a chord.
+    /// A body extruded from a conic front face, a rim line and a flat back.
+    fn conic_extrusion(
+        scene: &mut Scene3,
+        front: oc_core::profile2::Curve2,
+    ) -> oc_core::id::ObjectId {
         use oc_core::profile2::{
-            ClosedProfile2, ConicParams2, Curve2, ProfileConstruction3, ProfileEdge2, ProfileSolid3,
+            ClosedProfile2, Curve2, ProfileConstruction3, ProfileEdge2, ProfileSolid3,
         };
-        let mut scene = Scene3::new();
         let id = scene.alloc_object_id();
         let mut common = ObjectCommon::new(id, oc_core::id::LayerId(0));
         common.transform = oc_core::vec3::Isometry3::IDENTITY;
         let edges = vec![
             ProfileEdge2 {
                 patch: scene.alloc_patch_id(),
-                curve: Curve2::Conic(ConicParams2 {
-                    vertex: oc_core::vec::Vec2::new(-1.0, 0.0),
-                    axis: oc_core::vec::Vec2::X,
-                    c: 0.05,
-                    k: 0.0,
-                    half_ap: 4.0,
-                }),
+                curve: front,
             },
             ProfileEdge2 {
                 patch: scene.alloc_patch_id(),
@@ -2083,11 +2125,63 @@ mod tests {
             surface: SurfaceProps3::default(),
             priority: 0,
         });
+        id
+    }
+
+    #[test]
+    fn an_extrusion_with_a_conic_edge_is_compiled_to_its_edges() {
+        // A cylinder lens: the conic edge is solved exactly, not as a chord.
+        use oc_core::profile2::{ConicParams2, Curve2};
+        let mut scene = Scene3::new();
+        conic_extrusion(
+            &mut scene,
+            Curve2::Conic(ConicParams2 {
+                vertex: oc_core::vec::Vec2::new(-1.0, 0.0),
+                axis: oc_core::vec::Vec2::new(2.0, 0.0),
+                c: 0.05,
+                k: 0.0,
+                half_ap: 4.0,
+            }),
+        );
+        let gpu = GpuScene3::build(&scene, BuildOpts::default());
+        assert!(gpu.rejected.is_empty(), "{:?}", gpu.rejected);
+        let e = gpu.bodies[0].extrude.as_ref().unwrap();
+        assert!(e.verts.is_empty());
+        assert_eq!(e.edges.len(), 3);
+        let scale = gpu.norm.scale;
+        let GpuEdge2::Conic { vertex, axis, c, k, half_ap } = e.edges[0] else {
+            panic!("{:?}", e.edges[0]);
+        };
+        assert_eq!(axis, Vec2::X);
+        assert!((vertex.x as f64 * scale + 1.0).abs() < 1e-5 && vertex.y == 0.0);
+        assert!((c as f64 / scale - 0.05).abs() < 1e-7);
+        assert_eq!(k, 0.0);
+        assert!((half_ap as f64 * scale - 4.0).abs() < 1e-5);
+        assert!(matches!(e.edges[1], GpuEdge2::Line { .. }));
+    }
+
+    #[test]
+    fn an_extrusion_with_an_aspheric_edge_is_rejected_by_name() {
+        use oc_core::profile2::{ConicParams2, Curve2};
+        let mut scene = Scene3::new();
+        let id = conic_extrusion(
+            &mut scene,
+            Curve2::EvenAsphere {
+                base: ConicParams2 {
+                    vertex: oc_core::vec::Vec2::new(-1.0, 0.0),
+                    axis: oc_core::vec::Vec2::X,
+                    c: 0.05,
+                    k: 0.0,
+                    half_ap: 4.0,
+                },
+                coeffs: [1e-4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            },
+        );
         let gpu = GpuScene3::build(&scene, BuildOpts::default());
         assert!(gpu.bodies.is_empty());
         assert_eq!(gpu.rejected.len(), 1);
         assert_eq!(gpu.rejected[0].object, id.0);
-        assert!(gpu.rejected[0].kind.contains("curved edge"));
+        assert!(gpu.rejected[0].kind.contains("aspheric"));
     }
 
     fn plane_surface(scene: &mut Scene3, front: SurfaceResponse, back: SurfaceResponse) -> u64 {

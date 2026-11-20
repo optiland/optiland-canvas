@@ -20,9 +20,9 @@
 use glam::{DVec3, Vec2, Vec3};
 
 use crate::scene3::{
-    even_asphere_dsag, even_asphere_sag, GpuAperture3, GpuBody3, GpuDetector3, GpuExtrude,
-    GpuResponse, GpuRevolve, GpuScene3, GpuSurface3, RevFace, Spectral32, OBJ_BOX, OBJ_CYLINDER,
-    OBJ_EXTRUDE, OBJ_REVOLVE, OBJ_SPHERE, OBJ_TUBE, SURF_ABSORBER,
+    even_asphere_dsag, even_asphere_sag, GpuAperture3, GpuBody3, GpuDetector3, GpuEdge2,
+    GpuExtrude, GpuResponse, GpuRevolve, GpuScene3, GpuSurface3, RevFace, Spectral32, OBJ_BOX,
+    OBJ_CYLINDER, OBJ_EXTRUDE, OBJ_REVOLVE, OBJ_SPHERE, OBJ_TUBE, SURF_ABSORBER,
 };
 
 /// Segment flag bits (shared meaning with the 2D path).
@@ -1499,7 +1499,111 @@ fn angle_in_sweep(ang: f32, a0: f32, a1: f32) -> bool {
 
 /// Is a local point inside the extruded body?
 fn extrude_contains(e: &GpuExtrude, p: Vec3) -> bool {
-    p.z >= e.z_min && p.z <= e.z_max && point_in_polygon(&e.verts, Vec2::new(p.x, p.y))
+    p.z >= e.z_min && p.z <= e.z_max && profile_contains(e, Vec2::new(p.x, p.y))
+}
+
+/// Is a profile-plane point inside the extruded profile?
+fn profile_contains(e: &GpuExtrude, p: Vec2) -> bool {
+    if e.edges.is_empty() {
+        point_in_polygon(&e.verts, p)
+    } else {
+        edges_contain(&e.edges, p)
+    }
+}
+
+/// The probe of [`edges_contain`]: off every axis, as the f64 kernel's
+/// (`geom3::profile::profile_contains_2d`), so it grazes no vertex a profile is
+/// built from.
+const PROBE: Vec2 = Vec2::new(0.998_654_2, 0.051_857_3);
+
+/// A point inside a profile with a conic edge: the probe's crossings, counted.
+fn edges_contain(edges: &[GpuEdge2], p: Vec2) -> bool {
+    let mut crossings = 0u32;
+    for e in edges {
+        edge_hits(e, p, PROBE, 0.0, &mut |_, _| crossings += 1);
+    }
+    crossings % 2 == 1
+}
+
+/// Every hit at `t > tmin` of the 2D ray `o + t·d` (`d` need not be unit) on one
+/// profile edge, with the edge's unit normal (either side).
+fn edge_hits(e: &GpuEdge2, o: Vec2, d: Vec2, tmin: f32, push: &mut dyn FnMut(f32, Vec2)) {
+    match *e {
+        GpuEdge2::Line { a, b } => {
+            if let Some((t, n)) = segment_hit(a, b, o, d, tmin) {
+                push(t, n);
+            }
+        }
+        GpuEdge2::Conic {
+            vertex,
+            axis,
+            c,
+            k,
+            half_ap,
+        } => conic_edge_hits(vertex, axis, c, k, half_ap, o, d, tmin, push),
+    }
+}
+
+/// The conic edge `vertex + sag(y)·axis + y·perp(axis)`, `|y| <= half_ap`, against
+/// the 2D ray `o + t·d`: the f64 kernel's solve (`geom3::profile::conic2_range`)
+/// in f32. `c·y² + c(1+k)·z² − 2z = 0` along the ray is a quadratic in `t`; a root
+/// counts only within the face's axial span out to the aperture, so the far nappe
+/// of a sphere never does.
+#[allow(clippy::too_many_arguments)] // edge, ray, and sink
+fn conic_edge_hits(
+    vertex: Vec2,
+    axis: Vec2,
+    c: f32,
+    k: f32,
+    half_ap: f32,
+    o: Vec2,
+    d: Vec2,
+    tmin: f32,
+    push: &mut dyn FnMut(f32, Vec2),
+) {
+    let p = Vec2::new(-axis.y, axis.x);
+    let rel = o - vertex;
+    let (y0, z0) = (rel.dot(p), rel.dot(axis));
+    let (dy, dz) = (d.dot(p), d.dot(axis));
+    let k1 = 1.0 + k;
+    let rim = conic_sag(c, k, half_ap);
+    let (z_lo, z_hi) = (rim.min(0.0), rim.max(0.0));
+    let z_tol = 1e-5 * (1.0 + half_ap);
+    let y_max = half_ap * (1.0 + 1e-6);
+    let mut accept = |t: f32| {
+        if t <= tmin {
+            return;
+        }
+        let y = y0 + t * dy;
+        let z = z0 + t * dz;
+        if y.abs() <= y_max && z >= z_lo - z_tol && z <= z_hi + z_tol {
+            // ∇F = (2c·y, 2c(1+k)·z − 2) in (perp, axis).
+            push(t, (p * (2.0 * c * y) + axis * (2.0 * c * k1 * z - 2.0)).normalize());
+        }
+    };
+    let aa = c * (dy * dy + k1 * dz * dz);
+    let bb = 2.0 * (c * (y0 * dy + k1 * z0 * dz) - dz);
+    let cc = c * (y0 * y0 + k1 * z0 * z0) - 2.0 * z0;
+    if aa.abs() < 1e-12 {
+        if bb.abs() > 1e-12 {
+            accept(-cc / bb);
+        }
+        return;
+    }
+    let disc = bb * bb - 4.0 * aa * cc;
+    if disc < 0.0 {
+        return;
+    }
+    let q = -0.5 * (bb + bb.signum() * disc.sqrt());
+    accept(q / aa);
+    if q.abs() > 1e-12 {
+        accept(cc / q);
+    }
+}
+
+/// A conic's sag at height `y`.
+fn conic_sag(c: f32, k: f32, y: f32) -> f32 {
+    c * y * y / (1.0 + (1.0 - (1.0 + k) * c * c * y * y).max(0.0).sqrt())
 }
 
 fn point_in_polygon(verts: &[Vec2], p: Vec2) -> bool {
@@ -1611,16 +1715,25 @@ fn extrude_hit(e: &GpuExtrude, o: Vec3, d: Vec3, tmin: f32) -> Option<(f32, Vec3
     let n = e.verts.len();
     let o2 = Vec2::new(o.x, o.y);
     let d2 = Vec2::new(d.x, d.y);
+    let side = |best: &mut Option<(f32, Vec3)>, t: f32, n2: Vec2| {
+        let z = o.z + t * d.z;
+        if z >= e.z_min && z <= e.z_max {
+            let p = o + d * t;
+            let nrm = orient_out(e, Vec3::new(n2.x, n2.y, 0.0), p);
+            keep(best, t, nrm);
+        }
+    };
     if d2.length() > 1e-12 {
-        for i in 0..n {
-            let (a, b) = (e.verts[i], e.verts[(i + 1) % n]);
-            if let Some((t, n2)) = segment_hit(a, b, o2, d2, tmin) {
-                let z = o.z + t * d.z;
-                if z >= e.z_min && z <= e.z_max {
-                    let p = o + d * t;
-                    let nrm = orient_out(e, Vec3::new(n2.x, n2.y, 0.0), p);
-                    keep(&mut best, t, nrm);
+        if e.edges.is_empty() {
+            for i in 0..n {
+                let (a, b) = (e.verts[i], e.verts[(i + 1) % n]);
+                if let Some((t, n2)) = segment_hit(a, b, o2, d2, tmin) {
+                    side(&mut best, t, n2);
                 }
+            }
+        } else {
+            for edge in &e.edges {
+                edge_hits(edge, o2, d2, tmin, &mut |t, n2| side(&mut best, t, n2));
             }
         }
     }
@@ -1629,7 +1742,7 @@ fn extrude_hit(e: &GpuExtrude, o: Vec3, d: Vec3, tmin: f32) -> Option<(f32, Vec3
             let t = (z - o.z) / d.z;
             if t > tmin {
                 let p = o + d * t;
-                if point_in_polygon(&e.verts, Vec2::new(p.x, p.y)) {
+                if profile_contains(e, Vec2::new(p.x, p.y)) {
                     keep(&mut best, t, Vec3::new(0.0, 0.0, nz));
                 }
             }

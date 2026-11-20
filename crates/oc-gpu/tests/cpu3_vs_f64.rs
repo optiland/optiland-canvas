@@ -8,11 +8,12 @@
 //! be **rejected with a capability issue**, never swapped for a lookalike (§12.3).
 //!
 //! Covers the objects the compiler admits: sphere, box, cylinder, extruded line
-//! profiles, and revolved profiles (a spherical singlet and an even-asphere);
-//! mirror surfaces; beam splitters and dichroics (explicit R/T, constant and
-//! tabulated, with every out-of-range policy); and aperture-plus-detector
-//! clipping. What is still out of reach — a curved-edge extrusion — must show up
-//! in `rejected` rather than as a chord, which the rejection test pins.
+//! profiles and conic ones (a cylinder lens), and revolved profiles (a spherical
+//! singlet and an even-asphere); mirror surfaces; beam splitters and dichroics
+//! (explicit R/T, constant and tabulated, with every out-of-range policy); and
+//! aperture-plus-detector clipping. What is still out of reach — an aspheric edge
+//! on an extrusion — must show up in `rejected` rather than as a chord, which the
+//! rejection test pins.
 #![cfg(feature = "gpu3")]
 
 use oc_core::id::{LayerId, ObjectId, SourceId};
@@ -595,38 +596,43 @@ fn a_revolved_asphere_matches_f64_for_skew_rays() {
     assert_landing_matches(&scene, &rays);
 }
 
-#[test]
-fn a_curved_edge_extrusion_is_rejected_not_approximated() {
-    let mut scene = Scene3::new();
-    // An extrusion with a conic edge: the ruled curved side surface is the one
-    // profile case still to land, so it must reject rather than draw a chord.
-    let id = scene.alloc_object_id();
-    let edges = vec![
-        ProfileEdge2 {
-            patch: scene.alloc_patch_id(),
-            curve: Curve2::Conic(ConicParams2 {
-                vertex: Vec2::new(-1.0, 0.0),
-                axis: Vec2::X,
-                c: 0.05,
-                k: 0.0,
-                half_ap: 3.0,
-            }),
+/// A plano-convex cylinder lens as the service writes Thorlabs LJ1567L1: a conic
+/// front, a flat conic back, two rim lines, extruded ±16 mm. `front` replaces the
+/// front face.
+fn cylinder_lens(scene: &mut Scene3, front: Option<Curve2>) -> ObjectId {
+    let (r, ha, ct) = (51.68_f64, 15.0_f64, 5.22_f64);
+    let c = 1.0 / r;
+    let sag = c * ha * ha / (1.0 + (1.0 - c * c * ha * ha).sqrt());
+    let (zf, zb) = (-ct / 2.0, ct / 2.0);
+    let conic = |vertex: f64, c: f64| {
+        Curve2::Conic(ConicParams2 {
+            vertex: Vec2::new(vertex, 0.0),
+            axis: Vec2::X,
+            c,
+            k: 0.0,
+            half_ap: ha,
+        })
+    };
+    let curves = [
+        front.unwrap_or_else(|| conic(zf, c)),
+        Curve2::Line {
+            a: Vec2::new(zf + sag, ha),
+            b: Vec2::new(zb, ha),
         },
-        ProfileEdge2 {
-            patch: scene.alloc_patch_id(),
-            curve: Curve2::Line {
-                a: Vec2::new(-1.0, 3.0),
-                b: Vec2::new(1.0, 3.0),
-            },
-        },
-        ProfileEdge2 {
-            patch: scene.alloc_patch_id(),
-            curve: Curve2::Line {
-                a: Vec2::new(1.0, 3.0),
-                b: Vec2::new(1.0, 0.0),
-            },
+        conic(zb, 0.0),
+        Curve2::Line {
+            a: Vec2::new(zb, -ha),
+            b: Vec2::new(zf + sag, -ha),
         },
     ];
+    let id = scene.alloc_object_id();
+    let edges: Vec<ProfileEdge2> = curves
+        .into_iter()
+        .map(|curve| ProfileEdge2 {
+            patch: scene.alloc_patch_id(),
+            curve,
+        })
+        .collect();
     let mut common = ObjectCommon::new(id, LayerId(0));
     common.transform = Isometry3::IDENTITY;
     scene.bodies.push(Body3 {
@@ -634,24 +640,71 @@ fn a_curved_edge_extrusion_is_rejected_not_approximated() {
         geometry: SolidGeometry3::Profile(ProfileSolid3 {
             profile: ClosedProfile2 { edges },
             construction: ProfileConstruction3::ExtrudeLocalZ {
-                z_min_mm: -4.0,
-                z_max_mm: 4.0,
+                z_min_mm: -16.0,
+                z_max_mm: 16.0,
             },
         }),
-        material: glass(1.5),
+        material: glass(1.5168),
         absorption: Default::default(),
         surface: SurfaceProps3::default(),
         priority: 0,
     });
+    id
+}
+
+#[test]
+fn a_cylinder_lens_matches_f64_for_skew_rays() {
+    // The ruled conic side face solved exactly, its curved profile as the end
+    // caps' region: the face focuses in Y only.
+    let mut scene = Scene3::new();
+    cylinder_lens(&mut scene, None);
+    scene.validate().unwrap();
+
+    let rays = [
+        (Vec3::new(-20.0, 5.0, 0.0), Vec3::X),
+        (Vec3::new(-20.0, 0.5, 0.0), Vec3::X),
+        (
+            Vec3::new(-20.0, -10.0, 3.0),
+            Vec3::new(1.0, 0.02, 0.05).normalize(),
+        ),
+        (
+            Vec3::new(-20.0, 12.0, -12.0),
+            Vec3::new(1.0, -0.03, 0.01).normalize(),
+        ),
+        // In through one end cap and out through the other.
+        (
+            Vec3::new(0.0, 2.0, -30.0),
+            Vec3::new(0.05, 0.01, 1.0).normalize(),
+        ),
+    ];
+    assert_landing_matches(&scene, &rays);
+}
+
+#[test]
+fn an_aspheric_edge_extrusion_is_rejected_not_approximated() {
+    // An aspheric edge on an extrusion is the profile case still to land, so it
+    // must reject rather than draw a chord.
+    let mut scene = Scene3::new();
+    let c = 1.0 / 51.68;
+    let id = cylinder_lens(
+        &mut scene,
+        Some(Curve2::EvenAsphere {
+            base: ConicParams2 {
+                vertex: Vec2::new(-2.61, 0.0),
+                axis: Vec2::X,
+                c,
+                k: 0.0,
+                half_ap: 15.0,
+            },
+            coeffs: [1e-6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        }),
+    );
     scene.validate().unwrap();
 
     let gpu = GpuScene3::build(&scene, BuildOpts::default());
-    assert_eq!(
-        gpu.rejected.len(),
-        1,
-        "the curved extrusion should be rejected"
-    );
+    assert_eq!(gpu.rejected.len(), 1, "the aspheric extrusion should be rejected");
     assert_eq!(gpu.rejected[0].object, id.0);
+    assert!(gpu.rejected[0].kind.contains("aspheric"));
     assert!(gpu.bodies.is_empty(), "no body should be traced");
 }
 

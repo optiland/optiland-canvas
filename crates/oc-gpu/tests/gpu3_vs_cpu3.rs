@@ -472,6 +472,81 @@ fn an_extruded_prism_matches_cpu() {
     );
 }
 
+#[test]
+fn a_cylinder_lens_matches_cpu() {
+    let Some(tracer) = tracer_or_skip() else {
+        return;
+    };
+    // A plano-convex cylinder lens as the service writes Thorlabs LJ1567L1 (mirrors
+    // `cpu3_vs_f64`'s `cylinder_lens`): conic front, flat conic back, rim lines.
+    let mut scene = Scene3::new();
+    let (r, ha, ct) = (51.68_f64, 15.0_f64, 5.22_f64);
+    let c = 1.0 / r;
+    let sag = c * ha * ha / (1.0 + (1.0 - c * c * ha * ha).sqrt());
+    let (zf, zb) = (-ct / 2.0, ct / 2.0);
+    let conic = |vertex: f64, c: f64| {
+        Curve2::Conic(ConicParams2 {
+            vertex: Vec2::new(vertex, 0.0),
+            axis: Vec2::X,
+            c,
+            k: 0.0,
+            half_ap: ha,
+        })
+    };
+    let curves = [
+        conic(zf, c),
+        Curve2::Line {
+            a: Vec2::new(zf + sag, ha),
+            b: Vec2::new(zb, ha),
+        },
+        conic(zb, 0.0),
+        Curve2::Line {
+            a: Vec2::new(zb, -ha),
+            b: Vec2::new(zf + sag, -ha),
+        },
+    ];
+    let id = scene.alloc_object_id();
+    let edges: Vec<ProfileEdge2> = curves
+        .into_iter()
+        .map(|curve| ProfileEdge2 {
+            patch: scene.alloc_patch_id(),
+            curve,
+        })
+        .collect();
+    let mut common = ObjectCommon::new(id, LayerId(0));
+    common.transform = Isometry3::IDENTITY;
+    scene.bodies.push(Body3 {
+        common,
+        geometry: SolidGeometry3::Profile(ProfileSolid3 {
+            profile: ClosedProfile2 { edges },
+            construction: ProfileConstruction3::ExtrudeLocalZ {
+                z_min_mm: -16.0,
+                z_max_mm: 16.0,
+            },
+        }),
+        material: glass(1.5168),
+        absorption: Default::default(),
+        surface: SurfaceProps3::default(),
+        priority: 0,
+    });
+    scene.validate().unwrap();
+    assert_gpu_matches_cpu(
+        &tracer,
+        &scene,
+        &[
+            (Vec3::new(-20.0, 5.0, 0.0), Vec3::X),
+            (
+                Vec3::new(-20.0, -10.0, 3.0),
+                Vec3::new(1.0, 0.02, 0.05).normalize(),
+            ),
+            (
+                Vec3::new(0.0, 2.0, -30.0),
+                Vec3::new(0.05, 0.01, 1.0).normalize(),
+            ),
+        ],
+    );
+}
+
 /// A biconvex revolved singlet: two conic faces and two rim lines (mirrors
 /// `cpu3_vs_f64`'s `revolved_singlet`).
 fn revolved_singlet(scene: &mut Scene3, r1: f64, r2: f64, thickness: f64, half_ap: f64, nd: f64) {

@@ -297,6 +297,7 @@ fn migrate_detector(d: &Detector, scene3: &mut Scene3, report: &mut MigrationRep
         // A v1 detector measured flux and nothing else, so it keeps measuring
         // flux. A line has no area to divide by in any case.
         measure: DetectorMeasure::Power,
+        sides: Default::default(),
     }
 }
 

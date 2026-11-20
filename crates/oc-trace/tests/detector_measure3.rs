@@ -436,6 +436,7 @@ fn a_line_probe_cannot_be_asked_for_irradiance() {
         response: DetectorResponse::Unity,
         termination: DetectorTermination::Terminate,
         measure: DetectorMeasure::Power,
+        sides: Default::default(),
     });
     scene.validate().expect("a line probe measuring flux is fine");
 

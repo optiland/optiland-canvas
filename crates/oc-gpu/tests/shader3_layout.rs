@@ -220,7 +220,7 @@ fn shader3_structs_match_buffers3() {
             shape_kind,
             shape_a,
             shape_b,
-            terminate,
+            flags,
         }),
     );
     assert_struct(

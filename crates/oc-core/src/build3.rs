@@ -1828,6 +1828,7 @@ impl Scene3 {
             response: DetectorResponse::Unity,
             termination: DetectorTermination::Terminate,
             measure: DetectorMeasure::Power,
+            sides: Default::default(),
         });
         DetectorId(id.0)
     }

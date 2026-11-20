@@ -132,6 +132,7 @@ fn add_rect_detector(
         response: DetectorResponse::Unity,
         termination: DetectorTermination::Terminate,
         measure: oc_core::scene3::DetectorMeasure::Power,
+        sides: Default::default(),
     });
 }
 

@@ -69,9 +69,11 @@ pub enum SamplingWarning {
     /// A phase that changes by more than π between neighbouring samples
     /// somewhere in the window: what it describes is aliased there.
     Undersampled { what: String, max_phase_step_rad: f64 },
-    /// A field read over a face wider than the period of its padded
-    /// spectrum (`period_mm`, against the `span_mm` the face and the beam
-    /// need): periodic copies of the field may lie on the face.
+    /// A field read onto a face where the period of its padded spectrum
+    /// (`period_mm`) is shorter than the span the field needs there
+    /// (`span_mm`: its window on the face, with its walk to the face): the
+    /// light beyond the period folds back into it. The face beyond the
+    /// period reads zero; the field's periodic copies are never placed there.
     Periodic { period_mm: f64, span_mm: f64 },
 }
 

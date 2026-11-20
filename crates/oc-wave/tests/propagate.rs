@@ -772,3 +772,46 @@ fn the_rotated_spectrum_books_what_the_plane_cannot_hold_by_cause() {
         rep.warnings
     );
 }
+
+#[test]
+fn a_small_field_read_onto_a_wide_window_is_there_once() {
+    // The readout of a focal spot onto a detector many times its window. The
+    // zoomed spectrum is sampled 1/P apart, P the padded window, so its sum
+    // repeats the field every P (Goodman [1]: a sampled spectrum is a
+    // periodic field). Only the period about the field's window is the field;
+    // beyond it a window must read zero, not the field's copies, which put
+    // 2300 times a line's power on the app's default detector. At z = 0 the
+    // read is the field's band-limited interpolation, so a Gaussian 10 µm in
+    // radius read at 2 µm points keeps its power; through a plane tilted 20°
+    // the power crossing it (the irradiance times the carrier's obliquity)
+    // is the field's too.
+    use oc_core::{Isometry3, Vec3};
+    use oc_wave::beams::GaussianBeam;
+    use oc_wave::{asm_tilted, asm_zoom, Fft2, Grid2};
+    let g = Grid2::square(64, 0.001).unwrap();
+    let u = GaussianBeam { w0_mm: 0.01, lambda_um: 0.42, n: 1.0, power: 1.0, center: [0.0, 0.0] }.sample(g, 0.0).unwrap();
+    let mut fft = Fft2::new();
+    // 2 mm across: the field padded twice repeats every 0.128 mm.
+    let wide = Grid2::square(1000, 0.002).unwrap();
+    let half = 0.5 * 0.128 + 1e-9;
+    let th = 20f64.to_radians();
+    let q = glam::DQuat::from_rotation_y(th);
+    let tilted = Isometry3::new(Vec3::new(0.0, 0.0, 0.05), [q.x, q.y, q.z, q.w]).unwrap();
+    let (zoomed, zrep) = asm_zoom(&u, 0.0, wide, 2, &mut fft).unwrap();
+    let (turned, trep) = asm_tilted(&u, tilted, wide, 2, &mut fft).unwrap();
+    for (name, v, through) in [("zoomed", &zoomed, zrep.ledger.detected), ("tilted 20°", &turned, trep.ledger.detected)] {
+        let mut beyond: f64 = 0.0;
+        for j in 0..1000 {
+            for i in 0..1000 {
+                let (x, y) = wide.xy(i, j);
+                if x.abs() > half || y.abs() > half {
+                    beyond = beyond.max(v.at(i, j).abs());
+                }
+            }
+        }
+        let kept = through / u.power();
+        eprintln!("measured: {name}: power through a window 15 periods wide, of the field's = {kept:.9}; largest sample beyond the period = {beyond:.1e}");
+        assert_eq!(beyond, 0.0, "{name}");
+        assert!((kept - 1.0).abs() < 1e-4, "{name}: {kept}");
+    }
+}

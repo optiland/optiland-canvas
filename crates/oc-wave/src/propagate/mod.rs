@@ -270,6 +270,21 @@ pub(crate) fn crop(buf: &[Cx], p: [usize; 2], n: [usize; 2]) -> Vec<Cx> {
     out
 }
 
+/// The output samples `x₀ + m·Δx`, `m` in `0..n`, that lie within half a
+/// `period` of the point the sum is taken about (`x₀` is measured from it):
+/// `m0..m1`. A spectrum sampled at `1/period` sums to a field that repeats
+/// with that period; only the period about the field's own window is the
+/// field, and beyond it the sum would place the field's copies. A point on
+/// the period's edge, to round-off, is kept.
+pub(crate) fn within_period(x0: f64, dx: f64, n: usize, period: f64) -> (usize, usize) {
+    let half = 0.5 * period;
+    let lo = ((-half - x0) / dx - 1e-9).ceil();
+    let hi = ((half - x0) / dx + 1e-9).floor() + 1.0;
+    let clamp = |v: f64, fallback: usize| if v.is_nan() { fallback } else { v.clamp(0.0, n as f64) as usize };
+    let (m0, m1) = (clamp(lo, 0), clamp(hi, n));
+    (m0, m1.max(m0))
+}
+
 /// `Σ|z|²` over a buffer (multiply by the cell area for power).
 pub(crate) fn sum_sq(buf: &[Cx]) -> f64 {
     buf.iter().map(|z| z.norm_sqr()).sum()

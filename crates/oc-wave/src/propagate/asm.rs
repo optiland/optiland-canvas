@@ -173,10 +173,17 @@ pub(super) fn run(
 /// inverse transform is evaluated on the output grid by chirp-z
 /// ([`crate::czt::czt_line`]), one pass per axis, instead of by an inverse
 /// FFT on the input's grid. No band limit is applied: the output is a window,
-/// not a periodic copy of the input. Without padding the field is periodic in
-/// its window, which for a beam converging to the output is harmless (each
-/// periodic copy focuses a window away). Evanescent power is booked; power
-/// that lands outside the output window is booked as having left it.
+/// not a periodic copy of the input.
+///
+/// The spectrum is sampled `1/P` apart, `P` the padded window, so the sum
+/// repeats the field every `P`: only the period about the input window's
+/// centre is the field. Output points beyond it are left at zero and not
+/// summed; there the sum would place copies of the field, which on a window
+/// wider than `P` (a small focal spot read onto a large detector) would
+/// multiply its power. Light that walks out of the period over `z` is not
+/// held by it, which the padding is chosen to prevent. Evanescent power is
+/// booked; power that lands outside the output window is booked as having
+/// left it.
 pub fn asm_zoom(
     u: &Field2,
     z: f64,
@@ -229,25 +236,38 @@ pub fn asm_zoom(
     let c = u.grid.center_mm;
     let (x0, y0) = (out.coord(0, 0) - c[0], out.coord(1, 0) - c[1]);
     let (dx, dy) = (out.pitch_mm[0], out.pitch_mm[1]);
-    // Along fx: p[1] rows of p[0] frequencies → p[1] × mx.
-    let mut rows = vec![Cx::ZERO; p[1] * mx];
+    // The output points within the padded period about the input window's
+    // centre, `i0..i1` × `j0..j1`; the rest stay zero.
+    let period = [gp.width_mm(0), gp.width_mm(1)];
+    let (i0, i1) = super::within_period(x0, dx, mx, period[0]);
+    let (j0, j1) = super::within_period(y0, dy, my, period[1]);
+    let (nx, ny) = (i1 - i0, j1 - j0);
+    let first = |x0: f64, m0: usize, d: f64| if m0 == 0 { x0 } else { x0 + m0 as f64 * d };
+    let (x0, y0) = (first(x0, i0, dx), first(y0, j0, dy));
+    // Along fx: p[1] rows of p[0] frequencies → p[1] × nx.
+    let mut rows = vec![Cx::ZERO; p[1].checked_mul(nx).ok_or(WaveError::TooLarge { samples: usize::MAX, cap: crate::MAX_WAVE_SAMPLES })?];
     for ky in 0..p[1] {
         let line = &buf[ky * p[0]..(ky + 1) * p[0]];
-        let r = crate::czt::czt_line(line, f_at(0, 0), du, -x0, -dx, mx, fft);
-        rows[ky * mx..(ky + 1) * mx].copy_from_slice(&r);
+        let r = crate::czt::czt_line(line, f_at(0, 0), du, -x0, -dx, nx, fft);
+        rows[ky * nx..(ky + 1) * nx].copy_from_slice(&r);
     }
-    // Along fy: mx columns of p[1] frequencies → my × mx.
+    // Along fy: nx columns of p[1] frequencies → ny × nx, in place.
     let mut data = vec![Cx::ZERO; my * mx];
     let mut col = vec![Cx::ZERO; p[1]];
-    for i in 0..mx {
+    for i in 0..nx {
         for ky in 0..p[1] {
-            col[ky] = rows[ky * mx + i];
+            col[ky] = rows[ky * nx + i];
         }
-        let c = crate::czt::czt_line(&col, f_at(0, 1), dv, -y0, -dy, my, fft);
+        let c = crate::czt::czt_line(&col, f_at(0, 1), dv, -y0, -dy, ny, fft);
         for (m, v) in c.into_iter().enumerate() {
-            data[m * mx + i] = v;
+            data[(j0 + m) * mx + i0 + i] = v;
         }
     }
+    let zeroed = if nx * ny < mx * my {
+        format!("; the {} of its {} points beyond the field's padded period ({:.4e} × {:.4e} mm about its window) left at zero", mx * my - nx * ny, mx * my, period[0], period[1])
+    } else {
+        String::new()
+    };
     let mut v = u.clone();
     v.grid = out;
     v.data = data;
@@ -263,7 +283,7 @@ pub fn asm_zoom(
         z_mm: z,
         sampling: None,
         note: format!(
-            "angular spectrum of a {}×{} field (padded to {}×{}) onto a {}×{} window of pitch {:.4e} mm by chirp-z",
+            "angular spectrum of a {}×{} field (padded to {}×{}) onto a {}×{} window of pitch {:.4e} mm by chirp-z{zeroed}",
             n[0], n[1], p[0], p[1], mx, my, dx
         ),
     });

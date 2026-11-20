@@ -131,6 +131,13 @@ pub const READOUT_PER_PERIOD: f64 = 8.0;
 /// tests gained 1e-4 of an arm's power.
 pub const READOUT_PER_PERIOD_TAILS: f64 = 2.5;
 
+/// The share of a field's power, at most, whose local direction may pass
+/// its samples' band before its moments stop coming from the samples'
+/// spectrum ([`Moments`]): folded back by the spectrum, a share `q` of the
+/// power moves the slopes' variance by up to `q·(λ/Δx)²`, against the
+/// `(λ/4πσ)²` that sets a focus's size.
+const FOLDED_POWER: f64 = 1e-6;
+
 /// What to compute.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WavePathSpec {
@@ -455,17 +462,41 @@ fn merge(total: &mut WaveReport, step: WaveReport) {
 
 /// The padding a zoomed or rotated spectrum needs to read a field of `n`
 /// samples on a window `width` wide onto a face reaching `reach` from the
-/// beam, so that none of the field's periodic copies (a padded window apart)
-/// lands on the face: the padded window must hold the reach and half the
-/// beam's window, and at least `at_least` times the window. Capped so the
-/// padded grid stays within 4096 samples a side. Returns the padding and
-/// the period it gives; a period shorter than `reach + width/2` is reported
-/// by the caller as `Periodic`.
-fn readout_pad(n: usize, width: f64, reach: f64, at_least: usize) -> (usize, f64) {
+/// beam: a padded window that holds the reach and half the beam's window,
+/// so that the whole face lies within one period, and at least `at_least`
+/// times the window. Where that passes the cap, [`crate::max_padded_side`]
+/// samples a side (4096, 2048 in the browser), as for a focal spot on a
+/// detector many times its window, the padding need only hold the field's
+/// own `span` on the face: the propagators leave the face beyond the period
+/// at zero, where the sum would place the field's copies. Returns the
+/// padding and the period it gives; where the field's span passes the
+/// period, the caller reports `Periodic`.
+fn readout_pad(n: usize, width: f64, reach: f64, span: f64, at_least: usize) -> (usize, f64) {
+    let cap = (crate::max_padded_side() / n.max(1)).max(1);
     let need = (((reach + 0.5 * width) / width).ceil() as usize).max(at_least).max(1);
-    let cap = (4096 / n.max(1)).max(1);
-    let pad = need.min(cap);
+    let pad = if need <= cap { need } else { ((span / width).ceil() as usize).max(at_least).max(1).min(cap) };
     (pad, pad as f64 * width)
+}
+
+/// The readout's points a pixel `s` on `bins` pixels, scaled down evenly
+/// where the face's grid would pass `cap` samples, and whether it was. The
+/// count is taken in `f64`: as a `usize` product it wraps on a 32-bit target
+/// (the browser), where 64 × 64 pixels at 26 340 points each, 2.8·10¹²
+/// samples, wrapped to 2.8·10⁹, and the cap then let a 65 088² grid through
+/// to be refused.
+fn cap_points(bins: [usize; 2], s: [usize; 2], cap: usize) -> ([usize; 2], bool) {
+    let samples = |t: [usize; 2]| bins[0] as f64 * t[0] as f64 * bins[1] as f64 * t[1] as f64;
+    if samples(s) <= cap as f64 {
+        return (s, false);
+    }
+    let scale = (cap as f64 / samples(s)).sqrt();
+    let mut t = [((s[0] as f64 * scale).floor() as usize).max(1), ((s[1] as f64 * scale).floor() as usize).max(1)];
+    // The scale's round-off must not leave the grid over the cap.
+    while samples(t) > cap as f64 && (t[0] > 1 || t[1] > 1) {
+        let a = if t[0] >= t[1] { 0 } else { 1 };
+        t[a] -= 1;
+    }
+    (t, true)
 }
 
 /// The farthest a face reaches from the beam axis in the beam's plane: its
@@ -507,6 +538,23 @@ fn centred(mut g: Grid2) -> Grid2 {
 /// 1224, 2 (1990)), whatever the beam's shape: a predictor, not a bound on
 /// its tails, which re-gridding uses to choose the window at the next plane
 /// before the field is carried there, and checks after the step.
+///
+/// The slopes' moments come from the samples' spectrum, exact for a field
+/// its samples resolve. Where the field's local direction (the fitted
+/// sphere's, which is exact, and the rest's) passes the samples' band on more
+/// than [`FOLDED_POWER`] of the power, as behind a lens whose curvature turns
+/// more than π a sample at the beam's edge, the spectrum folds those plane
+/// waves back to smaller angles, the slopes' spread comes out short of `C`'s,
+/// and a predicted focus collapses: `σ²σ_θ² − C²` below zero, `σ²(z)`
+/// negative near the waist. Such a field's slopes are taken from the same
+/// local directions as `C`, with the diffraction part, the spread no local
+/// direction explains, from the spectrum of what is left once the sphere is
+/// taken out, which the samples do resolve: in the paraxial limit the
+/// spectral spread is the local directions' spread plus
+/// `⟨|∇A|²⟩/(k²⟨A²⟩)`, `A` the amplitude, the same for the field and its rest
+/// (Parseval). Either way no beam's moments break the uncertainty relation
+/// `σ²σ_θ² − C² ≥ (λ/4π)²` (Siegman's `M² ≥ 1`), which keeps the spread from
+/// falling below it.
 struct Moments {
     power: f64,
     mean: [f64; 2],
@@ -545,7 +593,15 @@ impl Moments {
             let (x, y) = g.xy(i, j);
             sm.at(x, y) * Cx::expi(-k * (0.5 * c * (x * x + y * y) + (al - u.carrier[0]) * x + (be - u.carrier[1]) * y))
         };
+        let lam = u.wavelength_in_medium_mm();
+        // The samples' band, in direction cosine about the carrier.
+        let band = [0.5 * lam / g.pitch_mm[0], 0.5 * lam / g.pitch_mm[1]];
         let (mut vx, mut vy, mut cx, mut cy) = (0.0, 0.0, 0.0, 0.0);
+        // Per axis, Σw·s and Σw·s² of the local slopes, and Σw·t and Σw·t²
+        // of the rest's local directions; and the power where the local
+        // direction passes the band.
+        let (mut s1, mut s2, mut r1, mut r2) = ([0.0f64; 2], [0.0f64; 2], [0.0f64; 2], [0.0f64; 2]);
+        let mut folded = 0.0;
         for j in 0..g.n[1] {
             for i in 0..g.n[0] {
                 let (x, y) = g.xy(i, j);
@@ -559,8 +615,18 @@ impl Moments {
                 let ty = if j > 0 && j + 1 < g.n[1] { crate::transfer::phase_gradient(&rest, i, j, 1, g.pitch_mm[1]) / k } else { 0.0 };
                 let (dx, dy) = (al + c * x + tx, be + c * y + ty);
                 let cz = (1.0 - dx * dx - dy * dy).max(1e-12).sqrt();
-                cx += (x - mx) * w * dx / cz;
-                cy += (y - my) * w * dy / cz;
+                let (sx, sy) = (dx / cz, dy / cz);
+                cx += (x - mx) * w * sx;
+                cy += (y - my) * w * sy;
+                for (a, (s, t)) in [(sx, tx), (sy, ty)].into_iter().enumerate() {
+                    s1[a] += w * s;
+                    s2[a] += w * s * s;
+                    r1[a] += w * t;
+                    r2[a] += w * t * t;
+                }
+                if (dx - u.carrier[0]).abs() > band[0] || (dy - u.carrier[1]).abs() > band[1] {
+                    folded += w;
+                }
             }
         }
         // The angular moments from the field's spectrum.
@@ -594,14 +660,50 @@ impl Moments {
             return None;
         }
         let (tx, ty) = (tx / q, ty / q);
-        Some(Moments {
-            power: p,
-            mean: [mx, my],
-            var: [vx / p, vy / p],
-            tilt: [tx, ty],
-            spread: [(sx / q - tx * tx).max(0.0), (sy / q - ty * ty).max(0.0)],
-            cross: [cx / p, cy / p],
-        })
+        let mut tilt = [tx, ty];
+        let mut spread = [(sx / q - tx * tx).max(0.0), (sy / q - ty * ty).max(0.0)];
+        if folded > FOLDED_POWER * p {
+            // The rest's spectral spread in direction cosine, of which its
+            // local directions' spread is the geometric part: what remains
+            // is the diffraction part, added to the local slopes' spread.
+            let mut buf: Vec<Cx> = (0..g.n[1])
+                .flat_map(|j| (0..g.n[0]).map(move |i| (i, j)))
+                .map(|(i, j)| {
+                    let (x, y) = g.xy(i, j);
+                    u.at(i, j) * Cx::expi(-k * (0.5 * c * (x * x + y * y) + (al - u.carrier[0]) * x + (be - u.carrier[1]) * y))
+                })
+                .collect();
+            crate::fft::ifftshift2(&mut buf, n);
+            fft.forward(&mut buf, n, g.cell_area_mm2());
+            let (mut e, mut m1, mut m2) = (0.0, [0.0f64; 2], [0.0f64; 2]);
+            for ky in 0..n[1] {
+                let ay = lam * g.fft_freq(1, ky);
+                for kx in 0..n[0] {
+                    let ax = lam * g.fft_freq(0, kx);
+                    let w = buf[ky * n[0] + kx].norm_sqr();
+                    e += w;
+                    m1[0] += w * ax;
+                    m1[1] += w * ay;
+                    m2[0] += w * ax * ax;
+                    m2[1] += w * ay * ay;
+                }
+            }
+            for a in 0..2 {
+                let spectral = if e > 0.0 { m2[a] / e - (m1[a] / e).powi(2) } else { 0.0 };
+                let local = r2[a] / p - (r1[a] / p).powi(2);
+                let mean = s1[a] / p;
+                tilt[a] = mean;
+                spread[a] = (s2[a] / p - mean * mean).max(0.0) + (spectral - local).max(0.0);
+            }
+        }
+        let (var, cross) = ([vx / p, vy / p], [cx / p, cy / p]);
+        let least = (lam / (4.0 * std::f64::consts::PI)).powi(2);
+        for a in 0..2 {
+            if var[a] > 0.0 {
+                spread[a] = spread[a].max((cross[a] * cross[a] + least) / var[a]);
+            }
+        }
+        Some(Moments { power: p, mean: [mx, my], var, tilt, spread, cross })
     }
 
     /// The moments of two orthogonal components together: power-weighted,
@@ -1684,9 +1786,10 @@ impl ChainJob {
         let walk = z * (m.tilt[0].abs().max(m.tilt[1].abs()) + 4.0 * m.spread[0].max(m.spread[1]).sqrt());
         let width_in = 2.0 * half_now;
         let zc = crate::propagate::padded_critical_distance_mm(&g, lam);
-        // The padding that holds the walk, within 8 and 4096 samples a side.
+        // The padding that holds the walk, within 8 and the target's widest
+        // padded grid (4096 samples a side, 2048 in the browser).
         let pad = ((2.0 * walk / width_in).ceil() as usize).max(2);
-        let cap = (4096 / n.max(1)).clamp(2, 8);
+        let cap = (crate::max_padded_side() / n.max(1)).clamp(2, 8);
         // Past the critical distance the zoomed Fresnel transform, where its
         // paraxial indicator is within the tolerance, or where no padding
         // can hold the walk; else the zoomed spectrum, padded.
@@ -3243,6 +3346,35 @@ struct FaceReading {
     width: f64,
     n_max: usize,
     aligned: Option<([usize; 2], [f64; 2])>,
+    /// The cosine of the beam's angle to the face's normal.
+    cos: f64,
+    /// How far the field's widest plane wave (the band holding all but 1e-6
+    /// of its power) walks across the beam per mm along it.
+    slope: f64,
+}
+
+impl FaceReading {
+    /// How far the field reaches on the face from where its centre crosses
+    /// it, either side: half its window, stretched by the face's tilt, and
+    /// the walk of its plane waves over the face's distance from the field's
+    /// plane (`z` at the crossing, and the tilted face's departure across
+    /// the window).
+    fn field_half_span(&self) -> f64 {
+        let cos = self.cos.clamp(1e-9, 1.0);
+        let tan = (1.0 - cos * cos).sqrt() / cos;
+        let depth = if self.aligned.is_some() { self.z.abs() } else { self.z.abs() + 0.5 * self.width * tan };
+        0.5 * self.width / cos + depth * self.slope
+    }
+
+    /// The readout's padding and the period it gives, and the `Periodic`
+    /// warning where the field reaches past half the period on the face:
+    /// there its light would fold back into the period, which the
+    /// propagators keep and leave the face beyond at zero.
+    fn padding(&self) -> (usize, Option<SamplingWarning>) {
+        let span = 2.0 * self.field_half_span();
+        let (pad, period) = readout_pad(self.n_max, self.width, self.reach, span, 2);
+        (pad, (span > period).then_some(SamplingWarning::Periodic { period_mm: period, span_mm: span }))
+    }
 }
 
 /// One component of an arm's field read onto the face's sub-pixel grid: its
@@ -3263,15 +3395,11 @@ fn read_onto_face(
     fft: &mut Fft2,
 ) -> Result<FaceRead, WaveError> {
     let mut data = vec![Cx::ZERO; fg.len()];
-    let mut periodic = None;
+    let (pad, periodic) = r.padding();
     let (eu, ev) = (t.rotate(Vec3::X), t.rotate(Vec3::Y));
     let (rep, carrier) = if let Some((n, pitch)) = r.aligned {
         let c = beam.coords(t.pos - beam.d * (t.pos - r.plane).dot(beam.d));
         let out = centred(Grid2::new(n, pitch, [c.0, c.1])?);
-        let (pad, period) = readout_pad(r.n_max, r.width, r.reach, 2);
-        if period < r.reach + 0.5 * r.width {
-            periodic = Some(SamplingWarning::Periodic { period_mm: period, span_mm: r.reach + 0.5 * r.width });
-        }
         let (zf, rep) = crate::asm_zoom(u, r.z.max(0.0), out, pad, fft)?;
         // The carrier, a direction across the beam, on the face's axes (the
         // beam's, here); its phase is referred to the field's origin on the
@@ -3293,10 +3421,6 @@ fn read_onto_face(
         }
         (rep, [c3.dot(eu), c3.dot(ev)])
     } else {
-        let (pad, period) = readout_pad(r.n_max, r.width, r.reach, 2);
-        if period < r.reach + 0.5 * r.width {
-            periodic = Some(SamplingWarning::Periodic { period_mm: period, span_mm: r.reach + 0.5 * r.width });
-        }
         let (zt, rep) = crate::asm_tilted(u, *t, fg, pad, fft)?;
         data = zt.data;
         (rep, zt.carrier)
@@ -3385,11 +3509,13 @@ impl ChainJob {
         if n_det.dot(beam.d).abs() < 1e-9 {
             return Err(WaveError::OutOfRange(format!("an arm runs along the face of detector #{}: it cannot be read there", self.spec.detector.0)));
         }
-        let reading = FaceReading { z, plane, reach, width, n_max, aligned };
         // The envelope's whole band against what the face's points can hold
         // (the carrier is analytic).
         let band = self.band();
         let highest = band.full[0].max(band.full[1]);
+        let sin = (self.u.wavelength_in_medium_mm() * band.main[0].max(band.main[1])).min(0.999);
+        let slope = sin / (1.0 - sin * sin).sqrt();
+        let reading = FaceReading { z, plane, reach, width, n_max, aligned, cos: n_det.dot(beam.d).abs(), slope };
         if highest > 0.5 / ps.max(qs) {
             self.report.warn(SamplingWarning::Undersampled {
                 what: format!("the envelope of an arm on detector #{}'s grid, {ps:.3e} mm apart: its band reaches {highest:.3e} /mm", self.spec.detector.0),
@@ -4576,12 +4702,8 @@ impl WaveJob {
             let want = (pitch * main.max(full)).ceil();
             s[axis] = (want.max(2.0) as usize).max(floor);
         }
-        let total = nu * s[0] * nv * s[1];
-        if total > crate::MAX_WAVE_SAMPLES {
-            let scale = (crate::MAX_WAVE_SAMPLES as f64 / total as f64).sqrt();
-            s = [((s[0] as f64 * scale).floor() as usize).max(1), ((s[1] as f64 * scale).floor() as usize).max(1)];
-            self.capped = true;
-        }
+        let (s, capped) = cap_points([nu, nv], s, crate::MAX_WAVE_SAMPLES);
+        self.capped |= capped;
         Ok(s)
     }
 
@@ -5429,5 +5551,63 @@ mod tests {
         let same = [[-0.5f64.sqrt(), 0.5f64.sqrt()], [0.5f64.sqrt(), -0.5f64.sqrt()]];
         let (_, hi, _) = eig(same);
         assert!((hi - 2.0).abs() < 1e-14, "{hi}");
+    }
+
+    #[test]
+    fn the_readout_cap_counts_its_samples_without_wrapping() {
+        // The app's default scene in the browser: 64 × 64 pixels at 26 340
+        // points each want 2.84·10¹² samples. As a 32-bit `usize` product
+        // that wraps to 2 813 394 944, and the cap scaled the points by it to
+        // 1017 a pixel: a 65 088² grid, which the grid refused. Counted in
+        // f64, the cap gives the 2²² samples the browser holds.
+        let wrapped = 64u32.wrapping_mul(26_340).wrapping_mul(64).wrapping_mul(26_340);
+        assert_eq!(wrapped, 2_813_394_944);
+        assert_eq!((26_340.0 * ((1u64 << 22) as f64 / wrapped as f64).sqrt()).floor(), 1017.0);
+        let (s, capped) = cap_points([64, 64], [26_340, 26_340], 1 << 22);
+        assert!(capped);
+        assert!(64 * s[0] * 64 * s[1] <= 1 << 22 && s[0] >= 31 && s[1] >= 31, "{s:?}");
+        assert_eq!(cap_points([64, 64], [16, 16], 1 << 22), ([16, 16], false));
+        // More pixels than the cap: one point a pixel, which the grid then
+        // refuses by name.
+        assert_eq!(cap_points([4096, 2048], [3, 3], 1 << 22), ([1, 1], true));
+    }
+
+    #[test]
+    fn an_undersampled_converging_beam_keeps_its_focus() {
+        // The app's default scene behind its singlet: a Gaussian (w 0.5 mm)
+        // converging on a focus 46.7 mm on, at 0.42 µm, 256 samples over
+        // 4 mm. Its curvature turns 4.7 rad a sample where it holds a
+        // thousandth of its peak, so its samples' spectrum folds about 1% of
+        // the power back to small angles. The moments from that spectrum
+        // broke the uncertainty relation (C²/σ²σ_θ² = 1.033) and predicted
+        // no spot at all, and the window shrank to 64λ and cut a sixth of
+        // the light. The waist the moments predict must be the Gaussian's
+        // own, from the complex beam parameter (Kogelnik & Li, Appl. Opt.
+        // 5, 1550 (1966)): 1/q = −1/R − iλ/(πw²), the waist at
+        // −Re q = 46.671 mm, of radius √(λ Im q/π) = 12.48 µm, its rms
+        // radius half that. A grid fine enough to resolve the curvature,
+        // read by its spectrum, must agree.
+        let (lam_um, r, w) = (0.42, 46.7, 0.5);
+        let lam = lam_um / 1000.0;
+        let (a, b) = (1.0 / r, lam / (std::f64::consts::PI * w * w));
+        let z_waist = a / (a * a + b * b);
+        let sigma_waist = 0.5 * (lam / std::f64::consts::PI * b / (a * a + b * b)).sqrt();
+        let k = 2.0 * std::f64::consts::PI / lam;
+        let mut fft = Fft2::new();
+        for n in [256usize, 2048] {
+            let g = Grid2::square(n, 4.0 / n as f64).unwrap();
+            let u = Field2::from_fn(g, lam_um, |x, y| {
+                let r2 = x * x + y * y;
+                Cx::expi(-k * r2 / (2.0 * r)) * (-r2 / (w * w)).exp()
+            })
+            .unwrap();
+            let m = Moments::of(&u, &mut fft).unwrap();
+            let ratio = m.cross[0] * m.cross[0] / (m.var[0] * m.spread[0]);
+            let sigma = m.sigma_at(0, z_waist);
+            eprintln!("measured: {n}² over 4 mm, C²/σ²σ_θ² = {ratio:.6}, predicted rms radius at the waist {sigma:.4e} mm against {sigma_waist:.4e}");
+            assert!(ratio < 1.0, "{n}: {ratio}");
+            assert!((sigma / sigma_waist - 1.0).abs() < 0.02, "{n}: {sigma} vs {sigma_waist}");
+            assert!((-m.cross[0] / m.spread[0] / z_waist - 1.0).abs() < 1e-3, "{n}: the waist at {} mm", -m.cross[0] / m.spread[0]);
+        }
     }
 }

@@ -28,6 +28,19 @@ async function giveTheSourceABeam(page: Page) {
   expect(coh.Gaussian.waist_radius_mm).toBe(0.5);
 }
 
+// The share of the launched power the dock says the detector caught, in
+// percent, with no ledger check failed: the status text alone passed while
+// the readout laid copies of the singlet's focal spot over the whole
+// detector, 995 times the launched power.
+async function detectedPercent(page: Page): Promise<number> {
+  const nums = page.locator("#dockNums");
+  const text = (await nums.textContent()) ?? "";
+  const m = /detected \((\d+(?:\.\d+)?)%\)/.exec(text);
+  expect(m, text).not.toBeNull();
+  expect((await nums.getAttribute("title")) ?? "").not.toContain("inconsistent:");
+  return Number(m![1]);
+}
+
 test("a coherent beam: a white source as its lines, carried through the singlet, and through empty space", async ({ page }) => {
   await page.goto("/?debug");
   await expect(page.locator("#stat")).toContainText("segs");
@@ -39,12 +52,20 @@ test("a coherent beam: a white source as its lines, carried through the singlet,
   // lines added in power.
   await expect(page.locator("#refStatus")).toContainText("wave current", { timeout: 180_000 });
   await expect(page.locator("#dockNums")).toHaveAttribute("title", /9 spectral lines added in power/);
+  // The singlet's two faces reflect about 8.5% (Fresnel); the focal spot
+  // lands once, with the rest of the light, and no more than was launched.
+  const white = await detectedPercent(page);
+  expect(white).toBeGreaterThan(85);
+  expect(white).toBeLessThanOrEqual(100);
   await page.locator("#wlPreset").selectOption("d");
   // The default scene's singlet is traced face by face; the beam reaches the
   // detector near its focus.
   await page.locator("#detWave").click();
   await expect(page.locator("#refStatus")).toContainText("wave current", { timeout: 60_000 });
   await expect(page.locator("#dockNums")).toContainText("detected");
+  const line = await detectedPercent(page);
+  expect(line).toBeGreaterThan(85);
+  expect(line).toBeLessThanOrEqual(100);
 
   // Without it, the beam crosses empty space to the detector.
   await page.evaluate(() => {

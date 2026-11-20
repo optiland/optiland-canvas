@@ -71,3 +71,36 @@ pub use report::{Method, SamplingWarning, ValidityFlag, WaveLedger, WaveReport};
 pub const MAX_WAVE_SAMPLES: usize = 1 << 22;
 #[cfg(not(target_arch = "wasm32"))]
 pub const MAX_WAVE_SAMPLES: usize = 1 << 26;
+
+/// The widest padded grid a step pads a field to, samples a side: 4096, or
+/// the widest power of two whose square [`MAX_WAVE_SAMPLES`] holds (2048 in
+/// the browser). The readout and a re-gridded step cap their padding with it,
+/// so that a target that holds the field is not refused its padded copy.
+#[cfg(feature = "scene")]
+pub(crate) fn max_padded_side() -> usize {
+    padded_side_within(MAX_WAVE_SAMPLES)
+}
+
+/// The widest power of two, at most 4096, whose square is within `cap`.
+#[cfg(feature = "scene")]
+pub(crate) fn padded_side_within(cap: usize) -> usize {
+    let mut side = 4096usize;
+    while side > 1 && side * side > cap {
+        side /= 2;
+    }
+    side
+}
+
+#[cfg(all(test, feature = "scene"))]
+mod tests {
+    #[test]
+    fn a_padded_grid_fits_the_target_that_holds_its_field() {
+        // The browser holds 2²² samples: a 2048² padded grid, not the
+        // 4096² that refused its readout; natively 4096², the most a step
+        // pads to.
+        assert_eq!(super::padded_side_within(1 << 22), 2048);
+        assert_eq!(super::padded_side_within(1 << 26), 4096);
+        assert_eq!(super::padded_side_within((1 << 22) - 1), 1024);
+        assert_eq!(super::padded_side_within(1 << 24), 4096);
+    }
+}

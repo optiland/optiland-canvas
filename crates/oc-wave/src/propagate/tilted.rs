@@ -42,6 +42,11 @@
 //! tilted-plane test prints it against a direct plane-wave sum). The target
 //! field is then evaluated on the output grid by chirp-z, as
 //! [`super::asm::asm_zoom`] does, so a small tilted window is not wrapped.
+//! The target spectrum is sampled as finely as the padded source's, so its
+//! sum repeats the field every padded period along the plane's axes; only
+//! the period about where the carrier through the source window's centre
+//! crosses the plane is the field, and output points beyond it are left at
+//! zero rather than given the field's copies.
 //! A plane wave travelling back across the source plane (`w ≤ 0`) is not part
 //! of the forward field and is left out. A target frequency `(u′, v′)` is
 //! met by two wavevectors, `w′ = ±√(1/λ² − u′² − v′²)`; each that is a
@@ -299,27 +304,54 @@ pub fn asm_tilted(
         }
     }
     // Evaluate on the output points by chirp-z, one axis at a time: the
-    // envelope about the target carrier `(u′₀, v′₀)`.
+    // envelope about the target carrier `(u′₀, v′₀)`. The target spectrum is
+    // sampled `du`, `dv` apart, so its sum repeats every `1/du`, `1/dv` along
+    // the plane's own axes; only the period about where the field crosses the
+    // plane is the field (centred where the carrier through the source
+    // window's centre meets the plane). Points beyond it stay zero and are
+    // not summed: there the sum would place the field's copies. A plane the
+    // carrier grazes keeps every point.
     let (ox, oy) = (out.n[0], out.n[1]);
-    let (x0, y0) = (out.coord(0, 0), out.coord(1, 0));
     let (dx, dy) = (out.pitch_mm[0], out.pitch_mm[1]);
-    let mut rows = vec![Cx::ZERO; my * ox];
+    let chat = c.normalize();
+    let along = chat.dot(tz);
+    let (xc, yc) = if along.abs() > 1e-9 {
+        let r = chat * (d.dot(tz) / along) - d;
+        (r.dot(tx), r.dot(ty))
+    } else {
+        (f64::NAN, f64::NAN)
+    };
+    let (x0, y0) = (out.coord(0, 0), out.coord(1, 0));
+    let ((i0, i1), (j0, j1)) = if xc.is_finite() && yc.is_finite() {
+        (super::within_period(x0 - xc, dx, ox, 1.0 / du), super::within_period(y0 - yc, dy, oy, 1.0 / dv))
+    } else {
+        ((0, ox), (0, oy))
+    };
+    let (nx, ny) = (i1 - i0, j1 - j0);
+    let first = |x0: f64, m0: usize, d: f64| if m0 == 0 { x0 } else { x0 + m0 as f64 * d };
+    let (x0, y0) = (first(x0, i0, dx), first(y0, j0, dy));
+    let mut rows = vec![Cx::ZERO; my.checked_mul(nx).ok_or(WaveError::TooLarge { samples: usize::MAX, cap: crate::MAX_WAVE_SAMPLES })?];
     for ky in 0..my {
         let line = &spec[ky * mx..(ky + 1) * mx];
-        let r = crate::czt::czt_line(line, f_at(0, 0), du, -x0, -dx, ox, fft);
-        rows[ky * ox..(ky + 1) * ox].copy_from_slice(&r);
+        let r = crate::czt::czt_line(line, f_at(0, 0), du, -x0, -dx, nx, fft);
+        rows[ky * nx..(ky + 1) * nx].copy_from_slice(&r);
     }
     let mut data = vec![Cx::ZERO; ox * oy];
     let mut col = vec![Cx::ZERO; my];
-    for i in 0..ox {
+    for i in 0..nx {
         for ky in 0..my {
-            col[ky] = rows[ky * ox + i];
+            col[ky] = rows[ky * nx + i];
         }
-        let cz = crate::czt::czt_line(&col, f_at(0, 1), dv, -y0, -dy, oy, fft);
+        let cz = crate::czt::czt_line(&col, f_at(0, 1), dv, -y0, -dy, ny, fft);
         for (m, v) in cz.into_iter().enumerate() {
-            data[m * ox + i] = v;
+            data[(j0 + m) * ox + i0 + i] = v;
         }
     }
+    let zeroed = if nx * ny < ox * oy {
+        format!("; the {} of its {} points beyond the field's period on the plane ({:.4e} × {:.4e} mm about where the carrier crosses it) left at zero", ox * oy - nx * ny, ox * oy, 1.0 / du, 1.0 / dv)
+    } else {
+        String::new()
+    };
     let mut v = u.clone();
     v.grid = out;
     v.data = data;
@@ -349,7 +381,7 @@ pub fn asm_tilted(
         z_mm: d.z,
         sampling: None,
         note: format!(
-            "angular spectrum of a {}×{} field (padded to {}×{}) onto a plane tilted {:.3}° and {:.4} mm along, by spectrum rotation (Matsushima, Schimmel & Wyrowski 2003), the spectrum read between its samples by a Kaiser–Bessel kernel {w} samples wide, and chirp-z onto {}×{} points; every forward plane wave that crosses the plane kept, from either side; power through the window projected by one obliquity, the carrier's",
+            "angular spectrum of a {}×{} field (padded to {}×{}) onto a plane tilted {:.3}° and {:.4} mm along, by spectrum rotation (Matsushima, Schimmel & Wyrowski 2003), the spectrum read between its samples by a Kaiser–Bessel kernel {w} samples wide, and chirp-z onto {}×{} points; every forward plane wave that crosses the plane kept, from either side; power through the window projected by one obliquity, the carrier's{zeroed}",
             n[0], n[1], p[0], p[1], tz.z.abs().min(1.0).acos().to_degrees(), d.z, ox, oy
         ),
     });

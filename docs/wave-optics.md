@@ -266,7 +266,7 @@ incoming ray to the plane across the outgoing one:
 | face of a refractive body, curved mirror or other curved surface | traced across the thin slab that holds the surface where the beam meets it (below), its rim laid on the field with exact cell coverage; between a body's faces the field diffracts inside the glass by the angular spectrum, in the glass's index | the slab is geometric: no diffraction across a surface's sag |
 | plane-parallel plate (a body entered and left by two flat, parallel faces, bare or with a residual AR) | one step: the closed-form slab, round trips included, on each plane wave of the field, then the angular spectrum across the planes (below) | exact for a plate of infinite extent, s or p; its rim laid on the field |
 | flat coated surface (`Coating`: a coated splitter, a dichroic) | each plane wave times the coating's complex `r` or `t` at its own angle, from the transfer matrix, then handed over like any flat element; a plate-backed coating's round trips as its plate declares (`PlateRoundTrips`): the first pass alone (the default), added in power, or summed as fields across its thickness | exact for the stack, s or p; the plate as it declares it, zero-thick in the scene's geometry |
-| detector (`Readout::Projected` or `Readout::Diffracted { samples_per_pixel }`) | one readout for every arm: the field, carried to the detector's plane across its chief ray, is interpolated onto the detector's own sub-pixel grid, `s × s` points a pixel at the centres of equal parts of each pixel, by the zoomed angular spectrum (`asm_zoom`) where the face is square to the beam with its axes along the beam's and by the spectrum rotated onto the face (`asm_tilted`) otherwise, its carrier kept analytic; `s` holds the intensity's band on the face (the arms' directions' spread plus twice the envelope's band) at `READOUT_PER_PERIOD` (8) points a period for the band that holds all but 1e-6 of the envelope's energy and at `READOUT_PER_PERIOD_TAILS` (2.5) for its whole band, down to 1e-8 of its peak amplitude (a field cut by its window has spectral tails to its grid's Nyquist frequency, whose beat with the main lobe is of first order in the edge's amplitude: read at points that do not resolve them, a Michelson's arm gained 1e-4 of its power; resolved above two points a period, the sum over the points is the interpolant's power exactly), two at least, and `Diffracted` sets a floor of its `samples_per_pixel`; a pixel's power is the sum of its cells' integrals, the fringe between two arms' carriers integrated over each cell exactly (the rectangular pixel's sinc factors) and the envelopes by the midpoint rule, the irradiance by the `DetectorModel` (below) | exact scalar propagation; the midpoint rule on the envelopes, `(πfh)²/6` of an intensity component at frequency `f` for points `h` apart (2.6% at the band's edge, 0.64% at half of it); padded so that the field's periodic copies, a padded window apart, stay clear of the face (`Periodic` warns where 4096 samples a side cannot); the sample cap (`CoarsePreview` says what the points fell short of) |
+| detector (`Readout::Projected` or `Readout::Diffracted { samples_per_pixel }`) | one readout for every arm: the field, carried to the detector's plane across its chief ray, is interpolated onto the detector's own sub-pixel grid, `s × s` points a pixel at the centres of equal parts of each pixel, by the zoomed angular spectrum (`asm_zoom`) where the face is square to the beam with its axes along the beam's and by the spectrum rotated onto the face (`asm_tilted`) otherwise, its carrier kept analytic; the field's spectrum is padded so that one period holds the whole face (and, on a face too wide for that within the target's widest padded grid, the field's own span on it), and the face beyond that period reads zero, where the sum would lay the field's copies (a focal spot on a detector many times its window); `s` holds the intensity's band on the face (the arms' directions' spread plus twice the envelope's band) at `READOUT_PER_PERIOD` (8) points a period for the band that holds all but 1e-6 of the envelope's energy and at `READOUT_PER_PERIOD_TAILS` (2.5) for its whole band, down to 1e-8 of its peak amplitude (a field cut by its window has spectral tails to its grid's Nyquist frequency, whose beat with the main lobe is of first order in the edge's amplitude: read at points that do not resolve them, a Michelson's arm gained 1e-4 of its power; resolved above two points a period, the sum over the points is the interpolant's power exactly), two at least, and `Diffracted` sets a floor of its `samples_per_pixel`; a pixel's power is the sum of its cells' integrals, the fringe between two arms' carriers integrated over each cell exactly (the rectangular pixel's sinc factors) and the envelopes by the midpoint rule, the irradiance by the `DetectorModel` (below) | exact scalar propagation; the midpoint rule on the envelopes, `(πfh)²/6` of an intensity component at frequency `f` for points `h` apart (2.6% at the band's edge, 0.64% at half of it); padded so that the field's periodic copies, a padded window apart, stay clear of the face (`Periodic` warns where 4096 samples a side cannot); the sample cap (`CoarsePreview` says what the points fell short of) |
 
 When the beam leaves an element at another angle than it came, its
 cross-section changes by `cos θ_out / cos θ_in`; the handover's amplitude
@@ -422,7 +422,22 @@ comes from the phase steps between adjacent samples, the fitted sphere taken
 out first so that a steep wavefront is not understated. Then
 `σ²(z) = σ² + 2zC + z²σ_θ²`, exact under paraxial propagation whatever the
 beam's shape (the second-moment law; A. E. Siegman [25]): a predictor, not a
-bound on the tails, which is why the step is checked after it runs (below). When the beam, taken as six rms
+bound on the tails, which is why the step is checked after it runs (below).
+The slopes' moments come from the samples' spectrum, exact for a field its
+samples resolve. Behind a lens whose curvature turns more than π a sample at
+the beam's edge the spectrum folds those plane waves back to smaller angles,
+the slopes' spread comes out short of `C`'s, and a focus is predicted to
+vanish: the app's default singlet, 256 samples over 4 mm at 0.42 µm, folded
+about 1% of the power, gave `C²/σ²σ_θ² = 1.033` and a negative `σ²` at the
+detector, and the window there shrank to 64λ and cut 16% of the light. Where
+the local direction passes the samples' band on more than a millionth of the
+power, the slopes' moments are taken from the same local directions as `C`,
+with the diffraction part (the spread no local direction explains,
+`⟨|∇A|²⟩/(k²⟨A²⟩)` in the paraxial limit) from the spectrum of the field
+with its fitted sphere taken out, which the samples do resolve; that
+beam's waist is then predicted within 5e-5 of a Gaussian's own. Either
+way the spread is kept from breaking the uncertainty relation
+`σ²σ_θ² − C² ≥ (λ/4π)²` (Siegman's `M² ≥ 1` [25]). When the beam, taken as six rms
 radii to either side of its centroid, would fill less than a quarter of the
 window, or on a window already narrowed more than four fifths of it, the
 field is carried onto a window fitted to it, centred on its predicted
@@ -438,7 +453,8 @@ window and the step is longer than the window's critical distance (a narrow
 window widening again, typically), the zoomed Fresnel transform, the Fresnel
 integral as one chirp-z transform onto the new grid, its paraxial error
 reported, but only where that error's indicator is within `STEP_TOLERANCE`
-or no padding up to 8 (and 4096 samples a side) can hold the walk; else the
+or no padding up to 8 (and the target's widest padded grid, 4096 samples a
+side, 2048 in the browser) can hold the walk; else the
 zoomed spectrum, padded. A Fresnel step taken past the tolerance is reported
 not certified. After each step the path checks what the window kept: where
 a window narrower than the declared one lost more than a millionth of the
@@ -774,8 +790,8 @@ These are acceptance case C53, in `crates/oc-wave/tests/path.rs`.
 | `a_glass_plate_shifts_a_gaussian_as_free_space_of_t_over_n` | a plate of thickness `t`, index `n` is free space `t/n` to a Gaussian [13]; faces anti-reflected, one closed-form step | 1e-5 | 1.9e-7 (implied index within 1.8e-5; face by face it was 2.4e-6 and 2.3e-4) |
 | `a_gaussian_through_a_singlet_waists_where_self_predicts` | Self [14] with the singlet's focal length and principal planes traced by the f64 tracer (an N-BK7 equiconvex lens, R ±50 mm, 4 mm) | 1e-3 | waist position 2.5e-4 of its Rayleigh range (2.9 µm); radius 5.1e-5 |
 | `a_tilted_plate_displaces_the_beam_where_the_rays_say` | the chief ray's landing point behind a plate at 30° | 0.05 pixel | 5.2e-5 mm |
-| `a_singlet_psf_matches_optiland_huygens_psf` | Optiland's `HuygensPSF` of the same singlet at f/10, at its paraxial focus (oracle, below) | Strehl ±0.01; rms 1e-2 of the ideal peak | Strehl 0.8622 against 0.8642; rms 2.8e-4 |
-| `stronger_na_and_off_axis_singlets_against_optiland_huygens_psf` | V02 of the expert review: Optiland's `HuygensPSF` (fixtures of `huygens_singlet.py --v02`) of the singlet at f/10 two degrees off axis; and at f/4 on and off axis on a 2048-sample window, whose 7.6 µm samples cannot hold the converging sphere (218 cycles/mm at the edge, Nyquist 66/mm) | f/10 at 2°: Strehl ±2%, rms 2e-3 of the oracle's peak, sums ±1%; f/4: the report must say the field after the face is undersampled | f/10 at 2°: 0.6119 against 0.6183, rms 6.1e-4, sums 1.002; f/4: flagged (6.6 rad between samples), the PSF's centre within 2% (0.0138 against 0.0141, at 2° 0.0108 against 0.0101) but the halo 5.6 times too faint (sums over the grid 0.18) |
+| `a_singlet_psf_matches_optiland_huygens_psf` | Optiland's `HuygensPSF` of the same singlet at f/10, at its paraxial focus (oracle, below) | Strehl ±0.01; rms 1e-2 of the ideal peak | Strehl 0.8623 against 0.8642; rms 2.8e-4 |
+| `stronger_na_and_off_axis_singlets_against_optiland_huygens_psf` | V02 of the expert review: Optiland's `HuygensPSF` (fixtures of `huygens_singlet.py --v02`) of the singlet at f/10 two degrees off axis; and at f/4 on and off axis on a 2048-sample window, whose 7.6 µm samples cannot hold the converging sphere (218 cycles/mm at the edge, Nyquist 66/mm) | f/10 at 2°: Strehl ±2%, rms 2e-3 of the oracle's peak, sums ±1%; f/4: the report must say the field after the face is undersampled | f/10 at 2°: 0.6120 against 0.6183, rms 6.1e-4, sums 1.002; f/4: flagged (6.6 rad between samples), the PSF's centre within 2% (0.0138 against 0.0141, at 2° 0.0108 against 0.0101) but the halo 5.6 times too faint (sums over the grid 0.18) |
 | `an_f2_singlet_against_optiland_huygens_psf_on_4096_samples` (ignored by default: minutes and gigabytes) | V02 at f/2: a singlet a tenth the size (R ±5 mm, 1.6 mm thick) on a 3.1 mm window of 4096 samples, which holds its sphere (417 cycles/mm, Nyquist 658/mm), on and off axis | Strehl ±10%, rms 1e-2 of the oracle's peak, sums ±3% | on the axis 0.01151 against 0.01130, rms 2.0e-3, sums 1.015; at 2° 0.00877 against 0.00952, rms 5.0e-3, sums 1.009 |
 | `a_tilted_detector_reads_the_beam_on_its_own_plane` | Kogelnik–Li [13] on a face tilted 30°, times the obliquity: each pixel's power against the 8 × 8 sub-pixel mean of the law, and the power caught | 2e-3 of the peak; power on the face 3e-3 | 8.4e-4; 1.8e-8 (−1.9e-3 under the bilinear spectrum reading before E3) |
 | `an_aperture_whose_outer_extent_the_beam_passes_beyond_leaves_it_alone` | the tracer's aperture: light beyond the outer extent passes; against an open aperture at the same plane | bit-identical | identical |
@@ -783,7 +799,7 @@ These are acceptance case C53, in `crates/oc-wave/tests/path.rs`.
 | `a_fold_mirror_smaller_than_the_beam_reflects_only_what_meets_it` | a 0.6 mm disc at 45° in a 1 mm Gaussian [13]: the power off its projected ellipse, by quadrature, passes beside it | 1e-4 | 1.5e-5 |
 | `a_thin_lens_smaller_than_the_beam_lets_the_rest_pass_beside_it` | 10 µm behind a 0.5 mm thin lens: the lens's phase inside, free space's field outside, away from the edge | 2e-3 | 1.0e-3 inside; 3.0e-5 outside |
 | `a_traced_ray_leaves_a_thin_lens_along_the_wave_s_phase_gradient` | Q22 of the expert review: the wave's lens phase (`apply_thin_lens`, [1]) read by a central difference on a plane wave, against the f64 tracer's ray at the same point and incidence; f = 20 and −35 mm, three points | 1e-9 in direction cosine | 1.8e-11 or better |
-| `a_lens_rim_smaller_than_the_beam_stops_and_diffracts_as_an_iris_against_it` | a 1 mm iris 1.5 µm before a lens too large to clip; the lens rim itself, with exact cover | power 3e-4; spot 2e-3 of peak | 1.1e-4 (the back face's rim stops 9e-4 of what reaches it, which is real); 3.7e-4 |
+| `a_lens_rim_smaller_than_the_beam_stops_and_diffracts_as_an_iris_against_it` | a 1 mm iris 1.5 µm before a lens too large to clip; the lens rim itself, with exact cover | power 3e-4; spot 2e-3 of peak | 1.1e-4 (the back face's rim stops 9e-4 of what reaches it, which is real); 3.5e-4 |
 | `an_lcos_on_the_path_sends_half_of_unpolarized_light_into_each_beam` | half of what the device meets in the unmodulated beam [20]; `sinc²(1/16)` of the modulated half in the first order [21] | 2e-3; 3e-3 | −5.9e-7; −2.0e-3 |
 | `a_glass_plate_delays_the_beam_by_its_optical_path` | `k₀(n − 1)t` less the Gouy change of the effective length [13] | 1e-4 rad | 8.9e-9 rad (face by face, 2.6e-6) |
 | `a_mach_zehnder_sends_all_the_power_out_of_its_two_ports_whatever_the_path_difference` | a lossless network is unitary: the two ports carry the input between them, `(1 ∓ cos Δφ)/2` each, at Δφ = 0, π/2, π, 3π/2 [23], [24] | sum 1e-3; share 2e-3 | sum 1.000; share within 1.0e-7; the network ledger's remainder 2.2e-14 |
@@ -812,7 +828,7 @@ These are acceptance case C53, in `crates/oc-wave/tests/path.rs`.
 | `a_half_wave_plate_in_one_arm_of_a_mach_zehnder_takes_its_fringes_away_and_a_polarizer_brings_them_back` | Fresnel–Arago [27]: half the launched in the X port at every Δφ; behind an analyzer at β, `1/4 − cos Δφ·cos 2(θ − β)/4` [26], θ = 20°, β = 20°, 50°, 65° | 1e-6 | 4.9e-8 |
 | `a_dmd_s_orders_cross_a_singlet_each_about_its_own_direction` | the orders of a DMD whose blaze lies between two of them, through an N-BK7 singlet (R ±8 mm): each crosses each face about its own direction [10], [17]; the chief ray lies 27 mrad from the nearest | steepest departure 0.54 mrad; rms and spectral departure 5.4 mrad; `numerical` 1e-6 | 0.29 mrad; 3.3 and 3.8 mrad (the weak orders folded at the window's band edge; the difference across two samples read 0.36 by folding their steps); 5.9e-9 (resampling 9.9e-3 at the DMD's take-up) |
 | `crossed_polarizers_before_a_lens_leave_it_a_dark_field_to_carry` | the chain is geometry: behind crossed polarizers a singlet carries an all-zero field, the ledger closed | 1e-12 | detected 1.7e-33 |
-| `a_pinhole_at_a_lens_s_focus_passes_what_the_focused_gaussian_puts_through_it` | a waist on a lens of focal length f has radius λf/(πw₀) at the focal plane (bundle M30, [13]): a pinhole of that radius stops `exp(−2)` | 1e-5 | 5.7e-7 |
+| `a_pinhole_at_a_lens_s_focus_passes_what_the_focused_gaussian_puts_through_it` | a waist on a lens of focal length f has radius λf/(πw₀) at the focal plane (bundle M30, [13]): a pinhole of that radius stops `exp(−2)` | 1e-5 | 7.0e-7 |
 | `a_ten_times_beam_expander_widens_the_beam_as_the_abcd_law_says` | the radius at the second lens by the Gaussian ABCD law [13], through a 50 µm focus | 1e-5 | 4.2e-7 |
 | `a_grating_order_leaves_with_its_momentum_and_its_phase` | the grating equation [1] (R01 of the expert review): a 20 l/mm grating met at 10°, η = 0.65; the order's field stays centred on the chief ray turned to the order, lands where the traced chief ray does, and takes the phase `e^{−i2πΔ/d}` when the grating moves Δ across its grooves | centroid 1e-4 mm; landing 6e-3 mm; phase 1e-8 | 2.3e-14 mm; 5.2e-4 mm; 1.2e-12 |
 | `both_orders_of_a_grating_book_what_neither_carries_once` | the order and the zero order on one detector (R02): `untracked_orders = 1 − η − η₀` once, nothing left to the remainder | 1e-6; 2e-3 | 0.250; detected 0.750, remainder −1.1e-7 |
@@ -823,6 +839,9 @@ These are acceptance case C53, in `crates/oc-wave/tests/path.rs`.
 | `a_noncoplanar_mach_zehnder_conserves_power_across_its_ports` | R14: arms folded out of the plane reach the second splitter with frames turned about the beam; added on the detector's own axes, both ports carry the launched power, and a rigid roll of the whole scene leaves the Z port's pixels | 2e-3; 1e-5 of the launched | 1.000; 1.0e-10 (the arms joined at the second splitter) |
 | `an_aperture_behind_a_recombining_splitter_clips_the_sum_of_the_arms` | R04: the Mach–Zehnder's arms join at the second splitter, so a disc of radius 0.4 mm behind it clips their sum: the same share of the X port at Δφ = π/2 and π, `exp(−2a²/w²)` [13], nothing when the port is dark (Δφ = 0); the Y port's own run against what the X run books to its unread port; a job sliced into single events against the whole | 1e-6; 2e-4 (the disc's edge cells on a 15.6 µm grid); 1e-6 of the launched; 1e-6; bit-identical | 5.4e-8; 9.2e-5; 1.8e-16; 2.8e-10; identical |
 | `two_plane_waves_integrate_over_the_pixels_with_the_sinc_factors` (a unit test of `path.rs`) | R13: two plane waves on a 20 × 20 detector, as the arms' carriers and as their envelopes, against the rectangular pixel's closed form `A(w₁ + w₂)[1 + cos(2πΔf x_c)·sinc(Δf d)]`, for the scalar flux (cos 0.9, 0.7; 1, 1) and the paraxial area | 1e-12; the midpoint rule's `(x/sin x − 1)·sinc(Δf d)`, `x = πΔf h`, within 10% | 2.4e-15; 1.19e-2 (the rule's 1.20e-2) |
+| `a_focal_spot_on_a_wide_detector_is_read_once_with_the_light_its_window_holds` | the app's default singlet at 0.42 µm, 256 samples over 4 mm, its focal spot on a strip 6 mm wide (24 × 1 pixels): the faces' Fresnel reflection (8.5% at n = 1.528) and the light the undersampled field folds away (the `Undersampled` warning), the spot once, on the two middle pixels, and no `Periodic` warning; before the fix the window there shrank to 64λ and the readout laid the spot's copies beside it | detected 0.88–0.915; left the window < 3%; middle pixels > 0.999 | 0.894; 2.1e-2; 1.000 |
+| `an_undersampled_converging_beam_keeps_its_focus` (a unit test of `path.rs`) | a Gaussian (w 0.5 mm) converging 46.7 mm on at 0.42 µm, whose samples' spectrum folds 1% of its power at 256 over 4 mm: the waist its moments predict against Kogelnik–Li's from the complex beam parameter [13], and the same beam on 2048² read by its spectrum | 2% | 5e-5 at 256², 6e-5 at 2048² |
+| `the_readout_cap_counts_its_samples_without_wrapping` (a unit test of `path.rs`) | the browser's refusal of the default scene: 64 × 64 pixels at 26 340 points each, whose 32-bit product wraps to 2 813 394 944 and scaled the points to 1017 a pixel; counted in f64 | within the cap | 2²² samples, 32 a pixel |
 
 The transfer's own tests (acceptance case C62, `crates/oc-wave/src/transfer.rs`):
 
@@ -867,6 +886,7 @@ The propagation tests of W8 (acceptance case C57, `crates/oc-wave/tests/propagat
 | `a_translated_frame_and_a_translated_grid_hold_the_same_field` | gauge: one field encoded as a grid at `c` or as a frame moved to `c`, by the zoom and by the rotation onto one plane | 1e-12 | 3.2e-15; 5.2e-16 |
 | `the_zoomed_fresnel_and_fraunhofer_transforms_take_the_grid_where_it_is` | the chirp-z Fresnel transform of an off-centre window against the zoomed angular spectrum (padded 8×, for its periodic copies); a shifted field's far field against the centred one's times the shift phase `e^{−i2πf·c}` [1] | 1e-4; 1e-10 | 4.2e-6; 8.3e-16 |
 | `a_baked_carrier_propagates_like_an_analytic_one` | gauge (R06): the carrier analytic or folded into the samples, through `Auto` and through the zoom | 1e-10 | 8.2e-13; 2.6e-13 |
+| `a_small_field_read_onto_a_wide_window_is_there_once` | a Gaussian 10 µm in radius read at z = 0, and through a plane tilted 20°, onto a window 15 of its padded periods wide: the sampled spectrum's sum repeats the field every period [1]; the window beyond the period must read zero and the field's power cross it once | zero beyond; power 1e-4 | 0 and 0; 1.000000000 and 1.0000058 |
 
 The DMD case shows what the ledger is for. Of the launched power, 73.0%
 reaches the detector and 11.7% falls in the dead space between mirrors
@@ -900,7 +920,9 @@ Every call returns a `WaveReport`:
 - the step taken, with its method, distance and sampling regime;
 - `warnings`: `BandLimited`, `WrapAround`, `OutsideRegime`, `Paraxial`,
   `Undersampled`, and on a wave path `TiltProjection` and `Periodic` (a
-  face wider than the period of the padded spectrum read onto it);
+  field whose span on a face, its window and its walk to the face, passes
+  the period of the padded spectrum read onto it: its light beyond the
+  period folds back in; the face beyond the period reads zero);
 - `validity` flags;
 - named approximations;
 - a `WaveLedger`, where every step books what it changed to a cause, in two
@@ -1016,9 +1038,9 @@ mm before the back vertex, and its edge is the marginal ray's height there,
 2.5204 mm, so `sin α = 0.049928`. The marginal ray's own sine (0.050118) is
 not the reference: the spherical aberration tilts that ray by its ray error,
 and dividing by it read the PSF 0.76% low, uniformly. The Strehl ratios are
-0.8622 (canvas) and 0.8642 (Optiland), 0.23% apart; the PSFs differ by
+0.8623 (canvas) and 0.8642 (Optiland), 0.22% apart; the PSFs differ by
 2.8e-4 rms of the ideal peak, and their sums over the grid by 0.24%. The
-step from the lens toward the focus lost 2.9e-3 of the launched power off
+step from the lens toward the focus lost 3.0e-3 of the launched power off
 the window fitted to the beam's moments, and was run again on one twice as
 wide, which loses 1.2e-3 off its edge and beyond its band; on the first
 window the canvas read 0.8644, 0.02% from Optiland, with an rms difference

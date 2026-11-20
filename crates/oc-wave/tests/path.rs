@@ -3191,3 +3191,39 @@ fn an_f2_singlet_against_optiland_huygens_psf_on_4096_samples() {
         assert!(!c.undersampled && c.rms_of_peak < 1e-2 && (c.strehl / c.strehl_oracle - 1.0).abs() < 0.1 && (c.sums - 1.0).abs() < 0.03, "{label}: {:?}", (c.strehl, c.strehl_oracle, c.rms_of_peak, c.sums));
     }
 }
+
+#[test]
+fn a_focal_spot_on_a_wide_detector_is_read_once_with_the_light_its_window_holds() {
+    // The app's default scene at its shortest line: a 0.5 mm Gaussian at
+    // 0.42 µm through an N-BK7 biconvex singlet (R ±50 mm, 4 mm thick), 256
+    // samples over 4 mm, onto a detector 46 mm behind it, 0.7 mm before the
+    // focus. Behind the lens the field turns 4.7 rad a sample where it holds
+    // a thousandth of its peak, and its samples' spectrum folds about 1% of
+    // the power back. The window chosen for the detector's plane had shrunk
+    // to 64λ, its moments predicting no spot, and cut 16% of the light; and
+    // the readout, its padded period 2.8 mm on a face 6 mm wide, laid the
+    // spot's copies beside it. Now: the faces reflect 8.5% (Fresnel at
+    // n = 1.528), the folded light leaves the window (about 2%, which the
+    // `Undersampled` warning names), and the spot lands once, on the two
+    // middle pixels. The detector is a strip, 24 × 1 pixels on 6 × 0.2 mm,
+    // wide enough to pass the readout's padded period and light to read.
+    use oc_core::build3::SingletGeom;
+    let mut s = Scene3::new();
+    let src = s.add_collimated_beam(Vec3::new(-70.0, 0.0, 0.0), 1.0, 1.0, 1, Spectrum::Monochromatic(0.42));
+    s.add_singlet(Vec3::ZERO, SingletGeom::biconvex(), 1.5168, 64.17);
+    let det = s.add_area_detector(Vec3::new(48.0, 0.0, 0.0), -Vec3::X, 3.0, 0.1, [24, 1]);
+    s.validate().unwrap();
+    let r = wave_path(&s, &spec(src, det, 0.5, 256, 4.0), 1).unwrap();
+    let l = r.report.ledger;
+    let detected = l.detected / l.launched;
+    let total: f64 = r.power.iter().sum();
+    let middle = (r.power[11] + r.power[12]) / total;
+    measured("focal spot on a strip: detected, of the launched power", detected);
+    measured("focal spot on a strip: left the window, of the launched power", l.left_window / l.launched);
+    measured("focal spot on a strip: share in the two middle pixels", middle);
+    assert!(detected > 0.88 && detected < 0.915, "{l:?}");
+    assert!(l.left_window < 0.03 * l.launched, "{l:?}");
+    assert!(middle > 0.999, "{:?}", r.power);
+    assert!(!r.report.warnings.iter().any(|w| matches!(w, SamplingWarning::Periodic { .. })), "{:?}", r.report.warnings);
+    assert!(r.report.warnings.iter().any(|w| matches!(w, SamplingWarning::Undersampled { what, .. } if what.contains("after face"))), "{:?}", r.report.warnings);
+}

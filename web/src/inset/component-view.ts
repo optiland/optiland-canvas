@@ -25,6 +25,7 @@ import type { InsetContent } from "./inset";
 import { createLensEditor } from "./lens-editor";
 import { createPolarizationEditor } from "./polarization-editor";
 import { createGratingEditor } from "./grating-editor";
+import { createModulatorEditor } from "./modulator-editor";
 import {
   drawHandle,
   fmt,
@@ -50,7 +51,7 @@ export type ComponentView = InsetContent & {
   debug: () => { id: number; kind: string; note: string; handles: { key: string; x: number; y: number }[] };
 };
 
-type EditorKind = "lens" | "fresnel" | "coating" | "polarizing" | "grating" | "aperture" | "detector" | "source" | "summary" | "none";
+type EditorKind = "lens" | "fresnel" | "coating" | "polarizing" | "grating" | "modulator" | "aperture" | "detector" | "source" | "summary" | "none";
 
 export function createComponentView(opts: {
   scene: Canvas;
@@ -130,6 +131,9 @@ export function createComponentView(opts: {
     // its R and T would be, so it has to be asked about first or it would open
     // the coating editor and show two empty curves.
     if (JSON.parse(scene.surfacePolarizationJSON(id))) return "polarizing";
+    // A DMD or SLM answers `surfaceCoatingJSON` with nulls as well; its
+    // pattern is what you came to edit.
+    if (JSON.parse(scene.modulatorJSON(id))) return "modulator";
     // A grating answers `surfaceCoatingJSON` with nulls too: it sends light
     // new ways rather than reflecting and transmitting it.
     if (JSON.parse(scene.gratingJSON(id))) return "grating";
@@ -196,6 +200,7 @@ export function createComponentView(opts: {
       case "coating": editor = createCoatingEditor(ctx); break;
       case "polarizing": editor = createPolarizationEditor(ctx); break;
       case "grating": editor = createGratingEditor(ctx); break;
+      case "modulator": editor = createModulatorEditor(ctx); break;
       case "aperture": editor = apertureView(ctx); break;
       case "detector": editor = createDetectorView(ctx); break;
       case "source": editor = sourceView(ctx); break;
@@ -222,6 +227,8 @@ export function createComponentView(opts: {
       ? (JSON.parse(scene.surfacePolarizationJSON(id))?.kind ?? "surface")
       : kind === "grating"
       ? `${JSON.parse(scene.gratingJSON(id))?.transmissive ? "transmission" : "reflection"} grating`
+      : kind === "modulator"
+      ? (JSON.parse(scene.modulatorJSON(id))?.kind === "dmd" ? "DMD" : "LCoS SLM")
       : o.kind === "profile"
       ? o.construction
       : o.kind;

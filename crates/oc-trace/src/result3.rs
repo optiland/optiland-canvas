@@ -800,6 +800,9 @@ pub struct EnergyLedger {
     pub absorbed_surface: f64,
     pub blocked_aperture: f64,
     pub truncated_flux: f64,
+    /// The diffraction orders a DMD or SLM in the orders ray model sent out
+    /// but the trace did not follow: past its count, or below its threshold.
+    pub untraced_orders: f64,
     pub numerical_loss: f64,
 }
 
@@ -813,6 +816,7 @@ impl EnergyLedger {
             + self.absorbed_surface
             + self.blocked_aperture
             + self.truncated_flux
+            + self.untraced_orders
             + self.numerical_loss
     }
 
@@ -836,6 +840,7 @@ impl EnergyLedger {
         self.absorbed_surface += o.absorbed_surface;
         self.blocked_aperture += o.blocked_aperture;
         self.truncated_flux += o.truncated_flux;
+        self.untraced_orders += o.untraced_orders;
         self.numerical_loss += o.numerical_loss;
     }
 }
@@ -925,6 +930,10 @@ pub enum PhysicsFeature {
     Retarder,
     VolumeAbsorption,
     SpectralResponse,
+    /// A DMD, in the geometric limit.
+    Micromirror,
+    /// An LCoS SLM, in the geometric limit.
+    PhaseModulator,
 }
 
 /// A feature that ran, but not exactly (§3.5). None are emitted yet — the

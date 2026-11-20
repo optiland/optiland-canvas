@@ -925,8 +925,10 @@ fn an_aperture_and_detector_match_f64() {
 
 #[test]
 fn a_thin_lens_matches_f64_for_skew_rays() {
-    // The ideal-lens slope law runs in both engines; the f32 preview must land
-    // where the f64 reference does, forward and backward.
+    // The ideal lens bends a ray along its quadratic phase's gradient,
+    // d′_t = d_t − p_t/f on direction cosines, in both engines; the f32
+    // preview must land where the f64 reference does, forward, backward and
+    // at skew incidence.
     let mut scene = Scene3::new();
     let id = scene.alloc_object_id();
     let mut common = ObjectCommon::new(id, LayerId(0));
@@ -953,6 +955,8 @@ fn a_thin_lens_matches_f64_for_skew_rays() {
         (Vec3::new(-30.0, 0.0, -8.0), Vec3::X),
         (Vec3::new(-30.0, 7.0, -4.0), Vec3::X),
         (Vec3::new(30.0, 6.0, -2.0), Vec3::NEG_X),
+        (Vec3::new(-30.0, 3.0, 2.0), Vec3::new(1.0, 0.1, -0.05).normalize()),
+        (Vec3::new(30.0, -4.0, 1.0), Vec3::new(-1.0, -0.08, 0.12).normalize()),
     ];
     assert_landing_matches(&scene, &rays);
 }
@@ -1997,6 +2001,149 @@ fn a_grating_matches_f64_order_for_order() {
             ] {
                 assert_tree_matches(&scene, ray, false);
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DMDs and LCoS SLMs, in the geometric limit
+// ---------------------------------------------------------------------------
+
+/// A modulator at x = 100 mm facing -X (its local X along world -Y, local Y
+/// along Z), and a detector 100 mm in front of it, so that a direction error
+/// of a milliradian lands twice the landing tolerance off. (A larger scene
+/// would loosen nothing but the start of each branch, which the preview
+/// offsets by its normalized epsilon.)
+fn modulator_scene(device: oc_core::modulator::SpatialModulator) -> Scene3 {
+    let mut scene = Scene3::new();
+    scene.add_modulator(Vec3::new(100.0, 0.0, 0.0), 180.0, device).unwrap();
+    add_rect_detector(&mut scene, Vec3::ZERO, Vec3::X, 80.0, 80.0, [8, 8]);
+    scene.validate().unwrap();
+    scene
+}
+
+/// A ray at wavelength `lambda_um` aimed at the device's local `(u, v)`, mm,
+/// along `dir`, from 60 mm in front.
+fn at_device(u: f64, v: f64, dir: Vec3, lambda_um: f64) -> (Vec3, Vec3, f64) {
+    let d = dir.normalize();
+    (Vec3::new(100.0, -u, v) - d * (60.0 / d.x), d, lambda_um)
+}
+
+fn dmd_device(axis: oc_core::modulator::TiltAxis, pattern: oc_core::modulator::Pattern) -> oc_core::modulator::SpatialModulator {
+    use oc_core::modulator::{DmdSpec, ModulatorKind, SpatialModulator};
+    SpatialModulator {
+        pixels: [33, 21],
+        pitch_um: 100.0,
+        kind: ModulatorKind::Dmd(DmdSpec {
+            tilt_deg: 12.0,
+            tilt_axis: axis,
+            mirror_fill: 0.9,
+            reflectance: 0.88,
+            window_transmittance: 0.97,
+        }),
+        pattern,
+    }
+}
+
+fn slm_device(pattern: oc_core::modulator::Pattern) -> oc_core::modulator::SpatialModulator {
+    use oc_core::modulator::{LcosSpec, ModulatorKind, PhaseLut, SpatialModulator};
+    SpatialModulator {
+        pixels: [33, 21],
+        pitch_um: 8.0,
+        kind: ModulatorKind::Lcos(LcosSpec {
+            director_deg: 30.0,
+            lut: PhaseLut::Linear { levels: 256, max_phase_rad: 2.0 * std::f64::consts::PI },
+            design_lambda_um: 0.633,
+            pixel_fill: 0.9,
+            gap_amplitude: 0.5,
+            gap_phase_rad: 0.0,
+            fringing_um: 0.0,
+            reflectance: 0.9,
+        }),
+        pattern,
+    }
+}
+
+/// The DMD cases: a binary grating (ON and OFF mirrors), every state (flat
+/// included) on side-tilted mirrors, and a uniform array.
+fn dmd_cases() -> Vec<oc_core::modulator::SpatialModulator> {
+    use oc_core::modulator::{Pattern, PatternGenerator, TiltAxis};
+    let every_state: Vec<u16> = (0..33 * 21).map(|q| (q % 3) as u16).collect();
+    vec![
+        dmd_device(
+            TiltAxis::Diagonal,
+            Pattern::Generated(PatternGenerator::BinaryGrating { period_px: 4.0, duty: 0.5, angle_deg: 0.0, phase: 0.0 }),
+        ),
+        dmd_device(TiltAxis::Side, Pattern::Explicit(every_state)),
+        dmd_device(TiltAxis::Diagonal, Pattern::Uniform { value: 1 }),
+    ]
+}
+
+/// Pixel centres, an off-centre point on a mirror, the dead space by a
+/// mirror's corner (index 3), normal and skew incidence, three wavelengths.
+fn dmd_rays() -> Vec<(Vec3, Vec3, f64)> {
+    let skew = Vec3::new(1.0, 0.2, -0.15);
+    vec![
+        at_device(0.0, 0.0, Vec3::X, 0.55),
+        at_device(0.2, 0.1, Vec3::X, 0.55),
+        at_device(0.31, -0.42, skew, 0.633),
+        at_device(0.048, 0.048, Vec3::X, 0.55),
+        at_device(-1.2, 0.7, skew, 0.45),
+    ]
+}
+
+/// The SLM cases: a blazed grating across both axes, a Fresnel lens, a
+/// vortex, and a uniform pattern (which steers nothing).
+fn slm_cases() -> Vec<oc_core::modulator::SpatialModulator> {
+    use oc_core::modulator::{Pattern, PatternGenerator};
+    vec![
+        slm_device(Pattern::Generated(PatternGenerator::BlazedGrating { period_px: 6.0, angle_deg: 30.0 })),
+        slm_device(Pattern::Generated(PatternGenerator::FresnelLens { focal_mm: 50.0 })),
+        slm_device(Pattern::Generated(PatternGenerator::Vortex { charge: 2 })),
+        slm_device(Pattern::Uniform { value: 100 }),
+    ]
+}
+
+/// Electrode centres, a pixel on the array's edge (one-sided difference),
+/// the dead space beside an electrode (index 3), the design wavelength and
+/// two others (the phase scales as λ₀/λ), normal and skew incidence.
+fn slm_rays() -> Vec<(Vec3, Vec3, f64)> {
+    let skew = Vec3::new(1.0, -0.1, 0.12);
+    vec![
+        at_device(0.024, 0.016, Vec3::X, 0.633),
+        at_device(-0.128, -0.04, Vec3::X, 0.633),
+        at_device(0.04, -0.064, skew, 0.532),
+        at_device(0.0039, 0.0, Vec3::X, 0.633),
+        at_device(0.096, 0.072, skew, 0.45),
+    ]
+}
+
+/// Both engines reflect each ray off the facet of the mirror it hits, tilted
+/// to that pixel's state, with the mirror's reflectance and the window's two
+/// passes, and absorb a ray that meets the dead space.
+#[test]
+fn a_dmd_matches_f64_mirror_for_mirror() {
+    for device in dmd_cases() {
+        let scene = modulator_scene(device);
+        for (k, ray) in dmd_rays().into_iter().enumerate() {
+            let segs = assert_tree_matches(&scene, ray, false);
+            let want = if k == 3 { 1 } else { 2 };
+            assert_eq!(segs.len(), want, "ray {k}: {segs:?}");
+        }
+    }
+}
+
+/// Both engines split an electrode's flux in two halves (the preview is
+/// unpolarized): one steered by the local phase gradient, one reflected
+/// specularly; the dead space is a mirror of |g|².
+#[test]
+fn an_slm_matches_f64_electrode_for_electrode() {
+    for device in slm_cases() {
+        let scene = modulator_scene(device);
+        for (k, ray) in slm_rays().into_iter().enumerate() {
+            let segs = assert_tree_matches(&scene, ray, false);
+            let want = if k == 3 { 2 } else { 3 };
+            assert_eq!(segs.len(), want, "ray {k}: {segs:?}");
         }
     }
 }

@@ -7,6 +7,7 @@ members = [
     "crates/oc-fit",
     "crates/oc-openuc2",
     "crates/oc-analysis",
+    "crates/oc-wave",
     "crates/oc-wasm",
     "crates/oc-py",
 ]
@@ -23,6 +24,7 @@ default-members = [
     "crates/oc-fit",
     "crates/oc-openuc2",
     "crates/oc-analysis",
+    "crates/oc-wave",
     "crates/oc-wasm",
 ]
 
@@ -38,6 +40,7 @@ oc-core = { path = "crates/oc-core" }
 oc-trace = { path = "crates/oc-trace" }
 oc-fit = { path = "crates/oc-fit" }
 oc-openuc2 = { path = "crates/oc-openuc2" }
+oc-wave = { path = "crates/oc-wave" }
 glam = { version = "0.29", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 # `float_roundtrip` because `.ocanvas` is the contract other tools build on, and
@@ -54,3 +57,12 @@ rayon = "1"
 [profile.release]
 opt-level = 3
 lto = "thin"
+
+# The wave-optics tests transform fields of a million samples and more. An
+# unoptimized FFT makes them minutes instead of seconds, and buys no debugging
+# anyone uses inside rustfft; the crates around it keep the usual dev profile.
+[profile.dev.package.rustfft]
+opt-level = 3
+
+[profile.dev.package.oc-wave]
+opt-level = 2

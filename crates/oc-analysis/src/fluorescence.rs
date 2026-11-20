@@ -500,6 +500,8 @@ impl Fluorescence {
                         sequence: SamplingSequence::Stratified,
                     },
                     window: Default::default(),
+                    coherence: None,
+                    polarization: None,
                 }
             })
             .collect();

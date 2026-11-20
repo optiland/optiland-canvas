@@ -631,6 +631,8 @@ mod tests {
             spectrum: Spectrum::Monochromatic(0.5),
             flux: 1.0,
             samples,
+            coherence: None,
+            polarization: None,
         }
     }
 

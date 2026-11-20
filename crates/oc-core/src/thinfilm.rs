@@ -104,141 +104,10 @@ pub(crate) mod mutation {
 #[cfg(test)]
 use mutation::Mutation;
 
-/// A complex number. Enough arithmetic for the transfer matrix and no more; a
-/// dependency for this would be four functions of value.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Cx {
-    pub re: f64,
-    pub im: f64,
-}
-
-impl Cx {
-    pub const fn new(re: f64, im: f64) -> Self {
-        Self { re, im }
-    }
-    pub const fn real(re: f64) -> Self {
-        Self { re, im: 0.0 }
-    }
-    pub fn conj(self) -> Self {
-        Self::new(self.re, -self.im)
-    }
-    /// `|z|²`, which is what the power coefficients actually want.
-    pub fn norm_sqr(self) -> f64 {
-        self.re * self.re + self.im * self.im
-    }
-    pub fn abs(self) -> f64 {
-        self.norm_sqr().sqrt()
-    }
-    /// The principal square root: the branch with `re ≥ 0`, and `+i` on the
-    /// negative real axis. This is what `numpy.sqrt` returns for a complex
-    /// argument, and matching it is what keeps an evanescent layer on the same
-    /// branch as the reference implementation.
-    pub fn sqrt(self) -> Self {
-        if self.re == 0.0 && self.im == 0.0 {
-            return Self::new(0.0, 0.0);
-        }
-        let m = self.abs();
-        // Near the real axis, but off it, one of the two half-angle formulas
-        // below subtracts two nearly equal numbers: for a film with k = 6e-4
-        // that lost 6e-9 in T (the `dispersive_catalogue_stack` fixture, against
-        // `tmm`, Optiland and the 40-digit oracle). There the small part is
-        // taken from the large one instead, `im / (2 re)`. Only there, so
-        // every result that was well conditioned keeps its bits.
-        if self.im != 0.0 && self.im.abs() < 1e-2 * self.re.abs() {
-            let big = ((m + self.re.abs()) * 0.5).sqrt();
-            let small = self.im.abs() / (2.0 * big);
-            return if self.re > 0.0 {
-                Self::new(big, if self.im < 0.0 { -small } else { small })
-            } else {
-                Self::new(small, if self.im < 0.0 { -big } else { big })
-            };
-        }
-        let re = ((m + self.re) * 0.5).max(0.0).sqrt();
-        let im = ((m - self.re) * 0.5).max(0.0).sqrt();
-        // `im == 0` on the positive real axis; on the negative real axis the
-        // real part vanishes instead and the sign below picks `+i`.
-        Self::new(re, if self.im < 0.0 { -im } else { im })
-    }
-    pub fn cos(self) -> Self {
-        Self::new(
-            self.re.cos() * self.im.cosh(),
-            -self.re.sin() * self.im.sinh(),
-        )
-    }
-    pub fn sin(self) -> Self {
-        Self::new(
-            self.re.sin() * self.im.cosh(),
-            self.re.cos() * self.im.sinh(),
-        )
-    }
-    pub fn is_finite(self) -> bool {
-        self.re.is_finite() && self.im.is_finite()
-    }
-    /// `e^{iθ}`: a unit phasor, which is what a retardance is.
-    pub fn expi(theta: f64) -> Self {
-        let (s, c) = theta.sin_cos();
-        Self::new(c, s)
-    }
-    /// The phase, in radians, on `(-π, π]`.
-    pub fn arg(self) -> f64 {
-        self.im.atan2(self.re)
-    }
-}
-
-impl std::ops::Neg for Cx {
-    type Output = Self;
-    fn neg(self) -> Self {
-        Self::new(-self.re, -self.im)
-    }
-}
-
-impl std::ops::Add for Cx {
-    type Output = Self;
-    fn add(self, o: Self) -> Self {
-        Self::new(self.re + o.re, self.im + o.im)
-    }
-}
-
-impl std::ops::Sub for Cx {
-    type Output = Self;
-    fn sub(self, o: Self) -> Self {
-        Self::new(self.re - o.re, self.im - o.im)
-    }
-}
-
-impl std::ops::Mul for Cx {
-    type Output = Self;
-    fn mul(self, o: Self) -> Self {
-        Self::new(
-            self.re * o.re - self.im * o.im,
-            self.re * o.im + self.im * o.re,
-        )
-    }
-}
-
-impl std::ops::Mul<f64> for Cx {
-    type Output = Self;
-    fn mul(self, k: f64) -> Self {
-        Self::new(self.re * k, self.im * k)
-    }
-}
-
-impl std::ops::Div for Cx {
-    type Output = Self;
-    /// Division, with a division by zero going to infinity rather than `NaN` so
-    /// a degenerate admittance shows up as total reflection instead of poisoning
-    /// the whole trace.
-    fn div(self, o: Self) -> Self {
-        let d = o.norm_sqr();
-        if d == 0.0 {
-            return Self::new(f64::INFINITY, f64::INFINITY);
-        }
-        Self::new(
-            (self.re * o.re + self.im * o.im) / d,
-            (self.im * o.re - self.re * o.im) / d,
-        )
-    }
-}
+/// The kernel's complex number. It lived here first; it moved to
+/// [`crate::complex`] so wave optics can use it without the `scene3` gate,
+/// and this path keeps every existing import working.
+pub use crate::complex::Cx;
 
 /// The optical constants of one film material: `n` and the extinction
 /// coefficient `k`, each constant or tabulated in wavelength.
@@ -568,6 +437,11 @@ pub enum CoatingBacking {
         /// where the iron absorbs. `0`, the default, is a lossless plate.
         #[serde(default, skip_serializing_if = "is_zero")]
         thickness_mm: f64,
+        /// How a coherent wave path adds the light the two faces send
+        /// between them ([`PlateRoundTrips`]). The ray tracer adds their
+        /// powers whatever this says.
+        #[serde(default, skip_serializing_if = "PlateRoundTrips::is_first_pass")]
+        round_trips: PlateRoundTrips,
     },
     /// A semi-infinite absorbing substrate: a metal block, a mirror whose
     /// metal is far thicker than its skin depth. Nothing comes out the far
@@ -582,6 +456,37 @@ pub enum CoatingBacking {
 
 fn is_zero(v: &f64) -> bool {
     *v == 0.0
+}
+
+/// How a coherent wave path treats the round trips between a coated plate's
+/// two faces. A monochromatic source does not lose its coherence because a
+/// substrate is thick: whether the round trips interfere depends on the
+/// source's coherence length against the plate's round trip, and on whether
+/// the faces are parallel to a fraction of a wavelength across the beam
+/// (Katsidis & Siapkas, *Appl. Opt.* 41, 3978 (2002); Byrnes,
+/// arXiv:1603.02720). The plate declares which it is.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlateRoundTrips {
+    /// The first pass alone: through the stack and out of the back face (or
+    /// the stack's reflection), the light the faces send round the plate
+    /// booked as light on another path. The default, and an approximation
+    /// the wave path's report names.
+    #[default]
+    FirstPass,
+    /// The round trips added in power, as for a source whose coherence length
+    /// is short against the round trip or a plate whose faces are not
+    /// parallel: the first pass's field carrying the whole series' power.
+    Incoherent,
+    /// The round trips summed as fields, `t₁t₂e^{iδ}/(1 − r₁′r₂′e^{2iδ})`,
+    /// `δ` from the plate's thickness: a parallel plate under a source
+    /// coherent across its round trip.
+    Coherent,
+}
+
+impl PlateRoundTrips {
+    pub fn is_first_pass(&self) -> bool {
+        *self == PlateRoundTrips::FirstPass
+    }
 }
 
 /// The second face of a plate.
@@ -932,10 +837,10 @@ fn stack_amp_pol(
         let big = a.norm_sqr().max(b.norm_sqr()).max(c.norm_sqr()).max(d.norm_sqr());
         if big > 1e200 {
             let k = 1.0 / big.sqrt();
-            a = a * k;
-            b = b * k;
-            c = c * k;
-            d = d * k;
+            a *= k;
+            b *= k;
+            c *= k;
+            d *= k;
             log_scale += 0.5 * big.ln();
         }
     }
@@ -1282,7 +1187,7 @@ pub fn coating_eval(
             // Everything that enters the substrate stays there.
             FilmRt { r_s: s.r, r_p: p.r, t_s: 0.0, t_p: 0.0 }
         }
-        CoatingBacking::Plate { substrate, exit, thickness_mm } => {
+        CoatingBacking::Plate { substrate, exit, thickness_mm, .. } => {
             let n_sub = sample_index(substrate, lambda_um, ctx, FilmError::SUBSTRATE, &mut notes)?;
             let residual = match exit {
                 ExitFace::Bare => 1.0,
@@ -1721,8 +1626,8 @@ fn flux_profile(layers: &[(Cx, f64)], n_sub: Cx, lambda_um: f64, q: Cx, p_pol: b
         let big = b.norm_sqr().max(c.norm_sqr());
         if big > 1e200 {
             let s = 1.0 / big.sqrt();
-            b = b * s;
-            c = c * s;
+            b *= s;
+            c *= s;
             ls += 0.5 * big.ln();
         }
         flux[k] = (b * c.conj()).re;
@@ -1824,7 +1729,7 @@ pub fn coating_power_flow_eval(
                 a_substrate_p: if opaque { sub_p } else { 0.0 },
             }
         }
-        CoatingBacking::Plate { substrate, exit, thickness_mm } => {
+        CoatingBacking::Plate { substrate, exit, thickness_mm, .. } => {
             let n_sub = sample_index(substrate, lambda_um, ctx, FilmError::SUBSTRATE, &mut scratch)?;
             let residual = match exit {
                 ExitFace::Bare => 1.0,
@@ -2101,7 +2006,7 @@ pub fn coating_mueller_eval(
     let n_far = Cx::real(n_far.max(1e-9));
     let mut residual = 1.0;
     match &c.backing {
-        CoatingBacking::Plate { substrate, exit, thickness_mm } => {
+        CoatingBacking::Plate { substrate, exit, thickness_mm, .. } => {
             if has_slab(c) {
                 return Err(FilmError::SlabOnPlate);
             }
@@ -2198,7 +2103,7 @@ fn mixed_eval(
     let (n_exit, exit_absorbs, plate_residual) = match &c.backing {
         CoatingBacking::Medium => (Cx::real(n_far.max(1e-9)), false, None),
         CoatingBacking::Opaque { substrate } => (sample_index(substrate, lambda_um, ctx, FilmError::SUBSTRATE, &mut notes)?, true, None),
-        CoatingBacking::Plate { substrate, exit, thickness_mm } => {
+        CoatingBacking::Plate { substrate, exit, thickness_mm, .. } => {
             if has_slab(c) {
                 return Err(FilmError::SlabOnPlate);
             }
@@ -2806,7 +2711,7 @@ pub fn plate_coating(
     if let Some(a) = design.adapt.as_mut() {
         a.substrate_n = substrate.index_at(design.lambda_nm / 1000.0).map_or(n_incident, |c| c.re);
     }
-    let backing = CoatingBacking::Plate { substrate, exit, thickness_mm: 0.0 };
+    let backing = CoatingBacking::Plate { substrate, exit, thickness_mm: 0.0, round_trips: PlateRoundTrips::FirstPass };
     let c = Coating {
         layers: design_layers_for(&design, n_incident, &backing, n_incident),
         backing,
@@ -2955,6 +2860,24 @@ pub fn crossing_nm(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_plate_s_round_trips_round_trip_through_json_and_default_to_the_first_pass() {
+        // A plate saved before the field existed loads as the first pass; a
+        // declared mode is written and read back; the default is not written.
+        let plate = |mode| CoatingBacking::Plate { substrate: FilmMaterial::constant("glass", 1.5), exit: ExitFace::Bare, thickness_mm: 1.0, round_trips: mode };
+        let old = r#"{"Plate":{"substrate":{"name":"glass","index":{"Constant":[1.5,0.0]}},"exit":"Bare","thickness_mm":1.0}}"#;
+        let first = serde_json::to_string(&plate(PlateRoundTrips::FirstPass)).unwrap();
+        assert!(!first.contains("round_trips"), "{first}");
+        let back: CoatingBacking = serde_json::from_str(&first).unwrap();
+        assert_eq!(back, plate(PlateRoundTrips::FirstPass));
+        let coherent = serde_json::to_string(&plate(PlateRoundTrips::Coherent)).unwrap();
+        assert!(coherent.contains("\"round_trips\":\"Coherent\""), "{coherent}");
+        assert_eq!(serde_json::from_str::<CoatingBacking>(&coherent).unwrap(), plate(PlateRoundTrips::Coherent));
+        if let Ok(b) = serde_json::from_str::<CoatingBacking>(old) {
+            assert_eq!(b, plate(PlateRoundTrips::FirstPass));
+        }
+    }
+
     #[test]
     fn the_cube_glass_is_not_a_free_choice() {
         // Titania and silica, the usual pair.
@@ -3464,7 +3387,7 @@ mod tests {
         let r = ((n - 1.0) / (n + 1.0)).powi(2);
         let bare = Coating {
             layers: Vec::new(),
-            backing: CoatingBacking::Plate { substrate: glass.clone(), exit: ExitFace::Bare, thickness_mm: d_mm },
+            backing: CoatingBacking::Plate { substrate: glass.clone(), exit: ExitFace::Bare, thickness_mm: d_mm, round_trips: Default::default() },
             incidence: Incidence::Film,
             design: None,
         };
@@ -3475,7 +3398,7 @@ mod tests {
 
         let silvered = Coating {
             layers: vec![FilmLayer::new(materials::silver(), 150.0)],
-            backing: CoatingBacking::Plate { substrate: glass, exit: ExitFace::Bare, thickness_mm: d_mm },
+            backing: CoatingBacking::Plate { substrate: glass, exit: ExitFace::Bare, thickness_mm: d_mm, round_trips: Default::default() },
             incidence: Incidence::Substrate,
             design: None,
         };
@@ -3505,6 +3428,7 @@ mod tests {
                 substrate: bk7.clone(),
                 exit: ExitFace::Bare,
                 thickness_mm: 0.0,
+                round_trips: Default::default(),
             },
             incidence: Incidence::Film,
             design: None,
@@ -3514,6 +3438,7 @@ mod tests {
                 substrate: bk7,
                 exit: ExitFace::AntiReflective { residual: 0.05 },
                 thickness_mm: 0.0,
+                round_trips: Default::default(),
             },
             ..bare.clone()
         };
@@ -4325,6 +4250,7 @@ mod tests {
                 substrate: FilmMaterial::absorbing("glass", 1.5168, 2e-6),
                 exit: ExitFace::Bare,
                 thickness_mm: 3.0,
+                round_trips: Default::default(),
             };
             c.incidence = incidence;
             for deg in [0.0f64, 45.0] {
@@ -4392,7 +4318,7 @@ mod tests {
         let glass = FilmMaterial::absorbing("glass", 1.5168, 3e-6);
         let plate = Coating {
             layers: films.clone(),
-            backing: CoatingBacking::Plate { substrate: glass.clone(), exit: ExitFace::Bare, thickness_mm: 2.0 },
+            backing: CoatingBacking::Plate { substrate: glass.clone(), exit: ExitFace::Bare, thickness_mm: 2.0, round_trips: Default::default() },
             incidence: Incidence::Film,
             design: None,
         };
@@ -4427,7 +4353,7 @@ mod tests {
         let films = vec![FilmLayer::new(FilmMaterial::constant("TiO2", 2.35), 58.0), FilmLayer::new(FilmMaterial::constant("SiO2", 1.46), 94.0)];
         let plate = Coating {
             layers: films.clone(),
-            backing: CoatingBacking::Plate { substrate: glass.clone(), exit: ExitFace::Bare, thickness_mm: 3.0 },
+            backing: CoatingBacking::Plate { substrate: glass.clone(), exit: ExitFace::Bare, thickness_mm: 3.0, round_trips: Default::default() },
             incidence: Incidence::Film,
             design: None,
         };
@@ -4488,6 +4414,7 @@ mod tests {
             substrate: FilmMaterial::absorbing("glass", 1.5168, 1e-6),
             exit: ExitFace::Bare,
             thickness_mm: 2.0,
+            round_trips: Default::default(),
         };
         c
     }

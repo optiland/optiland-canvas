@@ -93,6 +93,7 @@ fn c16_a_plate_puts_its_slab_in_the_volume() {
         substrate: FilmMaterial::absorbing("absorbing glass", 1.5168, 2e-5),
         exit: ExitFace::Bare,
         thickness_mm: 5.0,
+        round_trips: Default::default(),
     };
     let s = surface_with(coating);
     let r = trace3(&s, &rays(), &per_layer(true));

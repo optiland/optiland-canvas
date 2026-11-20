@@ -384,6 +384,8 @@ fn collimated_source(s: &mut Scene3, y: f64, half_width: f64, rays: u32) {
             angular_samples: 1,
             ..SourceSampling::default()
         },
+        coherence: None,
+        polarization: None,
     });
 }
 
@@ -506,6 +508,8 @@ fn a_cone_source_is_refused() {
         spectrum: Spectrum::Monochromatic(LAMBDA_D),
         flux: 1.0,
         samples: SourceSampling::default(),
+        coherence: None,
+        polarization: None,
     });
     match reduce_to_planar(&s, &Plane3::XY) {
         Err(ReductionIssue::NonPlanarSource { .. }) => {}

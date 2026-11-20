@@ -26,10 +26,12 @@
 #[cfg(feature = "scene3")]
 pub mod build3;
 pub mod colorimetry;
+pub mod complex;
 pub mod fidelity;
 #[cfg(feature = "scene3")]
 pub mod film_catalog;
 pub mod coordinates;
+pub mod encoding;
 #[cfg(feature = "scene3")]
 pub mod display_mesh;
 #[cfg(feature = "scene3")]
@@ -52,6 +54,7 @@ pub mod material;
 pub mod migrate_v1;
 #[cfg(feature = "scene3")]
 pub mod migrate_v2;
+pub mod modulator;
 #[cfg(feature = "scene3")]
 pub mod planar_reduce;
 #[cfg(feature = "scene3")]
@@ -82,6 +85,7 @@ pub mod tube;
 pub mod vec;
 pub mod vec3;
 
+pub use complex::Cx;
 pub use fragment::{
     FragmentError, IdRemap, InsertedFragment, ObjectIdSet, SceneFragment, Transform2,
 };

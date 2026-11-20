@@ -121,6 +121,7 @@ fn an_incoherent_plate_carries_polarization_without_an_approximation() {
             substrate: FilmMaterial::absorbing("glass", 1.5168, 2e-6),
             exit: ExitFace::Bare,
             thickness_mm: 3.0,
+            round_trips: Default::default(),
         },
         incidence: Incidence::Film,
         design: None,

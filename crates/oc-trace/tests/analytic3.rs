@@ -497,59 +497,91 @@ fn exit_dir(scene: &Scene3, ray: Ray3) -> Vec3 {
     *primary_dirs(&res).last().expect("ray reached the lens")
 }
 
+/// The direction the phase screen `exp(−ik|r|²/2f)` gives a ray of
+/// direction `d` meeting the lens plane (local `YZ`, axis `+X`) at `hit`: the
+/// direction cosines across the lens shifted by `−hit/f`, the ray going on to
+/// the same side (Q22 of the expert review of the wave engine).
+fn gradient_law(d: Vec3, hit: Vec3, f: f64) -> Vec3 {
+    let (ty, tz) = (d.y - hit.y / f, d.z - hit.z / f);
+    Vec3::new(d.x.signum() * (1.0 - ty * ty - tz * tz).sqrt(), ty, tz)
+}
+
 #[test]
-fn a_thin_lens_focuses_a_collimated_bundle_exactly_at_f() {
-    let scene = thin_lens_scene(50.0);
-    // Skew heights: nothing meridional about (y, z) = (7, -4).
-    for (y, z) in [(0.001, 0.0), (5.0, 0.0), (0.0, -8.0), (7.0, -4.0), (-12.0, 9.0)] {
-        let ray = Ray3::new(Vec3::new(-30.0, y, z), Vec3::X).unwrap();
-        let d = exit_dir(&scene, ray);
-        // Every ray passes exactly through the back focal point (50, 0, 0).
-        let expect = (Vec3::new(50.0, 0.0, 0.0) - Vec3::new(0.0, y, z)).normalize();
-        assert!(
-            (d - expect).length() < 1e-12,
-            "h = ({y}, {z}): {d:?} vs {expect:?}"
-        );
+fn a_thin_lens_bends_a_ray_by_its_phase_s_gradient() {
+    // The ideal lens is one operator for rays and waves: the quadratic phase
+    // `−k|r|²/2f` of the wave path, whose gradient over k shifts the ray's
+    // direction cosines across the lens by `−h/f` (the eikonal: M. Born, E.
+    // Wolf, *Principles of Optics*, 7th ed., §3.1). Skew heights and skew
+    // incidence, converging and diverging, forward and backward.
+    for f in [50.0, -50.0] {
+        let scene = thin_lens_scene(f);
+        for (y, z, dy, dz) in [(0.001, 0.0, 0.0, 0.0), (5.0, 0.0, 0.0, 0.0), (0.0, -8.0, 0.1, 0.0), (7.0, -4.0, -0.05, 0.2), (-12.0, 9.0, 0.0, -0.1)] {
+            for back in [false, true] {
+                let fwd = Vec3::new(1.0, dy, dz).normalize();
+                let d = if back { Vec3::new(-fwd.x, fwd.y, fwd.z) } else { fwd };
+                // Launched 30 mm before the lens plane, to meet it at (0, y, z).
+                let hit = Vec3::new(0.0, y, z);
+                let ray = Ray3::new(hit - d * (30.0 / d.x.abs()), d).unwrap();
+                let got = exit_dir(&scene, ray);
+                let want = gradient_law(d, hit, f);
+                assert!((got - want).length() < 1e-12, "f {f}, h ({y}, {z}), back {back}: {got:?} vs {want:?}");
+            }
+        }
     }
 }
 
 #[test]
-fn a_thin_lens_images_an_axial_point_exactly() {
-    // Object at 100 mm with f = 50: 1/s_o + 1/s_i = 1/f puts the image at
-    // exactly 100 mm behind the lens, for every aperture angle.
+fn a_collimated_bundle_crosses_the_axis_at_f_root_one_minus_h_over_f_squared() {
+    // The quadratic phase is the paraxial lens: a ray parallel to the axis at
+    // height h leaves with sin u′ = h/f and crosses the axis at
+    // f cos u′ = f√(1 − (h/f)²), reaching the focus f only as h → 0
+    // (the spherical aberration of the quadratic phase).
+    let f = 50.0;
+    let scene = thin_lens_scene(f);
+    for (y, z) in [(0.001, 0.0), (5.0, 0.0), (0.0, -8.0), (7.0, -4.0), (-12.0, 9.0)] {
+        let d = exit_dir(&scene, Ray3::new(Vec3::new(-30.0, y, z), Vec3::X).unwrap());
+        let h: f64 = (y * y + z * z).sqrt();
+        // Where the ray meets the axis: the transverse offset falls to zero.
+        let s = h / (d.y * d.y + d.z * d.z).sqrt();
+        let cross = s * d.x;
+        let want = f * (1.0 - (h / f).powi(2)).sqrt();
+        assert!((cross - want).abs() < 1e-9 * f, "h {h}: {cross} vs {want}");
+        // And through the axis, not beside it: the ray stays in its meridian.
+        assert!((d.y * z - d.z * y).abs() < 1e-12);
+    }
+    let paraxial = exit_dir(&scene, Ray3::new(Vec3::new(-30.0, 1e-4, 0.0), Vec3::X).unwrap());
+    assert!((1e-4 / -paraxial.y * paraxial.x - f).abs() < 1e-6, "{paraxial:?}");
+}
+
+#[test]
+fn a_thin_lens_images_an_axial_point_to_first_order() {
+    // Object at 100 mm with f = 50: 1/s_o + 1/s_i = 1/f puts the paraxial
+    // image 100 mm behind the lens. The quadratic phase meets it to first
+    // order in the aperture: the axial crossing departs from 100 mm as the
+    // square of the height (halving the height quarters the departure).
     let scene = thin_lens_scene(50.0);
     let src = Vec3::new(-100.0, 0.0, 0.0);
-    for (y, z) in [(3.0, 0.0), (0.0, 6.0), (-9.0, 5.0), (14.0, -8.0)] {
-        let hit = Vec3::new(0.0, y, z);
-        let ray = Ray3::new(src, (hit - src).normalize()).unwrap();
-        let d = exit_dir(&scene, ray);
-        let expect = (Vec3::new(100.0, 0.0, 0.0) - hit).normalize();
-        assert!(
-            (d - expect).length() < 1e-12,
-            "h = ({y}, {z}): {d:?} vs {expect:?}"
-        );
-    }
+    let crossing = |h: f64| {
+        let hit = Vec3::new(0.0, h, 0.0);
+        let d = exit_dir(&scene, Ray3::new(src, (hit - src).normalize()).unwrap());
+        h / -d.y * d.x
+    };
+    let (a, b) = (crossing(2.0) - 100.0, crossing(1.0) - 100.0);
+    assert!(crossing(1e-4) - 100.0 < 1e-6, "{}", crossing(1e-4));
+    assert!(a < 0.0 && ((a / b) - 4.0).abs() < 0.05, "{a} {b}");
 }
 
 #[test]
-fn a_backward_ray_converges_toward_the_front_focus() {
-    // Direction-aware sign: a bundle travelling -X focuses at (-50, 0, 0).
-    let scene = thin_lens_scene(50.0);
-    let ray = Ray3::new(Vec3::new(30.0, 6.0, -2.0), Vec3::NEG_X).unwrap();
-    let d = exit_dir(&scene, ray);
-    let expect = (Vec3::new(-50.0, 0.0, 0.0) - Vec3::new(0.0, 6.0, -2.0)).normalize();
-    assert!((d - expect).length() < 1e-12, "{d:?} vs {expect:?}");
-}
-
-#[test]
-fn a_diverging_thin_lens_diverges_from_the_virtual_front_focus() {
-    // f = -50: a parallel ray leaves along the line from the virtual focus
-    // (-50, 0, 0) through its hit point.
-    let scene = thin_lens_scene(-50.0);
-    let ray = Ray3::new(Vec3::new(-30.0, 8.0, 3.0), Vec3::X).unwrap();
-    let d = exit_dir(&scene, ray);
-    let expect = (Vec3::new(0.0, 8.0, 3.0) - Vec3::new(-50.0, 0.0, 0.0)).normalize();
-    assert!((d - expect).length() < 1e-12, "{d:?} vs {expect:?}");
+fn a_ray_the_gradient_takes_past_grazing_is_absorbed_at_the_lens() {
+    // f = 5 mm and a ray at 6 mm: the gradient asks for a direction cosine of
+    // 1.2 across the lens, which no propagating wave has. The flux is booked
+    // as absorbed at the lens, and the report names it.
+    let scene = thin_lens_scene(5.0);
+    let ray = Ray3::new(Vec3::new(-30.0, 6.0, 0.0), Vec3::X).unwrap();
+    let res = trace3(&scene, &[launch(ray, LAMBDA_D, 1.0)], &no_ghosts());
+    assert!((res.ledger.absorbed_surface - 1.0).abs() < 1e-12, "{:?}", res.ledger);
+    assert!(res.ledger.residual() < 1e-12);
+    assert_eq!(primary_dirs(&res).len(), 1);
 }
 
 #[test]

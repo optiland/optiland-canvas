@@ -173,10 +173,22 @@ export function initSlice3d(opts: {
     none: "no 3D scene",
   };
 
+  // What the f32 preview cannot draw, read once per scene revision: its rays
+  // pass straight through those elements, so the badge says so and names them.
+  let omittedRev = -1;
+  let omitted: { object: number; reason: string }[] = [];
   function refreshBadge() {
     const mode = scene.previewMode();
+    const rev = scene.sceneRevision();
+    if (rev !== omittedRev) {
+      omittedRev = rev;
+      omitted = JSON.parse(scene.previewOmittedJSON());
+    }
     badge.className = `badge3d ${mode}`;
-    badge.textContent = badgeText[mode] ?? mode;
+    badge.textContent = (badgeText[mode] ?? mode) + (omitted.length ? ` · preview omits ${omitted.length}` : "");
+    badge.title = omitted.length
+      ? `the f32 preview leaves these out (its rays pass through them; the f64 reference traces them):\n${omitted.map((o) => `#${o.object}: ${o.reason}`).join("\n")}`
+      : "";
   }
 
   // `fast` uses the interactive f32 path (during a drag); the default settles on
@@ -519,6 +531,8 @@ export function initSlice3d(opts: {
     // light that a line cannot show and should not look like a plain window.
     polarizing: { stroke: "rgba(186,168,235,0.95)", width: 2.5, dash: [2, 2] },
     surface: { stroke: "rgba(150,160,175,0.7)", width: 1.5 },
+    // A DMD or an SLM: a pixelated face, drawn dotted.
+    modulator: { stroke: "rgba(175,195,225,0.95)", width: 3, dash: [1.5, 1.5] },
     detector: { stroke: "rgba(127,214,255,0.85)", width: 2 },
     aperture: { stroke: "rgba(210,165,120,0.85)", width: 2.5 },
   };

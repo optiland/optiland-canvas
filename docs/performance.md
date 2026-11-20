@@ -198,6 +198,69 @@ The preview recompiles on every frame of a drag, so this is a per-frame cost
 for a coated face that is being moved; a scene's coatings that are not edited
 cost it once per compile.
 
+## Wave optics (`oc-wave`)
+
+The scalar wave kernel ([ADR 0004](architecture/adr/0004-scalar-wave-optics-engine.md),
+[wave-optics.md](wave-optics.md)) runs in the app in a worker of its own (W5),
+off the page thread. Its native timings, single thread, release, AMD Ryzen 9
+9900X, measured 2026-10-19:
+
+```text
+cargo run -p oc-wave --release --example bench_wave
+```
+
+| n² | 2D FFT | bridging `Cx` to rustfft's type | share |
+|---|---|---|---|
+| 128² | 0.07 ms | 0.01 ms | 7.0% |
+| 256² | 0.61 ms | 0.03 ms | 4.7% |
+| 512² | 2.49 ms | 0.13 ms | 5.1% |
+| 1024² | 11.8 ms | 0.82 ms | 6.9% |
+| 2048² | 53.8 ms | 6.0 ms | 11.2% |
+
+| Field (padded 2×) | One band-limited angular-spectrum step |
+|---|---|
+| 128² (256²) | 2.9 ms |
+| 256² (512²) | 11.7 ms |
+| 512² (1024²) | 52 ms |
+| 1024² (2048²) | 209 ms |
+
+ADR 0004 set a 15% ceiling on the bridge before the internals would switch
+type; it is under that everywhere. The plan's initial gate for a settled
+1024² step natively is 200 ms. At 209 ms it is just over: the cost is the
+per-sample transfer function (a square root and a sine-cosine pair over 4.2 M
+samples) as much as the transforms. The gate is recorded here rather than
+moved.
+
+In the browser (Playwright 1.61's bundled Chromium, same machine,
+2026-10-19; `tests/wave-bench.spec.ts`, opt-in): the whole wave path of the
+default scene with its singlet taken out, one band-limited angular-spectrum
+step over 118 mm and the detector readout, timed in the worker from the
+scene's load to the result:
+
+| Field | Wave path in the worker | Longest page task meanwhile |
+|---|---|---|
+| 128² | 10 ms (6 ms warm) | 0 ms |
+| 256² | 22 ms | 0 ms |
+| 512² | 87 ms | 0 ms |
+| 1024² | 298 ms | 0 ms |
+
+The page thread ran no task over 50 ms during any of them: the work is the
+worker's. One earlier run's first measurement showed a single 1.7 s page task
+that did not recur on a repeat; it is recorded here, not explained.
+
+The wave tests transform million-sample fields, so `rustfft` and `oc-wave` get
+an optimized dev profile in the workspace `Cargo.toml`. Without it the analytic
+suite takes 37 s in a debug build; with it, under 3 s.
+
+## Diffraction orders in the ray tracer
+
+A DMD or SLM in the orders ray model (W7) computes its unit cell's order
+table at every hit: for a 7.56 µm pitch at 550 nm about 750 propagating
+orders, each a product of sincs, a few tens of microseconds. Each hit then
+spawns up to `max_orders` children, so a trace's ray count grows by that
+factor at every modulator a ray meets; the editor's setting is 16 above
+0.1%. The TI test (64 rays, every order above 1e-9 followed) runs in 10 ms.
+
 ## What each fidelity switch costs
 
 Relative trace time of each switch value against the value named, about 200000 launch rays per scene, best of 3, ghosts off, deposits recorded on every body. Measured on one Windows desktop (release build, all cores), regenerated with

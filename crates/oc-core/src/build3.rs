@@ -492,6 +492,8 @@ impl Scene3 {
                 seed: 1,
                 sequence: SamplingSequence::Grid,
             },
+            coherence: None,
+            polarization: None,
         });
         id
     }
@@ -1618,6 +1620,45 @@ impl Scene3 {
         id.0
     }
 
+    /// Add a spatial light modulator: `device` on a standalone rectangle the
+    /// size of its pixel array, centred at `pos`, its normal tilted `tilt_deg`
+    /// in the meridional plane like [`Self::add_planar_element`], pixel rows
+    /// along world `Z`. The front is the device; the back absorbs. Returns the
+    /// new surface's id, or `None` if the device does not validate.
+    pub fn add_modulator(
+        &mut self,
+        pos: Vec3,
+        tilt_deg: f64,
+        device: crate::modulator::SpatialModulator,
+    ) -> Option<u64> {
+        device.validate().ok()?;
+        let phi = tilt_deg.to_radians();
+        let z = Vec3::new(phi.cos(), phi.sin(), 0.0);
+        let y = Vec3::Z;
+        let x = y.cross(z);
+        let q = glam::DQuat::from_mat3(&glam::DMat3::from_cols(x, y, z));
+        let transform =
+            Isometry3::new(pos, [q.x, q.y, q.z, q.w]).unwrap_or_else(|_| Isometry3::from_pos(pos));
+        let id = self.alloc_object_id();
+        let mut common = ObjectCommon::new(id, LayerId(0));
+        common.transform = transform;
+        let p = device.pitch_mm();
+        let (hw, hh) = (0.5 * device.pixels[0] as f64 * p, 0.5 * device.pixels[1] as f64 * p);
+        common.label = match device.kind {
+            crate::modulator::ModulatorKind::Dmd(_) => "DMD".into(),
+            crate::modulator::ModulatorKind::Lcos(_) => "SLM".into(),
+        };
+        self.surfaces.push(SurfaceObject3 {
+            common,
+            geometry: SurfaceGeometry3::Plane {
+                shape: PlanarShape2::Rectangle { half_width_mm: hw, half_height_mm: hh },
+            },
+            response_front: SurfaceResponse::Modulator { device: Box::new(device), ray_model: crate::modulator::RayModel::Geometric },
+            response_back: SurfaceResponse::Absorber,
+        });
+        Some(id.0)
+    }
+
     /// Change grating `id`: its groove density, its order, whether it
     /// transmits, and, when given, a constant efficiency for the working
     /// order and for the zero order (replacing any table). A reflection
@@ -2533,7 +2574,7 @@ pub fn axial_aoi_deg(tilt_deg: f64) -> f64 {
 /// `dichroic` (a [`DichroicSpec`] coating), `coated` (any other tabulated
 /// reflectance/transmittance), `film` (a real thin-film stack), `table` (a
 /// measured or supplied table with an angle axis), `polarizer`, `retarder`,
-/// `refract`, or `thin-lens`.
+/// `refract`, `thin-lens`, `grating`, `dmd` or `slm`.
 pub fn response_kind(r: &SurfaceResponse) -> &'static str {
     match r {
         SurfaceResponse::Mirror { .. } => "mirror",
@@ -2563,6 +2604,10 @@ pub fn response_kind(r: &SurfaceResponse) -> &'static str {
         SurfaceResponse::ThinLens { .. } => "thin-lens",
         SurfaceResponse::IdealMirror { .. } => "ideal-mirror",
         SurfaceResponse::Grating { .. } => "grating",
+        SurfaceResponse::Modulator { device, .. } => match device.kind {
+            crate::modulator::ModulatorKind::Dmd(_) => "dmd",
+            crate::modulator::ModulatorKind::Lcos(_) => "slm",
+        },
     }
 }
 

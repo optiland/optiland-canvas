@@ -560,9 +560,95 @@ fn interact_surface(
             min_flux,
         );
     };
+    // A primary branch leaving in `dir`: no ghost, no TIR.
+    let send = |stack: &mut Vec<Work>, dir: Vec3, flux: f32| {
+        push(
+            stack,
+            Work {
+                o: point + dir * EPS,
+                d: dir,
+                flux,
+                depth: w.depth + 1,
+                gdepth: w.gdepth,
+                medium_n: w.medium_n,
+                medium_alpha: w.medium_alpha,
+                flags: w.flags & !SEG_TIR,
+            },
+            max_depth,
+            min_flux,
+        );
+    };
 
     match resp {
         GpuResponse::Absorber => { /* terminate */ }
+        GpuResponse::Micromirror(m) => {
+            // tracer3's `modulator_ray`: the ray reflects off the facet of the
+            // mirror it hits, tilted to that pixel's state, with the mirror's
+            // reflectance and the window's two passes. The dead space between
+            // mirrors, and anything off the array, absorbs.
+            let pl = s.rot.transpose() * (point - s.pos);
+            let Some((i, j)) = m.array.pixel(pl.x, pl.y) else {
+                return;
+            };
+            let n_local = m.normals[m.states.state((j * m.array.pixels[0] + i) as usize) as usize];
+            // Inside the mirror's outline projected onto the array? Across
+            // the hinge the outline is compressed by cos θ: undo that.
+            let c = m.array.center(i, j);
+            let (dx, dy) = (pl.x - c.x, pl.y - c.y);
+            let [h, a] = m.hinge;
+            let (sh, sa) = (dx * h.x + dy * h.y, (dx * a.x + dy * a.y) / n_local.z);
+            let (ux, uy) = (h.x * sh + a.x * sa, h.y * sh + a.y * sa);
+            let half = 0.5 * m.fill * m.array.pitch;
+            if ux.abs() > half || uy.abs() > half {
+                return;
+            }
+            let normal = (s.rot * n_local).normalize();
+            let facing = if w.d.dot(normal) < 0.0 { normal } else { -normal };
+            send(stack, reflect(w.d, facing), flux_end * m.r);
+        }
+        GpuResponse::PhaseModulator(m) => {
+            // tracer3's `modulator_ray` with polarization off: on an
+            // electrode, half the flux (the share on the director) is steered
+            // by the local phase gradient and half reflects specularly; the
+            // dead space is a mirror of |g|².
+            let rt = s.rot.transpose();
+            let pl = rt * (point - s.pos);
+            let Some((i, j)) = m.array.pixel(pl.x, pl.y) else {
+                return;
+            };
+            let c = m.array.center(i, j);
+            let half = 0.5 * m.fill * m.array.pitch;
+            if (pl.x - c.x).abs() > half || (pl.y - c.y).abs() > half {
+                send(stack, reflect(w.d, n_oppose), flux_end * m.gap_r);
+                return;
+            }
+            // The phase scales as λ₀/λ; differences wrap into (−π, π]; the
+            // array's edge takes a one-sided difference.
+            let [nx, ny] = m.array.pixels;
+            let scale = m.design_lambda_um / lambda;
+            let two_pi = 2.0 * std::f32::consts::PI;
+            let phase = |ii: u32, jj: u32| m.phase[(jj * nx + ii) as usize] * scale;
+            let wrap = |x: f32| (x + std::f32::consts::PI).rem_euclid(two_pi) - std::f32::consts::PI;
+            let (gx, gy) = if m.phase.is_empty() {
+                (0.0, 0.0)
+            } else {
+                let (a, b) = (i.saturating_sub(1), (i + 1).min(nx - 1));
+                let gx = if a == b { 0.0 } else { wrap(phase(b, j) - phase(a, j)) / (b - a) as f32 };
+                let (a, b) = (j.saturating_sub(1), (j + 1).min(ny - 1));
+                let gy = if a == b { 0.0 } else { wrap(phase(i, b) - phase(i, a)) / (b - a) as f32 };
+                (gx, gy)
+            };
+            // Δ(direction cosine) = (λ/2π)∇φ, with ∇φ per pixel.
+            let k = lambda / (w.medium_n * m.pitch_um * two_pi);
+            let dl = rt * w.d;
+            let (tx, ty) = (dl.x + k * gx, dl.y + k * gy);
+            let share = 0.5 * m.r;
+            if tx * tx + ty * ty < 1.0 {
+                let dir = (s.rot * Vec3::new(tx, ty, (1.0 - tx * tx - ty * ty).sqrt())).normalize();
+                send(stack, dir, flux_end * share);
+            }
+            send(stack, reflect(w.d, n_oppose), flux_end * share);
+        }
         GpuResponse::Mirror { r } => {
             // A table with no value at this wavelength ends the branch (tracer3
             // names it as unsupported physics).
@@ -691,24 +777,24 @@ fn interact_surface(
             );
         }
         GpuResponse::ThinLens { f } => {
-            // Ideal-lens slope law u' = u − h/f in the surface's local frame
-            // (direction-aware; mirrors tracer3's f64 branch). Full
-            // transmission, no reflection, no absorption.
+            // The quadratic phase's gradient in the surface's local frame
+            // (mirrors tracer3's f64 branch): d′_t = d_t − p_t/f on direction
+            // cosines, d′_z = sign(d_z)√(1 − |d′_t|²). Full transmission; a
+            // ray the gradient takes past grazing is absorbed.
             let f = *f;
             let rt = s.rot.transpose();
             let pl = rt * (point - s.pos);
             let dl = rt * w.d;
-            let dir = if dl.z.abs() < 1e-6 || f == 0.0 {
-                w.d
-            } else {
-                s.rot
-                    * Vec3::new(
-                        dl.x - dl.z.abs() * pl.x / f,
-                        dl.y - dl.z.abs() * pl.y / f,
-                        dl.z,
-                    )
-                    .normalize()
-            };
+            if f == 0.0 {
+                return;
+            }
+            let (tx, ty) = (dl.x - pl.x / f, dl.y - pl.y / f);
+            let t2 = tx * tx + ty * ty;
+            if t2 >= 1.0 {
+                return;
+            }
+            let side = if dl.z < 0.0 { -1.0 } else { 1.0 };
+            let dir = (s.rot * Vec3::new(tx, ty, side * (1.0 - t2).sqrt())).normalize();
             push(
                 stack,
                 Work {

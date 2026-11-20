@@ -620,6 +620,8 @@ impl Scene3 {
                 seed: 0,
                 sequence: SamplingSequence::Sobol,
             },
+            coherence: None,
+            polarization: None,
         });
         self.solar = Some(Box::new(SolarRig {
             site,

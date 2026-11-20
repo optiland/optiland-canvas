@@ -337,6 +337,8 @@ fn response_to_spec(object: u64, r: &SurfaceResponse) -> Result<SurfaceSpec, Red
         SurfaceResponse::IdealMirror { .. } => Err(unsupported("ideal mirror")),
         // v1 has no diffraction at all.
         SurfaceResponse::Grating { .. } => Err(unsupported("grating")),
+        // Nor pixels, nor a mirror per pixel.
+        SurfaceResponse::Modulator { .. } => Err(unsupported("spatial light modulator")),
     }
 }
 

@@ -332,6 +332,8 @@ mod tests {
                 seed: 0,
                 sequence: SamplingSequence::Grid,
             },
+            coherence: None,
+            polarization: None,
         });
         let q = glam::DQuat::from_rotation_arc(Vec3::Z, -Vec3::X);
         let mut common = ObjectCommon::new(scene.alloc_object_id(), LayerId(0));

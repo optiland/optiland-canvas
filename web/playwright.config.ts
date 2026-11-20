@@ -31,7 +31,7 @@ export default defineConfig({
     {
       name: "chromium",
       // Need a GPU or a local baseline; they run only in the opt-in projects below.
-      testIgnore: /webgpu\.spec\.ts|render3d-(visual|bench)\.spec\.ts|reference-bench\.spec\.ts/,
+      testIgnore: /webgpu\.spec\.ts|render3d-(visual|bench)\.spec\.ts|(reference|wave)-bench\.spec\.ts/,
       use: {
         ...devices["Desktop Chrome"],
         // After the device spread, which carries its own 1280x720 and would
@@ -87,7 +87,7 @@ export default defineConfig({
       ? [
           {
             name: "bench",
-            testMatch: /(render3d|reference)-bench\.spec\.ts/,
+            testMatch: /(render3d|reference|wave)-bench\.spec\.ts/,
             timeout: 600_000,
             use: {
               ...devices["Desktop Chrome"],

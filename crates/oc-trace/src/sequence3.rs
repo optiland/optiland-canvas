@@ -16,6 +16,9 @@
 //! ([`SequenceError::NotReached`] carries every branch's actual fate), or it
 //! reached it more than one way ([`SequenceError::Ambiguous`] names the
 //! chains, and the caller disambiguates by declaring a tighter intent).
+//! A coherent consumer wants every way, not one: [`extract_sequences3`]
+//! returns one prescription per branch lineage that reaches the detector,
+//! which the wave path adds as the arms of an interferometer.
 //!
 //! Extraction traces **one** launch ray with ghosts off: Fresnel
 //! back-reflections are not part of a designed sequence, while deterministic
@@ -136,10 +139,15 @@ pub fn axial_launch(source: &Source3) -> Result<LaunchRay3, SequenceError> {
 ///
 /// `flux_eps` is far below the default because a legitimate chain through k
 /// lossy splitters carries `~0.5^k` of the launch flux, and culling it would
-/// turn a real sequence into a false [`SequenceError::NotReached`].
+/// turn a real sequence into a false [`SequenceError::NotReached`]. The trace
+/// is unpolarized for the same reason: crossed polarizers on the path pass
+/// nothing of a polarized ray, though the chain through them is as real as
+/// any, and a polarizer in an unpolarized trace is the half it passes of
+/// unpolarized light.
 fn extraction_config(revision: u64) -> TraceConfig3 {
     TraceConfig3 {
         ghosts: false,
+        polarization: false,
         record_events: true,
         record_detector_hits: false,
         max_depth: 64,
@@ -176,6 +184,106 @@ pub fn extract_sequence3(
     detector: DetectorId,
     revision: u64,
 ) -> Result<SequencePrescription3, SequenceError> {
+    let mut chains = extract_chains(scene, source, detector, None, revision, false, &|c| c)?;
+    Ok(chains.remove(0))
+}
+
+/// Every chain from `source` to `detector`: one prescription per branch
+/// lineage of the axial ray that reaches it, in the order the trace met the
+/// detector. Where splitter arms recombine on the detector (an
+/// interferometer) there are several, and a coherent computation needs all
+/// of them; [`extract_sequence3`] calls that [`SequenceError::Ambiguous`].
+/// The axial ray is traced at `lambda_um`, or the source's highest-weight
+/// line when `None`: a dispersive element sends each wavelength its own way.
+pub fn extract_sequences3(
+    scene: &Scene3,
+    source: SourceId,
+    detector: DetectorId,
+    lambda_um: Option<f64>,
+    revision: u64,
+) -> Result<Vec<SequencePrescription3>, SequenceError> {
+    extract_chains(scene, source, detector, lambda_um, revision, true, &|c| c)
+}
+
+/// The chains a coherent wave path follows from `source` to `detector`: as
+/// [`extract_sequences3`], with two differences that make a chain stand for
+/// the field rather than for its axial ray (R17 and R18 of the expert review
+/// of the wave engine). An aperture does not stop the axial ray, so a field
+/// an aperture lets through around the axis (an annular stop's, whose centre
+/// blocks the axial ray) still has a chain; the wave path lays the aperture on
+/// the field where the chain crosses it. And under the geometric ray model a
+/// DMD is traced once per mirror family its pattern holds, every mirror
+/// taken in that family, so that each family the field lights has its chain
+/// whatever the one pixel (or gap) the axial ray meets. The chains of every
+/// run are gathered, the same chain found twice kept once; the error is the
+/// plain extraction's when no run reaches the detector.
+pub fn extract_wave_sequences3(
+    scene: &Scene3,
+    source: SourceId,
+    detector: DetectorId,
+    lambda_um: Option<f64>,
+    revision: u64,
+) -> Result<Vec<SequencePrescription3>, SequenceError> {
+    use oc_core::modulator::{DmdState, ModulatorKind};
+    use oc_core::scene3::SurfaceResponse;
+    let mut families: Vec<Option<DmdState>> = vec![None];
+    for s in &scene.surfaces {
+        for r in [&s.response_front, &s.response_back] {
+            if let SurfaceResponse::Modulator { device, ray_model, .. } = r {
+                if matches!(device.kind, ModulatorKind::Dmd(_)) && ray_model.is_geometric() {
+                    for st in [DmdState::On, DmdState::Off, DmdState::Flat] {
+                        let present = (0..device.pixels[1] as usize).any(|j| (0..device.pixels[0] as usize).any(|i| DmdState::from_value(device.value(i, j)) == st));
+                        if present && !families.contains(&Some(st)) {
+                            families.push(Some(st));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut found: Vec<SequencePrescription3> = Vec::new();
+    let mut first_err = None;
+    for fam in families {
+        match extract_chains(scene, source, detector, lambda_um, revision, true, &|mut c| {
+            c.apertures_stop = false;
+            c.dmd_family = fam;
+            c
+        }) {
+            Ok(chains) => {
+                for c in chains {
+                    let same = |a: &SequencePrescription3| {
+                        a.hits.len() == c.hits.len()
+                            && a.hits.iter().zip(&c.hits).all(|(x, y)| x.object == y.object && x.action == y.action && (x.point - y.point).length() < 1e-9)
+                            && (a.terminal.point - c.terminal.point).length() < 1e-9
+                    };
+                    if !found.iter().any(same) {
+                        found.push(c);
+                    }
+                }
+            }
+            Err(e) => {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+    }
+    if found.is_empty() {
+        return Err(first_err.expect("one run at least"));
+    }
+    Ok(found)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn extract_chains(
+    scene: &Scene3,
+    source: SourceId,
+    detector: DetectorId,
+    lambda_um: Option<f64>,
+    revision: u64,
+    all: bool,
+    tune: &dyn Fn(TraceConfig3) -> TraceConfig3,
+) -> Result<Vec<SequencePrescription3>, SequenceError> {
     let src = scene
         .sources
         .iter()
@@ -185,8 +293,11 @@ pub fn extract_sequence3(
         return Err(SequenceError::DetectorNotFound(detector));
     }
 
-    let launch = axial_launch(src)?;
-    let cfg = extraction_config(revision);
+    let mut launch = axial_launch(src)?;
+    if let Some(l) = lambda_um {
+        launch.lambda_um = l;
+    }
+    let cfg = tune(extraction_config(revision));
     let result = trace3(scene, &[launch], &cfg);
     let events = &result.events;
 
@@ -290,19 +401,12 @@ pub fn extract_sequence3(
                 fates,
             })
         }
-        1 => {
-            let (path, terminal_idx) = survivors[0];
-            Ok(build_prescription(
-                scene,
-                &launch,
-                source,
-                detector,
-                revision,
-                events,
-                &lineage(path),
-                terminal_idx,
-            ))
-        }
+        n if n == 1 || all => Ok(survivors
+            .iter()
+            .map(|&(path, terminal_idx)| {
+                build_prescription(scene, &launch, source, detector, revision, events, &lineage(path), terminal_idx)
+            })
+            .collect()),
         _ => Err(SequenceError::Ambiguous {
             source,
             detector,
@@ -350,7 +454,7 @@ fn build_prescription(
         .unwrap_or(1);
     if spectral_lines > 1 {
         notes.push(format!(
-            "source has {spectral_lines} spectral lines; extracted at its highest-weight line \
+            "source has {spectral_lines} spectral lines; extracted at \
              λ = {} µm",
             launch.lambda_um
         ));
@@ -614,6 +718,20 @@ mod tests {
             SequenceError::Ambiguous { chains, .. } => assert_eq!(chains.len(), 2),
             other => panic!("expected Ambiguous, got {other:?}"),
         }
+
+        // Asked for every chain, the extractor gives both arms, each a whole
+        // prescription: the splitter's two actions, each arm's own fold.
+        let all = extract_sequences3(&s, src, det, None, 0).unwrap();
+        assert_eq!(all.len(), 2);
+        let actions: Vec<SeqAction> = all.iter().map(|p| p.hits[0].action).collect();
+        assert!(actions.contains(&SeqAction::Reflect) && actions.contains(&SeqAction::Transmit), "{actions:?}");
+        for p in &all {
+            assert_eq!(p.hits.len(), 2, "splitter and fold: {:?}", p.hits);
+            assert_eq!(p.terminal.detector, det);
+        }
+        // At another wavelength the chains are traced there.
+        let at = extract_sequences3(&s, src, det, Some(0.8), 0).unwrap();
+        assert!(at.iter().all(|p| close(p.launch.lambda_um, 0.8)));
     }
 
     #[test]

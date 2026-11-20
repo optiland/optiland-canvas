@@ -211,6 +211,28 @@ fn tables_to_v2(scene: &mut Scene3, losses: &mut Vec<String>) {
     }
 }
 
+/// A v2 reader has no pixelated modulator, and no other response sends light
+/// where a micromirror or a phase pattern does: a flat mirror would reflect it
+/// the wrong way. Each is written as an absorber of the same footprint, with
+/// a loss line naming it.
+fn modulators_to_v2(scene: &mut Scene3, losses: &mut Vec<String>) {
+    for s in &mut scene.surfaces {
+        for r in [&mut s.response_front, &mut s.response_back] {
+            if let SurfaceResponse::Modulator { device, .. } = r {
+                let kind = match device.kind {
+                    crate::modulator::ModulatorKind::Dmd(_) => "DMD",
+                    crate::modulator::ModulatorKind::Lcos(_) => "LCoS SLM",
+                };
+                losses.push(format!(
+                    "surface #{}: a {kind} has no v2 form and is written as an absorber of the same footprint",
+                    s.common.id.0
+                ));
+                *r = SurfaceResponse::Absorber;
+            }
+        }
+    }
+}
+
 /// The scene as a v2 document, and what v2 could not say.
 ///
 /// Empty losses means the v2 document holds everything the scene does, which
@@ -258,6 +280,12 @@ pub fn to_v2(scene: &Scene3) -> (Scene3, Vec<String>) {
         }
     });
     tables_to_v2(&mut s, &mut losses);
+    modulators_to_v2(&mut s, &mut losses);
+    for src in &mut s.sources {
+        if src.coherence.take().is_some() {
+            losses.push(format!("source #{}: its coherent beam is dropped; v2 has no wave path", src.id.0));
+        }
+    }
     if !s.film_catalog.is_empty() {
         s.film_catalog.clear();
     }

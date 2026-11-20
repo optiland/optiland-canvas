@@ -189,6 +189,14 @@ const RESP_COATING: u32 = 5u;
 const RESP_FLAG_STRAY: u32 = 1u;
 // A transmission grating. Must match buffers3::RESP_FLAG_TRANSMIT.
 const RESP_FLAG_TRANSMIT: u32 = 2u;
+// A DMD and an LCoS SLM in the geometric limit; the slots each uses are
+// documented at buffers3::RESP_MICROMIRROR and RESP_PHASE_MODULATOR. A
+// modulator with RESP_FLAG_PER_PIXEL carries a value per pixel in `verts`.
+const RESP_MICROMIRROR: u32 = 8u;
+const RESP_PHASE_MODULATOR: u32 = 9u;
+const RESP_FLAG_PER_PIXEL: u32 = 4u;
+const MOD_PI: f32 = 3.14159265358979;
+const MOD_TWO_PI: f32 = 6.28318530717959;
 
 // A baked thin-film coating. `resp.t` holds the wavelength axis (tab_count
 // entries at tab_start, x = lambda) and `resp.r` the grid itself: COAT_ANGLES
@@ -984,6 +992,50 @@ fn reflect3(d: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
     return normalize(d - 2.0 * dot(d, n) * n);
 }
 
+// The pixel of a modulator's array (`a`: pitch, columns, rows) that a local
+// point falls in, and its centre. Mirrors cpu3's `PixelArray32`.
+struct Pixel {
+    ok: bool,
+    i: u32,
+    j: u32,
+    c: vec2<f32>,
+};
+
+fn modulator_pixel(a: Spectral, pl: vec3<f32>) -> Pixel {
+    let nx = f32(a.tab_count);
+    let ny = f32(a.policy);
+    let fx = pl.x / a.value + nx * 0.5;
+    let fy = pl.y / a.value + ny * 0.5;
+    if (fx < 0.0 || fy < 0.0 || fx >= nx || fy >= ny) {
+        return Pixel(false, 0u, 0u, vec2<f32>(0.0));
+    }
+    let i = u32(floor(fx));
+    let j = u32(floor(fy));
+    let c = vec2<f32>((f32(i) - (nx - 1.0) * 0.5) * a.value, (f32(j) - (ny - 1.0) * 0.5) * a.value);
+    return Pixel(true, i, j, c);
+}
+
+// A DMD pixel's mirror state: two bits, twelve to an exact-integer f32.
+fn mirror_state(resp: Response, q: u32) -> u32 {
+    if ((resp.flags & RESP_FLAG_PER_PIXEL) == 0u) { return resp.ar.policy; }
+    let v = verts[resp.t.tab_start + q / 24u];
+    let word = select(v.x, v.y, (q % 24u) >= 12u);
+    return (u32(word) >> (2u * (q % 12u))) & 3u;
+}
+
+// An SLM pixel's phase at the design wavelength, two to a vertex.
+fn pixel_phase(resp: Response, i: u32, j: u32) -> f32 {
+    let q = j * resp.t.tab_count + i;
+    let v = verts[resp.t.tab_start + q / 2u];
+    return select(v.x, v.y, (q % 2u) == 1u);
+}
+
+// Into (-pi, pi], as tracer3 wraps a phase difference.
+fn wrap_phase(x: f32) -> f32 {
+    let t = x + MOD_PI;
+    return t - MOD_TWO_PI * floor(t / MOD_TWO_PI) - MOD_PI;
+}
+
 // Refracted direction; `w` is 1 on refraction, 0 on TIR. `n` opposes `d`.
 fn refract3(d: vec3<f32>, n: vec3<f32>, n1: f32, n2: f32) -> vec4<f32> {
     let eta = n1 / n2;
@@ -1372,16 +1424,25 @@ fn interact_surface(w: Work, ev: Event, point: vec3<f32>, flux_end: f32, lambda:
     if (kind == RESP_ABSORBER) {
         return;
     } else if (kind == RESP_THIN_LENS) {
-        // Ideal-lens slope law u' = u - h/f in the surface's local frame
-        // (`r` carries the normalized focal length). Full transmission.
+        // The quadratic phase's gradient in the surface's local frame (mirrors
+        // tracer3): d't = dt - pt/f on direction cosines, d'z = sign(dz)
+        // sqrt(1 - |d't|^2); `r` carries the normalized focal length. Full
+        // transmission; a ray taken past grazing is absorbed.
         let fl = resp.r.value;
+        if (fl == 0.0) {
+            return;
+        }
         let srot = surface_rot(s);
         let pl = transpose(srot) * (point - s.pos.xyz);
         let dl = transpose(srot) * w.d;
-        var dir = w.d;
-        if (abs(dl.z) > 1e-6 && fl != 0.0) {
-            dir = srot * normalize(vec3<f32>(dl.x - abs(dl.z) * pl.x / fl, dl.y - abs(dl.z) * pl.y / fl, dl.z));
+        let tx = dl.x - pl.x / fl;
+        let ty = dl.y - pl.y / fl;
+        let t2 = tx * tx + ty * ty;
+        if (t2 >= 1.0) {
+            return;
         }
+        let side = select(1.0, -1.0, dl.z < 0.0);
+        let dir = normalize(srot * vec3<f32>(tx, ty, side * sqrt(1.0 - t2)));
         push(Work(point + dir * EPS, dir, flux_end, w.depth + 1u, w.gdepth, w.medium_n, w.medium_alpha, w.flags & ~SEG_TIR), min_flux);
     } else if (kind == RESP_IDEAL_MIRROR) {
         // The flat mirror of reflectivity 1, then the bend toward the focus on
@@ -1415,6 +1476,85 @@ fn interact_surface(w: Work, ev: Event, point: vec3<f32>, flux_end: f32, lambda:
             if (!transmit) { dir = reflect3(w.d, n_oppose); }
             push(Work(point + dir * EPS, dir, flux_end * e0 / over, w.depth + 1u, w.gdepth, w.medium_n, w.medium_alpha, w.flags & ~SEG_TIR), min_flux);
         }
+    } else if (kind == RESP_MICROMIRROR) {
+        // tracer3's `modulator_ray`: the ray reflects off the facet of the
+        // mirror it hits, tilted to that pixel's state. The dead space between
+        // mirrors, and anything off the array, absorbs.
+        let srot = surface_rot(s);
+        let pl = transpose(srot) * (point - s.pos.xyz);
+        let px = modulator_pixel(resp.t, pl);
+        if (!px.ok) { return; }
+        let st = mirror_state(resp, px.j * resp.t.tab_count + px.i);
+        let g = resp.ar.tab_start;
+        let na = verts[g + 2u * st];
+        let nb = verts[g + 2u * st + 1u];
+        let n_local = vec3<f32>(na.x, na.y, nb.x);
+        // Inside the mirror's projected outline? Across the hinge it is
+        // compressed by cos(tilt): undo that.
+        let h = verts[g + 6u];
+        let x = verts[g + 7u];
+        let dx = pl.x - px.c.x;
+        let dy = pl.y - px.c.y;
+        let sh = dx * h.x + dy * h.y;
+        let sa = (dx * x.x + dy * x.y) / n_local.z;
+        let ux = h.x * sh + x.x * sa;
+        let uy = h.y * sh + x.y * sa;
+        let half = 0.5 * resp.ar.value * resp.t.value;
+        if (abs(ux) > half || abs(uy) > half) { return; }
+        let normal = normalize(srot * n_local);
+        var facing = normal;
+        if (dot(w.d, normal) >= 0.0) { facing = -normal; }
+        let dir = reflect3(w.d, facing);
+        push(Work(point + dir * EPS, dir, flux_end * resp.r.value, w.depth + 1u, w.gdepth, w.medium_n, w.medium_alpha, w.flags & ~SEG_TIR), min_flux);
+    } else if (kind == RESP_PHASE_MODULATOR) {
+        // tracer3's `modulator_ray` with polarization off: on an electrode,
+        // half the flux (the share on the director) is steered by the local
+        // phase gradient and half reflects specularly; the dead space is a
+        // mirror of |g|^2.
+        let srot = surface_rot(s);
+        let pl = transpose(srot) * (point - s.pos.xyz);
+        let px = modulator_pixel(resp.t, pl);
+        if (!px.ok) { return; }
+        let prm = verts[resp.ar.tab_start];
+        let pitch_um = verts[resp.ar.tab_start + 1u].x;
+        let half = 0.5 * resp.ar.value * resp.t.value;
+        if (abs(pl.x - px.c.x) > half || abs(pl.y - px.c.y) > half) {
+            let dir = reflect3(w.d, n_oppose);
+            push(Work(point + dir * EPS, dir, flux_end * prm.x, w.depth + 1u, w.gdepth, w.medium_n, w.medium_alpha, w.flags & ~SEG_TIR), min_flux);
+            return;
+        }
+        // The phase scales as lambda0/lambda; differences wrap; the array's
+        // edge takes a one-sided difference.
+        var gx = 0.0;
+        var gy = 0.0;
+        if ((resp.flags & RESP_FLAG_PER_PIXEL) != 0u) {
+            let nx = resp.t.tab_count;
+            let ny = resp.t.policy;
+            let scale = prm.y / lambda;
+            let xa = select(px.i - 1u, 0u, px.i == 0u);
+            let xb = min(px.i + 1u, nx - 1u);
+            if (xa != xb) {
+                gx = wrap_phase(pixel_phase(resp, xb, px.j) * scale - pixel_phase(resp, xa, px.j) * scale) / f32(xb - xa);
+            }
+            let ya = select(px.j - 1u, 0u, px.j == 0u);
+            let yb = min(px.j + 1u, ny - 1u);
+            if (ya != yb) {
+                gy = wrap_phase(pixel_phase(resp, px.i, yb) * scale - pixel_phase(resp, px.i, ya) * scale) / f32(yb - ya);
+            }
+        }
+        // The change in direction cosines is (lambda/2pi) grad(phi), the
+        // gradient per pixel.
+        let k = lambda / (w.medium_n * pitch_um * MOD_TWO_PI);
+        let dl = transpose(srot) * w.d;
+        let tx = dl.x + k * gx;
+        let ty = dl.y + k * gy;
+        let share = 0.5 * resp.r.value;
+        if (tx * tx + ty * ty < 1.0) {
+            let dir = normalize(srot * vec3<f32>(tx, ty, sqrt(1.0 - tx * tx - ty * ty)));
+            push(Work(point + dir * EPS, dir, flux_end * share, w.depth + 1u, w.gdepth, w.medium_n, w.medium_alpha, w.flags & ~SEG_TIR), min_flux);
+        }
+        let spec = reflect3(w.d, n_oppose);
+        push(Work(point + spec * EPS, spec, flux_end * share, w.depth + 1u, w.gdepth, w.medium_n, w.medium_alpha, w.flags & ~SEG_TIR), min_flux);
     } else if (kind == RESP_MIRROR) {
         // A table with no value at `lambda` ends the branch.
         let rs = sample_spectral(resp.r, lambda);

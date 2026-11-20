@@ -263,6 +263,16 @@ export class MaterialLibrary {
           iridescenceIOR: 1.6,
           iridescenceThicknessRange: [180, 650],
         }));
+      case "modulator":
+        // A DMD or an SLM: a dark array of mirrors or electrodes behind a
+        // window, glossy where the window catches the light.
+        return this.get("modulator", () => new THREE.MeshPhysicalNodeMaterial({
+          color: new THREE.Color(0.16, 0.17, 0.2),
+          metalness: 0.85,
+          roughness: 0.22,
+          clearcoat: 1,
+          clearcoatRoughness: 0.05,
+        }));
       case "slab_edge":
         // The edge of a display-only slab (a mirror or plate substrate).
         return this.get("slab_edge", () => new THREE.MeshStandardNodeMaterial({

@@ -98,6 +98,50 @@ fixtures (the evanescent branch), `test_c19_*` (Δ) and
 `test_optiland_puts_the_rhomb_phase_on_the_growing_branch` (Optiland's
 retardance past the critical angle is the negative of the true one).
 
+## Fourier and propagation conventions
+
+The scalar wave optics in `oc-wave` (ADR 0004) uses the same time dependence,
+`exp(-iωt)`, and so does its main reference, Goodman's *Introduction to Fourier
+Optics*, 4th ed. (W. H. Freeman/Macmillan Learning, 2017, ISBN
+978-1-319-11916-4). Everything below follows from it.
+
+| Quantity | Convention |
+|---|---|
+| Plane wave along `+z` | `exp(+ikz)`, `k = 2πn/λ` |
+| Forward transform | `Û(f) = Σ U(x) exp(−i2π f·x) ΔxΔy`, the sampled Fourier integral |
+| Inverse transform | `U(x) = Σ Û(f) exp(+i2π f·x) Δf_xΔf_y`, `Δf = 1/(NΔx)` |
+| Parseval | `Σ\|U\|²ΔxΔy = Σ\|Û\|²Δf_xΔf_y`, exactly, with the two scales above |
+| Field normalization | `\|U\|²` is flux per mm²; `Σ\|U\|²ΔA` is the field's flux, relative unless the source is calibrated |
+| Sample layout | sample `i` at `center + (i − ⌊n/2⌋)·Δx`; `ifftshift` puts the window centre at the transform origin |
+| Analytic carrier | the true field is `data · exp(ik(α₀x + β₀y))`, with `(α₀, β₀)` direction cosines held outside the samples |
+
+The propagators that land with W1 add their transfer functions to this table:
+the angular spectrum `H = exp(+i2πz√((n/λ)² − f²))`, the Fresnel impulse
+response `h = e^{ikz}/(iλz)·exp(ik r²/2z)` and the thin lens
+`t = exp(−ik r²/2f)` (so `f > 0` converges) are all Goodman's, in this
+convention.
+
+The thin lens is one operator for waves and rays (Q22 of the expert review of
+the wave engine). A ray goes along the phase's gradient (the eikonal, Born &
+Wolf §3.1), so the f64 tracer, the preview's CPU mirror and its shader all
+shift a ray's direction cosines across the lens by `−p/f` at the point `p`
+where it meets the lens plane, `d′_t = d_t − p_t/f`, and send it on to the same
+side, `d′_z = sign(d_z)√(1 − |d′_t|²)`. This is the paraxial lens and has the
+quadratic phase's spherical aberration: a collimated ray at height `h`
+crosses the axis at `f√(1 − (h/f)²)`, and an axial conjugate holds to first
+order in the aperture. A ray the gradient takes past grazing (`|d′_t| ≥ 1`)
+has no propagating wave to go on in and is absorbed at the lens, named in the
+report. Before, the rays used the slope law `u′ = u − h/f`, exact for every
+conjugate at every height, which differs from the wave's lens at finite
+angles.
+
+Held by `oc-wave/tests/fft.rs`:
+- `fft2_is_unitary_under_parseval` pins the scales.
+- `the_centered_transform_of_a_shifted_gaussian_is_a_gaussian_with_the_shift_phase`
+  pins the sign of the kernel and the centring. A Gaussian shifted by `a`
+  must come back as `exp(−πf²)·exp(−i2πfa)`, so a flipped kernel or a lost
+  shift fails it.
+
 ## Surfaces and sides
 
 A geometric normal identifies which material is on which side. The tracer hands
@@ -194,6 +238,16 @@ the same physical answer.
 | Plate backing | Substrate far thicker than the coherence length | Thin substrates would interfere and do not here |
 | Scalar responses (`Mirror`, `ExplicitRt`, `DielectricFresnel`) | Unpolarized light, one interaction | They carry no phase, so they cannot be given a Jones matrix; see below |
 | GRIN | Not implemented; traces as a homogeneous medium at `base_index` | Any quantitative GRIN claim |
+| Wave: band-limited angular spectrum (`oc-wave`) | The first Rayleigh–Sommerfeld solution, scalar, homogeneous isotropic medium, between parallel planes; exact up to the critical distance `LΔx/λ`, band-limited beyond it with the removed power booked | Vector fields, high-NA focusing, coupling to structures; a window too small for the far field shows as booked band-limit loss |
+| Wave: Fresnel transfer function and impulse response | The paraxial (Fresnel) approximation, each on its side of the critical distance (Voelz & Roggemann 2009); the zoomed Fresnel transform onto a new window | A field whose paraxial error, computed exactly from its spectrum, is not small (reported `Paraxial`); the other side of `z_c` (reported `OutsideRegime`) |
+| Wave: Fraunhofer | Source Fresnel number below 0.1 | Anything nearer (reported) |
+| Wave: polarizers and retarders on the wave path | The tracer's Jones matrix at the chief ray (faces, the layer's axis projected across the ray in its glass), applied to the field's two components (Jones 1941) | A field whose directions spread far from the chief ray's: the matrix is one for the whole field |
+| Wave: refractive faces and curved mirrors on the wave path | Geometric field tracing across a thin slab (Wyrowski & Kuhn 2011), rays along a reference fixed by the geometry (the beam's paraxial `q`, the chief ray's or a modulator order's direction); a linear operator | A field departing far from the reference (reported: its lateral move θL and its phase kθ²L/2 across the slab) |
+| Wave: thin elements (apertures, thin lens, phase screens) | A transmittance in one plane; apertures, element outlines and lens rims anti-aliased by exact cell area (of their projection along the beam, on an oblique plane) | The element's thickness; the sub-cell projection error of a sampled edge (booked as `subcell_projection`), the norm beyond the grid's band not measured apart from it; features below ~14λ, where Pommet, Moharam & Grann (1994) found scalar efficiencies off by more than ±5% for their binary gratings (a heuristic: their 8-level case needs a period above 20λ, and the error grows with index, depth, levels and incidence) |
+| Wave: DMD (`oc_core::modulator`, `oc_wave::modulator`) | Thin element: each mirror reflects as its tilted plane, over its outline projected onto the array plane; orders in direction cosines; Harvey's normalization by default ([dmd.md](../dmd.md)) | Mirror shading at oblique incidence, edges, hinges, curvature; the facet's own surface integral, which the array-normal mask approximates (compared in [dmd.md](../dmd.md), flagged above 15° incidence); a mirror under ~14λ (flagged, a heuristic); the superpixel method (not implemented) |
+| Wave: LCoS SLM | Thin element: phase from a table at `λ₀`, scaled `λ₀/λ` (flagged); dead space unmodulated; fringing as linear broadening; each polarization component a scalar field, the director's split applied to the pair at the chief ray ([slm.md](../slm.md)) | LC dynamics and flicker, birefringence dispersion, angle dependence of the phase; fringing beyond a box-averaged phase surrogate; an electrode under ~14λ (flagged, a heuristic) |
+| DMD and SLM in the ray tracers (reference and preview) | The geometric limit: a ray reflects off the facet it hits, or is steered by the local phase gradient `(λ/2π)∇φ`; reported as approximated. Or, in the reference only, the orders ray model: the brightest orders of the local unit cell as child rays, the rest booked as untraced | In the geometric limit, diffraction (the wave path carries it); in the orders model, coherence between hits, an aperiodic pattern beyond an 8 × 8 window, fringing, a device not in air |
+| Wave path (`oc_wave::path`) | A coherent beam along each chain of the chief ray to the detector, unpolarized, its samples carrying the whole phase; arms that meet on the detector added as fields, with unitary splitters (the Stokes signs); spectral lines added in power; a plane-parallel plate (round trips included) and a flat coating plane wave by plane wave, s or p of one plane of incidence; thin elements; a flat mirror by image theory; each face of a body and each curved surface by geometric field tracing across its sag, the field diffracting between faces; an oblique element by projection along the rays (`TiltProjection`) | Diffraction inside a face's slab; polarizing elements (refused); a chosen diffraction order (W7); the tilt projection's depth beyond `Δx²/λ` (reported); light on paths the chain does not follow (booked, never added back); feedback outside a plate; arms of different polarization (visibility an upper bound); planes of incidence that differ (refused); a lens's faces polarization-blind |
 
 **Power data does not determine phase.** `Rs`, `Rp`, `Ts`, `Tp` fix the
 magnitudes of a Jones element's diagonal and say nothing about the relative phase

@@ -20,6 +20,7 @@ import { drawPolarMap } from "./polarmap";
 import { cellGrid, drawCellGrid } from "./detector-plots";
 import { initGallery } from "./gallery";
 import { createReference, type ReferenceBundle } from "./reference";
+import { createWave, type Wave, type WaveBundle } from "./wave";
 import { initSunPanel } from "./sun-panel";
 import { initFidelityPanel } from "./fidelity-panel";
 
@@ -621,7 +622,7 @@ async function main() {
   // analysis. Two modes: the 2D binning heatmap (incident flux per cell) and the
   // spot diagram (the actual ray-detector intersection points). The numbers line
   // is the same reference readout under both.
-  type DetMode = "heatmap" | "spot";
+  type DetMode = "heatmap" | "spot" | "wave";
   let detMode: DetMode = "heatmap";
   const detHead = document.getElementById("detHead")!;
 
@@ -736,6 +737,10 @@ async function main() {
     // inset re-read too, so the two never quote different traces.
     componentView?.retraced();
     hctx.clearRect(0, 0, hist.width, hist.height);
+    if (detMode === "wave") {
+      drawWave();
+      return;
+    }
     const b = shownReference();
     writeReferenceStatus();
     if (!b) {
@@ -804,18 +809,145 @@ async function main() {
     dockNums.textContent = `${tag}hits ${info.hits} · flux ${formatFlux(info.totalIncident)}${reads} · centroid ${c} mm · OPL ${opl} mm${pol}`;
   }
 
-  // Detector analysis-mode toggle (heatmap ⇄ spot).
+  // --- the coherent wave path (the dock's wave mode) ----------------------
+  // The first source with a coherent beam, carried to the selected detector
+  // if it is a rectangle, else the first rectangular one. The worker runs it
+  // for the scene as it is; while it runs, the previous scene's result stays
+  // up, marked as such. Every number is the f64 wave engine's.
+  let wave: Wave | null = null;
+  type WaveView = "linear" | "log" | "phase";
+  let waveView: WaveView = "linear";
+  const cohN = document.getElementById("cohN") as HTMLSelectElement;
+  const cohWindow = document.getElementById("cohWindow") as HTMLInputElement;
+  type WaveTargets = {
+    sources: { id: number; coherence: unknown }[];
+    detectors: { id: number; label: string; rectangle: boolean; widthMm: number | null; heightMm: number | null; bins: [number, number] }[];
+  };
+  function hsv(h: number, v: number): [number, number, number] {
+    const f = (n: number) => {
+      const k = (n + h * 6) % 6;
+      return v * (1 - Math.max(0, Math.min(k, 4 - k, 1)));
+    };
+    return [Math.round(255 * f(5)), Math.round(255 * f(3)), Math.round(255 * f(1))];
+  }
+  function drawWave() {
+    wave ??= createWave(() => {
+      if (detMode === "wave") refresh3dDetector();
+    });
+    const t = JSON.parse(scene.waveTargetsJSON()) as WaveTargets | null;
+    const src = t?.sources.find((s) => s.coherence);
+    const dets = (t?.detectors ?? []).filter((d) => d.rectangle);
+    const sel = selectedBody3d();
+    const det = dets.find((d) => d.id === sel) ?? dets[0];
+    refStatus.classList.remove("stale");
+    dockPanel.classList.remove("stale");
+    if (!src || !det) {
+      wave.clear();
+      dockNums.textContent = !src
+        ? "no coherent beam: give the source one (coherent beam, left)"
+        : "no rectangular detector for the wave readout";
+      refStatus.textContent = "";
+      return;
+    }
+    const n = Number(cohN.value);
+    const windowMm = Number(cohWindow.value);
+    wave.request({ revision: scene.sceneRevision(), source: src.id, detector: det.id, n, windowMm }, () => scene.scene3JSON());
+    const st = wave.status();
+    const shown: WaveBundle | null = st.state === "current" ? st.bundle : wave.latest();
+    const secs = (ms: number) => (ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(1)} s`);
+    if (st.state === "current") refStatus.textContent = `wave current · ${n}² in ${secs(st.bundle.ms)}`;
+    else if (st.state === "running") refStatus.textContent = `computing the wave ${Math.round(st.fraction * 100)}%${shown ? " · picture is the previous scene's" : ""}`;
+    else if (st.state === "error") refStatus.textContent = `wave refused: ${st.message}`;
+    const stale = st.state !== "current" && !!shown;
+    refStatus.classList.toggle("stale", st.state === "running");
+    dockPanel.classList.toggle("stale", stale);
+    if (!shown) {
+      dockNums.textContent = st.state === "error" ? "no wave picture" : "computing the wave…";
+      return;
+    }
+    const r = shown.result;
+    const area = { x: 0, y: 0, w: hist.width, h: hist.height };
+    if (waveView === "phase") {
+      const [fx, fy] = r.field.n;
+      const [px, py] = r.field.pitchMm;
+      const face: DetectorFace = {
+        shape: "rectangle", width: fx * px, height: fy * py, inner: 0, pixels: [fx, fy], pitch: [px, py],
+        pixelArea: px * py, faceArea: fx * px * fy * py, directionBins: null, maxCells: fx * fy,
+      };
+      let top = 0;
+      for (const v of shown.intensity) top = Math.max(top, v);
+      const colours = new Uint8Array(3 * fx * fy);
+      const values = new Float64Array(fx * fy);
+      for (let i = 0; i < fx * fy; i++) {
+        const a = top > 0 ? Math.sqrt(shown.intensity[i] / top) : 0;
+        values[i] = a > 1e-3 ? 1 : 0;
+        const [cr, cg, cb] = hsv((shown.phase[i] + Math.PI) / (2 * Math.PI), a);
+        colours[3 * i] = cr;
+        colours[3 * i + 1] = cg;
+        colours[3 * i + 2] = cb;
+      }
+      detHead.textContent = "wave — arriving field, phase (f64)";
+      drawFacePixels(hctx, face, values, area, 1, undefined, colours);
+    } else {
+      const [nu, nv] = r.bins;
+      const w = det.widthMm ?? 1, h = det.heightMm ?? 1;
+      const face: DetectorFace = {
+        shape: "rectangle", width: w, height: h, inner: 0, pixels: [nu, nv], pitch: [w / nu, h / nv],
+        pixelArea: (w / nu) * (h / nv), faceArea: w * h, directionBins: null, maxCells: nu * nv,
+      };
+      let top = 0;
+      for (const v of shown.power) top = Math.max(top, v);
+      const values = waveView === "log"
+        ? Array.from(shown.power, (v) => (top > 0 && v > 0 ? Math.max(0, 6 + Math.log10(v / top)) : 0))
+        : shown.power;
+      detHead.textContent = `wave — power per pixel${waveView === "log" ? ", log" : ""} (f64)`;
+      drawFacePixels(hctx, face, values, area);
+    }
+    const l = r.report.ledger;
+    const pct = (x: number) => `${(100 * x / Math.max(l.launched, 1e-300)).toFixed(1)}%`;
+    const inconsistencies: string[] = r.report.inconsistencies ?? [];
+    const flags = r.report.warnings.length + r.report.validity.length + inconsistencies.length;
+    dockNums.textContent = `#${det.id} · ${formatFlux(l.detected)} detected (${pct(l.detected)}) · ${r.field.n[0]}² over ${windowMm} mm · λ ${(r.field.lambdaUm * 1000).toFixed(1)} nm`
+      + (flags ? ` · ${flags} flag${flags > 1 ? "s" : ""}` : "");
+    const named = (x: unknown) => (typeof x === "string" ? x : Object.keys(x as object)[0] ?? String(x));
+    dockNums.title = [
+      `ledger, physical: detected ${pct(l.detected)}, aperture ${pct(l.absorbed_aperture)}, element ${pct(l.absorbed_element)}, evanescent ${pct(l.evanescent ?? 0)}, other family ${pct(l.other_family)}, other orders ${pct(l.untracked_orders ?? 0)}, other arm ${pct(l.other_arm ?? 0)}, passed beside ${pct(l.passed_by ?? 0)}, other ports ${pct(l.other_ports ?? 0)}; numerical: left the window ${pct(l.left_window)}, band limit ${pct(l.band_limit_removed)}, band cut ${pct(l.spectral_projection ?? 0)}, sub-cell edges ${pct(l.subcell_projection ?? l.beyond_nyquist ?? 0)}, resampling ${pct(l.resampling ?? 0)}, remainder ${pct(l.numerical)}`,
+      ...inconsistencies.map((x) => `inconsistent: ${x}`),
+      ...r.report.warnings.map((x) => `warning: ${named(x)}`),
+      ...r.report.validity.map((x) => `validity: ${named(x)}`),
+      ...r.report.approximated.map((x) => `approximated: ${x}`),
+      ...r.report.steps.map((s) => `step: ${s.note}`),
+    ].join("\n");
+  }
+
+  // Detector analysis-mode toggle (heatmap ⇄ spot ⇄ wave).
   const detHeatBtn = document.getElementById("detHeatmap") as HTMLButtonElement;
   const detSpotBtn = document.getElementById("detSpot") as HTMLButtonElement;
+  const detWaveBtn = document.getElementById("detWave") as HTMLButtonElement;
+  const waveModes = document.getElementById("waveModes")!;
   function setDetMode(m: DetMode) {
     detMode = m;
     detHeatBtn.classList.toggle("active", m === "heatmap");
     detSpotBtn.classList.toggle("active", m === "spot");
-    detHead.textContent = `detector — ${m === "spot" ? "spot diagram" : "heatmap"} (f64)`;
+    detWaveBtn.classList.toggle("active", m === "wave");
+    waveModes.style.display = m === "wave" ? "" : "none";
+    if (m !== "wave") dockNums.title = "";
+    detHead.textContent = m === "wave" ? "wave (f64)" : `detector — ${m === "spot" ? "spot diagram" : "heatmap"} (f64)`;
     refreshReference();
   }
   detHeatBtn.onclick = () => setDetMode("heatmap");
   detSpotBtn.onclick = () => setDetMode("spot");
+  detWaveBtn.onclick = () => setDetMode("wave");
+  const waveViewBtns: [string, WaveView][] = [["waveLinear", "linear"], ["waveLog", "log"], ["wavePhaseBtn", "phase"]];
+  for (const [btnId, v] of waveViewBtns) {
+    document.getElementById(btnId)!.onclick = () => {
+      waveView = v;
+      for (const [b, w] of waveViewBtns) document.getElementById(b)!.classList.toggle("active", w === v);
+      refreshReference();
+    };
+  }
+  cohN.addEventListener("change", () => refreshReference());
+  cohWindow.addEventListener("change", () => refreshReference());
 
   // --- controls ----------------------------------------------------------
   // These knobs feed both tracers: `setGhosts`/`setMaxGhostBounces` set the
@@ -998,9 +1130,56 @@ async function main() {
   wlList.addEventListener("input", () => { wlPreset.value = "custom"; wlList.disabled = false; applyWavelengths(parseWlList()); renderView(); });
   wlList.addEventListener("change", refreshReference);
 
+  // The source's coherent beam: what the wave path launches. Its rays are
+  // unchanged, so only the wave mode reads it.
+  const cohType = document.getElementById("cohType") as HTMLSelectElement;
+  const cohP0 = document.getElementById("cohP0") as HTMLInputElement;
+  const cohP1 = document.getElementById("cohP1") as HTMLInputElement;
+  const cohL0 = document.getElementById("cohL0")!;
+  const cohRow1 = document.getElementById("cohRow1")!;
+  const cohSummary = document.getElementById("cohSummary")!;
+  const firstSourceId = () => (JSON.parse(scene.sourceObjectsJSON()) as { id: number }[])[0]?.id ?? -1;
+  function showCoherence(kind: string, note = "") {
+    cohL0.textContent = kind === "tophat" ? "r" : "w₀";
+    cohRow1.style.display = kind === "gaussian" ? "" : "none";
+    cohSummary.textContent = note || (kind === "none" ? "coherent beam: none"
+      : kind === "gaussian" ? `coherent beam: Gaussian, w₀ ${cohP0.value} mm`
+      : `coherent beam: top-hat, r ${cohP0.value} mm`);
+  }
+  function applyCoherence() {
+    const id = firstSourceId();
+    if (id < 0) return;
+    const p0 = Number(cohP0.value), p1 = Number(cohP1.value);
+    const json = cohType.value === "gaussian" ? JSON.stringify({ Gaussian: { waist_radius_mm: p0, waist_offset_mm: p1 } })
+      : cohType.value === "tophat" ? JSON.stringify({ TopHat: { radius_mm: p0 } })
+      : "null";
+    const r = JSON.parse(scene.setSourceCoherence(id, json));
+    showCoherence(cohType.value, r.error ? `coherent beam: refused (${r.error})` : "");
+    refreshReference();
+  }
+  function syncCoherence() {
+    const id = firstSourceId();
+    const c = id >= 0 ? JSON.parse(scene.sourceCoherenceJSON(id)) : null;
+    if (c?.Gaussian) {
+      cohType.value = "gaussian";
+      cohP0.value = String(c.Gaussian.waist_radius_mm);
+      cohP1.value = String(c.Gaussian.waist_offset_mm);
+    } else if (c?.TopHat) {
+      cohType.value = "tophat";
+      cohP0.value = String(c.TopHat.radius_mm);
+    } else {
+      cohType.value = "none";
+    }
+    showCoherence(cohType.value);
+  }
+  cohType.addEventListener("change", applyCoherence);
+  cohP0.addEventListener("change", applyCoherence);
+  cohP1.addEventListener("change", applyCoherence);
+
   // Sync the picker from the current Scene3 source (called after boot, since the
   // 3D scene is created later in init).
   function syncSourcePicker() {
+    syncCoherence();
     const s = JSON.parse(scene.firstSourceJSON());
     if (s) {
       srcType.value = s.kind;
@@ -1305,6 +1484,10 @@ async function main() {
     addAndFocus(scene.addGrating(freeX(-25, 0), 0, 25, 25, 180, 600, false));
   document.getElementById("addPolarizer")!.onclick = () => addAndFocus(scene.addPolarizer(freeX(-25, 0), 0, 12, 0, 0, 0));
   document.getElementById("addRetarder")!.onclick = () => addAndFocus(scene.addRetarder(freeX(-15, 0), 0, 12, 0, 45, 90));
+  // A DMD or SLM faces the beam like a grating; its pattern is edited in the
+  // component view. Preset 3 is TI's DLP9000 (DLPA083B Table 2-1).
+  document.getElementById("addDmd")!.onclick = () => addAndFocus(scene.addDmd(freeX(-25, 0), 0, 180, 3));
+  document.getElementById("addSlm")!.onclick = () => addAndFocus(scene.addSlm(freeX(-25, 0), 0, 180));
   // The polarizing cube is the odd one out: it is the only polarizing part
   // here whose behaviour is computed rather than declared. The stack is a
   // plain quarter-wave mirror, and what makes it polarizing is that it sits at

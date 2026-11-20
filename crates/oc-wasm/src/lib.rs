@@ -49,6 +49,10 @@ mod fidelity_ui;
 mod catalog_ui;
 mod coating_ui;
 mod grating_ui;
+/// DMDs and LCoS SLMs: add one, read and edit its device and pattern.
+mod modulator_ui;
+/// The coherent wave path: a source's beam, and a wave job run in steps.
+mod wave_ui;
 // The analysis job (ADR 0003): `oc-analysis` stepped from a worker.
 mod analysis_ui;
 
@@ -180,6 +184,10 @@ pub struct Canvas {
     /// This worker's share of a reference a pool of workers traces
     /// ([`Canvas::pool_prepare`]).
     pool: std::cell::RefCell<Option<Pool3>>,
+    /// A wave path being carried an event at a time ([`Canvas::wave_step`]).
+    wave_job: std::cell::RefCell<Option<oc_wave::path::WaveJob>>,
+    /// The last finished wave path.
+    wave_result: std::cell::RefCell<Option<oc_wave::path::WavePathResult>>,
     /// The analysis job in hand ([`Canvas::analysis_begin`]).
     analysis: std::cell::RefCell<analysis_ui::AnalysisSlot>,
 }
@@ -268,6 +276,8 @@ impl Canvas {
             reference: std::cell::RefCell::new(None),
             reference_job: std::cell::RefCell::new(None),
             pool: std::cell::RefCell::new(None),
+            wave_job: std::cell::RefCell::new(None),
+            wave_result: std::cell::RefCell::new(None),
             analysis: Default::default(),
         }
     }
@@ -1857,6 +1867,22 @@ impl Canvas {
     /// How the browser should preview the scene (§10.3): `"exact_planar"`,
     /// `"full_3d"`, `"legacy_planar"`, or `"none"` when nothing is loaded. This
     /// is the badge; it never labels a legacy result full 3D.
+    /// What the f32 preview leaves out of its picture, and why:
+    /// `[{"object": id, "reason": "..."}]`. The rays it draws pass straight
+    /// through these, so the view names them; the f64 reference traces them.
+    #[wasm_bindgen(js_name = previewOmittedJSON)]
+    pub fn preview_omitted_json(&self) -> String {
+        let Some(g) = self.fast_scene() else {
+            return "[]".into();
+        };
+        let items: Vec<String> = g
+            .rejected
+            .iter()
+            .map(|r| format!("{{\"object\":{},\"reason\":{}}}", r.object, json_str(&r.kind)))
+            .collect();
+        format!("[{}]", items.join(","))
+    }
+
     #[wasm_bindgen(js_name = previewMode)]
     pub fn preview_mode(&self) -> String {
         match &self.scene3 {
@@ -2768,6 +2794,8 @@ impl Canvas {
                 // A grating's light leaves in new directions, not as R and T:
                 // `gratingJSON` carries its orders.
                 SurfaceResponse::Grating { .. } => ("null".into(), "null".into()),
+                // A DMD or an SLM sends light per pixel, by pattern: no R or T.
+                SurfaceResponse::Modulator { .. } => ("null".into(), "null".into()),
             };
             let dichroic = DichroicSpec::from_response(r).map_or("null".into(), |d| {
                 format!(
@@ -2865,7 +2893,7 @@ impl Canvas {
                 SurfaceResponse::Polarizer { .. } | SurfaceResponse::Retarder { .. } => {
                     (None, None)
                 }
-                SurfaceResponse::Grating { .. } => (None, None),
+                SurfaceResponse::Grating { .. } | SurfaceResponse::Modulator { .. } => (None, None),
             };
             out.push(rr.unwrap_or(f64::NAN));
             out.push(tt.unwrap_or(f64::NAN));
@@ -5099,6 +5127,9 @@ pub(crate) fn surface_object_kind(s: &oc_core::scene3::SurfaceObject3) -> &'stat
         "beamsplitter"
     } else if f == "grating" || b == "grating" {
         "grating"
+    } else if f == "dmd" || f == "slm" {
+        // A pixelated modulator: its kind names which.
+        f
     } else if f == "polarizer" || f == "retarder" {
         // Named, because "surface" tells a reader nothing and these two are
         // not interchangeable: one absorbs half the light and one absorbs none.
@@ -6227,6 +6258,8 @@ mod scene3_tests {
                 seed: 1,
                 sequence: SamplingSequence::Grid,
             },
+            coherence: None,
+            polarization: None,
         });
 
         // A detector past the focus, facing back down the axis. Its local +Z
@@ -6323,6 +6356,8 @@ mod scene3_tests {
                 seed: 1,
                 sequence: SamplingSequence::Grid,
             },
+            coherence: None,
+            polarization: None,
         });
 
         // A mirror at the origin whose normal folds +X to (0, 0.6, 0.8): out of
@@ -6375,6 +6410,33 @@ mod scene3_tests {
             "/../../web/public/demo-fold.ocanvas"
         );
         std::fs::write(path, scene.to_json()).expect("write fold fixture");
+        eprintln!("wrote {path}");
+    }
+
+    /// The Michelson interferometer of oc-wave's wave-path tests: a 50/50
+    /// splitter, one mirror tilted 0.5 mrad, a 633 nm source with a 1 mm
+    /// Gaussian beam, and a detector at the output, so the wave dock shows
+    /// straight fringes 0.633 mm apart. Written to
+    /// `web/public/demo-michelson.ocanvas` for the wave spec. Ignored (fixture
+    /// generator): `cargo test -p oc-wasm --lib write_demo_michelson_fixture --
+    /// --ignored`.
+    #[test]
+    #[ignore]
+    fn write_demo_michelson_fixture() {
+        use oc_core::scene::Spectrum;
+        use oc_core::scene3::{CoherentBeam, Scene3, SpectralScalar, SurfaceResponse};
+        use oc_core::vec3::Vec3;
+        let mut s = Scene3::new();
+        s.add_collimated_beam(Vec3::ZERO, 1.0, 1.0, 1, Spectrum::Monochromatic(0.6328));
+        s.sources[0].coherence = Some(CoherentBeam::Gaussian { waist_radius_mm: 1.0, waist_offset_mm: 0.0 });
+        let m = SurfaceResponse::Mirror { reflectivity: SpectralScalar::Constant(1.0) };
+        s.add_beam_splitter(Vec3::new(50.0, 0.0, 0.0), 10.0, 135.0, 0.5, 0.5).unwrap();
+        s.add_planar_element(Vec3::new(150.0, 0.0, 0.0), 10.0, 180.0, m.clone(), m.clone());
+        s.add_planar_element(Vec3::new(50.0, 100.0, 0.0), 10.0, -90.0 + 5e-4f64.to_degrees(), m.clone(), m);
+        s.add_area_detector(Vec3::new(50.0, -100.0, 0.0), Vec3::Y, 2.0, 2.0, [128, 128]);
+        s.validate().expect("the Michelson validates");
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../web/public/demo-michelson.ocanvas");
+        std::fs::write(path, s.to_json()).expect("write the Michelson fixture");
         eprintln!("wrote {path}");
     }
 

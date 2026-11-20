@@ -585,10 +585,14 @@ pub enum SurfaceResponse {
         transmittance: SpectralScalar,
     },
     Absorber,
-    /// An ideal thin lens: the transmitted ray bends so the slope law
-    /// `u' = u − h/f` holds exactly at every height `h` in the lens plane
-    /// (direction-aware, so a backward ray converges toward the front focus).
-    /// Full transmission, no reflection, no dispersion, no added path length —
+    /// An ideal thin lens: the phase screen `exp(−ik|r − c|²/2f)` about the
+    /// surface's origin, one operator for the wave path and the rays. A ray
+    /// goes along the phase's gradient: its direction cosines across the lens
+    /// shift by `−p/f` at the point `p` it meets the lens plane, and it goes on
+    /// to the same side. This is the paraxial lens: a collimated bundle at
+    /// height `h` crosses the axis at `f√(1 − (h/f)²)` and an axial conjugate
+    /// holds to first order; a ray taken past grazing is absorbed. Full
+    /// transmission, no reflection, no dispersion, no added path length —
     /// the stand-in for a designed multi-element assembly whose prescription
     /// is not modelled (an infinity objective, a camera lens). Only meaningful
     /// on a standalone planar surface; a body patch authoring it is rejected
@@ -734,6 +738,22 @@ pub enum SurfaceResponse {
         /// angle.
         #[serde(default)]
         crystal: Option<Waveplate>,
+    },
+    /// A pixelated spatial light modulator: a digital micromirror device or a
+    /// phase-only LCoS SLM, with the pattern it displays. The device is centred
+    /// on the surface's origin, its pixel axes on local `X` and `Y`, facing
+    /// local `+Z` ([`crate::modulator`]).
+    ///
+    /// The ray tracer sees it in the geometric limit: a ray reflects off the
+    /// mirror facet of the pixel it hits, or is steered by the local phase
+    /// gradient. Its diffraction is the wave engine's (`oc-wave`). Only
+    /// meaningful on a standalone planar surface's front; a body patch
+    /// authoring one is rejected.
+    Modulator {
+        device: Box<crate::modulator::SpatialModulator>,
+        /// How the ray tracer treats it: the geometric limit unless set.
+        #[serde(default, skip_serializing_if = "crate::modulator::RayModel::is_geometric")]
+        ray_model: crate::modulator::RayModel,
     },
 }
 
@@ -894,7 +914,7 @@ impl SurfaceResponse {
                         ));
                     }
                 }
-                if let crate::thinfilm::CoatingBacking::Plate { substrate, exit, thickness_mm } = &coating.backing
+                if let crate::thinfilm::CoatingBacking::Plate { substrate, exit, thickness_mm, .. } = &coating.backing
                 {
                     substrate
                         .n
@@ -979,6 +999,10 @@ impl SurfaceResponse {
                     }
                 }
                 Ok(())
+            }
+            Self::Modulator { device, ray_model } => {
+                device.validate().map_err(|e| range("device", &e.to_string()))?;
+                ray_model.validate().map_err(|e| range("ray_model", &e.to_string()))
             }
         }
     }
@@ -1799,6 +1823,18 @@ pub struct Source3 {
     /// source is explicitly calibrated, and nothing here calibrates one.
     pub flux: f64,
     pub samples: SourceSampling,
+    /// The coherent beam this source launches on a wave path
+    /// (`oc_wave::path`), with the source's flux as its power. The rays it
+    /// emits are unaffected. Absent for a source traced only as rays, and
+    /// then left out on save.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coherence: Option<CoherentBeam>,
+    /// The polarization the source emits ([`SourcePolarization`]), in its own
+    /// frame. Absent, it emits unpolarized light, and is left out on save.
+    /// The f64 tracer launches its rays in this state and the wave path its
+    /// beam; the f32 preview stays unpolarized.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub polarization: Option<SourcePolarization>,
     /// The part of the sampling domain the source emits over; the whole of
     /// it by default. Not part of a scene file: an analysis sets it on a
     /// copy of a scene ([`SampleWindow`]).
@@ -1828,6 +1864,112 @@ pub struct SampleWindow {
     pub spatial: Option<[[f64; 2]; 2]>,
     /// The same of the directions' unit square.
     pub angular: Option<[[f64; 2]; 2]>,
+}
+
+/// The polarization a source emits, written in its own transverse frame:
+/// `x̂` along the source's local `+Y`, turned square to each ray it emits,
+/// and `ŷ = d̂ × x̂`. The time convention is `e^{−iωt}`, so the Jones vector
+/// `(1, i)/√2` turns from `x̂` toward `ŷ` with time, the handedness
+/// [`crate::polarization::Stokes::circular`] calls right (`S₃ > 0`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum SourcePolarization {
+    /// Unpolarized light, as a source that declares nothing emits.
+    Unpolarized,
+    /// Linear, `angle_deg` from `x̂` toward `ŷ`.
+    Linear { angle_deg: f64 },
+    /// Circular, right-handed (the field turning from `x̂` toward `ŷ`) or
+    /// left.
+    Circular { right: bool },
+    /// Any pure state, its Jones vector's `x̂` and `ŷ` components as
+    /// `[re, im]`; normalized on use.
+    Jones { x: [f64; 2], y: [f64; 2] },
+}
+
+impl SourcePolarization {
+    /// The state's unit Jones vector `(E_x, E_y)` on `x̂`, `ŷ`; `None` for
+    /// unpolarized light.
+    pub fn jones(&self) -> Option<[crate::Cx; 2]> {
+        use crate::Cx;
+        let (x, y) = match *self {
+            SourcePolarization::Unpolarized => return None,
+            SourcePolarization::Linear { angle_deg } => {
+                let (s, c) = angle_deg.to_radians().sin_cos();
+                (Cx::real(c), Cx::real(s))
+            }
+            SourcePolarization::Circular { right } => (Cx::real(1.0), Cx::new(0.0, if right { 1.0 } else { -1.0 })),
+            SourcePolarization::Jones { x, y } => (Cx::new(x[0], x[1]), Cx::new(y[0], y[1])),
+        };
+        let n = (x.norm_sqr() + y.norm_sqr()).sqrt();
+        Some([x * (1.0 / n), y * (1.0 / n)])
+    }
+
+    /// The state's Stokes vector at `flux`, on `x̂`, `ŷ`.
+    pub fn stokes(&self, flux: f64) -> crate::polarization::Stokes {
+        match self.jones() {
+            None => crate::polarization::Stokes::unpolarized(flux),
+            Some([x, y]) => crate::polarization::Stokes::from_jones(x, y).scaled(flux),
+        }
+    }
+
+    /// The frame's `x̂` for a ray along `dir` from a source placed by
+    /// `transform`: the local `+Y` turned square to the ray (the local `+Z`
+    /// where the ray runs along `+Y`).
+    pub fn frame_x(transform: &Isometry3, dir: Vec3) -> Vec3 {
+        let d = dir.normalize();
+        for local in [Vec3::Y, Vec3::Z] {
+            let a = transform.rotate(local);
+            let x = a - d * d.dot(a);
+            if x.length() > 1e-9 {
+                return x.normalize();
+            }
+        }
+        crate::polarization::any_perpendicular(d)
+    }
+
+    /// Why the state cannot be emitted, if it cannot.
+    pub fn check(&self) -> Result<(), String> {
+        match *self {
+            SourcePolarization::Linear { angle_deg } if !angle_deg.is_finite() => Err(format!("a linear polarization needs a finite angle, not {angle_deg}")),
+            SourcePolarization::Jones { x, y } => {
+                if !x.iter().chain(&y).all(|v| v.is_finite()) || x.iter().chain(&y).all(|v| *v == 0.0) {
+                    Err(format!("a Jones vector needs finite components, not all zero: {x:?}, {y:?}"))
+                } else {
+                    Ok(())
+                }
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// A coherent beam's profile at its source, for the wave path.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum CoherentBeam {
+    /// A Gaussian of `1/e²` radius `waist_radius_mm` at its waist,
+    /// `waist_offset_mm` downstream of the source along its axis (negative:
+    /// upstream).
+    Gaussian { waist_radius_mm: f64, waist_offset_mm: f64 },
+    /// A uniform, flat-phase disc of `radius_mm` at the source.
+    TopHat { radius_mm: f64 },
+}
+
+impl CoherentBeam {
+    /// Why the beam cannot be launched, if it cannot.
+    pub fn check(&self) -> Result<(), String> {
+        match *self {
+            CoherentBeam::Gaussian { waist_radius_mm, waist_offset_mm } => {
+                if !(waist_radius_mm.is_finite() && waist_radius_mm > 0.0 && waist_offset_mm.is_finite()) {
+                    return Err(format!("a Gaussian beam needs a positive waist and a finite offset, not {waist_radius_mm} mm at {waist_offset_mm} mm"));
+                }
+            }
+            CoherentBeam::TopHat { radius_mm } => {
+                if !(radius_mm.is_finite() && radius_mm > 0.0) {
+                    return Err(format!("a top-hat beam needs a positive radius, not {radius_mm} mm"));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -3009,6 +3151,12 @@ impl Scene3 {
                 field: field.to_string(),
                 reason: reason.to_string(),
             };
+            if let Some(pol) = &s.polarization {
+                pol.check().map_err(|e| range("polarization", &e))?;
+            }
+            if let Some(beam) = &s.coherence {
+                beam.check().map_err(|e| range("coherence", &e))?;
+            }
             match s.spatial {
                 SpatialDistribution3::Point => {}
                 SpatialDistribution3::Rectangle {

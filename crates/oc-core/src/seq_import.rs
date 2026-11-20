@@ -877,6 +877,8 @@ impl Builder {
             spectrum: spectrum.clone(),
             flux: 1.0,
             samples,
+            coherence: None,
+            polarization: None,
         });
         Ok(id)
     }

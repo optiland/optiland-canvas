@@ -252,7 +252,7 @@ pub struct Aperture3Buf {
     pub _pad: u32,
 }
 
-/// An area detector: a placed face shape, with a terminate/probe flag.
+/// An area detector: a placed face shape, with its flags.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct Detector3Buf {
@@ -263,8 +263,14 @@ pub struct Detector3Buf {
     pub shape_kind: u32,
     pub shape_a: f32,
     pub shape_b: f32,
-    pub terminate: u32,
+    /// [`DET_TERMINATES`] and [`DET_FRONT_ONLY`].
+    pub flags: u32,
 }
+
+/// The branch ends at the face (else it is a probe).
+pub const DET_TERMINATES: u32 = 1;
+/// The face counts its front only.
+pub const DET_FRONT_ONLY: u32 = 2;
 
 // A vec2 arena element (`array<vec2<f32>>`, stride 8 in std430).
 pub type Vert3Buf = [f32; 2];
@@ -689,7 +695,8 @@ fn pack_detector(d: &GpuDetector3) -> Detector3Buf {
         shape_kind,
         shape_a,
         shape_b,
-        terminate: d.terminate as u32,
+        flags: (if d.terminate { DET_TERMINATES } else { 0 })
+            | (if d.front_only { DET_FRONT_ONLY } else { 0 }),
     }
 }
 

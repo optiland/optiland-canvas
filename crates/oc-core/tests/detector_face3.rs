@@ -307,6 +307,7 @@ fn a_line_probe_has_no_face_to_resize_or_pixelate() {
         response: DetectorResponse::Unity,
         termination: DetectorTermination::Terminate,
         measure: DetectorMeasure::Power,
+        sides: Default::default(),
     });
     s.validate().expect("a line probe is valid");
     assert!(!s.set_detector_pixels(id.0, [4, 4]));

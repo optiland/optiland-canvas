@@ -120,7 +120,8 @@ struct Detector {
     shape_kind: u32,
     shape_a: f32,
     shape_b: f32,
-    terminate: u32,
+    // 1: the branch ends at the face; 2: it counts its front only.
+    flags: u32,
 };
 
 struct Seg {
@@ -1302,6 +1303,8 @@ fn nearest_event(o: vec3<f32>, d: vec3<f32>) -> Event {
     }
     for (var di = 0u; di < params.n_detectors; di = di + 1u) {
         let dd = detectors[di];
+        // A front-only face is not there for light arriving at its back.
+        if ((dd.flags & 2u) != 0u && dot(detector_rot(dd)[2], d) >= 0.0) { continue; }
         let f = plane_face(detector_rot(dd), dd.pos.xyz, o, d);
         if (f.hit && f.t < ev.t && shape_contains(dd.shape_kind, dd.shape_a, dd.shape_b, 0u, 0u, f.uv)) {
             ev = Event(f.t, 3u, di, vec3<f32>(0.0), f.uv, 0u);
@@ -1373,7 +1376,7 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>) {
             // Aperture: the branch ends here (blocked).
         } else {
             // Detector.
-            if (detectors[ev.idx].terminate == 0u) {
+            if ((detectors[ev.idx].flags & 1u) == 0u) {
                 var pw = w;
                 pw.o = point + d * EPS;
                 push(pw, min_flux);

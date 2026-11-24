@@ -6246,6 +6246,7 @@ mod scene3_tests {
             response: DetectorResponse::Unity,
             termination: DetectorTermination::Terminate,
             measure: oc_core::scene3::DetectorMeasure::Power,
+            sides: Default::default(),
         });
 
         scene.validate().expect("demo scene validates");
@@ -6359,6 +6360,7 @@ mod scene3_tests {
             response: DetectorResponse::Unity,
             termination: DetectorTermination::Terminate,
             measure: oc_core::scene3::DetectorMeasure::Power,
+            sides: Default::default(),
         });
 
         scene.validate().expect("fold scene validates");
@@ -6454,6 +6456,7 @@ mod scene3_tests {
             response: DetectorResponse::Unity,
             termination: DetectorTermination::Terminate,
             measure: oc_core::scene3::DetectorMeasure::Power,
+            sides: Default::default(),
         });
 
         let mut c = Canvas::new();
